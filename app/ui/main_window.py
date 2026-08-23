@@ -27,9 +27,11 @@ from PySide6.QtWidgets import (
     QMenu,
     QSizePolicy,
     QProgressBar,
-    QInputDialog,
+    QDialog,
+    QDialogButtonBox,
     QCheckBox,
     QAbstractItemView,
+    QSpinBox,
 )
 
 from app.core.app_settings import AppSettings
@@ -155,7 +157,7 @@ class DownloadTaskCard(QFrame):
             self.pause_requested.emit(self.task_id)
         elif status == "paused":
             self.resume_requested.emit(self.task_id)
-        elif status in {"queued", "canceling", "暂停中"}:
+        elif status in {"queued", "canceling", "暂停中", "waiting_selection"}:
             self.cancel_requested.emit(self.task_id)
         elif status in {"failed", "canceled", "deleted"}:
             self.retry_requested.emit(self.task_id)
@@ -228,6 +230,81 @@ class DownloadTaskCard(QFrame):
             self.action.setEnabled(task.status == "completed")
 
 
+class FormatSelectionDialog(QDialog):
+    """Compact format picker with a cover preview and a five-row viewport."""
+
+    def __init__(self, title: str, thumbnail_path: str, choices: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择视频分辨率")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        cover = QLabel("封面")
+        cover.setFixedSize(148, 84)
+        cover.setAlignment(Qt.AlignCenter)
+        cover.setObjectName("formatCover")
+        if thumbnail_path and Path(thumbnail_path).exists():
+            pixmap = QPixmap(thumbnail_path)
+            if not pixmap.isNull():
+                cover.setText("")
+                cover.setPixmap(pixmap.scaled(148, 84, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        heading = QLabel(title or "请选择下载格式")
+        heading.setWordWrap(True)
+        heading.setMaximumHeight(58)
+        heading.setToolTip(title or "")
+        header.addWidget(cover)
+        header.addWidget(heading, 1)
+        layout.addLayout(header)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setSpacing(3)
+        rows = min(5, max(1, len(choices)))
+        self.list.setFixedHeight(rows * 72 + 12)
+        for choice in choices:
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, choice)
+            item.setSizeHint(QSize(0, 68))
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 4, 8, 4)
+            row_layout.setSpacing(10)
+            row_cover = QLabel("封面")
+            row_cover.setFixedSize(84, 52)
+            row_cover.setAlignment(Qt.AlignCenter)
+            row_cover.setObjectName("formatRowCover")
+            if thumbnail_path and Path(thumbnail_path).exists():
+                pixmap = QPixmap(thumbnail_path)
+                if not pixmap.isNull():
+                    row_cover.setText("")
+                    row_cover.setPixmap(pixmap.scaled(84, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            text = QLabel()
+            text.setWordWrap(False)
+            text.setText(f"{choice.get('height', '?')}p  ·  {choice.get('ext', '?')}  ·  {choice.get('fps', '')}fps\n"
+                         f"{choice.get('format_note') or '视频 + 音频'}")
+            text.setToolTip(choice.get("label", ""))
+            row_layout.addWidget(row_cover)
+            row_layout.addWidget(text, 1)
+            self.list.addItem(item)
+            self.list.setItemWidget(item, row)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        layout.addWidget(self.list)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_choice(self) -> dict | None:
+        item = self.list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+
 class DashboardPage(QWidget):
     def __init__(self, window: "MainWindow"):
         super().__init__()
@@ -272,6 +349,11 @@ class DashboardPage(QWidget):
         self.quality.setCurrentIndex(max(0, self.quality.findData(saved_quality)))
         self.quality.currentIndexChanged.connect(lambda: self._save("quality", self.quality.currentData()))
         options.addWidget(self.quality)
+        self.album = QCheckBox("下载专辑/播放列表")
+        self.album.setChecked(window.app_settings.get("download_album") == "1")
+        self.album.toggled.connect(lambda checked: self._save("download_album", "1" if checked else "0"))
+        self.album.setToolTip("勾选后，支持下载 YouTube 播放列表或专辑中的全部视频")
+        options.addWidget(self.album)
         options.addSpacing(12)
         options.addWidget(QLabel("保存到"))
         self.output = QLineEdit(window.app_settings.get("download_dir"))
@@ -348,6 +430,7 @@ class DashboardPage(QWidget):
             quality=self.quality.currentData(),
             filename_template=self.window.app_settings.get("filename_template"),
             ffmpeg_path=self.window.app_settings.get("ffmpeg_path"),
+            download_album=self.album.isChecked(),
         )
         self.url.clear()
         self.status.setText("任务已加入队列，可以继续添加其他链接")
@@ -460,12 +543,16 @@ class DashboardPage(QWidget):
             QMessageBox.warning(self, "无法选择分辨率", "没有解析到可用的视频分辨率。")
             self.window.download_service.set_format_selector(task_id, "")
             return
-        labels = [choice["label"] for choice in choices]
-        selected, ok = QInputDialog.getItem(self, "选择视频分辨率", task.title or "请选择下载格式", labels, 0, False)
-        if ok and selected:
-            choice = choices[labels.index(selected)]
+        dialog = FormatSelectionDialog(
+            task.title or payload.get("title", "请选择下载格式"),
+            payload.get("thumbnail_path") or task.thumbnail_path,
+            choices,
+            self,
+        )
+        if dialog.exec() == QDialog.Accepted and dialog.selected_choice():
+            choice = dialog.selected_choice()
             self.window.download_service.set_format_selector(task_id, choice["selector"])
-            self.status.setText(f"已选择 {selected}，开始下载")
+            self.status.setText(f"已选择 {choice.get('height', '')}p，开始下载")
         else:
             self.window.download_service.cancel(task_id)
 
@@ -595,7 +682,7 @@ class DashboardPage(QWidget):
             card.deleteLater()
         self._update_empty_state()
         self._update_count()
-        self.status.setText("任务已删除，视频文件未删除")
+        self.status.setText("任务已删除")
 
     def apply_filter(self, _value: str = "") -> None:
         selected = self.filter_box.currentText()
@@ -616,7 +703,7 @@ class DashboardPage(QWidget):
 
     def _update_count(self) -> None:
         count = self.task_list.count()
-        active = sum(1 for task in self.window.download_service.tasks.values() if task.status == "downloading")
+        active = len(self.window.download_service.workers)
         self.count_label.setText(f"{count} 个任务 · {active} 个进行中")
 
     def resizeEvent(self, event) -> None:
@@ -788,12 +875,16 @@ class SettingsPage(QWidget):
         self.template = QLineEdit(window.app_settings.get("filename_template"))
         self.sau = QLineEdit(window.app_settings.get("sau_path"))
         self.ffmpeg = QLineEdit(window.app_settings.get("ffmpeg_path") or (str(bundled) if bundled.exists() else "ffmpeg"))
+        self.max_concurrent = QSpinBox()
+        self.max_concurrent.setRange(1, 8)
+        self.max_concurrent.setValue(max(1, min(8, int(window.app_settings.get("max_concurrent") or 3))))
         save = QPushButton("保存配置")
         save.clicked.connect(lambda: window.save_settings(self))
         form.addRow("默认代理", self.proxy)
         form.addRow("文件名模板", self.template)
         form.addRow("sau 可执行文件", self.sau)
         form.addRow("FFmpeg", self.ffmpeg)
+        form.addRow("并行下载数", self.max_concurrent)
         form.addRow(save)
 
 class MainWindow(QMainWindow):
@@ -821,13 +912,17 @@ class MainWindow(QMainWindow):
             QLabel#taskStatus { color: #3f6fca; min-width: 54px; }
             QProgressBar { border: none; background: #edf1f5; border-radius: 7px; text-align: center; color: #4d5968; }
             QProgressBar::chunk { background: #39b86a; border-radius: 7px; }
+            QLabel#formatCover, QLabel#formatRowCover { background: #e9eef5; color: #8090a6; border-radius: 6px; }
+            QListWidget { border: 1px solid #d9dee7; border-radius: 6px; background: #fbfcfe; }
+            QListWidget::item { border-radius: 6px; }
+            QListWidget::item:selected { background: #e8f3ff; border: 1px solid #2b8cff; }
             QTabWidget::pane { border: none; }
             """
         )
         data_dir = initialize_data_layout()
         self.app_settings = AppSettings()
         self.db = Database(data_dir / "app.db")
-        self.download_service = DownloadService(self.db)
+        self.download_service = DownloadService(self.db, max_concurrent=int(self.app_settings.get("max_concurrent") or 3))
         self.publish_service = PublishService(self.db)
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -868,21 +963,24 @@ class MainWindow(QMainWindow):
         self.app_settings.set("filename_template", page.template.text().strip())
         self.app_settings.set("sau_path", page.sau.text().strip())
         self.app_settings.set("ffmpeg_path", page.ffmpeg.text().strip())
+        self.app_settings.set("max_concurrent", str(page.max_concurrent.value()))
         self.app_settings.sync()
+        self.download_service.max_concurrent = page.max_concurrent.value()
+        self.download_service._start_next()
         self.dashboard.proxy.setText(self.app_settings.get("proxy"))
         QMessageBox.information(self, "已保存", "下载目录、代理和工具路径已保存")
 
     def closeEvent(self, event) -> None:
         # Persist the latest task state before the window exits. Active tasks
         # are restored as paused on the next launch instead of disappearing.
-        if self.download_service.active_task_id and self.download_service.worker:
-            active = self.download_service.tasks.get(self.download_service.active_task_id)
+        for task_id, worker in list(self.download_service.workers.items()):
+            active = self.download_service.tasks.get(task_id)
             if active:
                 active.pause_requested = True
                 active.cancel_requested = False
                 active.status = "暂停中"
                 self.download_service.db.upsert_download_task(active)
-            self.download_service.worker.cancel()
+            worker.cancel()
         for task in self.download_service.tasks.values():
             if task.status == "downloading":
                 task.status = "paused"

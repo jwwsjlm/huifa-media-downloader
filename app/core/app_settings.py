@@ -22,6 +22,7 @@ class AppSettings:
             "filename_template": "%(title)s [%(id)s].%(ext)s",
             "sau_path": "sau",
             "ffmpeg_path": "",
+            "max_concurrent": "3",
         }
         if first_run:
             self._migrate_legacy_settings()

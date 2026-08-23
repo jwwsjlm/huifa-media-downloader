@@ -54,6 +54,7 @@ class DownloadTask:
     url: str
     output_dir: str
     quality: str = "best"
+    download_album: bool = False
     proxy: str = ""
     filename_template: str = "%(title)s [%(id)s].%(ext)s"
     ffmpeg_path: str = ""
@@ -85,10 +86,11 @@ class DownloadWorker(QObject):
 
     def __init__(self, url: str, output_dir: str, db: Database, proxy: str = "", cookie_file: str = "",
                  quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
-                 ffmpeg_path: str = "", format_selector: str = ""):
+                 ffmpeg_path: str = "", format_selector: str = "", download_album: bool = False):
         super().__init__()
         self.url, self.output_dir, self.db, self.proxy, self.cookie_file = url, output_dir, db, proxy, cookie_file
         self.quality, self.filename_template, self.ffmpeg_path = quality, filename_template, ffmpeg_path
+        self.download_album = download_album
         self.format_selector = format_selector
         self._cancel = threading.Event()
         self._thumbnail_saved = False
@@ -138,7 +140,10 @@ class DownloadWorker(QObject):
             "writeinfojson": True,
             "writesubtitles": False,
             "progress_hooks": [hook],
-            "noplaylist": False,
+            "noplaylist": not self.download_album,
+            # Download independent DASH/HLS fragments concurrently as well as
+            # running multiple task workers in DownloadService.
+            "concurrent_fragment_downloads": 4,
             "quiet": True,
             "no_warnings": True,
         }
@@ -157,8 +162,17 @@ class DownloadWorker(QObject):
                 probe_opts = {k: v for k, v in ydl_opts.items() if k not in {"format", "progress_hooks", "writethumbnail", "writeinfojson"}}
                 with yt_dlp.YoutubeDL(probe_opts) as probe:
                     preview = probe.extract_info(self.url, download=False)
-                choices = self._build_format_choices(preview)
-                self.formats_ready.emit({"title": preview.get("title", ""), "choices": choices})
+                format_info = preview
+                if not preview.get("formats") and preview.get("entries"):
+                    first_entry = next((entry for entry in preview["entries"] if entry), None)
+                    if first_entry:
+                        format_info = first_entry
+                thumbnail_path = ""
+                thumbnail_url = preview.get("thumbnail") or format_info.get("thumbnail")
+                if thumbnail_url:
+                    thumbnail_path = self._save_thumbnail(thumbnail_url, preview.get("id") or format_info.get("id") or "video")
+                choices = self._build_format_choices(format_info)
+                self.formats_ready.emit({"title": preview.get("title", ""), "thumbnail_path": thumbnail_path, "choices": choices})
                 self._format_event.wait(timeout=900)
                 if self._cancel.is_set():
                     raise yt_dlp.utils.DownloadError("用户取消下载")
@@ -222,7 +236,15 @@ class DownloadWorker(QObject):
             label = f"{height}p  ·  {ext}  ·  {fps}fps"
             if item.get("format_note"):
                 label += f"  ·  {item['format_note']}"
-            choices.append({"label": label, "selector": selector})
+            choices.append({
+                "label": label,
+                "selector": selector,
+                "height": int(height),
+                "ext": str(ext),
+                "fps": str(fps),
+                "format_note": str(item.get("format_note") or ""),
+                "filesize": int(item.get("filesize") or item.get("filesize_approx") or 0),
+            })
         return choices
 
     def _save_thumbnail(self, url: str, video_id: str) -> str:
@@ -250,14 +272,17 @@ class DownloadService(QObject):
     formats_ready = Signal(str, object)
     failed = Signal(str)
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, max_concurrent: int = 3):
         super().__init__()
         self.db = db
         self.tasks: dict[str, DownloadTask] = {}
         self.queue: deque[str] = deque()
+        self.max_concurrent = max(1, min(int(max_concurrent or 1), 8))
         self.active_task_id: str | None = None
         self.thread: QThread | None = None
         self.worker: DownloadWorker | None = None
+        self.threads: dict[str, QThread] = {}
+        self.workers: dict[str, DownloadWorker] = {}
 
     def restore_tasks(self) -> list[DownloadTask]:
         restored: list[DownloadTask] = []
@@ -267,6 +292,7 @@ class DownloadService(QObject):
                 status = "paused"
             task = DownloadTask(
                 id=row["id"], url=row["url"], output_dir=row["output_dir"], quality=row["quality"] or "best",
+                download_album=bool(row["download_album"] or 0),
                 proxy=row["proxy"] or "", filename_template=row["filename_template"] or "%(title)s [%(id)s].%(ext)s",
                 ffmpeg_path=row["ffmpeg_path"] or "", format_selector=row["format_selector"] or "",
                 title=row["title"] or "等待获取视频信息", status=status,
@@ -302,10 +328,11 @@ class DownloadService(QObject):
 
     def enqueue(self, url: str, output_dir: str, proxy: str = "", cookie_file: str = "",
                 quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
-                ffmpeg_path: str = "", format_selector: str = "") -> str:
+                ffmpeg_path: str = "", format_selector: str = "", download_album: bool = False) -> str:
         task = DownloadTask(
             id=uuid4().hex[:10], url=url.strip(), output_dir=output_dir, proxy=proxy,
-            quality=quality, filename_template=filename_template, ffmpeg_path=ffmpeg_path, format_selector=format_selector,
+            quality=quality, download_album=download_album, filename_template=filename_template,
+            ffmpeg_path=ffmpeg_path, format_selector=format_selector,
         )
         self.tasks[task.id] = task
         self._persist(task)
@@ -328,25 +355,27 @@ class DownloadService(QObject):
             self._persist(task)
             self.task_updated.emit(task)
             return
-        if task_id == self.active_task_id and self.worker:
+        worker = self.workers.get(task_id)
+        if worker:
             task.pause_requested = False
             task.cancel_requested = True
             task.status = "canceling"
             self._persist(task)
             self.task_updated.emit(task)
-            self.worker.cancel()
+            worker.cancel()
 
     def pause(self, task_id: str | None = None) -> None:
         task_id = task_id or self.active_task_id
         if not task_id or task_id not in self.tasks:
             return
         task = self.tasks[task_id]
-        if task_id == self.active_task_id and task.status == "downloading" and self.worker:
+        worker = self.workers.get(task_id)
+        if worker and task.status in {"downloading", "waiting_selection"}:
             task.pause_requested = True
             task.status = "暂停中"
             self._persist(task)
             self.task_updated.emit(task)
-            self.worker.cancel()
+            worker.cancel()
         elif task.status == "queued":
             # A queued task has no worker yet; pausing it means removing it
             # from the queue and retaining the task record for later resume.
@@ -407,11 +436,12 @@ class DownloadService(QObject):
             return None
         return self.enqueue(task.url, task.output_dir, task.proxy, quality=quality_override or task.quality,
                             filename_template=task.filename_template, ffmpeg_path=task.ffmpeg_path,
-                            format_selector="" if quality_override else task.format_selector)
+                            format_selector="" if quality_override else task.format_selector,
+                            download_album=task.download_album)
 
     def delete_task(self, task_id: str, delete_files: bool = False) -> bool:
         task = self.tasks.get(task_id)
-        if not task or task_id == self.active_task_id or task.status in {"downloading", "canceling", "暂停中"}:
+        if not task or task_id in self.workers or task.status in {"downloading", "canceling", "暂停中"}:
             return False
         self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
         self.tasks.pop(task_id, None)
@@ -439,45 +469,54 @@ class DownloadService(QObject):
 
     def set_format_selector(self, task_id: str, selector: str) -> None:
         task = self.tasks.get(task_id)
-        if not task or not self.worker or task_id != self.active_task_id:
+        worker = self.workers.get(task_id)
+        if not task or not worker:
             return
         task.format_selector = selector
         task.status = "downloading" if selector else "canceled"
         self._persist(task)
-        self.worker.set_format_selector(selector)
+        worker.set_format_selector(selector)
 
     def _start_next(self) -> None:
-        if self.active_task_id or not self.queue:
+        if len(self.workers) >= self.max_concurrent or not self.queue:
             return
-        while self.queue:
+        while self.queue and len(self.workers) < self.max_concurrent:
             task_id = self.queue.popleft()
             task = self.tasks[task_id]
             if task.status != "queued":
                 continue
-            self.active_task_id = task_id
             task.status = "downloading"
             self._persist(task)
             self.task_updated.emit(task)
-            self.thread = QThread()
-            self.worker = DownloadWorker(task.url, task.output_dir, self.db, task.proxy, "", task.quality, task.filename_template, task.ffmpeg_path, task.format_selector)
-            self.worker.moveToThread(self.thread)
-            self.thread.started.connect(self.worker.run)
-            self.worker.progress.connect(lambda data, tid=task_id: self._on_progress(tid, data))
-            self.worker.formats_ready.connect(lambda payload, tid=task_id: self._on_formats_ready(tid, payload))
-            self.worker.completed.connect(lambda item, tid=task_id: self._on_media_completed(tid, item))
-            self.worker.failed.connect(lambda error, tid=task_id: self._on_failed(tid, error))
-            self.worker.finished.connect(self.thread.quit)
-            self.worker.finished.connect(self.worker.deleteLater)
-            self.thread.finished.connect(lambda tid=task_id: self._thread_finished(tid))
-            self.thread.finished.connect(self.thread.deleteLater)
-            self.thread.start()
-            return
+            thread = QThread()
+            worker = DownloadWorker(task.url, task.output_dir, self.db, task.proxy, "", task.quality,
+                                    task.filename_template, task.ffmpeg_path, task.format_selector,
+                                    task.download_album)
+            self.threads[task_id] = thread
+            self.workers[task_id] = worker
+            if self.active_task_id is None:
+                self.active_task_id = task_id
+                self.thread = thread
+                self.worker = worker
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(lambda data, tid=task_id: self._on_progress(tid, data))
+            worker.formats_ready.connect(lambda payload, tid=task_id: self._on_formats_ready(tid, payload))
+            worker.completed.connect(lambda item, tid=task_id: self._on_media_completed(tid, item))
+            worker.failed.connect(lambda error, tid=task_id: self._on_failed(tid, error))
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(lambda tid=task_id: self._thread_finished(tid))
+            thread.finished.connect(thread.deleteLater)
+            thread.start()
 
     def _on_formats_ready(self, task_id: str, payload: dict) -> None:
         task = self.tasks.get(task_id)
         if task:
             if payload.get("title"):
                 task.title = payload["title"]
+            if payload.get("thumbnail_path"):
+                task.thumbnail_path = payload["thumbnail_path"]
             task.status = "waiting_selection"
             self._persist(task)
             self.task_updated.emit(task)
@@ -493,7 +532,9 @@ class DownloadService(QObject):
         self.task_media_completed.emit(task_id, media)
 
     def _on_progress(self, task_id: str, data: dict) -> None:
-        task = self.tasks[task_id]
+        task = self.tasks.get(task_id)
+        if not task:
+            return
         total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
         done = data.get("downloaded_bytes") or 0
         task.downloaded_bytes = int(done or 0)
@@ -537,7 +578,10 @@ class DownloadService(QObject):
         self._persist(task)
         self.task_updated.emit(task)
         self.task_finished.emit(task_id, task.status, task.error)
-        self.active_task_id = None
-        self.thread = None
-        self.worker = None
+        self.threads.pop(task_id, None)
+        self.workers.pop(task_id, None)
+        if self.active_task_id == task_id:
+            self.active_task_id = next(iter(self.workers), None)
+            self.thread = self.threads.get(self.active_task_id) if self.active_task_id else None
+            self.worker = self.workers.get(self.active_task_id) if self.active_task_id else None
         self._start_next()
