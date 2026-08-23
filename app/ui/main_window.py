@@ -4,12 +4,13 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QSize, QEvent, QItemSelectionModel
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -83,6 +84,8 @@ class DownloadTaskCard(QFrame):
         super().__init__()
         self.task_id = task.id
         self._thumbnail_loaded_path = ""
+        self._title_text = ""
+        self._url_text = ""
         self.setObjectName("taskCard")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -99,7 +102,7 @@ class DownloadTaskCard(QFrame):
         )
 
         self.title = QLabel()
-        self.title.setWordWrap(True)
+        self.title.setWordWrap(False)
         self.title.setMinimumWidth(0)
         self.title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.url = QLabel()
@@ -188,8 +191,9 @@ class DownloadTaskCard(QFrame):
 
     def update_task(self, task: DownloadTask) -> None:
         self._status = task.status
-        self.title.setText(task.title or task.url)
-        self.url.setText(task.url)
+        self._title_text = task.title or task.url
+        self._url_text = task.url
+        self._refresh_elided_text()
         # Restore the cover from the persisted path after an application
         # restart.  The image itself is kept on disk, never embedded in
         # SQLite, and a missing path simply falls back to the placeholder.
@@ -241,6 +245,20 @@ class DownloadTaskCard(QFrame):
         else:
             self.action.setText("打开文件夹")
             self.action.setEnabled(task.status == "completed")
+
+    def _refresh_elided_text(self) -> None:
+        """Keep long titles and URLs readable without growing every card."""
+        title_width = max(160, self.title.width())
+        url_width = max(160, self.url.width())
+        metrics = QFontMetrics(self.title.font())
+        self.title.setText(metrics.elidedText(self._title_text, Qt.ElideRight, title_width))
+        self.url.setText(metrics.elidedText(self._url_text, Qt.ElideMiddle, url_width))
+        self.title.setToolTip(self._title_text)
+        self.url.setToolTip(self._url_text)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_elided_text()
 
 
 class FormatSelectionDialog(QDialog):
@@ -333,7 +351,9 @@ class DashboardPage(QWidget):
         title_row.addStretch(1)
         root.addLayout(title_row)
 
-        input_row = QHBoxLayout()
+        input_group = QGroupBox("新建下载任务")
+        input_row = QHBoxLayout(input_group)
+        input_row.setContentsMargins(10, 8, 10, 8)
         self.url = QLineEdit()
         self.url.setPlaceholderText("粘贴视频或播放列表链接，回车即可添加任务")
         self.url.returnPressed.connect(self.start)
@@ -342,9 +362,11 @@ class DashboardPage(QWidget):
         add_button.clicked.connect(self.start)
         input_row.addWidget(self.url, 1)
         input_row.addWidget(add_button)
-        root.addLayout(input_row)
+        root.addWidget(input_group)
 
-        options = QHBoxLayout()
+        options_group = QGroupBox("下载参数")
+        options = QHBoxLayout(options_group)
+        options.setContentsMargins(10, 8, 10, 8)
         options.addWidget(QLabel("画质"))
         self.quality = QComboBox()
         self.quality.addItem("最高画质", "best")
@@ -373,7 +395,7 @@ class DashboardPage(QWidget):
         self.proxy.setPlaceholderText("可选")
         self.proxy.setMaximumWidth(220)
         options.addWidget(self.proxy)
-        root.addLayout(options)
+        root.addWidget(options_group)
 
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("任务列表"))
@@ -404,7 +426,7 @@ class DashboardPage(QWidget):
         self.task_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.task_list.customContextMenuRequested.connect(self.task_context_menu)
         root.addWidget(self.task_list, 1)
-        self.empty_label = QLabel("还没有下载任务\n粘贴链接后点击“添加并下载”")
+        self.empty_label = QLabel("还没有下载任务\n粘贴视频或播放列表链接后点击“添加并下载”\n下载目录可在“设置”页面修改")
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.empty_label.setObjectName("emptyState")
         root.addWidget(self.empty_label)
@@ -419,20 +441,37 @@ class DashboardPage(QWidget):
 
     def refresh_settings(self) -> None:
         path = self.window.app_settings.get("download_dir")
-        self.download_dir_hint.setText(f"下载目录：{path}")
+        self.download_dir_hint.setText(f"当前下载目录：{path}")
 
     def open_download_dir(self) -> None:
-        path = Path(self.window.app_settings.get("download_dir"))
-        path.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(path))
+        path = self._ensure_download_dir()
+        if path is not None:
+            os.startfile(str(path))
+
+    def _ensure_download_dir(self) -> Path | None:
+        raw_path = self.window.app_settings.get("download_dir").strip()
+        if not raw_path:
+            QMessageBox.warning(self, "目录不可用", "请先在“设置”页面配置下载保存目录")
+            return None
+        path = Path(raw_path).expanduser()
+        try:
+            if path.exists() and not path.is_dir():
+                raise OSError("目标路径已存在但不是目录")
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "目录不可用", f"无法使用当前下载目录：\n{path}\n\n{exc}")
+            return None
+        return path
 
     def start(self) -> None:
         url = self.url.text().strip()
         if not url:
-            QMessageBox.warning(self, "提示", "请输入 YouTube URL")
+            QMessageBox.warning(self, "提示", "请输入视频或播放列表链接")
             return
-        output_dir = self.window.app_settings.get("download_dir")
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        output_path = self._ensure_download_dir()
+        if output_path is None:
+            return
+        output_dir = str(output_path)
         self._save("proxy", self.proxy.text().strip())
         self._save("quality", self.quality.currentData())
         self.window.download_service.enqueue(
@@ -904,35 +943,85 @@ class PublishQueuePage(QWidget):
 class SettingsPage(QWidget):
     def __init__(self, window: "MainWindow"):
         super().__init__()
-        form = QFormLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(14)
+        title = QLabel("应用设置")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel("下载目录只在这里配置，下载页面会自动使用当前设置。")
+        subtitle.setObjectName("mutedText")
+        root.addWidget(title)
+        root.addWidget(subtitle)
+
         bundled = bundled_ffmpeg_path()
         self.download_dir = QLineEdit(window.app_settings.get("download_dir"))
-        download_row = QHBoxLayout()
-        download_row.addWidget(self.download_dir, 1)
-        browse_download = QPushButton("选择目录")
-        browse_download.clicked.connect(self.choose_download_dir)
-        download_row.addWidget(browse_download)
         self.proxy = QLineEdit(window.app_settings.get("proxy"))
+        self.proxy.setPlaceholderText("可选，例如 http://127.0.0.1:7890")
         self.template = QLineEdit(window.app_settings.get("filename_template"))
         self.sau = QLineEdit(window.app_settings.get("sau_path"))
         self.ffmpeg = QLineEdit(window.app_settings.get("ffmpeg_path") or (str(bundled) if bundled.exists() else "ffmpeg"))
         self.max_concurrent = QSpinBox()
         self.max_concurrent.setRange(1, 8)
         self.max_concurrent.setValue(max(1, min(8, int(window.app_settings.get("max_concurrent") or 3))))
+
+        download_group = QGroupBox("下载设置")
+        download_form = QFormLayout(download_group)
+        download_form.setContentsMargins(14, 14, 14, 14)
+        download_form.setVerticalSpacing(10)
+        download_form.addRow("下载保存目录", self._path_row(self.download_dir, "选择目录", self.choose_download_dir))
+        download_form.addRow("文件名模板", self.template)
+        download_form.addRow("并行下载数", self.max_concurrent)
+        root.addWidget(download_group)
+
+        network_group = QGroupBox("网络设置")
+        network_form = QFormLayout(network_group)
+        network_form.setContentsMargins(14, 14, 14, 14)
+        network_form.addRow("默认代理", self.proxy)
+        root.addWidget(network_group)
+
+        tools_group = QGroupBox("工具设置")
+        tools_form = QFormLayout(tools_group)
+        tools_form.setContentsMargins(14, 14, 14, 14)
+        tools_form.setVerticalSpacing(10)
+        tools_form.addRow("上传工具路径", self._path_row(self.sau, "浏览", self.choose_sau))
+        tools_form.addRow("FFmpeg 路径", self._path_row(self.ffmpeg, "浏览", self.choose_ffmpeg))
+        root.addWidget(tools_group)
+
         save = QPushButton("保存配置")
+        save.setObjectName("primaryButton")
+        save.setMinimumWidth(120)
         save.clicked.connect(lambda: window.save_settings(self))
-        form.addRow("下载保存目录", download_row)
-        form.addRow("默认代理", self.proxy)
-        form.addRow("文件名模板", self.template)
-        form.addRow("上传工具路径", self.sau)
-        form.addRow("FFmpeg 路径", self.ffmpeg)
-        form.addRow("并行下载数", self.max_concurrent)
-        form.addRow(save)
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        save_row.addWidget(save)
+        root.addLayout(save_row)
+        root.addStretch(1)
+
+    @staticmethod
+    def _path_row(field: QLineEdit, label: str, callback) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(field, 1)
+        button = QPushButton(label)
+        button.clicked.connect(callback)
+        layout.addWidget(button)
+        return container
 
     def choose_download_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择下载保存目录", self.download_dir.text())
         if path:
             self.download_dir.setText(path)
+
+    def choose_sau(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择上传工具", "", "可执行文件 (*.exe);;所有文件 (*)")
+        if path:
+            self.sau.setText(path)
+
+    def choose_ffmpeg(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择 FFmpeg", "", "可执行文件 (*.exe);;所有文件 (*)")
+        if path:
+            self.ffmpeg.setText(path)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -948,6 +1037,8 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background: #f0f5ff; }
             QPushButton#primaryButton { color: white; background: #18a957; border: none; font-weight: 600; }
             QPushButton#primaryButton:hover { background: #128945; }
+            QGroupBox { border: 1px solid #e3e8ef; border-radius: 10px; margin-top: 8px; padding-top: 10px; background: #ffffff; font-weight: 600; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #354052; background: #ffffff; }
             QLabel#pageTitle { font-size: 22px; font-weight: 700; color: #172033; }
             QLabel#mutedText { color: #87909f; }
             QLabel#emptyState { color: #9aa3b2; padding: 40px; }
@@ -1012,8 +1103,15 @@ class MainWindow(QMainWindow):
         if not download_dir:
             QMessageBox.warning(self, "提示", "下载保存目录不能为空")
             return
-        Path(download_dir).mkdir(parents=True, exist_ok=True)
-        self.app_settings.set("download_dir", download_dir)
+        download_path = Path(download_dir).expanduser()
+        try:
+            if download_path.exists() and not download_path.is_dir():
+                raise OSError("目标路径已存在但不是目录")
+            download_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "目录不可用", f"无法使用下载保存目录：\n{download_dir}\n\n{exc}")
+            return
+        self.app_settings.set("download_dir", str(download_path))
         self.app_settings.set("proxy", page.proxy.text().strip())
         self.app_settings.set("filename_template", page.template.text().strip())
         self.app_settings.set("sau_path", page.sau.text().strip())
@@ -1024,7 +1122,12 @@ class MainWindow(QMainWindow):
         self.download_service._start_next()
         self.dashboard.proxy.setText(self.app_settings.get("proxy"))
         self.dashboard.refresh_settings()
-        QMessageBox.information(self, "已保存", "下载目录、代理和工具路径已保存")
+        QMessageBox.information(
+            self,
+            "配置已保存",
+            "下载设置、网络设置和工具路径已保存。\n\n"
+            f"当前下载目录：{download_path}",
+        )
 
     def closeEvent(self, event) -> None:
         # Persist the latest task state before the window exits. Active tasks

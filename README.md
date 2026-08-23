@@ -25,6 +25,8 @@ Runtime data is stored beside the application under `data/`:
 The Settings page is the single place for selecting the download directory.
 The download page only displays the current directory and provides shortcuts
 to open it or jump to Settings, so the two pages cannot drift out of sync.
+Settings are grouped into download, network and tool sections, and invalid or
+unwritable download paths are rejected with an explicit message.
 
 The application no longer uses the user's Documents directory for its own
 database or settings. Existing data from the legacy `.youtube-release-studio`
@@ -33,7 +35,7 @@ location is migrated to `data/app.db` on first launch.
 The first version provides:
 
 - queued downloads with progress, speed and ETA;
-- a task dashboard with per-task title, URL, thumbnail placeholder, status, progress, speed, ETA, cancel/retry and folder actions;
+- a task dashboard with grouped download controls, per-task title, URL, thumbnail placeholder, status, progress, speed, ETA, cancel/retry and folder actions;
 - persistent download directory, proxy, filename template and quality preferences;
 - quality presets for best available, 1080p maximum and 720p maximum;
 - custom quality mode that parses available formats before download;
