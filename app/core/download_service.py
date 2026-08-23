@@ -31,6 +31,23 @@ def bundled_ffmpeg_path() -> Path:
     return Path(__file__).resolve().parents[2] / "tools" / "ffmpeg" / arch / "ffmpeg.exe"
 
 
+def format_speed(bytes_per_second: float) -> str:
+    if bytes_per_second <= 0:
+        return ""
+    if bytes_per_second >= 1024 ** 2:
+        return f"{bytes_per_second / 1024 ** 2:.2f} MiB/s"
+    return f"{bytes_per_second / 1024:.0f} KiB/s"
+
+
+def format_eta(seconds: float) -> str:
+    if seconds <= 0:
+        return ""
+    seconds = int(seconds)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
 @dataclass
 class DownloadTask:
     id: str
@@ -44,6 +61,10 @@ class DownloadTask:
     status: str = "queued"
     progress: float = 0.0
     speed: str = ""
+    speed_bps: float = 0.0
+    speed_samples: deque[float] = field(default_factory=lambda: deque(maxlen=6), repr=False)
+    downloaded_bytes: int = 0
+    total_bytes: int = 0
     eta: str = ""
     size: str = ""
     error: str = ""
@@ -240,6 +261,9 @@ class DownloadService(QObject):
         task.status = "queued"
         task.pause_requested = False
         task.cancel_requested = False
+        task.speed_samples.clear()
+        task.speed_bps = 0.0
+        task.speed = ""
         self.queue.appendleft(task.id)
         self.task_updated.emit(task)
         self._start_next()
@@ -249,6 +273,9 @@ class DownloadService(QObject):
         if not task or task.status not in {"failed", "canceled"}:
             return
         task.status, task.error, task.progress, task.cancel_requested, task.pause_requested = "queued", "", 0.0, False, False
+        task.speed_samples.clear()
+        task.speed_bps = 0.0
+        task.speed = ""
         self.queue.append(task.id)
         self.task_updated.emit(task)
         self._start_next()
@@ -302,13 +329,20 @@ class DownloadService(QObject):
         task = self.tasks[task_id]
         total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
         done = data.get("downloaded_bytes") or 0
+        task.downloaded_bytes = int(done or 0)
+        task.total_bytes = int(total or 0)
         if total:
             task.progress = min(100.0, done * 100.0 / total)
         info = data.get("info_dict") or {}
         if info.get("title"):
             task.title = info["title"]
-        task.speed = data.get("_speed_str") or ""
-        task.eta = data.get("_eta_str") or ""
+        raw_speed = data.get("speed")
+        if raw_speed:
+            task.speed_samples.append(float(raw_speed))
+            task.speed_bps = sum(task.speed_samples) / len(task.speed_samples)
+        task.speed = format_speed(task.speed_bps) or data.get("_speed_str") or ""
+        remaining = task.total_bytes - task.downloaded_bytes
+        task.eta = format_eta(remaining / task.speed_bps) if task.speed_bps > 0 and remaining > 0 else data.get("_eta_str") or ""
         task.size = data.get("_total_bytes_str") or data.get("_total_bytes_estimate_str") or ""
         if data.get("thumbnail_path"):
             task.thumbnail_path = data["thumbnail_path"]
