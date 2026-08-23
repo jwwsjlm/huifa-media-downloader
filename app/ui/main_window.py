@@ -1170,6 +1170,9 @@ class PublishQueuePage(QWidget):
         run.clicked.connect(self.run_selected)
         controls.addWidget(refresh)
         controls.addWidget(run)
+        retry = QPushButton("重试失败任务")
+        retry.clicked.connect(self.retry_selected)
+        controls.addWidget(retry)
         controls.addStretch(1)
         layout.addLayout(controls)
         self.refresh()
@@ -1189,6 +1192,12 @@ class PublishQueuePage(QWidget):
         item = self.tree.currentItem()
         if item:
             self.window.publish_service.run_task(int(item.text(0)))
+            self.refresh()
+
+    def retry_selected(self) -> None:
+        item = self.tree.currentItem()
+        if item:
+            self.window.publish_service.retry_task(int(item.text(0)))
             self.refresh()
 
 
