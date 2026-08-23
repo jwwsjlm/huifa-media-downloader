@@ -18,6 +18,7 @@ class AppSettings:
         self.defaults = {
             "download_dir": str(default_dir),
             "quality": "best",
+            "playlist_mode": "auto",
             "proxy": "",
             "filename_template": "%(title)s [%(id)s].%(ext)s",
             "sau_path": "sau",

@@ -55,6 +55,7 @@ class DownloadTask:
     output_dir: str
     quality: str = "best"
     download_album: bool = False
+    playlist_mode: str = "auto"
     proxy: str = ""
     filename_template: str = "%(title)s [%(id)s].%(ext)s"
     ffmpeg_path: str = ""
@@ -83,14 +84,17 @@ class DownloadWorker(QObject):
     failed = Signal(str)
     finished = Signal()
     formats_ready = Signal(object)
+    playlist_info = Signal(object)
 
     def __init__(self, url: str, output_dir: str, db: Database, proxy: str = "", cookie_file: str = "",
                  quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
-                 ffmpeg_path: str = "", format_selector: str = "", download_album: bool = False):
+                 ffmpeg_path: str = "", format_selector: str = "", download_album: bool = False,
+                 playlist_mode: str = "auto"):
         super().__init__()
         self.url, self.output_dir, self.db, self.proxy, self.cookie_file = url, output_dir, db, proxy, cookie_file
         self.quality, self.filename_template, self.ffmpeg_path = quality, filename_template, ffmpeg_path
         self.download_album = download_album
+        self.playlist_mode = playlist_mode if playlist_mode in {"auto", "single", "playlist"} else ("playlist" if download_album else "single")
         self.format_selector = format_selector
         self._cancel = threading.Event()
         self._thumbnail_saved = False
@@ -140,7 +144,7 @@ class DownloadWorker(QObject):
             "writeinfojson": True,
             "writesubtitles": False,
             "progress_hooks": [hook],
-            "noplaylist": not self.download_album,
+            "noplaylist": self.playlist_mode == "single",
             # Download independent DASH/HLS fragments concurrently as well as
             # running multiple task workers in DownloadService.
             "concurrent_fragment_downloads": 4,
@@ -158,10 +162,27 @@ class DownloadWorker(QObject):
         if self.cookie_file:
             ydl_opts["cookiefile"] = self.cookie_file
         try:
-            if self.quality == "custom" and not self.format_selector:
+            preview = None
+            if self.playlist_mode == "auto" or (self.quality == "custom" and not self.format_selector):
                 probe_opts = {k: v for k, v in ydl_opts.items() if k not in {"format", "progress_hooks", "writethumbnail", "writeinfojson"}}
                 with yt_dlp.YoutubeDL(probe_opts) as probe:
                     preview = probe.extract_info(self.url, download=False)
+                if self.playlist_mode == "auto":
+                    entries = preview.get("entries") or []
+                    count = preview.get("playlist_count") or preview.get("n_entries")
+                    if not count:
+                        try:
+                            count = len(entries)
+                        except TypeError:
+                            count = 0
+                    is_playlist = preview.get("_type") == "playlist" or bool(count and count > 1)
+                    self.playlist_info.emit({"is_playlist": is_playlist, "count": int(count or 0),
+                                             "title": preview.get("title") or preview.get("playlist_title") or ""})
+            if self.quality == "custom" and not self.format_selector:
+                if preview is None:
+                    probe_opts = {k: v for k, v in ydl_opts.items() if k not in {"format", "progress_hooks", "writethumbnail", "writeinfojson"}}
+                    with yt_dlp.YoutubeDL(probe_opts) as probe:
+                        preview = probe.extract_info(self.url, download=False)
                 format_info = preview
                 if not preview.get("formats") and preview.get("entries"):
                     first_entry = next((entry for entry in preview["entries"] if entry), None)
@@ -270,6 +291,7 @@ class DownloadService(QObject):
     task_finished = Signal(str, str, str)
     task_deleted = Signal(str)
     formats_ready = Signal(str, object)
+    playlist_info = Signal(str, object)
     failed = Signal(str)
 
     def __init__(self, db: Database, max_concurrent: int = 3):
@@ -294,6 +316,7 @@ class DownloadService(QObject):
             task = DownloadTask(
                 id=row["id"], url=row["url"], output_dir=row["output_dir"], quality=row["quality"] or "best",
                 download_album=bool(row["download_album"] or 0),
+                playlist_mode=(row["playlist_mode"] or ("playlist" if row["download_album"] else "single")),
                 proxy=row["proxy"] or "", filename_template=row["filename_template"] or "%(title)s [%(id)s].%(ext)s",
                 ffmpeg_path=row["ffmpeg_path"] or "", format_selector=row["format_selector"] or "",
                 title=row["title"] or "等待获取视频信息", status=status,
@@ -329,10 +352,11 @@ class DownloadService(QObject):
 
     def enqueue(self, url: str, output_dir: str, proxy: str = "", cookie_file: str = "",
                 quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
-                ffmpeg_path: str = "", format_selector: str = "", download_album: bool = False) -> str:
+                ffmpeg_path: str = "", format_selector: str = "", download_album: bool = False,
+                playlist_mode: str = "auto") -> str:
         task = DownloadTask(
             id=uuid4().hex[:10], url=url.strip(), output_dir=output_dir, proxy=proxy,
-            quality=quality, download_album=download_album, filename_template=filename_template,
+            quality=quality, download_album=download_album, playlist_mode=playlist_mode, filename_template=filename_template,
             ffmpeg_path=ffmpeg_path, format_selector=format_selector,
         )
         self.tasks[task.id] = task
@@ -441,7 +465,7 @@ class DownloadService(QObject):
         return self.enqueue(task.url, task.output_dir, task.proxy, quality=quality_override or task.quality,
                             filename_template=task.filename_template, ffmpeg_path=task.ffmpeg_path,
                             format_selector="" if quality_override else task.format_selector,
-                            download_album=task.download_album)
+                            download_album=task.download_album, playlist_mode=task.playlist_mode)
 
     def delete_task(self, task_id: str, delete_files: bool = False) -> bool:
         task = self.tasks.get(task_id)
@@ -516,7 +540,7 @@ class DownloadService(QObject):
             thread = QThread()
             worker = DownloadWorker(task.url, task.output_dir, self.db, task.proxy, "", task.quality,
                                     task.filename_template, task.ffmpeg_path, task.format_selector,
-                                    task.download_album)
+                                    task.download_album, task.playlist_mode)
             self.threads[task_id] = thread
             self.workers[task_id] = worker
             if self.active_task_id is None:
@@ -527,6 +551,7 @@ class DownloadService(QObject):
             thread.started.connect(worker.run)
             worker.progress.connect(lambda data, tid=task_id: self._on_progress(tid, data))
             worker.formats_ready.connect(lambda payload, tid=task_id: self._on_formats_ready(tid, payload))
+            worker.playlist_info.connect(lambda payload, tid=task_id: self._on_playlist_info(tid, payload))
             worker.completed.connect(lambda item, tid=task_id: self._on_media_completed(tid, item))
             worker.failed.connect(lambda error, tid=task_id: self._on_failed(tid, error))
             worker.finished.connect(thread.quit)
@@ -546,6 +571,18 @@ class DownloadService(QObject):
             self._persist(task)
             self.task_updated.emit(task)
             self.formats_ready.emit(task_id, payload)
+
+    def _on_playlist_info(self, task_id: str, payload: dict) -> None:
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+        if payload.get("is_playlist"):
+            count = int(payload.get("count") or 0)
+            base = payload.get("title") or task.title or "播放列表"
+            task.title = f"{base}（共 {count} 个视频）" if count else f"{base}（播放列表）"
+            self._persist(task)
+            self.task_updated.emit(task)
+        self.playlist_info.emit(task_id, payload)
 
     def _on_media_completed(self, task_id: str, media: MediaItem) -> None:
         task = self.tasks.get(task_id)

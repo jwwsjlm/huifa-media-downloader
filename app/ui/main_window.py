@@ -339,11 +339,18 @@ class DashboardPage(QWidget):
         self.quality.setCurrentIndex(max(0, self.quality.findData(saved_quality)))
         self.quality.currentIndexChanged.connect(lambda: self._save("quality", self.quality.currentData()))
         options.addWidget(self.quality)
-        self.album = QCheckBox("下载专辑/播放列表")
-        self.album.setChecked(window.app_settings.get("download_album") == "1")
-        self.album.toggled.connect(lambda checked: self._save("download_album", "1" if checked else "0"))
-        self.album.setToolTip("勾选后，支持下载 YouTube 播放列表或专辑中的全部视频")
-        options.addWidget(self.album)
+        options.addWidget(QLabel("列表处理"))
+        self.playlist_mode = QComboBox()
+        self.playlist_mode.addItem("自动识别（推荐）", "auto")
+        self.playlist_mode.addItem("仅下载单个视频", "single")
+        self.playlist_mode.addItem("下载整个专辑/播放列表", "playlist")
+        saved_mode = window.app_settings.get("playlist_mode")
+        if saved_mode not in {"auto", "single", "playlist"}:
+            saved_mode = "playlist" if window.app_settings.get("download_album") == "1" else "auto"
+        self.playlist_mode.setCurrentIndex(max(0, self.playlist_mode.findData(saved_mode)))
+        self.playlist_mode.currentIndexChanged.connect(lambda: self._save("playlist_mode", self.playlist_mode.currentData()))
+        self.playlist_mode.setToolTip("自动识别 YouTube 视频、专辑或播放列表，并显示视频数量")
+        options.addWidget(self.playlist_mode)
         options.addSpacing(12)
         options.addWidget(QLabel("保存到"))
         self.output = QLineEdit(window.app_settings.get("download_dir"))
@@ -420,7 +427,8 @@ class DashboardPage(QWidget):
             quality=self.quality.currentData(),
             filename_template=self.window.app_settings.get("filename_template"),
             ffmpeg_path=self.window.app_settings.get("ffmpeg_path"),
-            download_album=self.album.isChecked(),
+            download_album=self.playlist_mode.currentData() == "playlist",
+            playlist_mode=self.playlist_mode.currentData(),
         )
         self.url.clear()
         self.status.setText("任务已加入队列，可以继续添加其他链接")
@@ -523,6 +531,13 @@ class DashboardPage(QWidget):
             self.status.setText("下载完成，媒体已加入完成列表")
         elif status == "canceled":
             self.status.setText("任务已取消")
+
+    def playlist_info(self, task_id: str, payload: dict) -> None:
+        if payload.get("is_playlist"):
+            count = int(payload.get("count") or 0)
+            self.status.setText(f"已解析播放列表：共 {count} 个视频" if count else "已识别为播放列表，正在准备下载")
+        else:
+            self.status.setText("已识别为单个视频")
 
     def choose_format(self, task_id: str, payload: dict) -> None:
         choices = payload.get("choices") or []
@@ -938,6 +953,7 @@ class MainWindow(QMainWindow):
         self.download_service.task_updated.connect(self.dashboard.update_task)
         self.download_service.task_progress.connect(self.dashboard.update_progress)
         self.download_service.formats_ready.connect(self.dashboard.choose_format)
+        self.download_service.playlist_info.connect(self.dashboard.playlist_info)
         self.download_service.task_media_completed.connect(self.dashboard.media_completed)
         self.download_service.task_finished.connect(self.dashboard.finished)
         self.download_service.task_deleted.connect(self.dashboard.remove_task)
