@@ -6,6 +6,8 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from app.core.log_service import DownloadLogService
+from app.core.download_service import DownloadWorker
+from app.storage.database import Database
 
 
 class DownloadDiagnosticsTests(unittest.TestCase):
@@ -52,6 +54,23 @@ class DownloadDiagnosticsTests(unittest.TestCase):
                 self.assertIn("downloads/task-3.jsonl", names)
                 payload = archive.read("downloads/task-3.jsonl").decode("utf-8")
                 self.assertNotIn("should-not-export", payload)
+
+    def test_network_retry_recovers_transient_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "app.db")
+            worker = DownloadWorker("retry-task", "https://example.com", directory, db)
+            worker.logs = DownloadLogService(Path(directory) / "logs")
+            calls = {"count": 0}
+
+            def flaky_action():
+                calls["count"] += 1
+                if calls["count"] < 3:
+                    raise RuntimeError("Connection timed out")
+                return "ok"
+
+            self.assertEqual(worker._run_with_network_retry(flaky_action, "测试请求"), "ok")
+            self.assertEqual(calls["count"], 3)
+            db.close()
 
 
 if __name__ == "__main__":

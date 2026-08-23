@@ -132,6 +132,20 @@ class DownloadWorker(QObject):
     def _log(self, level: str, category: str, message: str, **details: Any) -> None:
         self.logs.write(self.task_id, level, category, message, **details)
 
+    def _run_with_network_retry(self, action, stage: str):
+        """Retry transient network failures without retrying rate limits or login challenges."""
+        for attempt in range(3):
+            try:
+                return action()
+            except Exception as exc:
+                category = DownloadLogService.classify_error(str(exc))
+                if category != "网络/代理" or attempt >= 2 or self._cancel.is_set():
+                    raise
+                delay = 2 ** attempt
+                self._log("warning", "网络/代理", f"{stage}失败，将在 {delay} 秒后重试", attempt=attempt + 1, error=str(exc))
+                if self._cancel.wait(delay):
+                    raise yt_dlp.utils.DownloadError("用户取消下载")
+
     def cancel(self) -> None:
         self._cancel.set()
         self._format_event.set()
@@ -210,7 +224,7 @@ class DownloadWorker(QObject):
                 self._log("info", "解析", "开始解析视频信息")
                 probe_opts = {k: v for k, v in ydl_opts.items() if k not in {"format", "progress_hooks", "writethumbnail", "writeinfojson"}}
                 with yt_dlp.YoutubeDL(probe_opts) as probe:
-                    preview = probe.extract_info(self.url, download=False)
+                    preview = self._run_with_network_retry(lambda: probe.extract_info(self.url, download=False), "视频信息解析")
                 if self.playlist_mode == "auto":
                     entries = preview.get("entries") or []
                     count = preview.get("playlist_count") or preview.get("n_entries")
@@ -227,7 +241,7 @@ class DownloadWorker(QObject):
                 if preview is None:
                     probe_opts = {k: v for k, v in ydl_opts.items() if k not in {"format", "progress_hooks", "writethumbnail", "writeinfojson"}}
                     with yt_dlp.YoutubeDL(probe_opts) as probe:
-                        preview = probe.extract_info(self.url, download=False)
+                        preview = self._run_with_network_retry(lambda: probe.extract_info(self.url, download=False), "格式解析")
                 format_info = preview
                 if not preview.get("formats") and preview.get("entries"):
                     first_entry = next((entry for entry in preview["entries"] if entry), None)
@@ -250,7 +264,7 @@ class DownloadWorker(QObject):
                 self._log("info", "格式", "已选择视频格式", selector=self.format_selector)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 self._log("info", "下载", "开始调用 yt-dlp")
-                info = ydl.extract_info(self.url, download=True)
+                info = self._run_with_network_retry(lambda: ydl.extract_info(self.url, download=True), "视频下载")
                 entries = info.get("entries") if info.get("_type") == "playlist" else [info]
                 for entry in filter(None, entries):
                     requested = entry.get("requested_downloads") or []
