@@ -529,9 +529,11 @@ class DownloadService(QObject):
             self._persist(task)
             self.task_updated.emit(task)
             self.workers[task_id].cancel()
+            self.logs.write(task_id, "info", "用户操作", "已请求删除任务", delete_files=bool(delete_files))
             return True
         self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
         self._remove_task_record(task_id, delete_files)
+        self.logs.write(task_id, "info", "用户操作", "任务记录已删除", delete_files=bool(delete_files))
         return True
 
     def _remove_task_record(self, task_id: str, delete_files: bool = False) -> None:
@@ -590,6 +592,7 @@ class DownloadService(QObject):
         task.status = "downloading" if selector else "canceled"
         self._persist(task)
         self.task_updated.emit(task)
+        self.logs.write(task_id, "info", "用户操作", "已选择视频格式" if selector else "已取消格式选择", selector=selector)
         if selector:
             self.task_progress.emit(task_id, {"status": "downloading", "format_selected": True})
         worker.set_format_selector(selector)

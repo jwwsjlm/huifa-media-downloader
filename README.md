@@ -29,8 +29,8 @@ to open it or jump to Settings, so the two pages cannot drift out of sync.
 Settings are grouped into download, network and tool sections, and invalid or
 unwritable download paths are rejected with an explicit message.
 
-The download task list supports title/URL/ID search, global pause/resume,
-completed-record cleanup, and a `查看下载日志` action. Each task log records
+The download task list supports title/URL/ID search, sorting by time/title/status,
+global pause/resume, completed-record cleanup, and a `查看下载日志` action. Each task log records
 解析、格式选择、进度、网络/代理错误、风控/登录错误和完成状态 without
 storing cookies or tokens. The log dialog also provides an initial diagnosis
 category so network failures can be distinguished from rate limits, login,

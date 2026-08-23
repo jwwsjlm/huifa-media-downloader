@@ -464,6 +464,14 @@ class DashboardPage(QWidget):
         self.search_box.setMaximumWidth(260)
         self.search_box.textChanged.connect(self.apply_filter)
         toolbar.addWidget(self.search_box)
+        toolbar.addWidget(QLabel("排序"))
+        self.sort_box = QComboBox()
+        self.sort_box.addItem("添加时间（新→旧）", "newest")
+        self.sort_box.addItem("添加时间（旧→新）", "oldest")
+        self.sort_box.addItem("标题", "title")
+        self.sort_box.addItem("状态", "status")
+        self.sort_box.currentIndexChanged.connect(self.sort_tasks)
+        toolbar.addWidget(self.sort_box)
         self.filter_box = QComboBox()
         self.filter_box.addItems(["全部", "下载中", "排队中", "已完成", "文件已删除", "失败"])
         self.filter_box.currentTextChanged.connect(self.apply_filter)
@@ -581,6 +589,7 @@ class DashboardPage(QWidget):
         self.task_list.setItemWidget(item, card)
         self.cards[task.id] = card
         self.items[task.id] = item
+        self.sort_tasks()
         self._update_empty_state()
         self._update_count()
 
@@ -631,6 +640,36 @@ class DashboardPage(QWidget):
         task = self.window.download_service.tasks.get(task_ids[0])
         if task:
             DownloadLogDialog(task, self.window.download_service.logs, self).exec()
+
+    def sort_tasks(self, _index: int = -1) -> None:
+        if not self.items:
+            return
+        selected_ids = set(self.selected_task_ids())
+        mode = self.sort_box.currentData() if hasattr(self, "sort_box") else "newest"
+        tasks = [self.window.download_service.tasks.get(task_id) for task_id in self.items]
+        tasks = [task for task in tasks if task is not None]
+        status_order = {"downloading": 0, "waiting_selection": 1, "queued": 2, "paused": 3, "failed": 4, "canceled": 5, "completed": 6, "deleted": 7}
+        if mode == "oldest":
+            ordered = sorted(tasks, key=lambda task: task.created_at)
+        elif mode == "title":
+            ordered = sorted(tasks, key=lambda task: (task.title or task.url).casefold())
+        elif mode == "status":
+            ordered = sorted(tasks, key=lambda task: (status_order.get(task.status, 99), task.created_at))
+        else:
+            ordered = sorted(tasks, key=lambda task: task.created_at, reverse=True)
+        for task_id in list(self.items):
+            item = self.items[task_id]
+            row = self.task_list.row(item)
+            if row >= 0:
+                self.task_list.takeItem(row)
+        for task in ordered:
+            item = self.items[task.id]
+            card = self.cards[task.id]
+            self.task_list.addItem(item)
+            self.task_list.setItemWidget(item, card)
+            item.setSelected(task.id in selected_ids)
+        self.sync_selection()
+        self.apply_filter()
 
     def update_task(self, task: DownloadTask) -> None:
         card = self.cards.get(task.id)
