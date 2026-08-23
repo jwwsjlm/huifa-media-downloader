@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import platform
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QSize, QEvent, QItemSelectionModel
@@ -1232,6 +1234,7 @@ class PublishQueuePage(QWidget):
 class SettingsPage(QWidget):
     def __init__(self, window: "MainWindow"):
         super().__init__()
+        self.window = window
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
         root.setSpacing(14)
@@ -1275,6 +1278,18 @@ class SettingsPage(QWidget):
         tools_form.addRow("上传工具路径", self._path_row(self.sau, "浏览", self.choose_sau))
         tools_form.addRow("FFmpeg 路径", self._path_row(self.ffmpeg, "浏览", self.choose_ffmpeg))
         root.addWidget(tools_group)
+
+        diagnostics_group = QGroupBox("诊断与日志")
+        diagnostics_layout = QHBoxLayout(diagnostics_group)
+        diagnostics_layout.setContentsMargins(14, 12, 14, 12)
+        diagnostics_layout.addWidget(QLabel("下载日志用于区分风控、登录、网络、代理和格式问题。"), 1)
+        open_logs = QPushButton("打开日志目录")
+        open_logs.clicked.connect(window.open_log_directory)
+        export_logs = QPushButton("导出诊断包")
+        export_logs.clicked.connect(window.export_diagnostics)
+        diagnostics_layout.addWidget(open_logs)
+        diagnostics_layout.addWidget(export_logs)
+        root.addWidget(diagnostics_group)
 
         save = QPushButton("保存配置")
         save.setObjectName("primaryButton")
@@ -1432,6 +1447,36 @@ class MainWindow(QMainWindow):
             "配置已保存",
             message,
         )
+
+    def open_log_directory(self) -> None:
+        path = self.download_service.logs.root
+        path.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(path))
+
+    def export_diagnostics(self) -> None:
+        default_name = str(self.download_service.logs.root.parent / "diagnostics.zip")
+        target, _ = QFileDialog.getSaveFileName(self, "导出诊断包", default_name, "ZIP 压缩包 (*.zip)")
+        if not target:
+            return
+        try:
+            import app.core.download_service as download_module
+            bundle = self.download_service.logs.export_bundle(
+                target,
+                {
+                    "application": "汇发",
+                    "platform": platform.platform(),
+                    "python": sys.version.split()[0],
+                    "yt_dlp": getattr(download_module.yt_dlp, "version", "未安装") if download_module.yt_dlp else "未安装",
+                    "download_dir": self.app_settings.get("download_dir"),
+                    "proxy_configured": bool(self.app_settings.get("proxy")),
+                    "ffmpeg_path_configured": bool(self.app_settings.get("ffmpeg_path")),
+                    "sau_path_configured": bool(self.app_settings.get("sau_path")),
+                },
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", f"无法导出诊断包：\n{exc}")
+            return
+        QMessageBox.information(self, "导出完成", f"诊断包已保存到：\n{bundle}")
 
     def closeEvent(self, event) -> None:
         # Persist the latest task state before the window exits. Active tasks

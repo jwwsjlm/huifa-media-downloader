@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,20 @@ class DownloadLogService:
             suffix = "  " + json.dumps(details, ensure_ascii=False) if details else ""
             lines.append(f"[{event.get('time', '')}] [{event.get('level', '')}] [{event.get('category', '')}] {event.get('message', '')}{suffix}")
         return "\n".join(lines)
+
+    def export_bundle(self, destination: str | Path | None = None, summary: dict[str, Any] | None = None) -> Path:
+        """Export logs and a redacted environment summary for support tickets."""
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = Path(destination) if destination else self.root.parent / f"diagnostics-{timestamp}.zip"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        manifest = self._sanitize(summary or {})
+        manifest["exported_at"] = datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                for path in sorted(self.root.glob("*.jsonl")):
+                    archive.write(path, arcname=f"downloads/{path.name}")
+        return target
 
     @staticmethod
     def redact_url(url: str) -> str:

@@ -36,6 +36,10 @@ storing cookies or tokens. The log dialog also provides an initial diagnosis
 category so network failures can be distinguished from rate limits, login,
 CAPTCHA, format, and tool errors.
 
+The Settings page also provides `打开日志目录` and `导出诊断包`. The exported
+ZIP contains redacted task logs and a runtime summary for troubleshooting;
+cookies, tokens, authorization headers and URL query parameters are excluded.
+
 The application no longer uses the user's Documents directory for its own
 database or settings. Existing data from the legacy `.youtube-release-studio`
 location is migrated to `data/app.db` on first launch.
