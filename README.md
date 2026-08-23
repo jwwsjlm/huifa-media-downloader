@@ -43,6 +43,8 @@ cookies, tokens, authorization headers and URL query parameters are excluded.
 Transient network failures during解析 or下载 are retried up to two times with
 exponential backoff. Rate-limit, CAPTCHA, login and other風控类 errors are not
 blindly retried, which avoids making platform risk controls worse.
+The Settings page also exposes a configurable request interval (0–60 seconds)
+for cautious downloads; 0 keeps the original no-extra-delay behavior.
 
 The application no longer uses the user's Documents directory for its own
 database or settings. Existing data from the legacy `.youtube-release-studio`

@@ -24,6 +24,7 @@ class AppSettings:
             "sau_path": "sau",
             "ffmpeg_path": "",
             "max_concurrent": "3",
+            "request_delay": "0",
         }
         if first_run:
             self._migrate_legacy_settings()

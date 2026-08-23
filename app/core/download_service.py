@@ -116,12 +116,13 @@ class DownloadWorker(QObject):
     def __init__(self, task_id: str, url: str, output_dir: str, db: Database, proxy: str = "", cookie_file: str = "",
                  quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
                  ffmpeg_path: str = "", format_selector: str = "", download_album: bool = False,
-                 playlist_mode: str = "auto"):
+                 playlist_mode: str = "auto", request_delay: float = 0.0):
         super().__init__()
         self.task_id = task_id
         self.url, self.output_dir, self.db, self.proxy, self.cookie_file = url, output_dir, db, proxy, cookie_file
         self.logs = DownloadLogService()
         self.quality, self.filename_template, self.ffmpeg_path = quality, filename_template, ffmpeg_path
+        self.request_delay = max(0.0, float(request_delay or 0))
         self.download_album = download_album
         self.playlist_mode = playlist_mode if playlist_mode in {"auto", "single", "playlist"} else ("playlist" if download_album else "single")
         self.format_selector = format_selector
@@ -210,6 +211,8 @@ class DownloadWorker(QObject):
             "no_warnings": True,
             "logger": _YtdlpLogger(self._log),
         }
+        if self.request_delay > 0:
+            ydl_opts["sleep_interval_requests"] = self.request_delay
         bundled_ffmpeg = bundled_ffmpeg_path()
         configured_ffmpeg = Path(self.ffmpeg_path) if self.ffmpeg_path else bundled_ffmpeg
         if not configured_ffmpeg.exists():
@@ -371,12 +374,13 @@ class DownloadService(QObject):
     playlist_info = Signal(str, object)
     failed = Signal(str)
 
-    def __init__(self, db: Database, max_concurrent: int = 3):
+    def __init__(self, db: Database, max_concurrent: int = 3, request_delay: float = 0.0):
         super().__init__()
         self.db = db
         self.tasks: dict[str, DownloadTask] = {}
         self.queue: deque[str] = deque()
         self.max_concurrent = max(1, min(int(max_concurrent or 1), 8))
+        self.request_delay = max(0.0, float(request_delay or 0))
         self.active_task_id: str | None = None
         self.thread: QThread | None = None
         self.worker: DownloadWorker | None = None
@@ -659,7 +663,7 @@ class DownloadService(QObject):
             thread = QThread()
             worker = DownloadWorker(task_id, task.url, task.output_dir, self.db, task.proxy, "", task.quality,
                                     task.filename_template, task.ffmpeg_path, task.format_selector,
-                                    task.download_album, task.playlist_mode)
+                                    task.download_album, task.playlist_mode, self.request_delay)
             self.threads[task_id] = thread
             self.workers[task_id] = worker
             if self.active_task_id is None:

@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QAbstractItemView,
     QSpinBox,
+    QDoubleSpinBox,
 )
 
 from app.core.app_settings import AppSettings
@@ -1256,6 +1257,12 @@ class SettingsPage(QWidget):
         self.max_concurrent = QSpinBox()
         self.max_concurrent.setRange(1, 8)
         self.max_concurrent.setValue(max(1, min(8, int(window.app_settings.get("max_concurrent") or 3))))
+        self.request_delay = QDoubleSpinBox()
+        self.request_delay.setRange(0, 60)
+        self.request_delay.setSingleStep(0.5)
+        self.request_delay.setDecimals(1)
+        self.request_delay.setSuffix(" 秒")
+        self.request_delay.setValue(max(0.0, min(60.0, float(window.app_settings.get("request_delay") or 0))))
 
         download_group = QGroupBox("下载设置")
         download_form = QFormLayout(download_group)
@@ -1264,6 +1271,8 @@ class SettingsPage(QWidget):
         download_form.addRow("下载保存目录", self._path_row(self.download_dir, "选择目录", self.choose_download_dir))
         download_form.addRow("文件名模板", self.template)
         download_form.addRow("并行下载数", self.max_concurrent)
+        download_form.addRow("请求间隔", self.request_delay)
+        self.request_delay.setToolTip("每次请求之间的最小等待时间。设置 0 表示不额外等待；遇到风控时可设置为 1~3 秒。")
         root.addWidget(download_group)
 
         network_group = QGroupBox("网络设置")
@@ -1366,7 +1375,11 @@ class MainWindow(QMainWindow):
         data_dir = initialize_data_layout()
         self.app_settings = AppSettings()
         self.db = Database(data_dir / "app.db")
-        self.download_service = DownloadService(self.db, max_concurrent=int(self.app_settings.get("max_concurrent") or 3))
+        self.download_service = DownloadService(
+            self.db,
+            max_concurrent=int(self.app_settings.get("max_concurrent") or 3),
+            request_delay=float(self.app_settings.get("request_delay") or 0),
+        )
         self.publish_service = PublishService(self.db)
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -1432,8 +1445,10 @@ class MainWindow(QMainWindow):
         self.app_settings.set("sau_path", page.sau.text().strip())
         self.app_settings.set("ffmpeg_path", page.ffmpeg.text().strip())
         self.app_settings.set("max_concurrent", str(page.max_concurrent.value()))
+        self.app_settings.set("request_delay", str(page.request_delay.value()))
         self.app_settings.sync()
         self.download_service.max_concurrent = page.max_concurrent.value()
+        self.download_service.request_delay = page.request_delay.value()
         self.download_service._start_next()
         self.dashboard.proxy.setText(self.app_settings.get("proxy"))
         self.dashboard.refresh_settings()
