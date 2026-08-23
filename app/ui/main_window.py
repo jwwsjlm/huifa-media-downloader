@@ -40,6 +40,8 @@ STATUS_TEXT = {
     "queued": "排队中",
     "downloading": "下载中",
     "canceling": "取消中",
+    "暂停中": "暂停中",
+    "paused": "已暂停",
     "completed": "已完成",
     "failed": "失败",
     "canceled": "已取消",
@@ -48,6 +50,8 @@ STATUS_TEXT = {
 
 class DownloadTaskCard(QFrame):
     cancel_requested = Signal(str)
+    pause_requested = Signal(str)
+    resume_requested = Signal(str)
     retry_requested = Signal(str)
     open_requested = Signal(str)
 
@@ -64,12 +68,16 @@ class DownloadTaskCard(QFrame):
 
         self.title = QLabel()
         self.title.setWordWrap(True)
-        self.title.setMinimumWidth(260)
+        self.title.setMinimumWidth(0)
+        self.title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.url = QLabel()
         self.url.setObjectName("mutedText")
+        self.url.setMinimumWidth(0)
+        self.url.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.url.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.status = QLabel()
         self.status.setObjectName("taskStatus")
+        self.status.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setTextVisible(True)
@@ -100,7 +108,11 @@ class DownloadTaskCard(QFrame):
 
     def _action_clicked(self) -> None:
         status = getattr(self, "_status", "")
-        if status in {"queued", "downloading", "canceling"}:
+        if status == "downloading":
+            self.pause_requested.emit(self.task_id)
+        elif status == "paused":
+            self.resume_requested.emit(self.task_id)
+        elif status in {"queued", "canceling", "暂停中"}:
             self.cancel_requested.emit(self.task_id)
         elif status in {"failed", "canceled"}:
             self.retry_requested.emit(self.task_id)
@@ -122,13 +134,29 @@ class DownloadTaskCard(QFrame):
         self.url.setText(task.url)
         self.progress.setValue(int(task.progress))
         self.status.setText(STATUS_TEXT.get(task.status, task.status))
+        status_color = {
+            "downloading": "#2f7bdc",
+            "queued": "#8b96a6",
+            "paused": "#d48716",
+            "暂停中": "#d48716",
+            "completed": "#20a35a",
+            "failed": "#d64444",
+            "canceled": "#8b96a6",
+        }.get(task.status, "#2f7bdc")
+        self.status.setStyleSheet(f"color: {status_color}; font-weight: 600;")
         if task.status == "failed":
             self.status.setToolTip(task.error)
         details = "  ".join(x for x in [task.size, task.speed, f"剩余 {task.eta}" if task.eta else ""] if x)
         self.details.setText(details or "等待任务开始")
-        if task.status in {"queued", "downloading", "canceling"}:
+        if task.status == "downloading":
+            self.action.setText("暂停")
+            self.action.setEnabled(True)
+        elif task.status == "paused":
+            self.action.setText("继续")
+            self.action.setEnabled(True)
+        elif task.status in {"queued", "canceling", "暂停中"}:
             self.action.setText("取消")
-            self.action.setEnabled(task.status != "canceling")
+            self.action.setEnabled(task.status == "queued")
         elif task.status in {"failed", "canceled"}:
             self.action.setText("重试")
             self.action.setEnabled(True)
@@ -211,6 +239,7 @@ class DashboardPage(QWidget):
         self.task_list.setFrameShape(QFrame.NoFrame)
         self.task_list.setObjectName("taskList")
         self.task_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.task_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.task_list.customContextMenuRequested.connect(self.task_context_menu)
         root.addWidget(self.task_list, 1)
         self.empty_label = QLabel("还没有下载任务\n粘贴链接后点击“添加并下载”")
@@ -259,6 +288,8 @@ class DashboardPage(QWidget):
     def add_task(self, task: DownloadTask) -> None:
         card = DownloadTaskCard(task)
         card.cancel_requested.connect(self.window.download_service.cancel)
+        card.pause_requested.connect(self.window.download_service.pause)
+        card.resume_requested.connect(self.window.download_service.resume)
         card.retry_requested.connect(self.window.download_service.retry)
         card.open_requested.connect(self.open_task_folder)
         item = QListWidgetItem()
@@ -328,11 +359,17 @@ class DashboardPage(QWidget):
         if not task:
             return
         menu = QMenu(self)
-        if task.status in {"queued", "failed", "canceled", "completed"}:
+        if task.status in {"queued", "failed", "canceled", "completed", "paused"}:
             start_action = menu.addAction("下载" if task.status != "completed" else "重新下载")
         else:
             start_action = None
-        if task.status in {"queued", "downloading", "canceling"}:
+        if task.status == "downloading":
+            pause_action = menu.addAction("暂停任务")
+        elif task.status == "paused":
+            pause_action = menu.addAction("继续下载")
+        else:
+            pause_action = None
+        if task.status in {"queued", "downloading", "canceling", "暂停中"}:
             cancel_action = menu.addAction("取消任务")
         else:
             cancel_action = None
@@ -341,6 +378,11 @@ class DashboardPage(QWidget):
         chosen = menu.exec(self.task_list.mapToGlobal(pos))
         if chosen == start_action:
             self.window.download_service.start_task(task.id)
+        elif chosen == pause_action:
+            if task.status == "downloading":
+                self.window.download_service.pause(task.id)
+            else:
+                self.window.download_service.resume(task.id)
         elif chosen == cancel_action:
             self.window.download_service.cancel(task.id)
         elif chosen == open_action:
@@ -370,6 +412,12 @@ class DashboardPage(QWidget):
         count = self.task_list.count()
         active = sum(1 for task in self.window.download_service.tasks.values() if task.status == "downloading")
         self.count_label.setText(f"{count} 个任务 · {active} 个进行中")
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        card_width = max(320, self.task_list.viewport().width() - 8)
+        for card in self.cards.values():
+            card.setFixedWidth(card_width)
 
 
 class BrowserPage(QWidget):
@@ -549,7 +597,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("源流矩阵 · SourceFlow Studio")
-        self.resize(1280, 820)
+        self.setMinimumSize(820, 560)
+        self.resize(1080, 700)
         self.setStyleSheet(
             """
             QWidget { font-family: "Microsoft YaHei"; font-size: 13px; }

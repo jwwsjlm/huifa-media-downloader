@@ -51,6 +51,7 @@ class DownloadTask:
     thumbnail_path: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     cancel_requested: bool = False
+    pause_requested: bool = False
 
 
 class DownloadWorker(QObject):
@@ -215,16 +216,39 @@ class DownloadService(QObject):
             self.task_finished.emit(task.id, task.status, "")
             return
         if task_id == self.active_task_id and self.worker:
+            task.pause_requested = False
             task.cancel_requested = True
             task.status = "canceling"
             self.task_updated.emit(task)
             self.worker.cancel()
 
+    def pause(self, task_id: str | None = None) -> None:
+        task_id = task_id or self.active_task_id
+        if not task_id or task_id not in self.tasks:
+            return
+        task = self.tasks[task_id]
+        if task_id == self.active_task_id and task.status == "downloading" and self.worker:
+            task.pause_requested = True
+            task.status = "暂停中"
+            self.task_updated.emit(task)
+            self.worker.cancel()
+
+    def resume(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if not task or task.status != "paused":
+            return
+        task.status = "queued"
+        task.pause_requested = False
+        task.cancel_requested = False
+        self.queue.appendleft(task.id)
+        self.task_updated.emit(task)
+        self._start_next()
+
     def retry(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
         if not task or task.status not in {"failed", "canceled"}:
             return
-        task.status, task.error, task.progress, task.cancel_requested = "queued", "", 0.0, False
+        task.status, task.error, task.progress, task.cancel_requested, task.pause_requested = "queued", "", 0.0, False, False
         self.queue.append(task.id)
         self.task_updated.emit(task)
         self._start_next()
@@ -235,6 +259,8 @@ class DownloadService(QObject):
             return
         if task.status == "queued":
             self._start_next()
+        elif task.status == "paused":
+            self.resume(task_id)
         elif task.status in {"failed", "canceled"}:
             self.retry(task_id)
         elif task.status == "completed":
@@ -295,7 +321,9 @@ class DownloadService(QObject):
 
     def _thread_finished(self, task_id: str) -> None:
         task = self.tasks[task_id]
-        if task.cancel_requested:
+        if task.pause_requested:
+            task.status = "paused"
+        elif task.cancel_requested:
             task.status = "canceled"
         elif task.error:
             task.status = "failed"
