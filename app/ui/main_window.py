@@ -990,6 +990,7 @@ class BrowserPage(QWidget):
             cookie_store = self.profile.cookieStore()
             cookie_store.cookieAdded.connect(lambda *_: self._cookie_changed(1))
             cookie_store.cookieRemoved.connect(lambda *_: self._cookie_changed(-1))
+            cookie_store.loadAllCookies()
             self.browser.setPage(QWebEnginePage(self.profile, self.browser))
             layout.addWidget(self.browser)
             urls = {
