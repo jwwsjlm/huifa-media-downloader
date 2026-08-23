@@ -18,14 +18,24 @@ class PublishService(QObject):
     def __init__(self, db: Database):
         super().__init__()
         self.db = db
+        self.last_created_count = 0
+        self.last_existing_count = 0
 
     def create_tasks(self, media: MediaItem, platforms: list[str], metadata: dict, settings: dict) -> list[int]:
         ids = []
+        self.last_created_count = 0
+        self.last_existing_count = 0
         for platform in platforms:
             key = hashlib.sha256(f"{media.sha256}:{platform}:{metadata.get('title','')}".encode()).hexdigest()
+            existing = self.db.get_publish_task_by_key(key)
+            if existing:
+                ids.append(int(existing["id"]))
+                self.last_existing_count += 1
+                continue
             ids.append(self.db.add_publish_task(PublishTask(media_id=media.id or 0, platform=platform,
                           title=metadata.get("title", media.title), description=metadata.get("description", media.description),
                           topics=metadata.get("tags", media.tags), settings=settings.get(platform, {}), idempotency_key=key)))
+            self.last_created_count += 1
         return ids
 
     def run_task(self, task_id: int) -> None:
@@ -46,4 +56,3 @@ class PublishService(QObject):
         state = "success" if ok else "failed"
         self.db.update_publish_status(task_id, state, result)
         self.status.emit(task_id, state, result)
-

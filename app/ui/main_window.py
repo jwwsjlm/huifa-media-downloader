@@ -1146,7 +1146,12 @@ class PublishPage(QWidget):
             {"title": self.title.text(), "description": self.description.toPlainText(), "tags": tags},
             platform_settings,
         )
-        QMessageBox.information(self, "完成", "已加入发布队列")
+        created = self.window.publish_service.last_created_count
+        existing = self.window.publish_service.last_existing_count
+        message = f"新增 {created} 个发布任务。"
+        if existing:
+            message += f"\n检测到 {existing} 个重复任务，已保留原任务，避免重复发布。"
+        QMessageBox.information(self, "完成", message)
         self.window.tabs.setCurrentWidget(self.window.publish_queue)
 
 

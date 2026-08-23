@@ -115,6 +115,10 @@ class Database:
         with self._lock:
             return self.conn.execute("SELECT * FROM publish_tasks ORDER BY id DESC").fetchall()
 
+    def get_publish_task_by_key(self, idempotency_key: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute("SELECT * FROM publish_tasks WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+
     def update_publish_status(self, task_id: int, status: str, result: str = "") -> None:
         with self._lock:
             self.conn.execute("UPDATE publish_tasks SET status=?, result=? WHERE id=?", (status, result, task_id))

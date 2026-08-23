@@ -5,12 +5,12 @@ import re
 import struct
 import threading
 import time
+from uuid import uuid4
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import requests
 
@@ -326,15 +326,21 @@ class DownloadWorker(QObject):
         """Fetch the cover as soon as yt-dlp exposes it, so the task card can show it."""
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(video_id))[:80] or "video"
         path = Path(self.output_dir) / f"{safe_id}.thumb.jpg"
+        temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         try:
             response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
             response.raise_for_status()
-            path.write_bytes(response.content)
+            temp_path.write_bytes(response.content)
+            temp_path.replace(path)
             self._thumbnail_saved = True
             self._thumbnail_path = str(path)
             return str(path)
         except Exception as exc:
             self._log("warning", "网络/代理", "缩略图下载失败，已使用占位图", error=str(exc))
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             return ""
 
 
