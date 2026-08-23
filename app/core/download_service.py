@@ -57,6 +57,7 @@ class DownloadTask:
     proxy: str = ""
     filename_template: str = "%(title)s [%(id)s].%(ext)s"
     ffmpeg_path: str = ""
+    format_selector: str = ""
     title: str = "等待获取视频信息"
     status: str = "queued"
     progress: float = 0.0
@@ -80,18 +81,26 @@ class DownloadWorker(QObject):
     completed = Signal(object)
     failed = Signal(str)
     finished = Signal()
+    formats_ready = Signal(object)
 
     def __init__(self, url: str, output_dir: str, db: Database, proxy: str = "", cookie_file: str = "",
                  quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
-                 ffmpeg_path: str = ""):
+                 ffmpeg_path: str = "", format_selector: str = ""):
         super().__init__()
         self.url, self.output_dir, self.db, self.proxy, self.cookie_file = url, output_dir, db, proxy, cookie_file
         self.quality, self.filename_template, self.ffmpeg_path = quality, filename_template, ffmpeg_path
+        self.format_selector = format_selector
         self._cancel = threading.Event()
         self._thumbnail_saved = False
+        self._format_event = threading.Event()
 
     def cancel(self) -> None:
         self._cancel.set()
+        self._format_event.set()
+
+    def set_format_selector(self, selector: str) -> None:
+        self.format_selector = selector
+        self._format_event.set()
 
     @Slot()
     def run(self) -> None:
@@ -143,6 +152,18 @@ class DownloadWorker(QObject):
         if self.cookie_file:
             ydl_opts["cookiefile"] = self.cookie_file
         try:
+            if self.quality == "custom" and not self.format_selector:
+                probe_opts = {k: v for k, v in ydl_opts.items() if k not in {"format", "progress_hooks", "writethumbnail", "writeinfojson"}}
+                with yt_dlp.YoutubeDL(probe_opts) as probe:
+                    preview = probe.extract_info(self.url, download=False)
+                choices = self._build_format_choices(preview)
+                self.formats_ready.emit({"title": preview.get("title", ""), "choices": choices})
+                self._format_event.wait(timeout=900)
+                if self._cancel.is_set():
+                    raise yt_dlp.utils.DownloadError("用户取消下载")
+                if not self.format_selector:
+                    raise yt_dlp.utils.DownloadError("未选择视频分辨率")
+                ydl_opts["format"] = self.format_selector
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.url, download=True)
                 entries = info.get("entries") if info.get("_type") == "playlist" else [info]
@@ -179,6 +200,27 @@ class DownloadWorker(QObject):
         finally:
             self.finished.emit()
 
+    @staticmethod
+    def _build_format_choices(info: dict[str, Any]) -> list[dict[str, str]]:
+        choices: list[dict[str, str]] = []
+        seen: set[int] = set()
+        formats = sorted(info.get("formats") or [], key=lambda item: (item.get("height") or 0, item.get("fps") or 0), reverse=True)
+        for item in formats:
+            height = item.get("height")
+            format_id = item.get("format_id")
+            if not height or not format_id or height in seen or item.get("vcodec") == "none":
+                continue
+            seen.add(height)
+            ext = item.get("ext") or "?"
+            fps = item.get("fps") or ""
+            acodec = item.get("acodec")
+            selector = str(format_id) if acodec and acodec != "none" else f"{format_id}+bestaudio/best"
+            label = f"{height}p  ·  {ext}  ·  {fps}fps"
+            if item.get("format_note"):
+                label += f"  ·  {item['format_note']}"
+            choices.append({"label": label, "selector": selector})
+        return choices
+
     def _save_thumbnail(self, url: str, video_id: str) -> str:
         """Fetch the cover as soon as yt-dlp exposes it, so the task card can show it."""
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(video_id))[:80] or "video"
@@ -200,6 +242,7 @@ class DownloadService(QObject):
     task_media_completed = Signal(str, object)
     task_finished = Signal(str, str, str)
     task_deleted = Signal(str)
+    formats_ready = Signal(str, object)
     failed = Signal(str)
 
     def __init__(self, db: Database):
@@ -220,7 +263,8 @@ class DownloadService(QObject):
             task = DownloadTask(
                 id=row["id"], url=row["url"], output_dir=row["output_dir"], quality=row["quality"] or "best",
                 proxy=row["proxy"] or "", filename_template=row["filename_template"] or "%(title)s [%(id)s].%(ext)s",
-                ffmpeg_path=row["ffmpeg_path"] or "", title=row["title"] or "等待获取视频信息", status=status,
+                ffmpeg_path=row["ffmpeg_path"] or "", format_selector=row["format_selector"] or "",
+                title=row["title"] or "等待获取视频信息", status=status,
                 progress=float(row["progress"] or 0), speed=row["speed"] or "", speed_bps=float(row["speed_bps"] or 0),
                 downloaded_bytes=int(row["downloaded_bytes"] or 0), total_bytes=int(row["total_bytes"] or 0),
                 eta=row["eta"] or "", size=row["size"] or "", error=row["error"] or "",
@@ -236,10 +280,10 @@ class DownloadService(QObject):
 
     def enqueue(self, url: str, output_dir: str, proxy: str = "", cookie_file: str = "",
                 quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
-                ffmpeg_path: str = "") -> str:
+                ffmpeg_path: str = "", format_selector: str = "") -> str:
         task = DownloadTask(
             id=uuid4().hex[:10], url=url.strip(), output_dir=output_dir, proxy=proxy,
-            quality=quality, filename_template=filename_template, ffmpeg_path=ffmpeg_path,
+            quality=quality, filename_template=filename_template, ffmpeg_path=ffmpeg_path, format_selector=format_selector,
         )
         self.tasks[task.id] = task
         self._persist(task)
@@ -323,12 +367,13 @@ class DownloadService(QObject):
         elif task.status == "completed":
             self.redownload(task_id)
 
-    def redownload(self, task_id: str) -> str | None:
+    def redownload(self, task_id: str, quality_override: str | None = None) -> str | None:
         task = self.tasks.get(task_id)
         if not task:
             return None
-        return self.enqueue(task.url, task.output_dir, task.proxy, quality=task.quality,
-                            filename_template=task.filename_template, ffmpeg_path=task.ffmpeg_path)
+        return self.enqueue(task.url, task.output_dir, task.proxy, quality=quality_override or task.quality,
+                            filename_template=task.filename_template, ffmpeg_path=task.ffmpeg_path,
+                            format_selector="" if quality_override else task.format_selector)
 
     def delete_task(self, task_id: str) -> bool:
         task = self.tasks.get(task_id)
@@ -339,6 +384,15 @@ class DownloadService(QObject):
         self.db.delete_download_task(task_id)
         self.task_deleted.emit(task_id)
         return True
+
+    def set_format_selector(self, task_id: str, selector: str) -> None:
+        task = self.tasks.get(task_id)
+        if not task or not self.worker or task_id != self.active_task_id:
+            return
+        task.format_selector = selector
+        task.status = "downloading" if selector else "canceled"
+        self._persist(task)
+        self.worker.set_format_selector(selector)
 
     def _start_next(self) -> None:
         if self.active_task_id or not self.queue:
@@ -353,10 +407,11 @@ class DownloadService(QObject):
             self._persist(task)
             self.task_updated.emit(task)
             self.thread = QThread()
-            self.worker = DownloadWorker(task.url, task.output_dir, self.db, task.proxy, "", task.quality, task.filename_template, task.ffmpeg_path)
+            self.worker = DownloadWorker(task.url, task.output_dir, self.db, task.proxy, "", task.quality, task.filename_template, task.ffmpeg_path, task.format_selector)
             self.worker.moveToThread(self.thread)
             self.thread.started.connect(self.worker.run)
             self.worker.progress.connect(lambda data, tid=task_id: self._on_progress(tid, data))
+            self.worker.formats_ready.connect(lambda payload, tid=task_id: self._on_formats_ready(tid, payload))
             self.worker.completed.connect(lambda item, tid=task_id: self.task_media_completed.emit(tid, item))
             self.worker.failed.connect(lambda error, tid=task_id: self._on_failed(tid, error))
             self.worker.finished.connect(self.thread.quit)
@@ -365,6 +420,16 @@ class DownloadService(QObject):
             self.thread.finished.connect(self.thread.deleteLater)
             self.thread.start()
             return
+
+    def _on_formats_ready(self, task_id: str, payload: dict) -> None:
+        task = self.tasks.get(task_id)
+        if task:
+            if payload.get("title"):
+                task.title = payload["title"]
+            task.status = "waiting_selection"
+            self._persist(task)
+            self.task_updated.emit(task)
+            self.formats_ready.emit(task_id, payload)
 
     def _on_progress(self, task_id: str, data: dict) -> None:
         task = self.tasks[task_id]

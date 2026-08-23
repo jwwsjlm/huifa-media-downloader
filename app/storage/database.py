@@ -34,7 +34,7 @@ class Database:
             );
             CREATE TABLE IF NOT EXISTS download_tasks (
                 id TEXT PRIMARY KEY, url TEXT NOT NULL, output_dir TEXT NOT NULL,
-                quality TEXT, proxy TEXT, filename_template TEXT, ffmpeg_path TEXT,
+                quality TEXT, proxy TEXT, filename_template TEXT, ffmpeg_path TEXT, format_selector TEXT,
                 title TEXT, status TEXT, progress REAL DEFAULT 0,
                 speed TEXT, speed_bps REAL DEFAULT 0, downloaded_bytes INTEGER DEFAULT 0,
                 total_bytes INTEGER DEFAULT 0, eta TEXT, size TEXT, error TEXT,
@@ -43,6 +43,9 @@ class Database:
             );
             """
         )
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(download_tasks)").fetchall()}
+        if "format_selector" not in columns:
+            self.conn.execute("ALTER TABLE download_tasks ADD COLUMN format_selector TEXT DEFAULT ''")
         self.conn.commit()
 
     def add_media(self, item: MediaItem) -> int:
@@ -92,20 +95,21 @@ class Database:
     def upsert_download_task(self, task) -> None:
         self.conn.execute(
             """INSERT INTO download_tasks
-            (id,url,output_dir,quality,proxy,filename_template,ffmpeg_path,title,status,progress,
+            (id,url,output_dir,quality,proxy,filename_template,ffmpeg_path,format_selector,title,status,progress,
              speed,speed_bps,downloaded_bytes,total_bytes,eta,size,error,media_path,thumbnail_path,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
              url=excluded.url, output_dir=excluded.output_dir, quality=excluded.quality,
              proxy=excluded.proxy, filename_template=excluded.filename_template,
-             ffmpeg_path=excluded.ffmpeg_path, title=excluded.title, status=excluded.status,
+             ffmpeg_path=excluded.ffmpeg_path, format_selector=excluded.format_selector,
+             title=excluded.title, status=excluded.status,
              progress=excluded.progress, speed=excluded.speed, speed_bps=excluded.speed_bps,
              downloaded_bytes=excluded.downloaded_bytes, total_bytes=excluded.total_bytes,
              eta=excluded.eta, size=excluded.size, error=excluded.error,
              media_path=excluded.media_path, thumbnail_path=excluded.thumbnail_path,
              created_at=excluded.created_at, updated_at=datetime('now')""",
             (task.id, task.url, task.output_dir, task.quality, task.proxy, task.filename_template,
-             task.ffmpeg_path, task.title, task.status, task.progress, task.speed, task.speed_bps,
+             task.ffmpeg_path, task.format_selector, task.title, task.status, task.progress, task.speed, task.speed_bps,
              task.downloaded_bytes, task.total_bytes, task.eta, task.size, task.error,
              task.media_path, task.thumbnail_path, task.created_at),
         )

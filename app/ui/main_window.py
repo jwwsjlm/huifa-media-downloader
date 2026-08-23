@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QSizePolicy,
     QProgressBar,
+    QInputDialog,
 )
 
 from app.core.app_settings import AppSettings
@@ -43,6 +44,7 @@ STATUS_TEXT = {
     "canceling": "取消中",
     "暂停中": "暂停中",
     "paused": "已暂停",
+    "waiting_selection": "等待选择分辨率",
     "completed": "已完成",
     "failed": "失败",
     "canceled": "已取消",
@@ -55,6 +57,7 @@ class DownloadTaskCard(QFrame):
     resume_requested = Signal(str)
     retry_requested = Signal(str)
     open_requested = Signal(str)
+    context_requested = Signal(str, object)
 
     def __init__(self, task: DownloadTask):
         super().__init__()
@@ -89,6 +92,11 @@ class DownloadTaskCard(QFrame):
         self.action = QPushButton()
         self.action.setFixedWidth(76)
         self.action.clicked.connect(self._action_clicked)
+        for widget in (self, self.thumbnail, self.title, self.url, self.status, self.progress, self.details):
+            widget.setContextMenuPolicy(Qt.CustomContextMenu)
+            widget.customContextMenuRequested.connect(
+                lambda pos, source=widget: self.context_requested.emit(self.task_id, source.mapToGlobal(pos))
+            )
 
         text_layout = QVBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
@@ -155,6 +163,9 @@ class DownloadTaskCard(QFrame):
         elif task.status == "paused":
             self.action.setText("继续")
             self.action.setEnabled(True)
+        elif task.status == "waiting_selection":
+            self.action.setText("选择中")
+            self.action.setEnabled(False)
         elif task.status in {"queued", "canceling", "暂停中"}:
             self.action.setText("取消")
             self.action.setEnabled(task.status == "queued")
@@ -204,6 +215,7 @@ class DashboardPage(QWidget):
         self.quality.addItem("最高画质", "best")
         self.quality.addItem("1080p", "1080p")
         self.quality.addItem("720p", "720p")
+        self.quality.addItem("自定义（解析后选择）", "custom")
         saved_quality = window.app_settings.get("quality")
         self.quality.setCurrentIndex(max(0, self.quality.findData(saved_quality)))
         self.quality.currentIndexChanged.connect(lambda: self._save("quality", self.quality.currentData()))
@@ -293,6 +305,7 @@ class DashboardPage(QWidget):
         card.resume_requested.connect(self.window.download_service.resume)
         card.retry_requested.connect(self.window.download_service.retry)
         card.open_requested.connect(self.open_task_folder)
+        card.context_requested.connect(self.task_context_menu_for_task)
         item = QListWidgetItem()
         item.setSizeHint(QSize(0, 108))
         self.task_list.addItem(item)
@@ -344,6 +357,24 @@ class DashboardPage(QWidget):
         elif status == "canceled":
             self.status.setText("任务已取消")
 
+    def choose_format(self, task_id: str, payload: dict) -> None:
+        choices = payload.get("choices") or []
+        task = self.window.download_service.tasks.get(task_id)
+        if not task:
+            return
+        if not choices:
+            QMessageBox.warning(self, "无法选择分辨率", "没有解析到可用的视频分辨率。")
+            self.window.download_service.set_format_selector(task_id, "")
+            return
+        labels = [choice["label"] for choice in choices]
+        selected, ok = QInputDialog.getItem(self, "选择视频分辨率", task.title or "请选择下载格式", labels, 0, False)
+        if ok and selected:
+            choice = choices[labels.index(selected)]
+            self.window.download_service.set_format_selector(task_id, choice["selector"])
+            self.status.setText(f"已选择 {selected}，开始下载")
+        else:
+            self.window.download_service.cancel(task_id)
+
     def open_task_folder(self, task_id: str) -> None:
         task = self.window.download_service.tasks.get(task_id)
         if task:
@@ -356,31 +387,41 @@ class DashboardPage(QWidget):
         if not item:
             return
         task_id = next((task_id for task_id, list_item in self.items.items() if list_item is item), None)
-        task = self.window.download_service.tasks.get(task_id or "")
+        self.show_task_menu(task_id or "", self.task_list.mapToGlobal(pos))
+
+    def task_context_menu_for_task(self, task_id: str, global_pos) -> None:
+        self.show_task_menu(task_id, global_pos)
+
+    def show_task_menu(self, task_id: str, global_pos) -> None:
+        task = self.window.download_service.tasks.get(task_id)
         if not task:
             return
         menu = QMenu(self)
-        if task.status in {"queued", "failed", "canceled", "completed", "paused"}:
-            start_action = menu.addAction("下载" if task.status != "completed" else "重新下载")
-        else:
-            start_action = None
+        copy_link_action = menu.addAction("复制视频链接")
+        copy_folder_action = menu.addAction("复制视频文件夹路径")
+        menu.addSeparator()
         if task.status == "downloading":
-            pause_action = menu.addAction("暂停任务")
+            pause_action = menu.addAction("暂停下载")
         elif task.status == "paused":
             pause_action = menu.addAction("继续下载")
         else:
             pause_action = None
-        if task.status in {"queued", "downloading", "canceling", "暂停中"}:
-            cancel_action = menu.addAction("取消任务")
-        else:
-            cancel_action = None
-        open_action = menu.addAction("打开文件夹")
-        copy_action = menu.addAction("复制视频链接")
+        cancel_action = menu.addAction("取消任务") if task.status in {"queued", "downloading", "canceling", "暂停中"} else None
+        redownload_action = menu.addAction("重新下载") if task.status in {"failed", "canceled", "completed", "paused"} else None
+        custom_action = menu.addAction("选择分辨率并重新下载") if task.status in {"failed", "canceled", "completed", "paused"} else None
         menu.addSeparator()
+        open_action = menu.addAction("打开视频文件夹")
         delete_action = menu.addAction("删除任务")
-        chosen = menu.exec(self.task_list.mapToGlobal(pos))
-        if chosen == start_action:
-            self.window.download_service.start_task(task.id)
+        chosen = menu.exec(global_pos)
+        if chosen == copy_link_action:
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(task.url)
+            self.status.setText("视频链接已复制")
+        elif chosen == copy_folder_action:
+            from PySide6.QtWidgets import QApplication
+            folder = str(Path(task.media_path).parent if task.media_path else Path(task.output_dir))
+            QApplication.clipboard().setText(folder)
+            self.status.setText("视频文件夹路径已复制")
         elif chosen == pause_action:
             if task.status == "downloading":
                 self.window.download_service.pause(task.id)
@@ -388,12 +429,12 @@ class DashboardPage(QWidget):
                 self.window.download_service.resume(task.id)
         elif chosen == cancel_action:
             self.window.download_service.cancel(task.id)
+        elif chosen == redownload_action:
+            self.window.download_service.redownload(task.id)
+        elif chosen == custom_action:
+            self.window.download_service.redownload(task.id, quality_override="custom")
         elif chosen == open_action:
             self.open_task_folder(task.id)
-        elif chosen == copy_action:
-            from PySide6.QtWidgets import QApplication
-            QApplication.clipboard().setText(task.url)
-            self.status.setText("视频链接已复制")
         elif chosen == delete_action:
             if task.status in {"downloading", "canceling", "暂停中"}:
                 QMessageBox.information(self, "无法删除", "请先暂停或取消正在下载的任务，再执行删除。")
@@ -607,30 +648,17 @@ class SettingsPage(QWidget):
         super().__init__()
         form = QFormLayout(self)
         bundled = bundled_ffmpeg_path()
-        self.download_dir = QLineEdit(window.app_settings.get("download_dir"))
-        choose = QPushButton("选择")
-        choose.clicked.connect(self.choose_dir)
-        dir_row = QHBoxLayout()
-        dir_row.addWidget(self.download_dir)
-        dir_row.addWidget(choose)
         self.proxy = QLineEdit(window.app_settings.get("proxy"))
         self.template = QLineEdit(window.app_settings.get("filename_template"))
         self.sau = QLineEdit(window.app_settings.get("sau_path"))
         self.ffmpeg = QLineEdit(window.app_settings.get("ffmpeg_path") or (str(bundled) if bundled.exists() else "ffmpeg"))
         save = QPushButton("保存配置")
         save.clicked.connect(lambda: window.save_settings(self))
-        form.addRow("默认下载目录", dir_row)
         form.addRow("默认代理", self.proxy)
         form.addRow("文件名模板", self.template)
         form.addRow("sau 可执行文件", self.sau)
         form.addRow("FFmpeg", self.ffmpeg)
         form.addRow(save)
-
-    def choose_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择默认下载目录", self.download_dir.text())
-        if path:
-            self.download_dir.setText(path)
-
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -682,6 +710,7 @@ class MainWindow(QMainWindow):
         self.download_service.task_added.connect(self.dashboard.add_task)
         self.download_service.task_updated.connect(self.dashboard.update_task)
         self.download_service.task_progress.connect(self.dashboard.update_progress)
+        self.download_service.formats_ready.connect(self.dashboard.choose_format)
         self.download_service.task_media_completed.connect(self.dashboard.media_completed)
         self.download_service.task_finished.connect(self.dashboard.finished)
         self.download_service.task_deleted.connect(self.dashboard.remove_task)
@@ -697,13 +726,11 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(page)
 
     def save_settings(self, page: SettingsPage) -> None:
-        self.app_settings.set("download_dir", page.download_dir.text().strip())
         self.app_settings.set("proxy", page.proxy.text().strip())
         self.app_settings.set("filename_template", page.template.text().strip())
         self.app_settings.set("sau_path", page.sau.text().strip())
         self.app_settings.set("ffmpeg_path", page.ffmpeg.text().strip())
         self.app_settings.sync()
-        self.dashboard.output.setText(self.app_settings.get("download_dir"))
         self.dashboard.proxy.setText(self.app_settings.get("proxy"))
         QMessageBox.information(self, "已保存", "下载目录、代理和工具路径已保存")
 

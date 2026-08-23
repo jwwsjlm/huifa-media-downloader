@@ -22,6 +22,9 @@ Runtime data is stored beside the application under `data/`:
 - `data/browser/` — embedded browser cache and login profile;
 - `data/downloads/` — default download directory.
 
+The download page is the single place for selecting the download directory;
+the Settings page contains shared network and tool settings only.
+
 The application no longer uses the user's Documents directory for its own
 database or settings. Existing data from the legacy `.youtube-release-studio`
 location is migrated to `data/app.db` on first launch.
@@ -32,6 +35,7 @@ The first version provides:
 - a task dashboard with per-task title, URL, thumbnail placeholder, status, progress, speed, ETA, cancel/retry and folder actions;
 - persistent download directory, proxy, filename template and quality preferences;
 - quality presets for best available, 1080p maximum and 720p maximum;
+- custom quality mode that parses available formats before download;
 - metadata/thumbnail/info.json persistence in SQLite + files;
 - embedded browser profiles for YouTube and publishing sites;
 - completed media list with a context menu to create a publishing task;
