@@ -948,15 +948,32 @@ class BrowserPage(QWidget):
     def __init__(self, storage_dir: Path):
         super().__init__()
         layout = QVBoxLayout(self)
+        browser_toolbar = QHBoxLayout()
         selector = QComboBox()
         selector.addItems(["空白页", "YouTube", "抖音", "哔哩哔哩", "视频号", "快手", "今日头条"])
-        layout.addWidget(selector)
+        browser_toolbar.addWidget(selector)
         try:
             from PySide6.QtWebEngineWidgets import QWebEngineView
             from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
             from PySide6.QtCore import QUrl
 
             self.browser = QWebEngineView()
+            back = QPushButton("后退")
+            back.clicked.connect(self.browser.back)
+            forward = QPushButton("前进")
+            forward.clicked.connect(self.browser.forward)
+            refresh = QPushButton("刷新")
+            refresh.clicked.connect(self.browser.reload)
+            stop = QPushButton("停止")
+            stop.clicked.connect(self.browser.stop)
+            self.address = QLineEdit()
+            self.address.setPlaceholderText("输入网址并回车")
+            self.address.returnPressed.connect(lambda: self.browser.setUrl(QUrl(self.address.text().strip())))
+            browser_toolbar.addWidget(back)
+            browser_toolbar.addWidget(forward)
+            browser_toolbar.addWidget(refresh)
+            browser_toolbar.addWidget(stop)
+            browser_toolbar.addWidget(self.address, 1)
             profile_dir = storage_dir / "browser"
             cache_dir = profile_dir / "cache"
             profile_dir.mkdir(parents=True, exist_ok=True)
@@ -977,9 +994,11 @@ class BrowserPage(QWidget):
                 "今日头条": "https://mp.toutiao.com/",
             }
             selector.currentTextChanged.connect(lambda value: self.browser.setUrl(QUrl(urls[value])))
+            self.browser.urlChanged.connect(lambda value: self.address.setText(value.toString()))
             self.browser.setUrl(QUrl("about:blank"))
         except ImportError:
             layout.addWidget(QLabel("QtWebEngine 未安装；请安装 PySide6 完整组件。"))
+        layout.insertLayout(0, browser_toolbar)
 
 
 class CompletedPage(QWidget):
@@ -990,6 +1009,11 @@ class CompletedPage(QWidget):
         header = QHBoxLayout()
         header.addWidget(QLabel("已完成的视频"))
         header.addStretch(1)
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("搜索标题、上传者或路径")
+        self.search_box.setMaximumWidth(260)
+        self.search_box.textChanged.connect(self.apply_filter)
+        header.addWidget(self.search_box)
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.refresh)
         header.addWidget(refresh)
@@ -1003,9 +1027,19 @@ class CompletedPage(QWidget):
     def refresh(self) -> None:
         self.list.clear()
         for media in self.window.db.list_media():
-            item = QListWidgetItem(f"{media.title}  |  {media.uploader}  |  {media.video_path}")
+            exists = Path(media.video_path).exists()
+            state = "文件存在" if exists else "文件已删除"
+            item = QListWidgetItem(f"{media.title}  |  {media.uploader}  |  {state}  |  {media.video_path}")
             item.setData(Qt.UserRole, media.id)
+            item.setToolTip(f"标题：{media.title}\n上传者：{media.uploader}\n路径：{media.video_path}\n状态：{state}")
             self.list.addItem(item)
+        self.apply_filter()
+
+    def apply_filter(self) -> None:
+        query = self.search_box.text().strip().lower()
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            item.setHidden(bool(query and query not in item.text().lower()))
 
     def menu(self, pos) -> None:
         item = self.list.itemAt(pos)

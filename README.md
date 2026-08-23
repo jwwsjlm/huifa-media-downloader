@@ -49,6 +49,7 @@ The first version provides:
 - custom quality mode that parses available formats before download;
 - metadata/thumbnail/info.json persistence in SQLite + files;
 - embedded browser profiles for YouTube and publishing sites;
+- embedded browser navigation controls (back, forward, refresh, stop and address bar);
 - completed media list with a context menu to create a publishing task;
 - platform adapters for Douyin, Kuaishou, Bilibili, WeChat Channels (via `sau`) and a separate Toutiao adapter stub;
 - encrypted/OS-backed secret storage through `keyring` when available.
