@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import struct
 import threading
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from app.core.network_service import detect_public_ip
 from app.storage.database import Database
@@ -23,6 +26,28 @@ def bundled_ffmpeg_path() -> Path:
     """Return the bundled FFmpeg matching the current Python process bitness."""
     arch = "x64" if struct.calcsize("P") * 8 >= 64 else "x86"
     return Path(__file__).resolve().parents[2] / "tools" / "ffmpeg" / arch / "ffmpeg.exe"
+
+
+@dataclass
+class DownloadTask:
+    id: str
+    url: str
+    output_dir: str
+    quality: str = "best"
+    proxy: str = ""
+    filename_template: str = "%(title)s [%(id)s].%(ext)s"
+    ffmpeg_path: str = ""
+    title: str = "等待获取视频信息"
+    status: str = "queued"
+    progress: float = 0.0
+    speed: str = ""
+    eta: str = ""
+    size: str = ""
+    error: str = ""
+    media_path: str = ""
+    thumbnail_path: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    cancel_requested: bool = False
 
 
 class DownloadWorker(QObject):
@@ -73,8 +98,6 @@ class DownloadWorker(QObject):
             "quiet": True,
             "no_warnings": True,
         }
-        # Prefer the bundled FFmpeg shipped with the application. yt-dlp accepts
-        # either the executable path or its containing directory.
         bundled_ffmpeg = bundled_ffmpeg_path()
         configured_ffmpeg = Path(self.ffmpeg_path) if self.ffmpeg_path else bundled_ffmpeg
         if not configured_ffmpeg.exists():
@@ -97,16 +120,24 @@ class DownloadWorker(QObject):
                     base = Path(filepath)
                     mp4 = base.with_suffix(".mp4")
                     video_path = str(mp4 if mp4.exists() else base)
-                    thumb = next(iter(base.parent.glob(base.stem + ".*")), None)
+                    thumb = next((p for p in base.parent.glob(base.stem + ".*") if p.suffix.lower() not in {".mp4", ".webm", ".mkv"}), None)
                     info_path = str(base.with_suffix(".info.json"))
                     if not Path(info_path).exists():
                         info_path = str(base.with_suffix(".json"))
                     digest = hashlib.sha256(Path(video_path).read_bytes()).hexdigest() if Path(video_path).exists() else ""
-                    item = MediaItem(source_url=entry.get("webpage_url") or self.url, title=entry.get("title") or "",
-                                     description=entry.get("description") or "", tags=entry.get("tags") or [],
-                                     uploader=entry.get("uploader") or "", thumbnail_path=str(thumb or ""),
-                                     video_path=video_path, metadata_json_path=info_path,
-                                     source_ip=detect_public_ip(self.proxy), proxy_profile=self.proxy, sha256=digest)
+                    item = MediaItem(
+                        source_url=entry.get("webpage_url") or self.url,
+                        title=entry.get("title") or "",
+                        description=entry.get("description") or "",
+                        tags=entry.get("tags") or [],
+                        uploader=entry.get("uploader") or "",
+                        thumbnail_path=str(thumb or ""),
+                        video_path=video_path,
+                        metadata_json_path=info_path,
+                        source_ip=detect_public_ip(self.proxy),
+                        proxy_profile=self.proxy,
+                        sha256=digest,
+                    )
                     item.id = self.db.add_media(item)
                     self.completed.emit(item)
         except Exception as exc:
@@ -116,37 +147,120 @@ class DownloadWorker(QObject):
 
 
 class DownloadService(QObject):
-    progress = Signal(dict)
-    completed = Signal(object)
+    task_added = Signal(object)
+    task_updated = Signal(object)
+    task_progress = Signal(str, dict)
+    task_media_completed = Signal(str, object)
+    task_finished = Signal(str, str, str)
     failed = Signal(str)
-    started = Signal()
 
     def __init__(self, db: Database):
         super().__init__()
         self.db = db
+        self.tasks: dict[str, DownloadTask] = {}
+        self.queue: deque[str] = deque()
+        self.active_task_id: str | None = None
+        self.thread: QThread | None = None
+        self.worker: DownloadWorker | None = None
+
+    def enqueue(self, url: str, output_dir: str, proxy: str = "", cookie_file: str = "",
+                quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
+                ffmpeg_path: str = "") -> str:
+        task = DownloadTask(
+            id=uuid4().hex[:10], url=url.strip(), output_dir=output_dir, proxy=proxy,
+            quality=quality, filename_template=filename_template, ffmpeg_path=ffmpeg_path,
+        )
+        self.tasks[task.id] = task
+        self.queue.append(task.id)
+        self.task_added.emit(task)
+        self._start_next()
+        return task.id
+
+    # Backward-compatible name used by older callers.
+    start = enqueue
+
+    def cancel(self, task_id: str | None = None) -> None:
+        task_id = task_id or self.active_task_id
+        if not task_id or task_id not in self.tasks:
+            return
+        task = self.tasks[task_id]
+        if task.status == "queued":
+            task.status = "canceled"
+            self.task_updated.emit(task)
+            self.task_finished.emit(task.id, task.status, "")
+            return
+        if task_id == self.active_task_id and self.worker:
+            task.cancel_requested = True
+            task.status = "canceling"
+            self.task_updated.emit(task)
+            self.worker.cancel()
+
+    def retry(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if not task or task.status not in {"failed", "canceled"}:
+            return
+        task.status, task.error, task.progress, task.cancel_requested = "queued", "", 0.0, False
+        self.queue.append(task.id)
+        self.task_updated.emit(task)
+        self._start_next()
+
+    def _start_next(self) -> None:
+        if self.active_task_id or not self.queue:
+            return
+        while self.queue:
+            task_id = self.queue.popleft()
+            task = self.tasks[task_id]
+            if task.status != "queued":
+                continue
+            self.active_task_id = task_id
+            task.status = "downloading"
+            self.task_updated.emit(task)
+            self.thread = QThread()
+            self.worker = DownloadWorker(task.url, task.output_dir, self.db, task.proxy, "", task.quality, task.filename_template, task.ffmpeg_path)
+            self.worker.moveToThread(self.thread)
+            self.thread.started.connect(self.worker.run)
+            self.worker.progress.connect(lambda data, tid=task_id: self._on_progress(tid, data))
+            self.worker.completed.connect(lambda item, tid=task_id: self.task_media_completed.emit(tid, item))
+            self.worker.failed.connect(lambda error, tid=task_id: self._on_failed(tid, error))
+            self.worker.finished.connect(self.thread.quit)
+            self.worker.finished.connect(self.worker.deleteLater)
+            self.thread.finished.connect(lambda tid=task_id: self._thread_finished(tid))
+            self.thread.finished.connect(self.thread.deleteLater)
+            self.thread.start()
+            return
+
+    def _on_progress(self, task_id: str, data: dict) -> None:
+        task = self.tasks[task_id]
+        total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+        done = data.get("downloaded_bytes") or 0
+        if total:
+            task.progress = min(100.0, done * 100.0 / total)
+        info = data.get("info_dict") or {}
+        if info.get("title"):
+            task.title = info["title"]
+        task.speed = data.get("_speed_str") or ""
+        task.eta = data.get("_eta_str") or ""
+        task.size = data.get("_total_bytes_str") or data.get("_total_bytes_estimate_str") or ""
+        self.task_progress.emit(task_id, data)
+
+    def _on_failed(self, task_id: str, error: str) -> None:
+        task = self.tasks[task_id]
+        task.error = error
+        self.task_updated.emit(task)
+
+    def _thread_finished(self, task_id: str) -> None:
+        task = self.tasks[task_id]
+        if task.cancel_requested:
+            task.status = "canceled"
+        elif task.error:
+            task.status = "failed"
+        else:
+            task.status = "completed"
+            task.progress = 100.0
+        self.task_updated.emit(task)
+        self.task_finished.emit(task_id, task.status, task.error)
+        self.active_task_id = None
         self.thread = None
         self.worker = None
+        self._start_next()
 
-    def start(self, url: str, output_dir: str, proxy: str = "", cookie_file: str = "",
-              quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
-              ffmpeg_path: str = "") -> None:
-        from PySide6.QtCore import QThread
-        if self.thread and self.thread.isRunning():
-            self.failed.emit("当前已有下载任务，请等待完成")
-            return
-        self.thread = QThread()
-        self.worker = DownloadWorker(url, output_dir, self.db, proxy, cookie_file, quality, filename_template, ffmpeg_path)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.progress)
-        self.worker.completed.connect(self.completed)
-        self.worker.failed.connect(self.failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.start()
-        self.started.emit()
-
-    def cancel(self) -> None:
-        if self.worker:
-            self.worker.cancel()
