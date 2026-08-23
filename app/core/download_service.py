@@ -306,6 +306,7 @@ class DownloadService(QObject):
         self.threads: dict[str, QThread] = {}
         self.workers: dict[str, DownloadWorker] = {}
         self._discard_tasks: set[str] = set()
+        self._pending_deletes: dict[str, bool] = {}
 
     def restore_tasks(self) -> list[DownloadTask]:
         restored: list[DownloadTask] = []
@@ -469,10 +470,29 @@ class DownloadService(QObject):
 
     def delete_task(self, task_id: str, delete_files: bool = False) -> bool:
         task = self.tasks.get(task_id)
-        if not task or task_id in self.workers or task.status in {"downloading", "canceling", "暂停中"}:
+        if not task:
             return False
+        if task_id in self.workers:
+            # Deleting an active task also implies cancelling it.  Keep the
+            # requested file policy and remove everything after the worker
+            # unwinds, so the user does not need to pause first.
+            self._pending_deletes[task_id] = bool(delete_files)
+            task.pause_requested = False
+            task.cancel_requested = True
+            task.status = "canceling"
+            self._persist(task)
+            self.task_updated.emit(task)
+            self.workers[task_id].cancel()
+            return True
         self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
-        self.tasks.pop(task_id, None)
+        self._remove_task_record(task_id, delete_files)
+        return True
+
+    def _remove_task_record(self, task_id: str, delete_files: bool = False) -> None:
+        task = self.tasks.pop(task_id, None)
+        if not task:
+            return
+        self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
         if delete_files:
             for file_path in (task.media_path, task.thumbnail_path):
                 if file_path:
@@ -487,13 +507,9 @@ class DownloadService(QObject):
                 except OSError:
                     pass
         self.db.delete_download_task(
-            task_id,
-            source_url=task.url,
-            media_path=task.media_path,
-            delete_media=delete_files,
+            task_id, source_url=task.url, media_path=task.media_path, delete_media=delete_files
         )
         self.task_deleted.emit(task_id)
-        return True
 
     def discard_task(self, task_id: str) -> None:
         """Cancel a task that is still in pre-download format selection.
@@ -631,6 +647,17 @@ class DownloadService(QObject):
         if not task:
             self.threads.pop(task_id, None)
             self.workers.pop(task_id, None)
+            self._start_next()
+            return
+        if task_id in self._pending_deletes:
+            delete_files = self._pending_deletes.pop(task_id)
+            self._remove_task_record(task_id, delete_files)
+            self.threads.pop(task_id, None)
+            self.workers.pop(task_id, None)
+            if self.active_task_id == task_id:
+                self.active_task_id = next(iter(self.workers), None)
+                self.thread = self.threads.get(self.active_task_id) if self.active_task_id else None
+                self.worker = self.workers.get(self.active_task_id) if self.active_task_id else None
             self._start_next()
             return
         if task_id in self._discard_tasks:

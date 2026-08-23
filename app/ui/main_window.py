@@ -271,6 +271,7 @@ class FormatSelectionDialog(QDialog):
             item.setData(Qt.UserRole, choice)
             item.setSizeHint(QSize(0, 48))
             row = QWidget()
+            row.setObjectName("formatRow")
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(10, 3, 10, 3)
             row_layout.setSpacing(8)
@@ -661,14 +662,11 @@ class DashboardPage(QWidget):
 
     def delete_tasks_with_prompt(self, task_ids: list[str]) -> None:
         eligible = [task_id for task_id in task_ids if task_id in self.window.download_service.tasks]
-        blocked = [task_id for task_id in eligible if self.window.download_service.tasks[task_id].status in {"downloading", "canceling", "暂停中"}]
-        removable = [task_id for task_id in eligible if task_id not in blocked]
-        if not removable:
-            QMessageBox.information(self, "无法删除", "选中的任务正在下载，请先暂停或取消。")
+        if not eligible:
             return
         box = QMessageBox(self)
         box.setWindowTitle("删除任务")
-        box.setText(f"将删除 {len(removable)} 个任务记录。是否同时删除对应的视频文件？")
+        box.setText(f"将删除 {len(eligible)} 个任务记录。正在下载的任务会自动取消后删除。是否同时删除对应的视频文件？")
         keep_button = box.addButton("只删任务记录", QMessageBox.AcceptRole)
         file_button = box.addButton("任务和视频文件都删", QMessageBox.DestructiveRole)
         box.addButton("取消", QMessageBox.RejectRole)
@@ -677,7 +675,7 @@ class DashboardPage(QWidget):
         if clicked not in {keep_button, file_button}:
             return
         delete_files = clicked is file_button
-        for task_id in removable:
+        for task_id in eligible:
             self.window.download_service.delete_task(task_id, delete_files=delete_files)
 
     def remove_task(self, task_id: str) -> None:
@@ -925,6 +923,7 @@ class MainWindow(QMainWindow):
             QListWidget { border: 1px solid #d9dee7; border-radius: 6px; background: #fbfcfe; }
             QListWidget::item { border-radius: 6px; }
             QListWidget::item:selected { background: #e8f3ff; border: 1px solid #2b8cff; }
+            QWidget#formatRow { border-bottom: 1px solid #e0e5ec; }
             QTabWidget::pane { border: none; }
             """
         )
