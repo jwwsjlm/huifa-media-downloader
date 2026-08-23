@@ -538,8 +538,14 @@ class DownloadService(QObject):
         if not task or not worker:
             return
         task.format_selector = selector
+        task.error = ""
+        task.pause_requested = False
+        task.cancel_requested = False
         task.status = "downloading" if selector else "canceled"
         self._persist(task)
+        self.task_updated.emit(task)
+        if selector:
+            self.task_progress.emit(task_id, {"status": "downloading", "format_selected": True})
         worker.set_format_selector(selector)
 
     def _start_next(self) -> None:
