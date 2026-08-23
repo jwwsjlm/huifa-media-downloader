@@ -92,6 +92,7 @@ class DownloadWorker(QObject):
         self.format_selector = format_selector
         self._cancel = threading.Event()
         self._thumbnail_saved = False
+        self._thumbnail_path = ""
         self._format_event = threading.Event()
 
     def cancel(self) -> None:
@@ -175,7 +176,10 @@ class DownloadWorker(QObject):
                     base = Path(filepath)
                     mp4 = base.with_suffix(".mp4")
                     video_path = str(mp4 if mp4.exists() else base)
-                    thumb = next((p for p in base.parent.glob(base.stem + ".*") if p.suffix.lower() not in {".mp4", ".webm", ".mkv"}), None)
+                    image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+                    thumb = Path(self._thumbnail_path) if self._thumbnail_path else None
+                    if not thumb or not thumb.exists():
+                        thumb = next((p for p in base.parent.glob(base.stem + ".*") if p.suffix.lower() in image_suffixes), None)
                     info_path = str(base.with_suffix(".info.json"))
                     if not Path(info_path).exists():
                         info_path = str(base.with_suffix(".json"))
@@ -230,6 +234,7 @@ class DownloadWorker(QObject):
             response.raise_for_status()
             path.write_bytes(response.content)
             self._thumbnail_saved = True
+            self._thumbnail_path = str(path)
             return str(path)
         except Exception:
             return ""
@@ -271,6 +276,23 @@ class DownloadService(QObject):
                 media_path=row["media_path"] or "", thumbnail_path=row["thumbnail_path"] or "",
                 created_at=row["created_at"] or datetime.now().isoformat(timespec="seconds"),
             )
+            changed = False
+            if task.status in {"completed", "deleted"} and task.media_path:
+                file_exists = Path(task.media_path).exists()
+                next_status = "completed" if file_exists else "deleted"
+                if task.status != next_status:
+                    task.status = next_status
+                    changed = True
+            if not task.media_path and task.status in {"completed", "deleted"}:
+                media = self.db.get_latest_media_for_url(task.url)
+                if media:
+                    task.media_path = media.video_path
+                    task.thumbnail_path = media.thumbnail_path
+                    if not Path(task.media_path).exists():
+                        task.status = "deleted"
+                    changed = True
+            if changed:
+                self._persist(task)
             self.tasks[task.id] = task
             restored.append(task)
         return restored
@@ -301,10 +323,10 @@ class DownloadService(QObject):
             return
         task = self.tasks[task_id]
         if task.status == "queued":
-            task.status = "canceled"
+            task.status = "paused"
+            self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
             self._persist(task)
             self.task_updated.emit(task)
-            self.task_finished.emit(task.id, task.status, "")
             return
         if task_id == self.active_task_id and self.worker:
             task.pause_requested = False
@@ -325,6 +347,13 @@ class DownloadService(QObject):
             self._persist(task)
             self.task_updated.emit(task)
             self.worker.cancel()
+        elif task.status == "queued":
+            # A queued task has no worker yet; pausing it means removing it
+            # from the queue and retaining the task record for later resume.
+            task.status = "paused"
+            self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
+            self._persist(task)
+            self.task_updated.emit(task)
 
     def resume(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
@@ -343,6 +372,9 @@ class DownloadService(QObject):
 
     def retry(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
+        if task and task.status == "deleted":
+            self.redownload(task_id)
+            return
         if not task or task.status not in {"failed", "canceled"}:
             return
         task.status, task.error, task.progress, task.cancel_requested, task.pause_requested = "queued", "", 0.0, False, False
@@ -359,12 +391,14 @@ class DownloadService(QObject):
         if not task:
             return
         if task.status == "queued":
+            if task_id not in self.queue:
+                self.queue.append(task_id)
             self._start_next()
         elif task.status == "paused":
             self.resume(task_id)
         elif task.status in {"failed", "canceled"}:
             self.retry(task_id)
-        elif task.status == "completed":
+        elif task.status in {"completed", "deleted"}:
             self.redownload(task_id)
 
     def redownload(self, task_id: str, quality_override: str | None = None) -> str | None:
@@ -375,13 +409,31 @@ class DownloadService(QObject):
                             filename_template=task.filename_template, ffmpeg_path=task.ffmpeg_path,
                             format_selector="" if quality_override else task.format_selector)
 
-    def delete_task(self, task_id: str) -> bool:
+    def delete_task(self, task_id: str, delete_files: bool = False) -> bool:
         task = self.tasks.get(task_id)
         if not task or task_id == self.active_task_id or task.status in {"downloading", "canceling", "暂停中"}:
             return False
         self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
         self.tasks.pop(task_id, None)
-        self.db.delete_download_task(task_id)
+        if delete_files:
+            for file_path in (task.media_path, task.thumbnail_path):
+                if file_path:
+                    try:
+                        Path(file_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            if task.media_path:
+                info_path = Path(task.media_path).with_suffix(".info.json")
+                try:
+                    info_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self.db.delete_download_task(
+            task_id,
+            source_url=task.url,
+            media_path=task.media_path,
+            delete_media=delete_files,
+        )
         self.task_deleted.emit(task_id)
         return True
 
@@ -412,7 +464,7 @@ class DownloadService(QObject):
             self.thread.started.connect(self.worker.run)
             self.worker.progress.connect(lambda data, tid=task_id: self._on_progress(tid, data))
             self.worker.formats_ready.connect(lambda payload, tid=task_id: self._on_formats_ready(tid, payload))
-            self.worker.completed.connect(lambda item, tid=task_id: self.task_media_completed.emit(tid, item))
+            self.worker.completed.connect(lambda item, tid=task_id: self._on_media_completed(tid, item))
             self.worker.failed.connect(lambda error, tid=task_id: self._on_failed(tid, error))
             self.worker.finished.connect(self.thread.quit)
             self.worker.finished.connect(self.worker.deleteLater)
@@ -430,6 +482,15 @@ class DownloadService(QObject):
             self._persist(task)
             self.task_updated.emit(task)
             self.formats_ready.emit(task_id, payload)
+
+    def _on_media_completed(self, task_id: str, media: MediaItem) -> None:
+        task = self.tasks.get(task_id)
+        if task:
+            task.title = media.title or task.title
+            task.media_path = media.video_path
+            task.thumbnail_path = media.thumbnail_path
+            self._persist(task)
+        self.task_media_completed.emit(task_id, media)
 
     def _on_progress(self, task_id: str, data: dict) -> None:
         task = self.tasks[task_id]
@@ -473,6 +534,7 @@ class DownloadService(QObject):
         else:
             task.status = "completed"
             task.progress = 100.0
+        self._persist(task)
         self.task_updated.emit(task)
         self.task_finished.emit(task_id, task.status, task.error)
         self.active_task_id = None

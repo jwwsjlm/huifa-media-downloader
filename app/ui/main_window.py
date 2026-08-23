@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, Signal, QSize, QEvent, QItemSelectionModel
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QProgressBar,
     QInputDialog,
+    QCheckBox,
+    QAbstractItemView,
 )
 
 from app.core.app_settings import AppSettings
@@ -45,6 +47,7 @@ STATUS_TEXT = {
     "暂停中": "暂停中",
     "paused": "已暂停",
     "waiting_selection": "等待选择分辨率",
+    "deleted": "文件已删除",
     "completed": "已完成",
     "failed": "失败",
     "canceled": "已取消",
@@ -58,10 +61,13 @@ class DownloadTaskCard(QFrame):
     retry_requested = Signal(str)
     open_requested = Signal(str)
     context_requested = Signal(str, object)
+    selection_requested = Signal(str, object)
+    checked_changed = Signal(str, bool)
 
     def __init__(self, task: DownloadTask):
         super().__init__()
         self.task_id = task.id
+        self._thumbnail_loaded_path = ""
         self.setObjectName("taskCard")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -69,6 +75,13 @@ class DownloadTaskCard(QFrame):
         self.thumbnail.setFixedSize(116, 68)
         self.thumbnail.setAlignment(Qt.AlignCenter)
         self.thumbnail.setObjectName("taskThumbnail")
+        self.check_box = QCheckBox()
+        self.check_box.setFixedWidth(22)
+        self.check_box.toggled.connect(lambda checked: self.checked_changed.emit(self.task_id, checked))
+        self.check_box.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.check_box.customContextMenuRequested.connect(
+            lambda pos: self.context_requested.emit(self.task_id, self.check_box.mapToGlobal(pos))
+        )
 
         self.title = QLabel()
         self.title.setWordWrap(True)
@@ -97,6 +110,8 @@ class DownloadTaskCard(QFrame):
             widget.customContextMenuRequested.connect(
                 lambda pos, source=widget: self.context_requested.emit(self.task_id, source.mapToGlobal(pos))
             )
+            widget.installEventFilter(self)
+        self.check_box.installEventFilter(self)
 
         text_layout = QVBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
@@ -110,10 +125,29 @@ class DownloadTaskCard(QFrame):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(12)
         layout.addWidget(self.thumbnail)
+        layout.insertWidget(0, self.check_box)
         layout.addLayout(text_layout, 1)
         layout.addWidget(self.status)
         layout.addWidget(self.action)
         self.update_task(task)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            self.selection_requested.emit(self.task_id, event.modifiers())
+            # The task card owns selection state.  Intercept the checkbox
+            # click as well so Shift/Ctrl work consistently on every part of
+            # the row instead of only on the labels.
+            if watched is self.check_box:
+                return True
+        return super().eventFilter(watched, event)
+
+    def set_selected(self, selected: bool) -> None:
+        self.check_box.blockSignals(True)
+        self.check_box.setChecked(selected)
+        self.check_box.blockSignals(False)
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def _action_clicked(self) -> None:
         status = getattr(self, "_status", "")
@@ -123,7 +157,7 @@ class DownloadTaskCard(QFrame):
             self.resume_requested.emit(self.task_id)
         elif status in {"queued", "canceling", "暂停中"}:
             self.cancel_requested.emit(self.task_id)
-        elif status in {"failed", "canceled"}:
+        elif status in {"failed", "canceled", "deleted"}:
             self.retry_requested.emit(self.task_id)
         elif status == "completed":
             self.open_requested.emit(self.task_id)
@@ -141,6 +175,19 @@ class DownloadTaskCard(QFrame):
         self._status = task.status
         self.title.setText(task.title or task.url)
         self.url.setText(task.url)
+        # Restore the cover from the persisted path after an application
+        # restart.  The image itself is kept on disk, never embedded in
+        # SQLite, and a missing path simply falls back to the placeholder.
+        if task.thumbnail_path and Path(task.thumbnail_path).exists() and task.thumbnail_path != self._thumbnail_loaded_path:
+            pixmap = QPixmap(task.thumbnail_path)
+            if not pixmap.isNull():
+                self.thumbnail.setText("")
+                self.thumbnail.setPixmap(pixmap.scaled(116, 68, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self._thumbnail_loaded_path = task.thumbnail_path
+        elif not task.thumbnail_path or not Path(task.thumbnail_path).exists():
+            self.thumbnail.setPixmap(QPixmap())
+            self.thumbnail.setText("VIDEO")
+            self._thumbnail_loaded_path = ""
         self.progress.setValue(int(task.progress))
         self.status.setText(STATUS_TEXT.get(task.status, task.status))
         status_color = {
@@ -151,6 +198,7 @@ class DownloadTaskCard(QFrame):
             "completed": "#20a35a",
             "failed": "#d64444",
             "canceled": "#8b96a6",
+            "deleted": "#d48716",
         }.get(task.status, "#2f7bdc")
         self.status.setStyleSheet(f"color: {status_color}; font-weight: 600;")
         if task.status == "failed":
@@ -164,13 +212,16 @@ class DownloadTaskCard(QFrame):
             self.action.setText("继续")
             self.action.setEnabled(True)
         elif task.status == "waiting_selection":
-            self.action.setText("选择中")
-            self.action.setEnabled(False)
+            self.action.setText("取消")
+            self.action.setEnabled(True)
         elif task.status in {"queued", "canceling", "暂停中"}:
             self.action.setText("取消")
             self.action.setEnabled(task.status == "queued")
         elif task.status in {"failed", "canceled"}:
             self.action.setText("重试")
+            self.action.setEnabled(True)
+        elif task.status == "deleted":
+            self.action.setText("重新下载")
             self.action.setEnabled(True)
         else:
             self.action.setText("打开文件夹")
@@ -183,6 +234,7 @@ class DashboardPage(QWidget):
         self.window = window
         self.cards: dict[str, DownloadTaskCard] = {}
         self.items: dict[str, QListWidgetItem] = {}
+        self._selection_anchor_row = -1
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
@@ -238,7 +290,7 @@ class DashboardPage(QWidget):
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("任务列表"))
         self.filter_box = QComboBox()
-        self.filter_box.addItems(["全部", "下载中", "排队中", "已完成", "失败"])
+        self.filter_box.addItems(["全部", "下载中", "排队中", "已完成", "文件已删除", "失败"])
         self.filter_box.currentTextChanged.connect(self.apply_filter)
         toolbar.addWidget(self.filter_box)
         toolbar.addStretch(1)
@@ -251,6 +303,8 @@ class DashboardPage(QWidget):
         self.task_list.setSpacing(8)
         self.task_list.setFrameShape(QFrame.NoFrame)
         self.task_list.setObjectName("taskList")
+        self.task_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.task_list.itemSelectionChanged.connect(self.sync_selection)
         self.task_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.task_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.task_list.customContextMenuRequested.connect(self.task_context_menu)
@@ -306,6 +360,8 @@ class DashboardPage(QWidget):
         card.retry_requested.connect(self.window.download_service.retry)
         card.open_requested.connect(self.open_task_folder)
         card.context_requested.connect(self.task_context_menu_for_task)
+        card.selection_requested.connect(self.select_task_from_card)
+        card.checked_changed.connect(self.check_task)
         item = QListWidgetItem()
         item.setSizeHint(QSize(0, 108))
         self.task_list.addItem(item)
@@ -314,6 +370,44 @@ class DashboardPage(QWidget):
         self.items[task.id] = item
         self._update_empty_state()
         self._update_count()
+
+    def select_task_from_card(self, task_id: str, modifiers) -> None:
+        item = self.items.get(task_id)
+        if item is None:
+            return
+        row = self.task_list.row(item)
+        anchor = self._selection_anchor_row
+        if anchor < 0:
+            anchor = self.task_list.currentRow()
+        if modifiers & Qt.ShiftModifier and anchor >= 0:
+            start, end = sorted((anchor, row))
+            self.task_list.clearSelection()
+            for index in range(start, end + 1):
+                self.task_list.item(index).setSelected(True)
+        elif modifiers & Qt.ControlModifier:
+            item.setSelected(not item.isSelected())
+            self._selection_anchor_row = row
+        else:
+            self.task_list.clearSelection()
+            item.setSelected(True)
+            self._selection_anchor_row = row
+        # Keep the range selected; the default setCurrentItem behavior may
+        # clear the other selected rows in ExtendedSelection mode.
+        self.task_list.setCurrentItem(item, QItemSelectionModel.NoUpdate)
+        self.sync_selection()
+
+    def check_task(self, task_id: str, checked: bool) -> None:
+        item = self.items.get(task_id)
+        if item is not None and item.isSelected() != checked:
+            item.setSelected(checked)
+        self.sync_selection()
+
+    def sync_selection(self) -> None:
+        selected = {id(item) for item in self.task_list.selectedItems()}
+        for task_id, item in self.items.items():
+            card = self.cards.get(task_id)
+            if card:
+                card.set_selected(id(item) in selected)
 
     def update_task(self, task: DownloadTask) -> None:
         card = self.cards.get(task.id)
@@ -396,6 +490,17 @@ class DashboardPage(QWidget):
         task = self.window.download_service.tasks.get(task_id)
         if not task:
             return
+        selected_ids = self.selected_task_ids()
+        if task_id not in selected_ids:
+            self.task_list.clearSelection()
+            item = self.items.get(task_id)
+            if item:
+                item.setSelected(True)
+            selected_ids = [task_id]
+            self.sync_selection()
+        if len(selected_ids) > 1:
+            self.show_batch_menu(selected_ids, global_pos)
+            return
         menu = QMenu(self)
         copy_link_action = menu.addAction("复制视频链接")
         copy_folder_action = menu.addAction("复制视频文件夹路径")
@@ -406,9 +511,9 @@ class DashboardPage(QWidget):
             pause_action = menu.addAction("继续下载")
         else:
             pause_action = None
-        cancel_action = menu.addAction("取消任务") if task.status in {"queued", "downloading", "canceling", "暂停中"} else None
-        redownload_action = menu.addAction("重新下载") if task.status in {"failed", "canceled", "completed", "paused"} else None
-        custom_action = menu.addAction("选择分辨率并重新下载") if task.status in {"failed", "canceled", "completed", "paused"} else None
+        cancel_action = menu.addAction("取消任务") if task.status in {"queued", "downloading", "canceling", "暂停中", "waiting_selection"} else None
+        redownload_action = menu.addAction("重新下载") if task.status in {"failed", "canceled", "completed", "paused", "deleted"} else None
+        custom_action = menu.addAction("选择分辨率并重新下载") if task.status in {"failed", "canceled", "completed", "paused", "deleted"} else None
         menu.addSeparator()
         open_action = menu.addAction("打开视频文件夹")
         delete_action = menu.addAction("删除任务")
@@ -436,18 +541,48 @@ class DashboardPage(QWidget):
         elif chosen == open_action:
             self.open_task_folder(task.id)
         elif chosen == delete_action:
-            if task.status in {"downloading", "canceling", "暂停中"}:
-                QMessageBox.information(self, "无法删除", "请先暂停或取消正在下载的任务，再执行删除。")
-                return
-            answer = QMessageBox.question(
-                self,
-                "删除任务",
-                f"确定从任务列表中删除“{task.title}”吗？\n\n已下载的视频文件不会被删除。",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer == QMessageBox.Yes:
-                self.window.download_service.delete_task(task.id)
+            self.delete_tasks_with_prompt([task.id])
+
+    def selected_task_ids(self) -> list[str]:
+        selected_items = {id(item) for item in self.task_list.selectedItems()}
+        return [task_id for task_id, item in self.items.items() if id(item) in selected_items]
+
+    def show_batch_menu(self, task_ids: list[str], global_pos) -> None:
+        menu = QMenu(self)
+        pause_action = menu.addAction(f"批量暂停（{len(task_ids)}）")
+        start_action = menu.addAction(f"批量开始（{len(task_ids)}）")
+        menu.addSeparator()
+        delete_action = menu.addAction(f"批量删除（{len(task_ids)}）")
+        chosen = menu.exec(global_pos)
+        if chosen == pause_action:
+            for task_id in task_ids:
+                self.window.download_service.pause(task_id)
+        elif chosen == start_action:
+            for task_id in task_ids:
+                self.window.download_service.start_task(task_id)
+        elif chosen == delete_action:
+            self.delete_tasks_with_prompt(task_ids)
+
+    def delete_tasks_with_prompt(self, task_ids: list[str]) -> None:
+        eligible = [task_id for task_id in task_ids if task_id in self.window.download_service.tasks]
+        blocked = [task_id for task_id in eligible if self.window.download_service.tasks[task_id].status in {"downloading", "canceling", "暂停中"}]
+        removable = [task_id for task_id in eligible if task_id not in blocked]
+        if not removable:
+            QMessageBox.information(self, "无法删除", "选中的任务正在下载，请先暂停或取消。")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("删除任务")
+        box.setText(f"将删除 {len(removable)} 个任务记录。是否同时删除对应的视频文件？")
+        keep_button = box.addButton("只删任务记录", QMessageBox.AcceptRole)
+        file_button = box.addButton("任务和视频文件都删", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in {keep_button, file_button}:
+            return
+        delete_files = clicked is file_button
+        for task_id in removable:
+            self.window.download_service.delete_task(task_id, delete_files=delete_files)
 
     def remove_task(self, task_id: str) -> None:
         item = self.items.pop(task_id, None)
@@ -469,6 +604,7 @@ class DashboardPage(QWidget):
             "下载中": {"downloading", "canceling"},
             "排队中": {"queued"},
             "已完成": {"completed"},
+            "文件已删除": {"deleted"},
             "失败": {"failed", "canceled"},
         }[selected]
         for task_id, item in self.items.items():
@@ -679,6 +815,8 @@ class MainWindow(QMainWindow):
             QLabel#emptyState { color: #9aa3b2; padding: 40px; }
             QListWidget#taskList { background: #f6f8fb; border: none; }
             QFrame#taskCard { background: white; border: 1px solid #e3e8ef; border-radius: 10px; }
+            QFrame#taskCard[selected="true"] { background: #edf7ff; border: 1px solid #2b8cff; }
+            QCheckBox { spacing: 0; }
             QLabel#taskThumbnail { background: #e9eef5; color: #8090a6; border-radius: 6px; font-weight: 700; }
             QLabel#taskStatus { color: #3f6fca; min-width: 54px; }
             QProgressBar { border: none; background: #edf1f5; border-radius: 7px; text-align: center; color: #4d5968; }
@@ -737,6 +875,14 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         # Persist the latest task state before the window exits. Active tasks
         # are restored as paused on the next launch instead of disappearing.
+        if self.download_service.active_task_id and self.download_service.worker:
+            active = self.download_service.tasks.get(self.download_service.active_task_id)
+            if active:
+                active.pause_requested = True
+                active.cancel_requested = False
+                active.status = "暂停中"
+                self.download_service.db.upsert_download_task(active)
+            self.download_service.worker.cancel()
         for task in self.download_service.tasks.values():
             if task.status == "downloading":
                 task.status = "paused"

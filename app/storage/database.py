@@ -74,6 +74,18 @@ class Database:
     def get_media(self, media_id: int) -> MediaItem | None:
         return next((m for m in self.list_media() if m.id == media_id), None)
 
+    def get_latest_media_for_url(self, source_url: str) -> MediaItem | None:
+        row = self.conn.execute("SELECT * FROM media_items WHERE source_url=? ORDER BY id DESC LIMIT 1", (source_url,)).fetchone()
+        if not row:
+            return None
+        return MediaItem(id=row["id"], source_url=row["source_url"], source_platform=row["source_platform"],
+                         title=row["title"] or "", description=row["description"] or "",
+                         tags=json.loads(row["tags"] or "[]"), uploader=row["uploader"] or "",
+                         thumbnail_path=row["thumbnail_path"] or "", video_path=row["video_path"] or "",
+                         metadata_json_path=row["metadata_json_path"] or "", source_ip=row["source_ip"] or "",
+                         proxy_profile=row["proxy_profile"] or "", downloaded_at=row["downloaded_at"] or "",
+                         sha256=row["sha256"] or "")
+
     def add_publish_task(self, task: PublishTask) -> int:
         cur = self.conn.execute(
             """INSERT OR REPLACE INTO publish_tasks(media_id,platform,account,status,title,description,
@@ -118,6 +130,14 @@ class Database:
     def list_download_tasks(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM download_tasks ORDER BY created_at ASC").fetchall()
 
-    def delete_download_task(self, task_id: str) -> None:
+    def delete_download_task(self, task_id: str, source_url: str = "", media_path: str = "", delete_media: bool = False) -> None:
         self.conn.execute("DELETE FROM download_tasks WHERE id=?", (task_id,))
+        # The completed-media catalog is independent from the download queue.
+        # Keep it when the user only removes a task record; remove it only
+        # when the associated files are explicitly deleted as well.
+        if delete_media:
+            if media_path:
+                self.conn.execute("DELETE FROM media_items WHERE video_path=?", (media_path,))
+            elif source_url:
+                self.conn.execute("DELETE FROM media_items WHERE source_url=?", (source_url,))
         self.conn.commit()
