@@ -55,9 +55,11 @@ class _YtdlpLogger:
 
     def __init__(self, callback):
         self._callback = callback
+        self._debug_count = 0
 
     def debug(self, message: str) -> None:
-        if message and not message.startswith("[debug] Progress"):
+        if message and not message.startswith("[debug] Progress") and self._debug_count < 300:
+            self._debug_count += 1
             self._callback("debug", "yt-dlp", message)
 
     def info(self, message: str) -> None:

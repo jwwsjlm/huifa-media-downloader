@@ -31,6 +31,7 @@ class DownloadDiagnosticsTests(unittest.TestCase):
 
     def test_error_classification(self) -> None:
         self.assertEqual(DownloadLogService.classify_error("HTTP Error 429: Too Many Requests"), "风控/登录")
+        self.assertEqual(DownloadLogService.classify_error("HTTP Error 403: Forbidden"), "风控/登录")
         self.assertEqual(DownloadLogService.classify_error("Proxy connection timed out"), "网络/代理")
         self.assertEqual(DownloadLogService.classify_error("Requested format is not available"), "格式/工具")
         self.assertEqual(DownloadLogService.classify_error("用户取消下载"), "用户操作")

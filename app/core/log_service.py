@@ -103,7 +103,11 @@ class DownloadLogService:
     @staticmethod
     def classify_error(error: str) -> str:
         text = (error or "").lower()
-        risk_words = ("captcha", "challenge", "bot", "robot", "sign in", "login", "age-restricted", "verification", "429", "rate limit", "too many requests")
+        risk_words = (
+            "captcha", "challenge", "bot", "robot", "sign in", "login", "age-restricted",
+            "verification", "429", "rate limit", "too many requests", "403", "forbidden",
+            "ip block", "blocked", "geo restriction", "unavailable in your country",
+        )
         network_words = ("timeout", "timed out", "connection", "dns", "proxy", "network", "http error 5", "temporary failure", "name or service not known", "connection reset")
         format_words = ("requested format", "format is not available", "ffmpeg", "merge")
         if any(word in text for word in risk_words):
