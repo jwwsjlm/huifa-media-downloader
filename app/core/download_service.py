@@ -199,6 +199,7 @@ class DownloadService(QObject):
     task_progress = Signal(str, dict)
     task_media_completed = Signal(str, object)
     task_finished = Signal(str, str, str)
+    task_deleted = Signal(str)
     failed = Signal(str)
 
     def __init__(self, db: Database):
@@ -328,6 +329,16 @@ class DownloadService(QObject):
             return None
         return self.enqueue(task.url, task.output_dir, task.proxy, quality=task.quality,
                             filename_template=task.filename_template, ffmpeg_path=task.ffmpeg_path)
+
+    def delete_task(self, task_id: str) -> bool:
+        task = self.tasks.get(task_id)
+        if not task or task_id == self.active_task_id or task.status in {"downloading", "canceling", "暂停中"}:
+            return False
+        self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
+        self.tasks.pop(task_id, None)
+        self.db.delete_download_task(task_id)
+        self.task_deleted.emit(task_id)
+        return True
 
     def _start_next(self) -> None:
         if self.active_task_id or not self.queue:

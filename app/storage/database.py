@@ -113,3 +113,7 @@ class Database:
 
     def list_download_tasks(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM download_tasks ORDER BY created_at ASC").fetchall()
+
+    def delete_download_task(self, task_id: str) -> None:
+        self.conn.execute("DELETE FROM download_tasks WHERE id=?", (task_id,))
+        self.conn.commit()

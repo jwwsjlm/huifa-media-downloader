@@ -13,6 +13,19 @@ python -m app.main
 
 The repository includes bundled FFmpeg 9.0.1 runtimes under `tools/ffmpeg/x64/` and `tools/ffmpeg/x86/`. The downloader automatically selects the build matching the Python process bitness; you can override the path in Settings.
 
+## Portable data directory
+
+Runtime data is stored beside the application under `data/`:
+
+- `data/app.db` — download, media and publishing task database;
+- `data/settings.ini` — download directory, quality, proxy and tool settings;
+- `data/browser/` — embedded browser cache and login profile;
+- `data/downloads/` — default download directory.
+
+The application no longer uses the user's Documents directory for its own
+database or settings. Existing data from the legacy `.youtube-release-studio`
+location is migrated to `data/app.db` on first launch.
+
 The first version provides:
 
 - queued downloads with progress, speed and ETA;

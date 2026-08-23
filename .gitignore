@@ -1,5 +1,7 @@
 /.venv
 /.idea
+/data/*
+!/data/.gitkeep
 
 # Python caches and local runtime data
 __pycache__/

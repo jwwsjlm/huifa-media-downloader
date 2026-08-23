@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from app.core.app_settings import AppSettings
 from app.core.download_service import DownloadService, DownloadTask, bundled_ffmpeg_path
+from app.core.paths import initialize_data_layout
 from app.core.publish_service import PublishService
 from app.storage.database import Database
 from app.storage.models import MediaItem
@@ -375,6 +376,8 @@ class DashboardPage(QWidget):
             cancel_action = None
         open_action = menu.addAction("打开文件夹")
         copy_action = menu.addAction("复制视频链接")
+        menu.addSeparator()
+        delete_action = menu.addAction("删除任务")
         chosen = menu.exec(self.task_list.mapToGlobal(pos))
         if chosen == start_action:
             self.window.download_service.start_task(task.id)
@@ -391,6 +394,32 @@ class DashboardPage(QWidget):
             from PySide6.QtWidgets import QApplication
             QApplication.clipboard().setText(task.url)
             self.status.setText("视频链接已复制")
+        elif chosen == delete_action:
+            if task.status in {"downloading", "canceling", "暂停中"}:
+                QMessageBox.information(self, "无法删除", "请先暂停或取消正在下载的任务，再执行删除。")
+                return
+            answer = QMessageBox.question(
+                self,
+                "删除任务",
+                f"确定从任务列表中删除“{task.title}”吗？\n\n已下载的视频文件不会被删除。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self.window.download_service.delete_task(task.id)
+
+    def remove_task(self, task_id: str) -> None:
+        item = self.items.pop(task_id, None)
+        card = self.cards.pop(task_id, None)
+        if item is not None:
+            row = self.task_list.row(item)
+            removed = self.task_list.takeItem(row)
+            del removed
+        if card is not None:
+            card.deleteLater()
+        self._update_empty_state()
+        self._update_count()
+        self.status.setText("任务已删除，视频文件未删除")
 
     def apply_filter(self, _value: str = "") -> None:
         selected = self.filter_box.currentText()
@@ -421,7 +450,7 @@ class DashboardPage(QWidget):
 
 
 class BrowserPage(QWidget):
-    def __init__(self):
+    def __init__(self, storage_dir: Path):
         super().__init__()
         layout = QVBoxLayout(self)
         selector = QComboBox()
@@ -429,9 +458,19 @@ class BrowserPage(QWidget):
         layout.addWidget(selector)
         try:
             from PySide6.QtWebEngineWidgets import QWebEngineView
+            from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
             from PySide6.QtCore import QUrl
 
             self.browser = QWebEngineView()
+            profile_dir = storage_dir / "browser"
+            cache_dir = profile_dir / "cache"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            self.profile = QWebEngineProfile("huifa", self)
+            self.profile.setPersistentStoragePath(str(profile_dir / "profile"))
+            self.profile.setCachePath(str(cache_dir))
+            self.profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
+            self.browser.setPage(QWebEnginePage(self.profile, self.browser))
             layout.addWidget(self.browser)
             urls = {
                 "空白页": "about:blank",
@@ -619,7 +658,7 @@ class MainWindow(QMainWindow):
             QTabWidget::pane { border: none; }
             """
         )
-        data_dir = Path.home() / ".youtube-release-studio"
+        data_dir = initialize_data_layout()
         self.app_settings = AppSettings()
         self.db = Database(data_dir / "app.db")
         self.download_service = DownloadService(self.db)
@@ -627,7 +666,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.dashboard = DashboardPage(self)
-        self.browser_page = BrowserPage()
+        self.browser_page = BrowserPage(data_dir)
         self.completed = CompletedPage(self)
         self.publish_queue = PublishQueuePage(self)
         self.settings = SettingsPage(self)
@@ -645,6 +684,7 @@ class MainWindow(QMainWindow):
         self.download_service.task_progress.connect(self.dashboard.update_progress)
         self.download_service.task_media_completed.connect(self.dashboard.media_completed)
         self.download_service.task_finished.connect(self.dashboard.finished)
+        self.download_service.task_deleted.connect(self.dashboard.remove_task)
         self.publish_service.status.connect(lambda *_: self.publish_queue.refresh())
 
         # Restore tasks saved in SQLite after a previous application run.
