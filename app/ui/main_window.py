@@ -54,6 +54,19 @@ STATUS_TEXT = {
     "failed": "失败",
     "canceled": "已取消",
 }
+PLATFORM_TEXT = {
+    "douyin": "抖音",
+    "bilibili": "哔哩哔哩",
+    "tencent": "视频号",
+    "kuaishou": "快手",
+    "toutiao": "今日头条",
+}
+PUBLISH_STATUS_TEXT = {
+    "pending": "待发布",
+    "uploading": "发布中",
+    "success": "已成功",
+    "failed": "失败",
+}
 
 
 class DownloadTaskCard(QFrame):
@@ -73,7 +86,7 @@ class DownloadTaskCard(QFrame):
         self.setObjectName("taskCard")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.thumbnail = QLabel("VIDEO")
+        self.thumbnail = QLabel("视频")
         self.thumbnail.setFixedSize(116, 68)
         self.thumbnail.setAlignment(Qt.AlignCenter)
         self.thumbnail.setObjectName("taskThumbnail")
@@ -188,7 +201,7 @@ class DownloadTaskCard(QFrame):
                 self._thumbnail_loaded_path = task.thumbnail_path
         elif not task.thumbnail_path or not Path(task.thumbnail_path).exists():
             self.thumbnail.setPixmap(QPixmap())
-            self.thumbnail.setText("VIDEO")
+            self.thumbnail.setText("视频")
             self._thumbnail_loaded_path = ""
         self.progress.setValue(int(task.progress))
         self.status.setText(STATUS_TEXT.get(task.status, task.status))
@@ -278,7 +291,7 @@ class FormatSelectionDialog(QDialog):
             text = QLabel()
             text.setWordWrap(False)
             note = choice.get('format_note') or '视频 + 音频'
-            text.setText(f"{choice.get('height', '?')}p  ·  {choice.get('ext', '?')}  ·  {choice.get('fps', '')}fps  ·  {note}")
+            text.setText(f"{choice.get('height', '?')}p  ·  {choice.get('ext', '?')}  ·  {choice.get('fps', '')}帧/秒  ·  {note}")
             text.setToolTip(choice.get("label", ""))
             row_layout.addWidget(text, 1)
             self.list.addItem(item)
@@ -287,6 +300,8 @@ class FormatSelectionDialog(QDialog):
             self.list.setCurrentRow(0)
         layout.addWidget(self.list)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -320,7 +335,7 @@ class DashboardPage(QWidget):
 
         input_row = QHBoxLayout()
         self.url = QLineEdit()
-        self.url.setPlaceholderText("粘贴 YouTube 视频或播放列表链接，回车即可添加任务")
+        self.url.setPlaceholderText("粘贴视频或播放列表链接，回车即可添加任务")
         self.url.returnPressed.connect(self.start)
         add_button = QPushButton("添加并下载")
         add_button.setObjectName("primaryButton")
@@ -725,7 +740,7 @@ class BrowserPage(QWidget):
         super().__init__()
         layout = QVBoxLayout(self)
         selector = QComboBox()
-        selector.addItems(["空白页", "YouTube", "抖音", "Bilibili", "视频号", "快手", "今日头条"])
+        selector.addItems(["空白页", "YouTube", "抖音", "哔哩哔哩", "视频号", "快手", "今日头条"])
         layout.addWidget(selector)
         try:
             from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -747,7 +762,7 @@ class BrowserPage(QWidget):
                 "空白页": "about:blank",
                 "YouTube": "https://accounts.google.com/",
                 "抖音": "https://creator.douyin.com/",
-                "Bilibili": "https://member.bilibili.com/",
+                "哔哩哔哩": "https://member.bilibili.com/",
                 "视频号": "https://channels.weixin.qq.com/",
                 "快手": "https://cp.kuaishou.com/",
                 "今日头条": "https://mp.toutiao.com/",
@@ -815,8 +830,16 @@ class PublishPage(QWidget):
         form.addRow("话题", self.topics)
         layout.addLayout(form)
         self.platforms = QListWidget()
-        for name in ["douyin", "bilibili", "tencent", "kuaishou", "toutiao"]:
-            item = QListWidgetItem(name)
+        platform_names = {
+            "douyin": "抖音",
+            "bilibili": "哔哩哔哩",
+            "tencent": "视频号",
+            "kuaishou": "快手",
+            "toutiao": "今日头条",
+        }
+        for name, label in platform_names.items():
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
             self.platforms.addItem(item)
@@ -827,7 +850,7 @@ class PublishPage(QWidget):
         layout.addWidget(button)
 
     def submit(self) -> None:
-        platforms = [self.platforms.item(i).text() for i in range(self.platforms.count()) if self.platforms.item(i).checkState() == Qt.Checked]
+        platforms = [self.platforms.item(i).data(Qt.UserRole) for i in range(self.platforms.count()) if self.platforms.item(i).checkState() == Qt.Checked]
         if not platforms:
             QMessageBox.warning(self, "提示", "至少选择一个平台")
             return
@@ -848,7 +871,7 @@ class PublishQueuePage(QWidget):
         self.window = window
         layout = QVBoxLayout(self)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["ID", "平台", "状态", "标题", "结果"])
+        self.tree.setHeaderLabels(["编号", "平台", "状态", "标题", "结果"])
         layout.addWidget(self.tree)
         controls = QHBoxLayout()
         refresh = QPushButton("刷新")
@@ -864,7 +887,13 @@ class PublishQueuePage(QWidget):
     def refresh(self) -> None:
         self.tree.clear()
         for row in self.window.db.list_publish_tasks():
-            self.tree.addTopLevelItem(QTreeWidgetItem([str(row["id"]), row["platform"], row["status"], row["title"], row["result"] or ""]))
+            self.tree.addTopLevelItem(QTreeWidgetItem([
+                str(row["id"]),
+                PLATFORM_TEXT.get(row["platform"], row["platform"]),
+                PUBLISH_STATUS_TEXT.get(row["status"], row["status"]),
+                row["title"],
+                row["result"] or "",
+            ]))
 
     def run_selected(self) -> None:
         item = self.tree.currentItem()
@@ -889,8 +918,8 @@ class SettingsPage(QWidget):
         save.clicked.connect(lambda: window.save_settings(self))
         form.addRow("默认代理", self.proxy)
         form.addRow("文件名模板", self.template)
-        form.addRow("sau 可执行文件", self.sau)
-        form.addRow("FFmpeg", self.ffmpeg)
+        form.addRow("上传工具路径", self.sau)
+        form.addRow("FFmpeg 路径", self.ffmpeg)
         form.addRow("并行下载数", self.max_concurrent)
         form.addRow(save)
 
