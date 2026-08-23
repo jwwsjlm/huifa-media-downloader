@@ -1,0 +1,10 @@
+# Keep source and documentation normalized as LF on every platform.
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.gitignore text eol=lf
+
+# Executables and shared libraries are binary files.
+*.exe binary
+*.dll binary
