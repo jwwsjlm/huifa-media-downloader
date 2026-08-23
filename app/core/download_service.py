@@ -50,6 +50,29 @@ def format_eta(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
 
 
+class _YtdlpLogger:
+    """Bridge yt-dlp diagnostics into the per-task JSONL log."""
+
+    def __init__(self, callback):
+        self._callback = callback
+
+    def debug(self, message: str) -> None:
+        if message and not message.startswith("[debug] Progress"):
+            self._callback("debug", "yt-dlp", message)
+
+    def info(self, message: str) -> None:
+        if message:
+            self._callback("info", "yt-dlp", message)
+
+    def warning(self, message: str) -> None:
+        if message:
+            self._callback("warning", DownloadLogService.classify_error(message), message)
+
+    def error(self, message: str) -> None:
+        if message:
+            self._callback("error", DownloadLogService.classify_error(message), message)
+
+
 @dataclass
 class DownloadTask:
     id: str
@@ -169,6 +192,7 @@ class DownloadWorker(QObject):
             "concurrent_fragment_downloads": 4,
             "quiet": True,
             "no_warnings": True,
+            "logger": _YtdlpLogger(self._log),
         }
         bundled_ffmpeg = bundled_ffmpeg_path()
         configured_ffmpeg = Path(self.ffmpeg_path) if self.ffmpeg_path else bundled_ffmpeg
@@ -244,6 +268,8 @@ class DownloadWorker(QObject):
                     if not Path(info_path).exists():
                         info_path = str(base.with_suffix(".json"))
                     digest = hashlib.sha256(Path(video_path).read_bytes()).hexdigest() if Path(video_path).exists() else ""
+                    source_ip = detect_public_ip(self.proxy)
+                    self._log("info" if source_ip else "warning", "网络/代理", "已检测下载出口 IP" if source_ip else "未能检测下载出口 IP", source_ip=source_ip or "")
                     item = MediaItem(
                         source_url=entry.get("webpage_url") or self.url,
                         title=entry.get("title") or "",
@@ -253,7 +279,7 @@ class DownloadWorker(QObject):
                         thumbnail_path=str(thumb or ""),
                         video_path=video_path,
                         metadata_json_path=info_path,
-                        source_ip=detect_public_ip(self.proxy),
+                        source_ip=source_ip,
                         proxy_profile=self.proxy,
                         sha256=digest,
                     )

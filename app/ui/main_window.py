@@ -1086,11 +1086,42 @@ class PublishPage(QWidget):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
             self.platforms.addItem(item)
+        self.platforms.itemChanged.connect(lambda *_: self.update_platform_settings())
         layout.addWidget(QLabel("平台"))
         layout.addWidget(self.platforms)
+
+        self.platform_settings_group = QGroupBox("平台专属设置")
+        platform_form = QFormLayout(self.platform_settings_group)
+        self.source_type = QComboBox()
+        self.source_type.addItem("原创", "original")
+        self.source_type.addItem("转载", "repost")
+        self.source_url = QLineEdit(media.source_url)
+        self.source_url.setReadOnly(True)
+        self.source_ip = QLineEdit(media.source_ip or "未记录")
+        self.source_ip.setReadOnly(True)
+        self.visibility = QComboBox()
+        self.visibility.addItems(["公开", "仅自己可见", "私密/草稿"])
+        self.collection = QLineEdit()
+        self.collection.setPlaceholderText("可选：合集或专辑名称")
+        self.partition = QLineEdit()
+        self.partition.setPlaceholderText("可选：分区/栏目")
+        platform_form.addRow("发布来源", self.source_type)
+        platform_form.addRow("来源链接", self.source_url)
+        platform_form.addRow("来源 IP", self.source_ip)
+        platform_form.addRow("可见范围", self.visibility)
+        platform_form.addRow("合集/专辑", self.collection)
+        platform_form.addRow("分区/栏目", self.partition)
+        layout.addWidget(self.platform_settings_group)
+        self.platform_settings_group.setVisible(False)
         button = QPushButton("保存并加入发布队列")
         button.clicked.connect(self.submit)
         layout.addWidget(button)
+
+    def update_platform_settings(self) -> None:
+        selected = [self.platforms.item(i).data(Qt.UserRole) for i in range(self.platforms.count()) if self.platforms.item(i).checkState() == Qt.Checked]
+        self.platform_settings_group.setVisible(bool(selected))
+        if selected:
+            self.platform_settings_group.setTitle("平台专属设置（" + "、".join(PLATFORM_TEXT.get(name, name) for name in selected) + "）")
 
     def submit(self) -> None:
         platforms = [self.platforms.item(i).data(Qt.UserRole) for i in range(self.platforms.count()) if self.platforms.item(i).checkState() == Qt.Checked]
@@ -1098,11 +1129,22 @@ class PublishPage(QWidget):
             QMessageBox.warning(self, "提示", "至少选择一个平台")
             return
         tags = [x.lstrip("#") for x in self.topics.text().split() if x.strip()]
+        platform_settings = {
+            platform: {
+                "source_type": self.source_type.currentData(),
+                "source_url": self.source_url.text().strip(),
+                "source_ip": self.source_ip.text().strip(),
+                "visibility": self.visibility.currentText(),
+                "collection": self.collection.text().strip(),
+                "partition": self.partition.text().strip(),
+            }
+            for platform in platforms
+        }
         self.window.publish_service.create_tasks(
             self.media,
             platforms,
             {"title": self.title.text(), "description": self.description.toPlainText(), "tags": tags},
-            {},
+            platform_settings,
         )
         QMessageBox.information(self, "完成", "已加入发布队列")
         self.window.tabs.setCurrentWidget(self.window.publish_queue)
