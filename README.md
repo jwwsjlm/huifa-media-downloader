@@ -16,6 +16,7 @@ The repository includes bundled FFmpeg 9.0.1 runtimes under `tools/ffmpeg/x64/` 
 The first version provides:
 
 - queued downloads with progress, speed and ETA;
+- a task dashboard with per-task title, URL, thumbnail placeholder, status, progress, speed, ETA, cancel/retry and folder actions;
 - persistent download directory, proxy, filename template and quality preferences;
 - quality presets for best available, 1080p maximum and 720p maximum;
 - metadata/thumbnail/info.json persistence in SQLite + files;
