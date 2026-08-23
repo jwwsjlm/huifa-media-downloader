@@ -596,7 +596,7 @@ class SettingsPage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("源流矩阵 · SourceFlow Studio")
+        self.setWindowTitle("汇发")
         self.setMinimumSize(820, 560)
         self.resize(1080, 700)
         self.setStyleSheet(

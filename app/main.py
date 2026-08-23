@@ -8,7 +8,7 @@ from app.ui.main_window import MainWindow
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("YouTube Release Studio")
+    app.setApplicationName("汇发")
     window = MainWindow()
     window.show()
     return app.exec()
@@ -16,4 +16,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,4 +1,4 @@
-# YouTube Release Studio
+# 汇发
 
 Windows 10/11 desktop application for downloading YouTube media with `yt-dlp` and preparing multi-platform publishing tasks.
 
