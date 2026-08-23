@@ -40,6 +40,10 @@ The Settings page also provides `打开日志目录` and `导出诊断包`. The 
 ZIP contains redacted task logs and a runtime summary for troubleshooting;
 cookies, tokens, authorization headers and URL query parameters are excluded.
 
+Transient network failures during解析 or下载 are retried up to two times with
+exponential backoff. Rate-limit, CAPTCHA, login and other風控类 errors are not
+blindly retried, which avoids making platform risk controls worse.
+
 The application no longer uses the user's Documents directory for its own
 database or settings. Existing data from the legacy `.youtube-release-studio`
 location is migrated to `data/app.db` on first launch.
