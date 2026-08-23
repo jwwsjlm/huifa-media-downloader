@@ -22,8 +22,9 @@ Runtime data is stored beside the application under `data/`:
 - `data/browser/` — embedded browser cache and login profile;
 - `data/downloads/` — default download directory.
 
-The download page is the single place for selecting the download directory;
-the Settings page contains shared network and tool settings only.
+The Settings page is the single place for selecting the download directory.
+The download page only displays the current directory and provides shortcuts
+to open it or jump to Settings, so the two pages cannot drift out of sync.
 
 The application no longer uses the user's Documents directory for its own
 database or settings. Existing data from the legacy `.youtube-release-studio`
