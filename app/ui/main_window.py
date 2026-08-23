@@ -67,13 +67,15 @@ class DashboardPage(QWidget):
 class BrowserPage(QWidget):
     def __init__(self):
         super().__init__(); layout = QVBoxLayout(self)
-        selector = QComboBox(); selector.addItems(["YouTube", "抖音", "Bilibili", "视频号", "快手", "今日头条"])
+        # Do not open a login page on application startup. Users can choose a
+        # platform explicitly when they need to sign in.
+        selector = QComboBox(); selector.addItems(["空白页", "YouTube", "抖音", "Bilibili", "视频号", "快手", "今日头条"])
         layout.addWidget(selector)
         try:
             from PySide6.QtWebEngineWidgets import QWebEngineView
             from PySide6.QtCore import QUrl
             self.browser = QWebEngineView(); layout.addWidget(self.browser)
-            urls = {"YouTube": "https://accounts.google.com/", "抖音": "https://creator.douyin.com/",
+            urls = {"空白页": "about:blank", "YouTube": "https://accounts.google.com/", "抖音": "https://creator.douyin.com/",
                     "Bilibili": "https://member.bilibili.com/", "视频号": "https://channels.weixin.qq.com/",
                     "快手": "https://cp.kuaishou.com/", "今日头条": "https://mp.toutiao.com/"}
             selector.currentTextChanged.connect(lambda x: self.browser.setUrl(QUrl(urls[x])))
