@@ -210,6 +210,29 @@ class DownloadService(QObject):
         self.thread: QThread | None = None
         self.worker: DownloadWorker | None = None
 
+    def restore_tasks(self) -> list[DownloadTask]:
+        restored: list[DownloadTask] = []
+        for row in self.db.list_download_tasks():
+            status = row["status"]
+            if status in {"downloading", "canceling", "暂停中"}:
+                status = "paused"
+            task = DownloadTask(
+                id=row["id"], url=row["url"], output_dir=row["output_dir"], quality=row["quality"] or "best",
+                proxy=row["proxy"] or "", filename_template=row["filename_template"] or "%(title)s [%(id)s].%(ext)s",
+                ffmpeg_path=row["ffmpeg_path"] or "", title=row["title"] or "等待获取视频信息", status=status,
+                progress=float(row["progress"] or 0), speed=row["speed"] or "", speed_bps=float(row["speed_bps"] or 0),
+                downloaded_bytes=int(row["downloaded_bytes"] or 0), total_bytes=int(row["total_bytes"] or 0),
+                eta=row["eta"] or "", size=row["size"] or "", error=row["error"] or "",
+                media_path=row["media_path"] or "", thumbnail_path=row["thumbnail_path"] or "",
+                created_at=row["created_at"] or datetime.now().isoformat(timespec="seconds"),
+            )
+            self.tasks[task.id] = task
+            restored.append(task)
+        return restored
+
+    def _persist(self, task: DownloadTask) -> None:
+        self.db.upsert_download_task(task)
+
     def enqueue(self, url: str, output_dir: str, proxy: str = "", cookie_file: str = "",
                 quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
                 ffmpeg_path: str = "") -> str:
@@ -218,6 +241,7 @@ class DownloadService(QObject):
             quality=quality, filename_template=filename_template, ffmpeg_path=ffmpeg_path,
         )
         self.tasks[task.id] = task
+        self._persist(task)
         self.queue.append(task.id)
         self.task_added.emit(task)
         self._start_next()
@@ -233,6 +257,7 @@ class DownloadService(QObject):
         task = self.tasks[task_id]
         if task.status == "queued":
             task.status = "canceled"
+            self._persist(task)
             self.task_updated.emit(task)
             self.task_finished.emit(task.id, task.status, "")
             return
@@ -240,6 +265,7 @@ class DownloadService(QObject):
             task.pause_requested = False
             task.cancel_requested = True
             task.status = "canceling"
+            self._persist(task)
             self.task_updated.emit(task)
             self.worker.cancel()
 
@@ -251,6 +277,7 @@ class DownloadService(QObject):
         if task_id == self.active_task_id and task.status == "downloading" and self.worker:
             task.pause_requested = True
             task.status = "暂停中"
+            self._persist(task)
             self.task_updated.emit(task)
             self.worker.cancel()
 
@@ -264,6 +291,7 @@ class DownloadService(QObject):
         task.speed_samples.clear()
         task.speed_bps = 0.0
         task.speed = ""
+        self._persist(task)
         self.queue.appendleft(task.id)
         self.task_updated.emit(task)
         self._start_next()
@@ -276,6 +304,7 @@ class DownloadService(QObject):
         task.speed_samples.clear()
         task.speed_bps = 0.0
         task.speed = ""
+        self._persist(task)
         self.queue.append(task.id)
         self.task_updated.emit(task)
         self._start_next()
@@ -310,6 +339,7 @@ class DownloadService(QObject):
                 continue
             self.active_task_id = task_id
             task.status = "downloading"
+            self._persist(task)
             self.task_updated.emit(task)
             self.thread = QThread()
             self.worker = DownloadWorker(task.url, task.output_dir, self.db, task.proxy, "", task.quality, task.filename_template, task.ffmpeg_path)
@@ -346,12 +376,15 @@ class DownloadService(QObject):
         task.size = data.get("_total_bytes_str") or data.get("_total_bytes_estimate_str") or ""
         if data.get("thumbnail_path"):
             task.thumbnail_path = data["thumbnail_path"]
+        self._persist(task)
         self.task_progress.emit(task_id, data)
 
     def _on_failed(self, task_id: str, error: str) -> None:
         task = self.tasks[task_id]
         task.error = error
+        self._persist(task)
         self.task_updated.emit(task)
+        self._persist(task)
 
     def _thread_finished(self, task_id: str) -> None:
         task = self.tasks[task_id]

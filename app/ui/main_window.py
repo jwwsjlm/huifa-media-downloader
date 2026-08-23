@@ -647,6 +647,10 @@ class MainWindow(QMainWindow):
         self.download_service.task_finished.connect(self.dashboard.finished)
         self.publish_service.status.connect(lambda *_: self.publish_queue.refresh())
 
+        # Restore tasks saved in SQLite after a previous application run.
+        for task in self.download_service.restore_tasks():
+            self.dashboard.add_task(task)
+
     def open_publish(self, media: MediaItem) -> None:
         page = PublishPage(self, media)
         self.tabs.addTab(page, "发布编辑")
@@ -662,3 +666,12 @@ class MainWindow(QMainWindow):
         self.dashboard.output.setText(self.app_settings.get("download_dir"))
         self.dashboard.proxy.setText(self.app_settings.get("proxy"))
         QMessageBox.information(self, "已保存", "下载目录、代理和工具路径已保存")
+
+    def closeEvent(self, event) -> None:
+        # Persist the latest task state before the window exits. Active tasks
+        # are restored as paused on the next launch instead of disappearing.
+        for task in self.download_service.tasks.values():
+            if task.status == "downloading":
+                task.status = "paused"
+            self.download_service.db.upsert_download_task(task)
+        event.accept()
