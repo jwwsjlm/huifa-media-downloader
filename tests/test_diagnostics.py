@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from zipfile import ZipFile
 
 from app.core.log_service import DownloadLogService
 
@@ -39,6 +40,18 @@ class DownloadDiagnosticsTests(unittest.TestCase):
             self.assertTrue(Path(service.path_for("task-2")).exists())
             service.clear("task-2")
             self.assertEqual(service.read("task-2"), [])
+
+    def test_export_bundle_contains_manifest_and_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = DownloadLogService(Path(directory) / "logs")
+            service.write("task-3", "info", "任务", "开始", token="should-not-export")
+            bundle = service.export_bundle(Path(directory) / "diagnostics.zip", {"proxy": "configured"})
+            with ZipFile(bundle) as archive:
+                names = set(archive.namelist())
+                self.assertIn("manifest.json", names)
+                self.assertIn("downloads/task-3.jsonl", names)
+                payload = archive.read("downloads/task-3.jsonl").decode("utf-8")
+                self.assertNotIn("should-not-export", payload)
 
 
 if __name__ == "__main__":
