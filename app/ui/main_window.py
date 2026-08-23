@@ -210,6 +210,8 @@ class DashboardPage(QWidget):
         self.task_list.setSpacing(8)
         self.task_list.setFrameShape(QFrame.NoFrame)
         self.task_list.setObjectName("taskList")
+        self.task_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.task_list.customContextMenuRequested.connect(self.task_context_menu)
         root.addWidget(self.task_list, 1)
         self.empty_label = QLabel("还没有下载任务\n粘贴链接后点击“添加并下载”")
         self.empty_label.setAlignment(Qt.AlignCenter)
@@ -272,6 +274,11 @@ class DashboardPage(QWidget):
         card = self.cards.get(task.id)
         if card:
             card.update_task(task)
+            if task.thumbnail_path and Path(task.thumbnail_path).exists():
+                pixmap = QPixmap(task.thumbnail_path)
+                if not pixmap.isNull():
+                    card.thumbnail.setText("")
+                    card.thumbnail.setPixmap(pixmap.scaled(116, 68, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             self.items[task.id].setSizeHint(card.sizeHint())
         self.apply_filter()
         self._update_count()
@@ -311,6 +318,37 @@ class DashboardPage(QWidget):
             path = Path(task.media_path).parent if task.media_path else Path(task.output_dir)
             path.mkdir(parents=True, exist_ok=True)
             os.startfile(str(path))
+
+    def task_context_menu(self, pos) -> None:
+        item = self.task_list.itemAt(pos)
+        if not item:
+            return
+        task_id = next((task_id for task_id, list_item in self.items.items() if list_item is item), None)
+        task = self.window.download_service.tasks.get(task_id or "")
+        if not task:
+            return
+        menu = QMenu(self)
+        if task.status in {"queued", "failed", "canceled", "completed"}:
+            start_action = menu.addAction("下载" if task.status != "completed" else "重新下载")
+        else:
+            start_action = None
+        if task.status in {"queued", "downloading", "canceling"}:
+            cancel_action = menu.addAction("取消任务")
+        else:
+            cancel_action = None
+        open_action = menu.addAction("打开文件夹")
+        copy_action = menu.addAction("复制视频链接")
+        chosen = menu.exec(self.task_list.mapToGlobal(pos))
+        if chosen == start_action:
+            self.window.download_service.start_task(task.id)
+        elif chosen == cancel_action:
+            self.window.download_service.cancel(task.id)
+        elif chosen == open_action:
+            self.open_task_folder(task.id)
+        elif chosen == copy_action:
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(task.url)
+            self.status.setText("视频链接已复制")
 
     def apply_filter(self, _value: str = "") -> None:
         selected = self.filter_box.currentText()

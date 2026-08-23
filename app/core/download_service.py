@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 import threading
 from collections import deque
@@ -9,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+import requests
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
@@ -63,6 +66,7 @@ class DownloadWorker(QObject):
         self.url, self.output_dir, self.db, self.proxy, self.cookie_file = url, output_dir, db, proxy, cookie_file
         self.quality, self.filename_template, self.ffmpeg_path = quality, filename_template, ffmpeg_path
         self._cancel = threading.Event()
+        self._thumbnail_saved = False
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -78,6 +82,14 @@ class DownloadWorker(QObject):
         def hook(data: dict[str, Any]) -> None:
             if self._cancel.is_set():
                 raise yt_dlp.utils.DownloadError("用户取消下载")
+            if not self._thumbnail_saved:
+                info = data.get("info_dict") or {}
+                thumbnail_url = info.get("thumbnail")
+                if thumbnail_url:
+                    thumbnail_path = self._save_thumbnail(thumbnail_url, info.get("id") or "video")
+                    if thumbnail_path:
+                        data = dict(data)
+                        data["thumbnail_path"] = thumbnail_path
             self.progress.emit(data)
 
         formats = {
@@ -145,6 +157,19 @@ class DownloadWorker(QObject):
         finally:
             self.finished.emit()
 
+    def _save_thumbnail(self, url: str, video_id: str) -> str:
+        """Fetch the cover as soon as yt-dlp exposes it, so the task card can show it."""
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(video_id))[:80] or "video"
+        path = Path(self.output_dir) / f"{safe_id}.thumb.jpg"
+        try:
+            response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            response.raise_for_status()
+            path.write_bytes(response.content)
+            self._thumbnail_saved = True
+            return str(path)
+        except Exception:
+            return ""
+
 
 class DownloadService(QObject):
     task_added = Signal(object)
@@ -204,6 +229,24 @@ class DownloadService(QObject):
         self.task_updated.emit(task)
         self._start_next()
 
+    def start_task(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+        if task.status == "queued":
+            self._start_next()
+        elif task.status in {"failed", "canceled"}:
+            self.retry(task_id)
+        elif task.status == "completed":
+            self.redownload(task_id)
+
+    def redownload(self, task_id: str) -> str | None:
+        task = self.tasks.get(task_id)
+        if not task:
+            return None
+        return self.enqueue(task.url, task.output_dir, task.proxy, quality=task.quality,
+                            filename_template=task.filename_template, ffmpeg_path=task.ffmpeg_path)
+
     def _start_next(self) -> None:
         if self.active_task_id or not self.queue:
             return
@@ -241,6 +284,8 @@ class DownloadService(QObject):
         task.speed = data.get("_speed_str") or ""
         task.eta = data.get("_eta_str") or ""
         task.size = data.get("_total_bytes_str") or data.get("_total_bytes_estimate_str") or ""
+        if data.get("thumbnail_path"):
+            task.thumbnail_path = data["thumbnail_path"]
         self.task_progress.emit(task_id, data)
 
     def _on_failed(self, task_id: str, error: str) -> None:
@@ -263,4 +308,3 @@ class DownloadService(QObject):
         self.thread = None
         self.worker = None
         self._start_next()
-
