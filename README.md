@@ -50,6 +50,7 @@ The first version provides:
 - metadata/thumbnail/info.json persistence in SQLite + files;
 - embedded browser profiles for YouTube and publishing sites;
 - embedded browser navigation controls (back, forward, refresh, stop and address bar);
+- browser account status feedback based on the persistent cookie profile;
 - completed media list with a context menu to create a publishing task;
 - asynchronous publishing queue execution with failed-task retry and duplicate-task protection;
 - platform adapters for Douyin, Kuaishou, Bilibili, WeChat Channels (via `sau`) and a separate Toutiao adapter stub;

@@ -949,6 +949,8 @@ class BrowserPage(QWidget):
         super().__init__()
         layout = QVBoxLayout(self)
         browser_toolbar = QHBoxLayout()
+        self.account_status = QLabel("账号状态：未检测")
+        self.account_status.setObjectName("mutedText")
         selector = QComboBox()
         selector.addItems(["空白页", "YouTube", "抖音", "哔哩哔哩", "视频号", "快手", "今日头条"])
         browser_toolbar.addWidget(selector)
@@ -982,6 +984,10 @@ class BrowserPage(QWidget):
             self.profile.setPersistentStoragePath(str(profile_dir / "profile"))
             self.profile.setCachePath(str(cache_dir))
             self.profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
+            self._cookie_count = 0
+            cookie_store = self.profile.cookieStore()
+            cookie_store.cookieAdded.connect(lambda *_: self._cookie_changed(1))
+            cookie_store.cookieRemoved.connect(lambda *_: self._cookie_changed(-1))
             self.browser.setPage(QWebEnginePage(self.profile, self.browser))
             layout.addWidget(self.browser)
             urls = {
@@ -999,6 +1005,11 @@ class BrowserPage(QWidget):
         except ImportError:
             layout.addWidget(QLabel("QtWebEngine 未安装；请安装 PySide6 完整组件。"))
         layout.insertLayout(0, browser_toolbar)
+        layout.addWidget(self.account_status)
+
+    def _cookie_changed(self, delta: int) -> None:
+        self._cookie_count = max(0, getattr(self, "_cookie_count", 0) + delta)
+        self.account_status.setText("账号状态：已保存浏览器 Cookie" if self._cookie_count else "账号状态：请先在当前平台登录")
 
 
 class CompletedPage(QWidget):
@@ -1160,6 +1171,15 @@ class PublishQueuePage(QWidget):
         super().__init__()
         self.window = window
         layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("发布队列"))
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("搜索标题、平台、状态或结果")
+        self.search_box.setMaximumWidth(300)
+        self.search_box.textChanged.connect(self.apply_filter)
+        header.addWidget(self.search_box)
+        header.addStretch(1)
+        layout.addLayout(header)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["编号", "平台", "状态", "标题", "结果"])
         layout.addWidget(self.tree)
@@ -1187,6 +1207,14 @@ class PublishQueuePage(QWidget):
                 row["title"],
                 row["result"] or "",
             ]))
+        self.apply_filter()
+
+    def apply_filter(self) -> None:
+        query = self.search_box.text().strip().lower()
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            haystack = " ".join(item.text(column) for column in range(item.columnCount())).lower()
+            item.setHidden(bool(query and query not in haystack))
 
     def run_selected(self) -> None:
         item = self.tree.currentItem()
