@@ -368,13 +368,6 @@ class DashboardPage(QWidget):
         self.playlist_mode.setToolTip("自动识别 YouTube 视频、专辑或播放列表，并显示视频数量")
         options.addWidget(self.playlist_mode)
         options.addSpacing(12)
-        options.addWidget(QLabel("保存到"))
-        self.output = QLineEdit(window.app_settings.get("download_dir"))
-        browse = QPushButton("选择目录")
-        browse.clicked.connect(self.choose_dir)
-        options.addWidget(self.output, 1)
-        options.addWidget(browse)
-        options.addSpacing(12)
         options.addWidget(QLabel("代理"))
         self.proxy = QLineEdit(window.app_settings.get("proxy"))
         self.proxy.setPlaceholderText("可选")
@@ -389,9 +382,16 @@ class DashboardPage(QWidget):
         self.filter_box.currentTextChanged.connect(self.apply_filter)
         toolbar.addWidget(self.filter_box)
         toolbar.addStretch(1)
+        self.download_dir_hint = QLabel()
+        self.download_dir_hint.setObjectName("mutedText")
+        self.download_dir_hint.setToolTip("下载目录请在“设置”页面统一修改")
+        toolbar.addWidget(self.download_dir_hint, 1)
         open_dir = QPushButton("打开下载目录")
         open_dir.clicked.connect(self.open_download_dir)
         toolbar.addWidget(open_dir)
+        settings_button = QPushButton("目录设置")
+        settings_button.clicked.connect(lambda: self.window.tabs.setCurrentWidget(self.window.settings))
+        toolbar.addWidget(settings_button)
         root.addLayout(toolbar)
 
         self.task_list = QListWidget()
@@ -411,19 +411,18 @@ class DashboardPage(QWidget):
         self.status = QLabel("就绪")
         self.status.setObjectName("mutedText")
         root.addWidget(self.status)
+        self.refresh_settings()
 
     def _save(self, key: str, value: str) -> None:
         self.window.app_settings.set(key, str(value))
         self.window.app_settings.sync()
 
-    def choose_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择保存目录", self.output.text())
-        if path:
-            self.output.setText(path)
-            self._save("download_dir", path)
+    def refresh_settings(self) -> None:
+        path = self.window.app_settings.get("download_dir")
+        self.download_dir_hint.setText(f"下载目录：{path}")
 
     def open_download_dir(self) -> None:
-        path = Path(self.output.text().strip() or self.window.app_settings.get("download_dir"))
+        path = Path(self.window.app_settings.get("download_dir"))
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(str(path))
 
@@ -432,8 +431,8 @@ class DashboardPage(QWidget):
         if not url:
             QMessageBox.warning(self, "提示", "请输入 YouTube URL")
             return
-        output_dir = self.output.text().strip() or self.window.app_settings.get("download_dir")
-        self._save("download_dir", output_dir)
+        output_dir = self.window.app_settings.get("download_dir")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
         self._save("proxy", self.proxy.text().strip())
         self._save("quality", self.quality.currentData())
         self.window.download_service.enqueue(
@@ -907,6 +906,12 @@ class SettingsPage(QWidget):
         super().__init__()
         form = QFormLayout(self)
         bundled = bundled_ffmpeg_path()
+        self.download_dir = QLineEdit(window.app_settings.get("download_dir"))
+        download_row = QHBoxLayout()
+        download_row.addWidget(self.download_dir, 1)
+        browse_download = QPushButton("选择目录")
+        browse_download.clicked.connect(self.choose_download_dir)
+        download_row.addWidget(browse_download)
         self.proxy = QLineEdit(window.app_settings.get("proxy"))
         self.template = QLineEdit(window.app_settings.get("filename_template"))
         self.sau = QLineEdit(window.app_settings.get("sau_path"))
@@ -916,12 +921,18 @@ class SettingsPage(QWidget):
         self.max_concurrent.setValue(max(1, min(8, int(window.app_settings.get("max_concurrent") or 3))))
         save = QPushButton("保存配置")
         save.clicked.connect(lambda: window.save_settings(self))
+        form.addRow("下载保存目录", download_row)
         form.addRow("默认代理", self.proxy)
         form.addRow("文件名模板", self.template)
         form.addRow("上传工具路径", self.sau)
         form.addRow("FFmpeg 路径", self.ffmpeg)
         form.addRow("并行下载数", self.max_concurrent)
         form.addRow(save)
+
+    def choose_download_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择下载保存目录", self.download_dir.text())
+        if path:
+            self.download_dir.setText(path)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -997,6 +1008,12 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(page)
 
     def save_settings(self, page: SettingsPage) -> None:
+        download_dir = page.download_dir.text().strip()
+        if not download_dir:
+            QMessageBox.warning(self, "提示", "下载保存目录不能为空")
+            return
+        Path(download_dir).mkdir(parents=True, exist_ok=True)
+        self.app_settings.set("download_dir", download_dir)
         self.app_settings.set("proxy", page.proxy.text().strip())
         self.app_settings.set("filename_template", page.template.text().strip())
         self.app_settings.set("sau_path", page.sau.text().strip())
@@ -1006,6 +1023,7 @@ class MainWindow(QMainWindow):
         self.download_service.max_concurrent = page.max_concurrent.value()
         self.download_service._start_next()
         self.dashboard.proxy.setText(self.app_settings.get("proxy"))
+        self.dashboard.refresh_settings()
         QMessageBox.information(self, "已保存", "下载目录、代理和工具路径已保存")
 
     def closeEvent(self, event) -> None:
