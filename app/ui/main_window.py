@@ -265,30 +265,20 @@ class FormatSelectionDialog(QDialog):
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.setSpacing(3)
         rows = min(5, max(1, len(choices)))
-        self.list.setFixedHeight(rows * 72 + 12)
+        self.list.setFixedHeight(rows * 52 + 12)
         for choice in choices:
             item = QListWidgetItem()
             item.setData(Qt.UserRole, choice)
-            item.setSizeHint(QSize(0, 68))
+            item.setSizeHint(QSize(0, 48))
             row = QWidget()
             row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(8, 4, 8, 4)
-            row_layout.setSpacing(10)
-            row_cover = QLabel("封面")
-            row_cover.setFixedSize(84, 52)
-            row_cover.setAlignment(Qt.AlignCenter)
-            row_cover.setObjectName("formatRowCover")
-            if thumbnail_path and Path(thumbnail_path).exists():
-                pixmap = QPixmap(thumbnail_path)
-                if not pixmap.isNull():
-                    row_cover.setText("")
-                    row_cover.setPixmap(pixmap.scaled(84, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            row_layout.setContentsMargins(10, 3, 10, 3)
+            row_layout.setSpacing(8)
             text = QLabel()
             text.setWordWrap(False)
-            text.setText(f"{choice.get('height', '?')}p  ·  {choice.get('ext', '?')}  ·  {choice.get('fps', '')}fps\n"
-                         f"{choice.get('format_note') or '视频 + 音频'}")
+            note = choice.get('format_note') or '视频 + 音频'
+            text.setText(f"{choice.get('height', '?')}p  ·  {choice.get('ext', '?')}  ·  {choice.get('fps', '')}fps  ·  {note}")
             text.setToolTip(choice.get("label", ""))
-            row_layout.addWidget(row_cover)
             row_layout.addWidget(text, 1)
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
@@ -554,7 +544,11 @@ class DashboardPage(QWidget):
             self.window.download_service.set_format_selector(task_id, choice["selector"])
             self.status.setText(f"已选择 {choice.get('height', '')}p，开始下载")
         else:
-            self.window.download_service.cancel(task_id)
+            # The picker is only a preview step. Closing/cancelling it means
+            # abandon this request entirely, not create a visible "已取消"
+            # download task.
+            self.window.download_service.discard_task(task_id)
+            self.status.setText("已关闭画质预览，未创建下载任务")
 
     def open_task_folder(self, task_id: str) -> None:
         task = self.window.download_service.tasks.get(task_id)

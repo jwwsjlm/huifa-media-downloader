@@ -283,6 +283,7 @@ class DownloadService(QObject):
         self.worker: DownloadWorker | None = None
         self.threads: dict[str, QThread] = {}
         self.workers: dict[str, DownloadWorker] = {}
+        self._discard_tasks: set[str] = set()
 
     def restore_tasks(self) -> list[DownloadTask]:
         restored: list[DownloadTask] = []
@@ -349,6 +350,9 @@ class DownloadService(QObject):
         if not task_id or task_id not in self.tasks:
             return
         task = self.tasks[task_id]
+        if task.status == "waiting_selection":
+            self.discard_task(task_id)
+            return
         if task.status == "queued":
             task.status = "paused"
             self.queue = deque(queued_id for queued_id in self.queue if queued_id != task_id)
@@ -467,6 +471,27 @@ class DownloadService(QObject):
         self.task_deleted.emit(task_id)
         return True
 
+    def discard_task(self, task_id: str) -> None:
+        """Cancel a task that is still in pre-download format selection.
+
+        Closing the format picker means the user only inspected formats; it
+        must not leave a cancelled task in the persistent download list.
+        The worker is allowed to unwind first, then its DB row/card is removed
+        from _thread_finished.
+        """
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+        worker = self.workers.get(task_id)
+        if worker:
+            self._discard_tasks.add(task_id)
+            worker.cancel()
+            return
+        self.tasks.pop(task_id, None)
+        self.queue = deque(item for item in self.queue if item != task_id)
+        self.db.delete_download_task(task_id)
+        self.task_deleted.emit(task_id)
+
     def set_format_selector(self, task_id: str, selector: str) -> None:
         task = self.tasks.get(task_id)
         worker = self.workers.get(task_id)
@@ -565,7 +590,25 @@ class DownloadService(QObject):
         self._persist(task)
 
     def _thread_finished(self, task_id: str) -> None:
-        task = self.tasks[task_id]
+        task = self.tasks.get(task_id)
+        if not task:
+            self.threads.pop(task_id, None)
+            self.workers.pop(task_id, None)
+            self._start_next()
+            return
+        if task_id in self._discard_tasks:
+            self._discard_tasks.discard(task_id)
+            self.db.delete_download_task(task_id)
+            self.tasks.pop(task_id, None)
+            self.task_deleted.emit(task_id)
+            self.threads.pop(task_id, None)
+            self.workers.pop(task_id, None)
+            if self.active_task_id == task_id:
+                self.active_task_id = next(iter(self.workers), None)
+                self.thread = self.threads.get(self.active_task_id) if self.active_task_id else None
+                self.worker = self.workers.get(self.active_task_id) if self.active_task_id else None
+            self._start_next()
+            return
         if task.pause_requested:
             task.status = "paused"
         elif task.cancel_requested:
