@@ -21,12 +21,20 @@ Runtime data is stored beside the application under `data/`:
 - `data/settings.ini` — download directory, quality, proxy and tool settings;
 - `data/browser/` — embedded browser cache and login profile;
 - `data/downloads/` — default download directory.
+- `data/logs/downloads/` — per-task diagnostic logs in JSON Lines format;
 
 The Settings page is the single place for selecting the download directory.
 The download page only displays the current directory and provides shortcuts
 to open it or jump to Settings, so the two pages cannot drift out of sync.
 Settings are grouped into download, network and tool sections, and invalid or
 unwritable download paths are rejected with an explicit message.
+
+The download task list supports title/URL/ID search, global pause/resume,
+completed-record cleanup, and a `查看下载日志` action. Each task log records
+解析、格式选择、进度、网络/代理错误、风控/登录错误和完成状态 without
+storing cookies or tokens. The log dialog also provides an initial diagnosis
+category so network failures can be distinguished from rate limits, login,
+CAPTCHA, format, and tool errors.
 
 The application no longer uses the user's Documents directory for its own
 database or settings. Existing data from the legacy `.youtube-release-studio`

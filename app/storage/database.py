@@ -54,6 +54,10 @@ class Database:
             self.conn.execute("ALTER TABLE download_tasks ADD COLUMN playlist_mode TEXT DEFAULT 'auto'")
         self.conn.commit()
 
+    def close(self) -> None:
+        with self._lock:
+            self.conn.close()
+
     def add_media(self, item: MediaItem) -> int:
         with self._lock:
             cur = self.conn.execute(

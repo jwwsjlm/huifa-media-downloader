@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from app.core.app_settings import AppSettings
 from app.core.download_service import DownloadService, DownloadTask, bundled_ffmpeg_path
+from app.core.log_service import DownloadLogService
 from app.core.paths import initialize_data_layout
 from app.core.publish_service import PublishService
 from app.storage.database import Database
@@ -221,7 +223,10 @@ class DownloadTaskCard(QFrame):
         }.get(task.status, "#2f7bdc")
         self.status.setStyleSheet(f"color: {status_color}; font-weight: 600;")
         if task.status == "failed":
-            self.status.setToolTip(task.error)
+            diagnosis = DownloadLogService.classify_error(task.error)
+            self.status.setToolTip(f"初步判断：{diagnosis}\n{task.error}")
+        else:
+            self.status.setToolTip("")
         details = "  ".join(x for x in [task.size, task.speed, f"剩余 {task.eta}" if task.eta else ""] if x)
         self.details.setText(details or "等待任务开始")
         if task.status == "downloading":
@@ -329,6 +334,59 @@ class FormatSelectionDialog(QDialog):
         return item.data(Qt.UserRole) if item else None
 
 
+class DownloadLogDialog(QDialog):
+    def __init__(self, task: DownloadTask, logs: DownloadLogService, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"下载日志：{task.title or task.id}")
+        self.resize(860, 520)
+        layout = QVBoxLayout(self)
+        summary = QLabel()
+        summary.setObjectName("mutedText")
+        events = logs.read(task.id)
+        counts: dict[str, int] = {}
+        for event in events:
+            category = str(event.get("category") or "未知")
+            counts[category] = counts.get(category, 0) + 1
+        if task.status == "failed":
+            diagnosis = DownloadLogService.classify_error(task.error)
+            summary.setText(f"任务状态：失败 · 初步判断：{diagnosis} · 日志条数：{len(events)}")
+        else:
+            summary.setText(f"任务状态：{STATUS_TEXT.get(task.status, task.status)} · 日志条数：{len(events)}")
+        if counts:
+            summary.setToolTip("；".join(f"{key}: {value}" for key, value in counts.items()))
+        layout.addWidget(summary)
+        log_path = QLabel(f"日志文件：{logs.path_for(task.id)}")
+        log_path.setObjectName("mutedText")
+        log_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(log_path)
+
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setPlainText(logs.render(task.id))
+        layout.addWidget(self.text, 1)
+
+        buttons = QHBoxLayout()
+        copy_button = QPushButton("复制日志")
+        copy_button.clicked.connect(self.copy_logs)
+        clear_button = QPushButton("清空日志")
+        clear_button.clicked.connect(lambda: self.clear_logs(task.id, logs))
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(copy_button)
+        buttons.addWidget(clear_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+    def copy_logs(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self.text.toPlainText())
+
+    def clear_logs(self, task_id: str, logs: DownloadLogService) -> None:
+        logs.clear(task_id)
+        self.text.setPlainText("暂无日志。")
+
+
 class DashboardPage(QWidget):
     def __init__(self, window: "MainWindow"):
         super().__init__()
@@ -365,9 +423,11 @@ class DashboardPage(QWidget):
         root.addWidget(input_group)
 
         options_group = QGroupBox("下载参数")
-        options = QHBoxLayout(options_group)
+        options = QGridLayout(options_group)
         options.setContentsMargins(10, 8, 10, 8)
-        options.addWidget(QLabel("画质"))
+        options.setHorizontalSpacing(10)
+        options.setVerticalSpacing(8)
+        options.addWidget(QLabel("画质"), 0, 0)
         self.quality = QComboBox()
         self.quality.addItem("最高画质", "best")
         self.quality.addItem("1080p", "1080p")
@@ -376,8 +436,8 @@ class DashboardPage(QWidget):
         saved_quality = window.app_settings.get("quality")
         self.quality.setCurrentIndex(max(0, self.quality.findData(saved_quality)))
         self.quality.currentIndexChanged.connect(lambda: self._save("quality", self.quality.currentData()))
-        options.addWidget(self.quality)
-        options.addWidget(QLabel("列表处理"))
+        options.addWidget(self.quality, 0, 1)
+        options.addWidget(QLabel("列表处理"), 0, 2)
         self.playlist_mode = QComboBox()
         self.playlist_mode.addItem("自动识别（推荐）", "auto")
         self.playlist_mode.addItem("仅下载单个视频", "single")
@@ -388,17 +448,22 @@ class DashboardPage(QWidget):
         self.playlist_mode.setCurrentIndex(max(0, self.playlist_mode.findData(saved_mode)))
         self.playlist_mode.currentIndexChanged.connect(lambda: self._save("playlist_mode", self.playlist_mode.currentData()))
         self.playlist_mode.setToolTip("自动识别 YouTube 视频、专辑或播放列表，并显示视频数量")
-        options.addWidget(self.playlist_mode)
-        options.addSpacing(12)
-        options.addWidget(QLabel("代理"))
+        options.addWidget(self.playlist_mode, 0, 3)
+        options.addWidget(QLabel("代理"), 1, 0)
         self.proxy = QLineEdit(window.app_settings.get("proxy"))
         self.proxy.setPlaceholderText("可选")
-        self.proxy.setMaximumWidth(220)
-        options.addWidget(self.proxy)
+        options.addWidget(self.proxy, 1, 1, 1, 3)
+        options.setColumnStretch(1, 1)
+        options.setColumnStretch(3, 2)
         root.addWidget(options_group)
 
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("任务列表"))
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("搜索标题、链接或编号")
+        self.search_box.setMaximumWidth(260)
+        self.search_box.textChanged.connect(self.apply_filter)
+        toolbar.addWidget(self.search_box)
         self.filter_box = QComboBox()
         self.filter_box.addItems(["全部", "下载中", "排队中", "已完成", "文件已删除", "失败"])
         self.filter_box.currentTextChanged.connect(self.apply_filter)
@@ -414,6 +479,19 @@ class DashboardPage(QWidget):
         settings_button = QPushButton("目录设置")
         settings_button.clicked.connect(lambda: self.window.tabs.setCurrentWidget(self.window.settings))
         toolbar.addWidget(settings_button)
+        pause_all = QPushButton("全部暂停")
+        pause_all.clicked.connect(self.pause_all)
+        toolbar.addWidget(pause_all)
+        resume_all = QPushButton("全部继续")
+        resume_all.clicked.connect(self.resume_all)
+        toolbar.addWidget(resume_all)
+        self.log_button = QPushButton("查看日志")
+        self.log_button.setEnabled(False)
+        self.log_button.clicked.connect(self.show_selected_log)
+        toolbar.addWidget(self.log_button)
+        cleanup_button = QPushButton("清理已完成")
+        cleanup_button.clicked.connect(self.cleanup_completed)
+        toolbar.addWidget(cleanup_button)
         root.addLayout(toolbar)
 
         self.task_list = QListWidget()
@@ -543,6 +621,16 @@ class DashboardPage(QWidget):
             card = self.cards.get(task_id)
             if card:
                 card.set_selected(id(item) in selected)
+        if hasattr(self, "log_button"):
+            self.log_button.setEnabled(len(selected) == 1)
+
+    def show_selected_log(self) -> None:
+        task_ids = self.selected_task_ids()
+        if len(task_ids) != 1:
+            return
+        task = self.window.download_service.tasks.get(task_ids[0])
+        if task:
+            DownloadLogDialog(task, self.window.download_service.logs, self).exec()
 
     def update_task(self, task: DownloadTask) -> None:
         card = self.cards.get(task.id)
@@ -654,6 +742,7 @@ class DashboardPage(QWidget):
         menu = QMenu(self)
         copy_link_action = menu.addAction("复制视频链接")
         copy_folder_action = menu.addAction("复制视频文件夹路径")
+        log_action = menu.addAction("查看下载日志")
         menu.addSeparator()
         if task.status == "downloading":
             pause_action = menu.addAction("暂停下载")
@@ -677,6 +766,8 @@ class DashboardPage(QWidget):
             folder = str(Path(task.media_path).parent if task.media_path else Path(task.output_dir))
             QApplication.clipboard().setText(folder)
             self.status.setText("视频文件夹路径已复制")
+        elif chosen == log_action:
+            DownloadLogDialog(task, self.window.download_service.logs, self).exec()
         elif chosen == pause_action:
             if task.status == "downloading":
                 self.window.download_service.pause(task.id)
@@ -746,6 +837,7 @@ class DashboardPage(QWidget):
 
     def apply_filter(self, _value: str = "") -> None:
         selected = self.filter_box.currentText()
+        query = self.search_box.text().strip().lower()
         allowed = {
             "全部": None,
             "下载中": {"downloading", "canceling"},
@@ -756,10 +848,50 @@ class DashboardPage(QWidget):
         }[selected]
         for task_id, item in self.items.items():
             task = self.window.download_service.tasks.get(task_id)
-            item.setHidden(bool(allowed and task and task.status not in allowed))
+            if not task:
+                item.setHidden(True)
+                continue
+            haystack = f"{task.id} {task.title} {task.url}".lower()
+            status_match = not allowed or task.status in allowed
+            query_match = not query or query in haystack
+            item.setHidden(not (status_match and query_match))
+        self._update_empty_state()
 
     def _update_empty_state(self) -> None:
-        self.empty_label.setVisible(self.task_list.count() == 0)
+        visible_count = sum(not self.task_list.item(index).isHidden() for index in range(self.task_list.count()))
+        if self.task_list.count() == 0:
+            self.empty_label.setText("还没有下载任务\n粘贴视频或播放列表链接后点击“添加并下载”\n下载目录可在“设置”页面修改")
+            self.empty_label.setVisible(True)
+        elif visible_count == 0:
+            self.empty_label.setText("没有匹配的任务\n可以更换搜索关键词或状态筛选")
+            self.empty_label.setVisible(True)
+        else:
+            self.empty_label.setVisible(False)
+
+    def pause_all(self) -> None:
+        for task_id, task in list(self.window.download_service.tasks.items()):
+            if task.status in {"downloading", "queued"}:
+                self.window.download_service.pause(task_id)
+
+    def resume_all(self) -> None:
+        for task_id, task in list(self.window.download_service.tasks.items()):
+            if task.status in {"paused", "failed", "canceled"}:
+                self.window.download_service.start_task(task_id)
+
+    def cleanup_completed(self) -> None:
+        task_ids = [task_id for task_id, task in self.window.download_service.tasks.items() if task.status == "completed"]
+        if not task_ids:
+            self.status.setText("没有可清理的已完成任务")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("清理已完成任务")
+        box.setText(f"将清理 {len(task_ids)} 条已完成任务记录，视频文件和完成列表不会被删除。")
+        clean_button = box.addButton("清理记录", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is clean_button:
+            for task_id in task_ids:
+                self.window.download_service.delete_task(task_id, delete_files=False)
 
     def _update_count(self) -> None:
         count = self.task_list.count()
@@ -1111,6 +1243,16 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, "目录不可用", f"无法使用下载保存目录：\n{download_dir}\n\n{exc}")
             return
+        tool_warnings: list[str] = []
+        for label, raw_value in (("上传工具", page.sau.text().strip()), ("FFmpeg", page.ffmpeg.text().strip())):
+            if not raw_value:
+                continue
+            tool_path = Path(raw_value).expanduser()
+            # Command names such as `sau` or `ffmpeg` are valid when they are
+            # provided by PATH; explicit filesystem paths should exist.
+            looks_like_path = tool_path.is_absolute() or "\\" in raw_value or "/" in raw_value or tool_path.suffix.lower() == ".exe"
+            if looks_like_path and (not tool_path.exists() or not tool_path.is_file()):
+                tool_warnings.append(f"{label}路径不存在：{raw_value}")
         self.app_settings.set("download_dir", str(download_path))
         self.app_settings.set("proxy", page.proxy.text().strip())
         self.app_settings.set("filename_template", page.template.text().strip())
@@ -1122,11 +1264,16 @@ class MainWindow(QMainWindow):
         self.download_service._start_next()
         self.dashboard.proxy.setText(self.app_settings.get("proxy"))
         self.dashboard.refresh_settings()
+        message = (
+            "下载设置、网络设置和工具路径已保存。\n\n"
+            f"当前下载目录：{download_path}"
+        )
+        if tool_warnings:
+            message += "\n\n配置提醒：\n" + "\n".join(tool_warnings) + "\n可继续保存，但相关功能可能无法使用。"
         QMessageBox.information(
             self,
             "配置已保存",
-            "下载设置、网络设置和工具路径已保存。\n\n"
-            f"当前下载目录：{download_path}",
+            message,
         )
 
     def closeEvent(self, event) -> None:
