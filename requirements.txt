@@ -1,0 +1,5 @@
+PySide6>=6.7
+yt-dlp>=2025.1.0
+requests>=2.32
+keyring>=25.0
+

@@ -1,0 +1,24 @@
+/.venv
+/.idea
+
+# Python caches and local runtime data
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.youtube-release-studio/
+
+# Build and packaging output
+build/
+dist/
+*.spec
+
+# Download archives are kept outside the repository; bundled runtime files
+# under tools/ffmpeg/x86 and tools/ffmpeg/x64 are intentionally tracked.
+*.zip
+
+# Legacy binaries at tools/ffmpeg root; architecture-specific builds are tracked below.
+/tools/ffmpeg/*.exe
+/tools/ffmpeg/*.dll
