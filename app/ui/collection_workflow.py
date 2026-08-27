@@ -57,6 +57,8 @@ class CollectionWorkflowController(QObject):
 
     def request_shutdown(self) -> None:
         self.coordinator.request_shutdown()
+        self.selection_view.set_storage_preview_provider(None)
+        self.selection_view.model.clear_source()
 
     def request_id_for_parent(self, parent_id: str) -> str:
         return next(
@@ -458,7 +460,7 @@ class CollectionWorkflowController(QObject):
         if not parent_id:
             return
         old_count = int(state.get('entry_count') or 0)
-        self.window.db.upsert_on_entries(parent_id, entries)
+        self.window.db.upsert_collection_probe_entries(parent_id, entries)
         current_count = self.window.db.collection_probe_entry_count(parent_id)
         state['entry_count'] = current_count
         self.window.download_service.update_collection_probe(
@@ -468,11 +470,18 @@ class CollectionWorkflowController(QObject):
             parsed_count=current_count,
         )
         options = DownloadOptions.from_mapping(state['context'].get('options_json'))
+        selection_opened_for_batch = False
         if not self.active_request_id and options.collection_mode == 'select':
             self.show_selection(request_id)
-        if self.active_request_id == request_id:
+            selection_opened_for_batch = self.active_request_id == request_id
+        if self.active_request_id == request_id and not selection_opened_for_batch:
             if current_count > old_count:
-                self.selection_view.append_entries(entries[-(current_count - old_count):])
+                appended = self.window.db.list_collection_probe_entries(
+                    parent_id,
+                    offset=old_count,
+                    limit=current_count - old_count,
+                )
+                self.selection_view.append_entries(appended)
 
     def show_selection(self, request_id: str) -> None:
         state = self.coordinator.states.get(request_id)
@@ -486,7 +495,7 @@ class CollectionWorkflowController(QObject):
         count = self.window.db.collection_probe_entry_count(parent_id)
         self.selection_view.set_paged_entries(
             count,
-            lambda offset, limit, parent_id=parent_id: self.window.db.list_on_entries(
+            lambda offset, limit, parent_id=parent_id: self.window.db.list_collection_probe_entries(
                 parent_id, offset=offset, limit=limit
             ),
             selection_updater=lambda index, selected, parent_id=parent_id: self.window.db.set_collection_probe_entry_selected(
@@ -495,13 +504,13 @@ class CollectionWorkflowController(QObject):
             selection_setter=lambda mode, parent_id=parent_id: self.window.db.set_collection_probe_selection(
                 parent_id, mode
             ),
-            selected_loader=lambda parent_id=parent_id: self.window.db.list_on_entries(
+            selected_loader=lambda parent_id=parent_id: self.window.db.list_collection_probe_entries(
                 parent_id, offset=0, limit=2**31 - 1, selected_only=True
             ),
-            selected_counter=lambda parent_id=parent_id: self.window.db.count_selected_on_entries(
+            selected_counter=lambda parent_id=parent_id: self.window.db.count_selected_collection_probe_entries(
                 parent_id
             ),
-            view_loader=lambda offset, limit, view, parent_id=parent_id: self.window.db.list_on_entries(
+            view_loader=lambda offset, limit, view, parent_id=parent_id: self.window.db.list_collection_probe_entries(
                 parent_id,
                 offset=offset,
                 limit=limit,
@@ -687,7 +696,7 @@ class CollectionWorkflowController(QObject):
         )
         options = DownloadOptions.from_mapping(state['context'].get('options_json'))
         if options.collection_mode == 'all':
-            nested = self.window.db.list_on_entries(
+            nested = self.window.db.list_collection_probe_entries(
                 parent_id,
                 offset=0,
                 limit=2**31 - 1,
@@ -728,7 +737,7 @@ class CollectionWorkflowController(QObject):
         state['confirmed'] = True
         options = DownloadOptions.from_mapping(state['context'].get('options_json'))
         if selected is None:
-            nested_entries = self.window.db.list_on_entries(
+            nested_entries = self.window.db.list_collection_probe_entries(
                 parent_id,
                 offset=0,
                 limit=2**31 - 1,

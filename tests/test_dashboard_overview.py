@@ -37,6 +37,7 @@ from app.core.download_performance import (
     smart_download_performance,
 )
 from app.core.download_service import DownloadService, DownloadTask
+from app.storage.database import Database
 from app.storage.models import MediaItem
 from app.ui.download_control_presentation import DOWNLOAD_QUALITY_VALUES
 from app.ui.download_cookie_controller import DownloadCookieController
@@ -1568,6 +1569,60 @@ class DashboardOverviewTests(unittest.TestCase):
         start_probe.assert_called_once()
         self.assertEqual(start_probe.call_args.kwargs["existing_parent_id"], task.id)
 
+    def test_collection_probe_entries_use_database_collection_api(self) -> None:
+        database = Database(Path(self.temp_dir.name) / "collection-probe.db")
+        self.window.db = database
+        parent = DownloadTask(
+            "collection-probe-parent",
+            "https://example.com/playlist",
+            "D:/downloads",
+            task_kind="collection",
+            status="parsing_collection",
+            stage="parsing_collection",
+        )
+        self.service.tasks[parent.id] = parent
+        request_id = "collection-probe-entries"
+        workflow = self.page.collection_workflow
+        workflow.coordinator.states[request_id] = {
+            "parent_id": parent.id,
+            "context": {"options_json": {"collection_mode": "select"}},
+            "metadata": {"title": "Playlist", "source_key": "Example:playlist"},
+            "entry_count": 0,
+            "confirmed": False,
+        }
+
+        workflow._on_entries(request_id, [{
+            "index": 1,
+            "url": "https://example.com/video/1",
+            "title": "Episode 1",
+            "entry_kind": "video",
+            "downloadable": True,
+            "selected": True,
+        }])
+
+        self.assertEqual(database.collection_probe_entry_count(parent.id), 1)
+        self.assertEqual(workflow.selection_view.model.source_count(), 1)
+        self.assertEqual(
+            database.list_collection_probe_entries(parent.id)[0]["title"],
+            "Episode 1",
+        )
+
+        workflow._on_entries(request_id, [{
+            "index": 2,
+            "url": "https://example.com/video/2",
+            "title": "Episode 2",
+            "entry_kind": "video",
+            "downloadable": True,
+            "selected": True,
+        }])
+
+        self.assertEqual(database.collection_probe_entry_count(parent.id), 2)
+        self.assertEqual(workflow.selection_view.model.source_count(), 2)
+
+        workflow.request_shutdown()
+        self.assertEqual(workflow.selection_view.model.source_count(), 0)
+        database.close()
+
     def test_collection_resume_waits_for_confirmed_running_probe_to_exit(self) -> None:
         task = DownloadTask(
             "resume-running-probe",
@@ -1805,7 +1860,7 @@ class DashboardOverviewTests(unittest.TestCase):
             "confirmed": False,
         }
         self.window.db = SimpleNamespace(
-            upsert_on_entries=lambda *_args, **_kwargs: self.fail(
+            upsert_collection_probe_entries=lambda *_args, **_kwargs: self.fail(
                 "late entries must not be persisted"
             ),
             collection_probe_entry_count=lambda *_args, **_kwargs: self.fail(
