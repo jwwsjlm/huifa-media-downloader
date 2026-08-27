@@ -3,14 +3,11 @@
 核验日期：2026-08-24  
 目标版本：Velopack Python SDK / `vpk` 1.2.0
 
-> 当前发行决策：以 `scripts/build_release.ps1` 生成的单独
-> `HuifaVideoDownloader.exe` 为主交付，不生成 ZIP。Velopack 方案作为未来可选能力保留，
-> 不参与当前单 EXE 交付。Velopack 必须使用 PyInstaller onedir，因此不能让当前 onefile
-> EXE 原地自更新；若未来启用本方案，交付形态必须明确切换为安装版或目录型便携版。
-> 日常单 EXE 构建只运行 `scripts/build_release.ps1`，该脚本不会调用本页的 Velopack
-> 构建，也不会生成或复制任何发行 ZIP；其顶层交付文件固定为
-> `releases/HuifaVideoDownloader.exe`。只有显式运行 `scripts/build_velopack_release.ps1`
-> 才会产生 Velopack 协议要求的 `Portable.zip` 和更新包。
+> 当前发行决策：GitHub Release 同时提供便携版 ZIP 和安装包 ZIP。便携版 ZIP 包含
+> `scripts/build_release.ps1` 生成的单文件 `HuifaVideoDownloader.exe`；安装包 ZIP 包含
+> `scripts/build_velopack_release.ps1` 生成的 Velopack `Setup.exe`。Release 还会保留原始
+> 单 EXE 作为便携版自动更新载荷，并上传 Velopack feed 与完整包供安装版自动更新。
+> `scripts/package_github_release.ps1` 负责统一封装两个 ZIP、复制版本说明并生成校验清单。
 
 ## 已核验的官方能力与限制
 

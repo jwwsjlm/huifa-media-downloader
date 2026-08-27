@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from app.core.app_settings import default_settings
+from app.core.version import APP_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +27,7 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("actions/setup-python@v7", source)
         self.assertIn("actions/upload-artifact@v7", release)
 
-    def test_tag_release_builds_exact_asset_required_by_portable_updater(self) -> None:
+    def test_tag_release_builds_both_zip_editions_and_update_assets(self) -> None:
         release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
@@ -35,12 +36,38 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("contents: write", release)
         self.assertIn("prepare_release_runtime.ps1", release)
         self.assertIn("build_release.ps1", release)
-        self.assertIn("HuifaVideoDownloader.exe", release)
+        self.assertIn("build_velopack_release.ps1", release)
+        self.assertIn("package_github_release.ps1", release)
+        self.assertIn("release-notes\\$Version.md", release)
+        self.assertIn("--notes-file", release)
+        self.assertNotIn("--generate-notes", release)
+        self.assertIn("release-assets/*", release)
         self.assertIn("gh release create", release)
         self.assertIn("gh release upload", release)
         self.assertIn("--clobber", release)
         self.assertIn("--verify-tag", release)
         self.assertIn("--latest", release)
+
+    def test_release_packager_keeps_two_user_zip_files_and_both_update_protocols(self) -> None:
+        source = (ROOT / "scripts" / "package_github_release.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("portable-win-x64.zip", source)
+        self.assertIn("installer-win-x64.zip", source)
+        self.assertIn("HuifaMediaDownloader-Setup.exe", source)
+        self.assertIn("RELEASE_NOTES.md", source)
+        self.assertIn("HuifaVideoDownloader.exe", source)
+        self.assertIn("releases.win.json", source)
+        self.assertIn("assets.win.json", source)
+        self.assertIn("SHA256SUMS.txt", source)
+
+    def test_current_version_has_non_empty_bilingual_release_notes(self) -> None:
+        notes = ROOT / "release-notes" / f"{APP_VERSION}.md"
+        self.assertTrue(notes.is_file())
+        source = notes.read_text(encoding="utf-8")
+        self.assertIn(f"Huifa Media Downloader {APP_VERSION}", source)
+        self.assertIn("## 中文", source)
+        self.assertIn("## English", source)
 
     def test_release_runtime_bootstrap_uses_official_github_api_and_digest(self) -> None:
         source = (ROOT / "scripts" / "prepare_release_runtime.ps1").read_text(

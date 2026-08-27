@@ -1,8 +1,7 @@
 [CmdletBinding()]
-# Optional managed-update pipeline. The primary scripts/build_release.ps1 does
-# not invoke this command. Velopack inherently produces a Portable.zip and
-# update packages, so run this script only when an installation/managed
-# portable release is explicitly required instead of the single-EXE delivery.
+# Managed installer pipeline used by the GitHub tag release workflow. The
+# separate scripts/build_release.ps1 still owns the one-file portable build;
+# this command produces Setup.exe plus the Velopack feeds and update packages.
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')]

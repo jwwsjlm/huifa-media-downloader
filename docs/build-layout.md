@@ -9,7 +9,8 @@
 发行脚本按需创建以下目录：
 
 - `releases/`：单文件正式发行目录，主构建脚本输出 `HuifaVideoDownloader.exe`；
-- `releases-velopack/`：显式执行 Velopack 脚本时生成的安装包和 Portable 包。
+- `releases-velopack/`：Velopack 脚本生成的安装器、更新 feed 和完整更新包；
+- `release-assets/`：标签发布时生成的最终 GitHub Release 资产，包括便携版 ZIP、安装包 ZIP、版本说明、校验清单及自动更新技术文件。
 
 `data/` 是运行时数据，不能当作构建产物清理；`tools/`、`third_party/`、`languages/` 是软件运行所需的本地组件和资源。
 

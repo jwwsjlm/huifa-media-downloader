@@ -20,7 +20,7 @@
 
 汇发媒体下载器是一款面向 Windows 10/11 x64 的桌面应用。它使用 `yt-dlp` 解析视频、播放列表、频道及其他聚合链接，使用 FFmpeg 完成合并和转码，并提供 Cookie 登录、封面处理、字幕、任务管理与多平台发布工作流。
 
-正式版本为单个 `HuifaVideoDownloader.exe`，已经包含 Python 运行时和程序所需组件。普通用户无需安装 Python、Chrome、FFmpeg 或 yt-dlp。
+正式版本同时提供便携版 ZIP 和安装包 ZIP，二者都已经包含 Python 运行时和程序所需组件。普通用户无需安装 Python、Chrome、FFmpeg 或 yt-dlp。
 
 ## 主要功能
 
@@ -39,11 +39,11 @@
 ## 下载与使用
 
 1. 打开 [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest)。
-2. 下载 `HuifaVideoDownloader.exe`。
-3. 将 EXE 放到准备长期使用的目录后直接运行。
-4. 软件数据默认保存在 EXE 同目录的 `data/`，移动软件时可以将 EXE 与该目录一起移动。
+2. 便携使用请选择 `HuifaMediaDownloader-<版本>-portable-win-x64.zip`，解压后运行 `HuifaVideoDownloader.exe`。
+3. 需要安装到系统时请选择 `HuifaMediaDownloader-<版本>-installer-win-x64.zip`，解压后运行 `HuifaMediaDownloader-Setup.exe`。
+4. 便携版数据默认保存在 EXE 同目录的 `data/`，移动软件时可以将 EXE 与该目录一起移动；安装版由安装程序管理应用目录和更新。
 
-单文件版本首次启动需要解包运行组件，可能比后续启动稍慢。Windows SmartScreen 提示未知发布者时，请先确认文件来自本仓库 Release，再决定是否运行。
+便携版首次启动需要解包运行组件，可能比后续启动稍慢。Windows SmartScreen 提示未知发布者时，请先确认文件来自本仓库 Release，再决定是否运行。
 
 ## 便携数据
 

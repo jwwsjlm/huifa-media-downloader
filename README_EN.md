@@ -20,7 +20,7 @@
 
 Huifa Media Downloader is a desktop application for Windows 10/11 x64. It uses `yt-dlp` to resolve videos, playlists, channels, and other collection URLs, uses FFmpeg for merging and transcoding, and provides cookie-based sign-in, thumbnail processing, subtitles, task management, and multi-platform publishing workflows.
 
-The official release is a single `HuifaVideoDownloader.exe` containing the Python runtime and required application components. End users do not need to install Python, Chrome, FFmpeg, or yt-dlp.
+Official releases provide both a portable ZIP and an installer ZIP. Both editions contain the Python runtime and required application components, so end users do not need to install Python, Chrome, FFmpeg, or yt-dlp.
 
 ## Features
 
@@ -39,11 +39,11 @@ The official release is a single `HuifaVideoDownloader.exe` containing the Pytho
 ## Download and use
 
 1. Open the [latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest).
-2. Download `HuifaVideoDownloader.exe`.
-3. Place the executable in a permanent folder and run it directly.
-4. Application data is stored in `data/` beside the executable. Move that directory together with the EXE to retain your settings and tasks.
+2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract it, and run `HuifaVideoDownloader.exe`.
+3. For an installed edition, download `HuifaMediaDownloader-<version>-installer-win-x64.zip`, extract it, and run `HuifaMediaDownloader-Setup.exe`.
+4. Portable-edition data stays in `data/` beside the EXE. The installed edition lets its installer manage the application directory and updates.
 
-The single-file build extracts its runtime on first launch, so the first startup may take longer. If Windows SmartScreen reports an unknown publisher, verify that the file came from this repository's Release page before deciding whether to run it.
+The portable build extracts its runtime on first launch, so the first startup may take longer. If Windows SmartScreen reports an unknown publisher, verify that the file came from this repository's Release page before deciding whether to run it.
 
 ## Portable data
 
@@ -77,4 +77,3 @@ Pushing a `v<version>` tag matching `APP_VERSION` makes GitHub Actions run the t
 ## Responsible use
 
 Only download, process, and publish content you are authorized to use. Some platforms may require sign-in, CAPTCHA, two-factor authentication, or manual confirmation, and their rules or available formats may change over time.
-

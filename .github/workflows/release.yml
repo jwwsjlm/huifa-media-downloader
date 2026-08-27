@@ -43,6 +43,15 @@ jobs:
           if ($env:GITHUB_REF_NAME -ne "v$Version") {
               throw "Tag $env:GITHUB_REF_NAME does not match APP_VERSION $Version"
           }
+          $ReleaseNotes = "release-notes\$Version.md"
+          if (-not (Test-Path -LiteralPath $ReleaseNotes -PathType Leaf)) {
+              throw "Release notes are required: $ReleaseNotes"
+          }
+          if ([string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $ReleaseNotes -Raw -Encoding UTF8))) {
+              throw "Release notes are empty: $ReleaseNotes"
+          }
+          "RELEASE_VERSION=$Version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_NOTES=$ReleaseNotes" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Create release environment
         shell: pwsh
@@ -61,20 +70,26 @@ jobs:
         shell: pwsh
         run: .\scripts\build_release.ps1
 
-      - name: Create SHA-256 manifest
+      - name: Build and verify installer
         shell: pwsh
-        run: |
-          $Executable = 'releases\HuifaVideoDownloader.exe'
-          $Digest = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$Digest  HuifaVideoDownloader.exe" | Set-Content -LiteralPath 'releases\SHA256SUMS.txt' -Encoding utf8NoBOM
+        run: >-
+          .\scripts\build_velopack_release.ps1
+          -Version $env:RELEASE_VERSION
+          -ReleaseNotes $env:RELEASE_NOTES
+          -SkipTests
+
+      - name: Package portable and installer ZIP files
+        shell: pwsh
+        run: >-
+          .\scripts\package_github_release.ps1
+          -Version $env:RELEASE_VERSION
+          -ReleaseNotes $env:RELEASE_NOTES
 
       - name: Preserve build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: HuifaVideoDownloader-${{ github.ref_name }}
-          path: |
-            releases/HuifaVideoDownloader.exe
-            releases/SHA256SUMS.txt
+          name: HuifaMediaDownloader-${{ github.ref_name }}
+          path: release-assets/*
           if-no-files-found: error
           retention-days: 14
 
@@ -85,10 +100,10 @@ jobs:
         run: |
           $Tag = $env:GITHUB_REF_NAME
           $Version = $Tag.TrimStart('v')
-          $Assets = @(
-              'releases\HuifaVideoDownloader.exe#Huifa Media Downloader (Windows x64)',
-              'releases\SHA256SUMS.txt#SHA-256 checksums'
-          )
+          $Assets = @(Get-ChildItem -LiteralPath 'release-assets' -File | ForEach-Object { $_.FullName })
+          if ($Assets.Count -lt 6) {
+              throw "Release asset set is incomplete; found $($Assets.Count) files"
+          }
           gh release view $Tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
               gh release upload $Tag @Assets `
@@ -98,13 +113,14 @@ jobs:
               gh release edit $Tag `
                   --repo $env:GITHUB_REPOSITORY `
                   --latest `
+                  --notes-file $env:RELEASE_NOTES `
                   --title "Huifa Media Downloader $Version"
           }
           else {
               gh release create $Tag @Assets `
                   --repo $env:GITHUB_REPOSITORY `
                   --verify-tag `
-                  --generate-notes `
+                  --notes-file $env:RELEASE_NOTES `
                   --latest `
                   --title "Huifa Media Downloader $Version"
           }
