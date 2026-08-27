@@ -164,6 +164,13 @@ class PackagedRuntimeSmokeTests(unittest.TestCase):
         self.assertIn("pyside6_version", script)
         self.assertIn("secure_store_backend", script)
 
+    def test_velopack_spec_does_not_package_removed_sau_directories(self) -> None:
+        spec = (app_main.PROJECT_ROOT / "build" / "HuifaVideoDownloader.velopack.spec").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn('(\"myUtils\", \"third_party/social_auto_upload/myUtils\")', spec)
+
 
 if __name__ == "__main__":
     unittest.main()

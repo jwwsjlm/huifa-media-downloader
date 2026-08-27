@@ -49,7 +49,6 @@ for vendor_name, vendor_destination in (
     ("sau_cli.py", "third_party/social_auto_upload"),
     ("LICENSE", "third_party/social_auto_upload"),
     ("UPSTREAM_COMMIT", "third_party/social_auto_upload"),
-    ("myUtils", "third_party/social_auto_upload/myUtils"),
     ("uploader", "third_party/social_auto_upload/uploader"),
     ("utils", "third_party/social_auto_upload/utils"),
 ):
