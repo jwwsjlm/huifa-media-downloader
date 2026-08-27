@@ -39,11 +39,11 @@
 ## 下载与使用
 
 1. 打开 [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest)。
-2. 便携使用请选择 `HuifaMediaDownloader-<版本>-portable-win-x64.zip`，解压后运行 `HuifaVideoDownloader.exe`。
+2. 便携使用请选择 `HuifaMediaDownloader-<版本>-portable-win-x64.zip`，完整解压后运行根目录的 `HuifaVideoDownloader.exe`，不要只复制 EXE。
 3. 需要安装到系统时请选择 `HuifaMediaDownloader-<版本>-installer-win-x64.zip`，解压后运行 `HuifaMediaDownloader-Setup.exe`。
-4. 便携版数据默认保存在 EXE 同目录的 `data/`，移动软件时可以将 EXE 与该目录一起移动；安装版由安装程序管理应用目录和更新。
+4. 便携版数据默认保存在解压目录的 `data/`，移动软件时需要移动整个文件夹；安装版由安装程序管理应用目录和更新。
 
-便携版首次启动需要解包运行组件，可能比后续启动稍慢。Windows SmartScreen 提示未知发布者时，请先确认文件来自本仓库 Release，再决定是否运行。
+便携版采用可自动更新的目录结构，FFmpeg、FFprobe、yt-dlp、Deno、yt-dlp-ejs 和 Chromium 位于软件自身的 `current/tools/` 中。Windows SmartScreen 提示未知发布者时，请先确认文件来自本仓库 Release，再决定是否运行。
 
 ## 便携数据
 
@@ -72,7 +72,7 @@ python -m app.main
 
 ## 自动发布
 
-推送与 `APP_VERSION` 一致的 `v<版本号>` tag 后，GitHub Actions 会在 Windows Runner 上执行测试、准备官方运行时、构建单文件 EXE、生成 SHA-256 清单并发布 GitHub Release。
+推送与 `APP_VERSION` 一致的 `v<版本号>` tag 后，GitHub Actions 会在 Windows Runner 上执行测试、准备官方运行时、构建可整目录更新的便携版和安装版、生成 SHA-256 清单并发布 GitHub Release。
 
 ## 使用说明
 

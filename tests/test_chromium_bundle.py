@@ -16,19 +16,29 @@ class ChromiumBundleTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.root = Path(__file__).resolve().parents[1]
 
-    def test_release_specs_ship_only_the_complete_chromium_runtime(self) -> None:
-        for spec_name in (
-            "HuifaVideoDownloader.lean.spec",
-            "HuifaVideoDownloader.velopack.spec",
-        ):
-            with self.subTest(spec=spec_name):
-                source = (self.root / "build" / spec_name).read_text(encoding="utf-8")
-                self.assertIn("chromium-*/chrome-win64/chrome.exe", source)
-                self.assertIn("tools/chromium/chrome-win64", source)
-                self.assertNotIn("datas.append((str(chromium_dir)", source)
-                self.assertNotIn("chromium_headless_shell", source)
-                self.assertNotIn("ffmpeg-1011", source)
-                self.assertNotIn("winldd-1007", source)
+    def test_release_builds_ship_only_the_complete_chromium_runtime(self) -> None:
+        legacy_spec = (
+            self.root / "build" / "HuifaVideoDownloader.lean.spec"
+        ).read_text(encoding="utf-8")
+        self.assertIn("chromium-*/chrome-win64/chrome.exe", legacy_spec)
+        self.assertIn("tools/chromium/chrome-win64", legacy_spec)
+        self.assertNotIn("datas.append((str(chromium_dir)", legacy_spec)
+
+        managed_spec = (
+            self.root / "build" / "HuifaVideoDownloader.velopack.spec"
+        ).read_text(encoding="utf-8")
+        managed_build = (
+            self.root / "scripts" / "build_velopack_release.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("tools/chromium/chrome-win64", managed_spec)
+        self.assertIn("Stage-PortableRuntimeTools", managed_build)
+        self.assertIn("tools\\chromium\\chrome-win64", managed_build)
+        self.assertIn("chrome.exe", managed_build)
+
+        for source in (legacy_spec, managed_spec, managed_build):
+            self.assertNotIn("chromium_headless_shell", source)
+            self.assertNotIn("ffmpeg-1011", source)
+            self.assertNotIn("winldd-1007", source)
 
     def test_browser_runtime_uses_official_playwright_only(self) -> None:
         runtime_source = Path(runtime.__file__).read_text(encoding="utf-8")

@@ -14,7 +14,6 @@ $SingleExeRoot = Join-Path $Root 'releases'
 $VelopackRoot = Join-Path $Root 'releases-velopack'
 $OutputRoot = Join-Path $Root 'release-assets'
 $StageRoot = Join-Path $Root "build\github-release-$Version"
-$PortableStage = Join-Path $StageRoot 'portable'
 $InstallerStage = Join-Path $StageRoot 'installer'
 $SingleExe = Join-Path $SingleExeRoot 'HuifaVideoDownloader.exe'
 $PortableName = "HuifaMediaDownloader-$Version-portable-win-x64.zip"
@@ -74,6 +73,37 @@ function Assert-ZipEntries(
     }
 }
 
+function Assert-ZipEntryPattern(
+    [string] $ArchivePath,
+    [string] $Pattern,
+    [string] $Label,
+    [bool] $RequireNonEmpty = $true
+) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Archive = $null
+    try {
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+        $Matches = @(
+            $Archive.Entries |
+                Where-Object {
+                    $_.FullName -match $Pattern -and
+                    (-not $RequireNonEmpty -or $_.Length -gt 0)
+                }
+        )
+        if ($Matches.Count -ne 1) {
+            throw "archive must contain one $Label"
+        }
+    }
+    catch {
+        throw "Invalid release archive $ArchivePath ($($_.Exception.Message))"
+    }
+    finally {
+        if ($null -ne $Archive) {
+            $Archive.Dispose()
+        }
+    }
+}
+
 $ReleaseNotesFull = Resolve-ProjectPath $ReleaseNotes
 if (-not (Test-Path -LiteralPath $ReleaseNotesFull -PathType Leaf)) {
     throw "Release notes file does not exist: $ReleaseNotesFull"
@@ -92,6 +122,13 @@ if ($SetupMatches.Count -ne 1 -or $SetupMatches[0].Length -le 0) {
     throw "Expected exactly one non-empty Velopack Setup.exe; found $($SetupMatches.Count)"
 }
 $Setup = $SetupMatches[0]
+$PortableMatches = @(
+    Get-ChildItem -LiteralPath $VelopackRoot -Filter 'Huifa.VideoDownloader*-Portable.zip' -File -ErrorAction SilentlyContinue
+)
+if ($PortableMatches.Count -ne 1 -or $PortableMatches[0].Length -le 0) {
+    throw "Expected exactly one non-empty Velopack Portable.zip; found $($PortableMatches.Count)"
+}
+$VelopackPortable = $PortableMatches[0]
 
 $ReleaseFeed = Join-Path $VelopackRoot 'releases.win.json'
 $AssetsFeed = Join-Path $VelopackRoot 'assets.win.json'
@@ -126,21 +163,34 @@ foreach ($Target in @($OutputRootFull, $StageRootFull)) {
     }
 }
 New-Item -ItemType Directory -Path $OutputRootFull -Force | Out-Null
-New-Item -ItemType Directory -Path $PortableStage -Force | Out-Null
 New-Item -ItemType Directory -Path $InstallerStage -Force | Out-Null
 
-Copy-Item -LiteralPath $SingleExe -Destination (Join-Path $PortableStage 'HuifaVideoDownloader.exe')
-Copy-Item -LiteralPath $ReleaseNotesFull -Destination (Join-Path $PortableStage 'RELEASE_NOTES.md')
 Copy-Item -LiteralPath $Setup.FullName -Destination (Join-Path $InstallerStage 'HuifaMediaDownloader-Setup.exe')
 Copy-Item -LiteralPath $ReleaseNotesFull -Destination (Join-Path $InstallerStage 'RELEASE_NOTES.md')
 
-Compress-Archive -Path (Join-Path $PortableStage '*') -DestinationPath $PortableArchive -CompressionLevel Optimal
+Copy-Item -LiteralPath $VelopackPortable.FullName -Destination $PortableArchive
 Compress-Archive -Path (Join-Path $InstallerStage '*') -DestinationPath $InstallerArchive -CompressionLevel Optimal
-Assert-ZipEntries $PortableArchive @('HuifaVideoDownloader.exe', 'RELEASE_NOTES.md')
+Assert-ZipEntries $PortableArchive @(
+    'Update.exe',
+    'current/HuifaVideoDownloader.exe',
+    'current/sq.version',
+    'current/RELEASE_NOTES.md',
+    'current/tools/ffmpeg/x64/ffmpeg.exe',
+    'current/tools/ffmpeg/x64/ffprobe.exe',
+    'current/tools/yt-dlp/x64/yt-dlp.exe',
+    'current/tools/deno/x64/deno.exe',
+    'current/tools/chromium/chrome-win64/chrome.exe'
+)
+Assert-ZipEntryPattern $PortableArchive '^\.portable$' 'Velopack portable marker' $false
+Assert-ZipEntryPattern `
+    $PortableArchive `
+    '^current/tools/yt-dlp-ejs/yt_dlp_ejs-.+-py3-none-any\.whl$' `
+    'yt-dlp-ejs wheel'
 Assert-ZipEntries $InstallerArchive @('HuifaMediaDownloader-Setup.exe', 'RELEASE_NOTES.md')
 
-# Keep the raw one-file executable as a technical asset for the existing
-# portable updater. Human-facing downloads are the two ZIP archives above.
+# Keep the raw one-file executable only as a compatibility asset for users of
+# the legacy v0.1.1 portable updater. New portable downloads use Velopack's
+# directory layout and update the complete application plus bundled tools.
 Copy-Item -LiteralPath $SingleExe -Destination (Join-Path $OutputRoot 'HuifaVideoDownloader.exe')
 Copy-Item -LiteralPath $ReleaseNotesFull -Destination (Join-Path $OutputRoot 'RELEASE_NOTES.md')
 

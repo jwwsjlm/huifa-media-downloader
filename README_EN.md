@@ -39,11 +39,11 @@ Official releases provide both a portable ZIP and an installer ZIP. Both edition
 ## Download and use
 
 1. Open the [latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest).
-2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract it, and run `HuifaVideoDownloader.exe`.
+2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract the complete archive, and run the root `HuifaVideoDownloader.exe`. Do not copy only the EXE.
 3. For an installed edition, download `HuifaMediaDownloader-<version>-installer-win-x64.zip`, extract it, and run `HuifaMediaDownloader-Setup.exe`.
-4. Portable-edition data stays in `data/` beside the EXE. The installed edition lets its installer manage the application directory and updates.
+4. Portable-edition data stays in `data/` inside the extracted root. Move the complete folder when relocating it. The installed edition lets its installer manage the application directory and updates.
 
-The portable build extracts its runtime on first launch, so the first startup may take longer. If Windows SmartScreen reports an unknown publisher, verify that the file came from this repository's Release page before deciding whether to run it.
+The portable edition uses a self-updating directory layout. FFmpeg, FFprobe, yt-dlp, Deno, yt-dlp-ejs, and Chromium are shipped in the application's own `current/tools/` directory. If Windows SmartScreen reports an unknown publisher, verify that the file came from this repository's Release page before deciding whether to run it.
 
 ## Portable data
 
@@ -72,7 +72,7 @@ See the [development and release notes](docs/DEVELOPMENT.md) for build details, 
 
 ## Automated releases
 
-Pushing a `v<version>` tag matching `APP_VERSION` makes GitHub Actions run the test suite, prepare official runtimes, build the single executable, create a SHA-256 manifest, and publish a GitHub Release on a Windows runner.
+Pushing a `v<version>` tag matching `APP_VERSION` makes GitHub Actions run the test suite, prepare official runtimes, build the directory-updatable portable and installed editions, create a SHA-256 manifest, and publish a GitHub Release on a Windows runner.
 
 ## Responsible use
 

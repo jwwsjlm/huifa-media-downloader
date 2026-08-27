@@ -36,6 +36,7 @@ $StageRoot = Join-Path $Root 'build\velopack-dist'
 $StageApp = Join-Path $StageRoot 'HuifaVideoDownloader'
 $WorkRoot = Join-Path $Root 'build\pyinstaller-velopack'
 $ReleaseRoot = Join-Path $Root 'releases-velopack'
+$ReleaseToolsRoot = Join-Path $Root 'tools'
 $ReleaseNotesFull = ''
 $ExpectedVelopackVersion = '1.2.0'
 
@@ -160,6 +161,77 @@ function Assert-ValidZipArchive {
     }
 }
 
+function Copy-RequiredReleaseFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf) -or (Get-Item -LiteralPath $Source).Length -le 0) {
+        throw "Required portable runtime is missing or empty: $Source"
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $Destination) -Force | Out-Null
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
+function Stage-PortableRuntimeTools {
+    $ToolTarget = Join-Path $StageApp 'tools'
+    Copy-RequiredReleaseFile `
+        -Source (Join-Path $ReleaseToolsRoot 'ffmpeg\x64\ffmpeg.exe') `
+        -Destination (Join-Path $ToolTarget 'ffmpeg\x64\ffmpeg.exe')
+    Copy-RequiredReleaseFile `
+        -Source (Join-Path $ReleaseToolsRoot 'ffmpeg\x64\ffprobe.exe') `
+        -Destination (Join-Path $ToolTarget 'ffmpeg\x64\ffprobe.exe')
+    Copy-RequiredReleaseFile `
+        -Source (Join-Path $ReleaseToolsRoot 'yt-dlp\x64\yt-dlp.exe') `
+        -Destination (Join-Path $ToolTarget 'yt-dlp\x64\yt-dlp.exe')
+    Copy-RequiredReleaseFile `
+        -Source (Join-Path $ReleaseToolsRoot 'deno\x64\deno.exe') `
+        -Destination (Join-Path $ToolTarget 'deno\x64\deno.exe')
+
+    $EjsWheels = @(
+        Get-ChildItem -LiteralPath (Join-Path $ReleaseToolsRoot 'yt-dlp-ejs') -File -Filter 'yt_dlp_ejs-*.whl' -ErrorAction SilentlyContinue |
+            Sort-Object {
+                if ($_.Name -match '^yt_dlp_ejs-([0-9]+(?:\.[0-9]+){1,3})-') {
+                    [version]$Matches[1]
+                }
+                else {
+                    [version]'0.0'
+                }
+            }
+    )
+    if ($EjsWheels.Count -lt 1 -or $EjsWheels[-1].Length -le 0) {
+        throw 'No non-empty yt-dlp-ejs wheel was found.'
+    }
+    $EjsWheel = $EjsWheels[-1]
+    Copy-RequiredReleaseFile `
+        -Source $EjsWheel.FullName `
+        -Destination (Join-Path $ToolTarget ('yt-dlp-ejs\' + $EjsWheel.Name))
+
+    $ChromiumExecutables = @(
+        Get-ChildItem -LiteralPath (Join-Path $ReleaseToolsRoot 'chromium') -Recurse -File -Filter 'chrome.exe' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Name -eq 'chrome-win64' }
+    )
+    if ($ChromiumExecutables.Count -lt 1) {
+        throw 'No complete Playwright Chromium runtime was found.'
+    }
+    $ChromiumExecutable = @(
+        $ChromiumExecutables |
+            Sort-Object {
+                if ($_.FullName -match 'chromium-(\d+)') { [int]$Matches[1] } else { 0 }
+            }
+    )[-1]
+    $ChromiumSource = $ChromiumExecutable.Directory.FullName
+    $ChromiumTarget = Join-Path $ToolTarget 'chromium\chrome-win64'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ChromiumTarget) -Force | Out-Null
+    Copy-Item -LiteralPath $ChromiumSource -Destination $ChromiumTarget -Recurse -Force
+
+    if ($ReleaseNotesFull) {
+        Copy-RequiredReleaseFile `
+            -Source $ReleaseNotesFull `
+            -Destination (Join-Path $StageApp 'RELEASE_NOTES.md')
+    }
+}
+
 foreach ($RequiredFile in @($Python, $PyInstaller, $Spec, $ToolManifest, $ApplicationIcon)) {
     if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
         throw "Required build file is missing: $RequiredFile"
@@ -235,6 +307,7 @@ $MainExecutable = Join-Path $StageApp 'HuifaVideoDownloader.exe'
 if (-not (Test-Path -LiteralPath $MainExecutable -PathType Leaf)) {
     throw "PyInstaller completed without creating $MainExecutable"
 }
+Stage-PortableRuntimeTools
 
 # Keep the deployment tool pinned to the same version as the Python SDK.
 Push-Location $Root
@@ -361,6 +434,120 @@ if ($ExpectedHash) {
 
 Assert-ValidZipArchive -File $FullPackage
 Assert-ValidZipArchive -File $Portable -RequiredFileName 'HuifaVideoDownloader.exe'
+
+# Exercise the exact directory-style portable artifact that users download.
+# Running from current/ proves Velopack management is detected and that the
+# external tools copied beside the application are preferred over PyInstaller
+# extraction fallbacks.
+$PortableSmokeRoot = Join-Path $Root ('build\velopack-portable-smoke-' + [guid]::NewGuid().ToString('N'))
+$PortableSmokeReport = Join-Path $PortableSmokeRoot 'portable-smoke.json'
+try {
+    Expand-Archive -LiteralPath $Portable.FullName -DestinationPath $PortableSmokeRoot -Force
+    $PortableCurrent = Join-Path $PortableSmokeRoot 'current'
+    $PortableExecutable = Join-Path $PortableCurrent 'HuifaVideoDownloader.exe'
+    foreach ($RequiredPortablePath in @(
+        (Join-Path $PortableSmokeRoot 'Update.exe'),
+        (Join-Path $PortableSmokeRoot '.portable'),
+        (Join-Path $PortableCurrent 'sq.version'),
+        $PortableExecutable,
+        (Join-Path $PortableCurrent 'tools\ffmpeg\x64\ffmpeg.exe'),
+        (Join-Path $PortableCurrent 'tools\ffmpeg\x64\ffprobe.exe'),
+        (Join-Path $PortableCurrent 'tools\yt-dlp\x64\yt-dlp.exe'),
+        (Join-Path $PortableCurrent 'tools\deno\x64\deno.exe'),
+        (Join-Path $PortableCurrent 'tools\chromium\chrome-win64\chrome.exe')
+    )) {
+        if (-not (Test-Path -LiteralPath $RequiredPortablePath -PathType Leaf)) {
+            throw "Portable package is missing required file: $RequiredPortablePath"
+        }
+    }
+    $PortableEjsWheels = @(
+        Get-ChildItem -LiteralPath (Join-Path $PortableCurrent 'tools\yt-dlp-ejs') -File -Filter 'yt_dlp_ejs-*.whl' -ErrorAction SilentlyContinue
+    )
+    if ($PortableEjsWheels.Count -ne 1 -or $PortableEjsWheels[0].Length -le 0) {
+        throw "Portable package must contain exactly one yt-dlp-ejs wheel; found $($PortableEjsWheels.Count)."
+    }
+
+    $SmokeStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $SmokeStartInfo.FileName = $PortableExecutable
+    $SmokeStartInfo.WorkingDirectory = $PortableCurrent
+    $SmokeStartInfo.UseShellExecute = $false
+    $SmokeStartInfo.CreateNoWindow = $true
+    $SmokeStartInfo.EnvironmentVariables['QT_QPA_PLATFORM'] = 'offscreen'
+    $SmokeStartInfo.EnvironmentVariables['HUIFA_PACKAGED_SMOKE_OUTPUT'] = $PortableSmokeReport
+    $SmokeProcess = [System.Diagnostics.Process]::Start($SmokeStartInfo)
+    if ($null -eq $SmokeProcess -or -not $SmokeProcess.WaitForExit(90000)) {
+        if ($null -ne $SmokeProcess) {
+            try { $SmokeProcess.Kill($true) } catch { Stop-Process -Id $SmokeProcess.Id -Force -ErrorAction SilentlyContinue }
+        }
+        throw 'Velopack portable smoke test timed out after 90 seconds.'
+    }
+    if ($SmokeProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $PortableSmokeReport -PathType Leaf)) {
+        throw "Velopack portable smoke test failed with exit code $($SmokeProcess.ExitCode)."
+    }
+    $SmokeResult = Get-Content -LiteralPath $PortableSmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $SmokeResult.ok -or $SmokeResult.application_update_mode -ne 'velopack') {
+        throw 'Velopack portable smoke report did not confirm a managed portable runtime.'
+    }
+    foreach ($ToolPath in @($SmokeResult.ffmpeg.runtime_path, $SmokeResult.ffprobe.runtime_path)) {
+        if (-not ([System.IO.Path]::GetFullPath([string]$ToolPath)).StartsWith(
+            [System.IO.Path]::GetFullPath((Join-Path $PortableCurrent 'tools')) + '\',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "Portable runtime resolved a tool outside current\tools: $ToolPath"
+        }
+    }
+
+    # Prove that a real Velopack apply operation replaces the complete current
+    # directory (including external tools) while preserving portable data.
+    $PersistentMarker = Join-Path $PortableSmokeRoot 'data\portable-update-preserve.txt'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $PersistentMarker) -Force | Out-Null
+    Set-Content -LiteralPath $PersistentMarker -Value 'preserve' -Encoding ASCII
+    $DenoPath = Join-Path $PortableCurrent 'tools\deno\x64\deno.exe'
+    $ExpectedDenoHash = (Get-FileHash -LiteralPath $DenoPath -Algorithm SHA256).Hash
+    [System.IO.File]::WriteAllBytes($DenoPath, [byte[]](0x4d, 0x5a, 0x00, 0x01))
+    $PortablePackages = Join-Path $PortableSmokeRoot 'packages'
+    New-Item -ItemType Directory -Path $PortablePackages -Force | Out-Null
+    $LocalFullPackage = Join-Path $PortablePackages $FullPackage.Name
+    Copy-Item -LiteralPath $FullPackage.FullName -Destination $LocalFullPackage -Force
+
+    $UpdateStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $UpdateStartInfo.FileName = Join-Path $PortableSmokeRoot 'Update.exe'
+    $UpdateStartInfo.WorkingDirectory = $PortableSmokeRoot
+    $UpdateStartInfo.UseShellExecute = $false
+    $UpdateStartInfo.CreateNoWindow = $true
+    foreach ($Argument in @(
+        '--silent',
+        '--rootDir', $PortableSmokeRoot,
+        '--packageDir', $PortablePackages,
+        'apply',
+        '--package', $LocalFullPackage,
+        '--norestart'
+    )) {
+        $UpdateStartInfo.ArgumentList.Add($Argument)
+    }
+    $UpdateProcess = [System.Diagnostics.Process]::Start($UpdateStartInfo)
+    if ($null -eq $UpdateProcess -or -not $UpdateProcess.WaitForExit(120000)) {
+        if ($null -ne $UpdateProcess) {
+            try { $UpdateProcess.Kill($true) } catch { Stop-Process -Id $UpdateProcess.Id -Force -ErrorAction SilentlyContinue }
+        }
+        throw 'Velopack portable update apply test timed out after 120 seconds.'
+    }
+    if ($UpdateProcess.ExitCode -ne 0) {
+        throw "Velopack portable update apply test failed with exit code $($UpdateProcess.ExitCode)."
+    }
+    $ActualDenoHash = (Get-FileHash -LiteralPath $DenoPath -Algorithm SHA256).Hash
+    if ($ActualDenoHash -ne $ExpectedDenoHash) {
+        throw 'Velopack update did not restore the bundled Deno runtime.'
+    }
+    if (-not (Test-Path -LiteralPath $PersistentMarker -PathType Leaf)) {
+        throw 'Velopack update removed portable user data outside current/.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $PortableSmokeRoot) {
+        Remove-Item -LiteralPath $PortableSmokeRoot -Recurse -Force
+    }
+}
 
 Write-Host "Velopack release directory: $ReleaseRoot"
 Write-Host "Installer: $($Setup.Name) ($($Setup.Length) bytes)"

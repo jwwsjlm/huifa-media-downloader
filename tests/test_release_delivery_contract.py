@@ -65,6 +65,37 @@ class ReleaseDeliveryContractTests(unittest.TestCase):
         self.assertIn("--release-dir", script)
         self.assertNotIn("COLLECT(", spec)
 
+    def test_user_portable_is_velopack_managed_and_stages_visible_tools(self) -> None:
+        build = (ROOT / "scripts" / "build_velopack_release.ps1").read_text(
+            encoding="utf-8"
+        )
+        package = (ROOT / "scripts" / "package_github_release.ps1").read_text(
+            encoding="utf-8"
+        )
+        spec = (ROOT / "build" / "HuifaVideoDownloader.velopack.spec").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Stage-PortableRuntimeTools", build)
+        for relative in (
+            "ffmpeg\\x64\\ffmpeg.exe",
+            "ffmpeg\\x64\\ffprobe.exe",
+            "yt-dlp\\x64\\yt-dlp.exe",
+            "deno\\x64\\deno.exe",
+            "yt-dlp-ejs",
+            "chromium\\chrome-win64",
+        ):
+            self.assertIn(relative, build)
+        self.assertIn("application_update_mode -ne 'velopack'", build)
+        self.assertIn("portable-update-preserve.txt", build)
+        self.assertIn("Velopack update did not restore the bundled Deno runtime", build)
+        self.assertIn("ArgumentList.Add", build)
+        self.assertIn("Huifa.VideoDownloader*-Portable.zip", package)
+        self.assertIn("current/sq.version", package)
+        self.assertIn("^\\.portable$", package)
+        self.assertNotIn('ffmpeg_dir = PROJECT_ROOT / "tools"', spec)
+        self.assertNotIn('chromium_dir = PROJECT_ROOT / "tools"', spec)
+
     def test_portable_external_tools_always_prefer_exe_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

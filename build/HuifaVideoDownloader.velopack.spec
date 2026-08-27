@@ -38,26 +38,12 @@ windows_version_info = build_windows_version_info(
 )
 
 
-ffmpeg_dir = PROJECT_ROOT / "tools" / "ffmpeg" / "x64"
-datas = [
-    (str(path), "tools/ffmpeg/x64")
-    for path in ffmpeg_dir.iterdir()
-    if path.is_file() and path.name.lower() not in {"ffplay.exe", "readme.md"}
-]
+datas = []
 datas.append((str(PROJECT_ROOT / "assets" / "huifa.ico"), "assets"))
 datas.append((str(PROJECT_ROOT / "languages"), "languages"))
 vendor_sau = PROJECT_ROOT / "third_party" / "social_auto_upload"
-chromium_dir = PROJECT_ROOT / "tools" / "chromium"
 if not (vendor_sau / "sau_cli.py").is_file():
     raise FileNotFoundError("Missing vendored social-auto-upload source")
-chromium_executables = sorted(chromium_dir.glob("chromium-*/chrome-win64/chrome.exe"))
-if not chromium_executables:
-    raise FileNotFoundError("Missing app-local Playwright Chromium")
-chromium_executable = max(
-    chromium_executables,
-    key=lambda path: int(path.parents[1].name.rsplit("-", 1)[-1]),
-)
-chromium_runtime_dir = chromium_executable.parent
 for vendor_name, vendor_destination in (
     ("__init__.py", "third_party/social_auto_upload"),
     ("conf.py", "third_party/social_auto_upload"),
@@ -69,9 +55,6 @@ for vendor_name, vendor_destination in (
     ("utils", "third_party/social_auto_upload/utils"),
 ):
     datas.append((str(vendor_sau / vendor_name), vendor_destination))
-# One complete Chromium handles both visible login and background publishing.
-# Exclude the duplicate headless shell and Playwright's recording/install tools.
-datas.append((str(chromium_runtime_dir), "tools/chromium/chrome-win64"))
 datas += collect_data_files("yt_dlp")
 playwright_datas, playwright_binaries, playwright_hidden = collect_all("playwright")
 datas += playwright_datas
