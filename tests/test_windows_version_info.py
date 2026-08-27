@@ -1,0 +1,74 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from windows_version_info import build_windows_version_info, normalize_windows_version
+
+from app.core.version import (
+    APP_COPYRIGHT,
+    APP_DESCRIPTION,
+    APP_NAME,
+    APP_PUBLISHER,
+    APP_VERSION,
+)
+
+
+class WindowsVersionInfoTests(unittest.TestCase):
+    def test_pep440_versions_are_normalized_to_four_windows_fields(self) -> None:
+        self.assertEqual(normalize_windows_version("0.1.0"), ((0, 1, 0, 0), "0.1.0", False))
+        self.assertEqual(normalize_windows_version("v1.2.3-beta.2"), ((1, 2, 3, 0), "1.2.3-beta.2", True))
+
+    def test_invalid_or_unrepresentable_versions_are_rejected(self) -> None:
+        for value in ("", "not-a-version", "1.2.3.4.5", "1.70000"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                normalize_windows_version(value)
+
+    def test_product_fields_are_embedded_in_version_resource(self) -> None:
+        version_info = build_windows_version_info(
+            APP_VERSION,
+            APP_NAME,
+            APP_PUBLISHER,
+            APP_DESCRIPTION,
+            APP_COPYRIGHT,
+        )
+        rendered = str(version_info)
+        for expected in (
+            APP_NAME,
+            APP_PUBLISHER,
+            APP_DESCRIPTION,
+            APP_COPYRIGHT,
+            "HuifaVideoDownloader.exe",
+            "ProductVersion",
+            APP_VERSION,
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, rendered)
+
+    def test_both_specs_attach_shared_version_resource(self) -> None:
+        for name in ("HuifaVideoDownloader.lean.spec", "HuifaVideoDownloader.velopack.spec"):
+            source = (ROOT / "build" / name).read_text(encoding="utf-8")
+            with self.subTest(spec=name):
+                self.assertIn("build_windows_version_info", source)
+                self.assertIn("version=windows_version_info", source)
+
+    def test_release_script_validates_windows_product_identity(self) -> None:
+        source = (ROOT / "scripts" / "build_release.ps1").read_text(encoding="utf-8")
+        for field in ("ProductVersion", "FileVersion", "ProductName", "CompanyName", "OriginalFilename"):
+            with self.subTest(field=field):
+                self.assertIn(field, source)
+        self.assertIn("from app.core.version import APP_NAME", source)
+        self.assertIn("base64.b64encode(APP_NAME.encode('utf-8'))", source)
+        self.assertIn("from app.core.version import APP_PUBLISHER", source)
+        self.assertIn("[StringComparison]::Ordinal", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

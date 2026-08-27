@@ -1,0 +1,16 @@
+# 构建目录约定
+
+项目根目录只保留源码、运行组件和正式发行目录。构建过程产生的中间文件统一放在 `build/`：
+
+- `build/HuifaVideoDownloader*.spec`：可复现的 PyInstaller 配置；
+- `build/01_velopack_hook.py`：Velopack 构建钩子；
+- 其他目录和报告均为可重新生成的临时构建产物，不保留在工作区中。
+
+发行脚本按需创建以下目录：
+
+- `releases/`：单文件正式发行目录，主构建脚本输出 `HuifaVideoDownloader.exe`；
+- `releases-velopack/`：显式执行 Velopack 脚本时生成的安装包和 Portable 包。
+
+`data/` 是运行时数据，不能当作构建产物清理；`tools/`、`third_party/`、`languages/` 是软件运行所需的本地组件和资源。
+
+需要回到干净的开发工作区时执行 `scripts/organize_workspace.ps1`。该脚本会删除可重新生成的构建/发行输出、旧组件副本和已知测试缓存；保留源码、当前运行组件、数据库、设置、有效 Cookie/Profile、下载内容与三代数据库备份。

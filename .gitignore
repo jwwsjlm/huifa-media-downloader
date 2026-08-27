@@ -15,12 +15,35 @@ __pycache__/
 # Build and packaging output
 build/
 dist/
+/release/
+/releases/
+/releases-velopack/
+/releases_debug/
+/releases_icon/
+/releases_lean/
+/.tmp/
 *.spec
 
-# Download archives are kept outside the repository; bundled runtime files
-# under tools/ffmpeg/x86 and tools/ffmpeg/x64 are intentionally tracked.
-*.zip
+# Keep reproducible build recipes while ignoring generated PyInstaller output.
+!build/
+build/*
+!build/00_qtwebengine_hook.py
+!build/01_velopack_hook.py
+!build/HuifaVideoDownloader.lean.spec
+!build/HuifaVideoDownloader.velopack.spec
 
-# Legacy binaries at tools/ffmpeg root; architecture-specific builds are tracked below.
+# Download archives are kept outside the repository. App-local runtime
+# payloads are reproducible release inputs and do not belong in normal Git.
+# Release workflows obtain FFmpeg/FFprobe from yt-dlp/FFmpeg-Builds.
+*.zip
+/tools/chromium/
+/tools/deno/
+/tools/yt-dlp/
+/tools/yt-dlp-ejs/
+/tools/node/
+/tools/ffmpeg/**/*.exe
+/tools/ffmpeg/**/*.dll
+
+# Legacy binaries at tools/ffmpeg root.
 /tools/ffmpeg/*.exe
 /tools/ffmpeg/*.dll

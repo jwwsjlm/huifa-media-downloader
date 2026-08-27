@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Keep the Python SDK and vpk CLI on the same release. See
+# .config/dotnet-tools.json and scripts/build_velopack_release.ps1.
+velopack==1.2.0

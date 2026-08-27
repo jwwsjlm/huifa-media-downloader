@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      PYTHONUTF8: '1'
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Verify tag matches application version
+        shell: pwsh
+        run: |
+          $Version = (python -c "from app.core.version import APP_VERSION; print(APP_VERSION)").Trim()
+          if ($env:GITHUB_REF_NAME -ne "v$Version") {
+              throw "Tag $env:GITHUB_REF_NAME does not match APP_VERSION $Version"
+          }
+
+      - name: Create release environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+
+      - name: Download official release runtimes
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .\scripts\prepare_release_runtime.ps1
+
+      - name: Build and verify single executable
+        shell: pwsh
+        run: .\scripts\build_release.ps1
+
+      - name: Create SHA-256 manifest
+        shell: pwsh
+        run: |
+          $Executable = 'releases\HuifaVideoDownloader.exe'
+          $Digest = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$Digest  HuifaVideoDownloader.exe" | Set-Content -LiteralPath 'releases\SHA256SUMS.txt' -Encoding utf8NoBOM
+
+      - name: Preserve build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: HuifaVideoDownloader-${{ github.ref_name }}
+          path: |
+            releases/HuifaVideoDownloader.exe
+            releases/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $Tag = $env:GITHUB_REF_NAME
+          $Version = $Tag.TrimStart('v')
+          $Assets = @(
+              'releases\HuifaVideoDownloader.exe#Huifa Media Downloader (Windows x64)',
+              'releases\SHA256SUMS.txt#SHA-256 checksums'
+          )
+          gh release view $Tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+              gh release upload $Tag @Assets `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --clobber
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              gh release edit $Tag `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --latest `
+                  --title "Huifa Media Downloader $Version"
+          }
+          else {
+              gh release create $Tag @Assets `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --verify-tag `
+                  --generate-notes `
+                  --latest `
+                  --title "Huifa Media Downloader $Version"
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

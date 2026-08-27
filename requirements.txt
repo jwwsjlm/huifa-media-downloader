@@ -1,5 +1,16 @@
-PySide6>=6.7
-yt-dlp>=2025.1.0
-requests>=2.32
-keyring>=25.0
-
+PySide6>=6.11.2
+# Use yt-dlp maintained optional dependencies for full extraction support:
+# yt-dlp-ejs, certifi, brotli, mutagen, pycryptodomex, websockets and
+# curl_cffi. The app uses yt-dlp/FFmpeg-Builds-compatible FFmpeg/FFprobe and
+# uses one app-local Playwright Chromium for login and publishing;
+# QtWebEngine and an external social-auto-upload CLI are intentionally absent.
+yt-dlp[default,curl-cffi]>=2026.8.19
+requests>=2.34.2
+packaging>=26.0
+keyring>=25.7.0
+# In-process dependencies of the vendored social-auto-upload source. They run
+# on the application's Python runtime; no separate Python 3.12 is downloaded.
+playwright==1.62.0
+loguru==0.7.3
+opencv-python>=4.13.0.92
+segno>=1.6.6

@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Release builds are intentionally pinned so a new PyInstaller release cannot
+# silently change the generated executable on tag builds.
+pyinstaller==6.22.2

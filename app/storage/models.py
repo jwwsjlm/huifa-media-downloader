@@ -20,7 +20,6 @@ class MediaItem:
     source_ip: str = ""
     proxy_profile: str = ""
     downloaded_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
-    sha256: str = ""
 
 
 @dataclass
@@ -37,4 +36,3 @@ class PublishTask:
     idempotency_key: str = ""
     result: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
-
