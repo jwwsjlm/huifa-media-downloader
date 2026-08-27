@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import unittest
 from pathlib import Path
 
@@ -8,6 +9,11 @@ from app.core.version import APP_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from create_github_release_body import build_release_body
 
 
 class GithubReleaseWorkflowTests(unittest.TestCase):
@@ -38,6 +44,8 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("build_release.ps1", release)
         self.assertIn("build_velopack_release.ps1", release)
         self.assertIn("package_github_release.ps1", release)
+        self.assertIn("create_github_release_body.py", release)
+        self.assertIn("GITHUB_RELEASE.md", release)
         self.assertIn("release-notes\\$Version.md", release)
         self.assertIn("--notes-file", release)
         self.assertNotIn("--generate-notes", release)
@@ -47,6 +55,27 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("--clobber", release)
         self.assertIn("--verify-tag", release)
         self.assertIn("--latest", release)
+
+    def test_release_page_puts_direct_user_downloads_before_notes(self) -> None:
+        body = build_release_body(
+            "jwwsjlm/huifa-media-downloader",
+            "v0.1.1",
+            "0.1.1",
+            "# Huifa Media Downloader 0.1.1\n\n- Notes",
+        )
+        portable = (
+            "https://github.com/jwwsjlm/huifa-media-downloader/releases/download/"
+            "v0.1.1/HuifaMediaDownloader-0.1.1-portable-win-x64.zip"
+        )
+        installer = (
+            "https://github.com/jwwsjlm/huifa-media-downloader/releases/download/"
+            "v0.1.1/HuifaMediaDownloader-0.1.1-installer-win-x64.zip"
+        )
+        self.assertIn("## 直接下载 / Direct downloads", body)
+        self.assertIn(portable, body)
+        self.assertIn(installer, body)
+        self.assertIn("普通用户只需选择下面一种版本", body)
+        self.assertLess(body.index(portable), body.index("# Huifa Media Downloader"))
 
     def test_release_packager_keeps_two_user_zip_files_and_both_update_protocols(self) -> None:
         source = (ROOT / "scripts" / "package_github_release.ps1").read_text(

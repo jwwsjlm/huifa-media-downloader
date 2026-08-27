@@ -85,6 +85,16 @@ jobs:
           -Version $env:RELEASE_VERSION
           -ReleaseNotes $env:RELEASE_NOTES
 
+      - name: Create GitHub Release page
+        shell: pwsh
+        run: >-
+          .\.venv\Scripts\python.exe scripts\create_github_release_body.py
+          --repository $env:GITHUB_REPOSITORY
+          --tag $env:GITHUB_REF_NAME
+          --version $env:RELEASE_VERSION
+          --notes $env:RELEASE_NOTES
+          --output release-assets\GITHUB_RELEASE.md
+
       - name: Preserve build artifact
         uses: actions/upload-artifact@v7
         with:
@@ -100,7 +110,12 @@ jobs:
         run: |
           $Tag = $env:GITHUB_REF_NAME
           $Version = $Tag.TrimStart('v')
-          $Assets = @(Get-ChildItem -LiteralPath 'release-assets' -File | ForEach-Object { $_.FullName })
+          $ReleaseBody = 'release-assets\GITHUB_RELEASE.md'
+          $Assets = @(
+              Get-ChildItem -LiteralPath 'release-assets' -File |
+                  Where-Object { $_.Name -ne 'GITHUB_RELEASE.md' } |
+                  ForEach-Object { $_.FullName }
+          )
           if ($Assets.Count -lt 6) {
               throw "Release asset set is incomplete; found $($Assets.Count) files"
           }
@@ -113,14 +128,14 @@ jobs:
               gh release edit $Tag `
                   --repo $env:GITHUB_REPOSITORY `
                   --latest `
-                  --notes-file $env:RELEASE_NOTES `
+                  --notes-file $ReleaseBody `
                   --title "Huifa Media Downloader $Version"
           }
           else {
               gh release create $Tag @Assets `
                   --repo $env:GITHUB_REPOSITORY `
                   --verify-tag `
-                  --notes-file $env:RELEASE_NOTES `
+                  --notes-file $ReleaseBody `
                   --latest `
                   --title "Huifa Media Downloader $Version"
           }
