@@ -95,7 +95,7 @@ class ReleaseDeliveryContractTests(unittest.TestCase):
                     ),
                 )
 
-                self.assertEqual(Path(resolution.executable), local)
+                self.assertEqual(Path(resolution.executable), local.resolve())
                 self.assertEqual(resolution.source, f"程序目录 {filename}")
 
     def test_native_windows_arm64_uses_arm64_runtime_directory(self) -> None:
@@ -119,7 +119,7 @@ class ReleaseDeliveryContractTests(unittest.TestCase):
                     which=lambda _command: None,
                 )
 
-        self.assertEqual(Path(resolution.executable), arm64)
+        self.assertEqual(Path(resolution.executable), arm64.resolve())
         self.assertEqual(
             resolution.source,
             "程序目录 tools/deno/arm64/deno.exe",

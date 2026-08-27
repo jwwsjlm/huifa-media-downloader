@@ -288,7 +288,10 @@ class ApplicationUpdaterTests(unittest.TestCase):
             current.mkdir()
             (root / "Update.exe").write_bytes(b"")
             (current / "sq.version").write_text("{}", encoding="utf-8")
-            self.assertEqual(velopack_persistent_data_dir(current), root / "data")
+            self.assertEqual(
+                velopack_persistent_data_dir(current),
+                (root / "data").resolve(),
+            )
             self.assertIsNone(velopack_persistent_data_dir(root))
 
     def test_build_foundation_is_onedir_pinned_and_never_uploads(self) -> None:

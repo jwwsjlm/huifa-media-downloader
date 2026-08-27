@@ -287,7 +287,7 @@ try {
         '--packVersion', $Version,
         '--packDir', $StageApp,
         '--mainExe', 'HuifaVideoDownloader.exe',
-        '--packTitle', '汇发视频下载工具',
+        '--packTitle', 'Huifa Media Downloader',
         '--packAuthors', 'Huifa',
         '--icon', $ApplicationIcon,
         '--outputDir', $ReleaseRoot,

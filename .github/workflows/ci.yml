@@ -32,14 +32,21 @@ jobs:
             requirements.txt
             requirements-build.txt
 
-      - name: Install dependencies
+      - name: Create test environment
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-build.txt
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+
+      - name: Download official test runtimes
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .\scripts\prepare_release_runtime.ps1
 
       - name: Run unit tests
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m unittest discover -s tests -v
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests -v
