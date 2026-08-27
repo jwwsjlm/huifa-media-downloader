@@ -151,9 +151,11 @@ class DownloadCompletionFlowTests(unittest.TestCase):
             template, _limit = worker._download_output_template("%(title)s [%(id)s].%(ext)s")
 
             self.assertFalse(template.is_absolute())
-            self.assertEqual(
-                workspace,
-                temp_root / "huifa-processing" / "task-123" / "download",
+            self.assertTrue(
+                os.path.samefile(
+                    workspace,
+                    temp_root / "huifa-processing" / "task-123" / "download",
+                ),
             )
             marker = workspace / "fragment.part"
             marker.write_bytes(b"partial")
@@ -194,7 +196,7 @@ class DownloadCompletionFlowTests(unittest.TestCase):
             task_root = app_root / "task-safe"
             with patch(
                 "app.core.download_service._is_reparse_point",
-                side_effect=lambda path: Path(path) == task_root,
+                side_effect=lambda path: os.path.samefile(path, task_root),
             ):
                 self.assertFalse(cleanup_processing_workspace(workspace))
             self.assertTrue(marker.exists())
@@ -2444,9 +2446,30 @@ class DownloadCompletionFlowTests(unittest.TestCase):
 
         artifacts = task_download_artifact_paths(task)
 
-        self.assertTrue(managed.issubset(artifacts))
-        self.assertTrue(user_files.isdisjoint(artifacts))
-        self.assertNotIn(root_decoy, artifacts)
+        self.assertTrue(
+            all(
+                any(
+                    actual.exists() and os.path.samefile(expected, actual)
+                    for actual in artifacts
+                )
+                for expected in managed
+            )
+        )
+        self.assertTrue(
+            all(
+                not any(
+                    actual.exists() and os.path.samefile(user_file, actual)
+                    for actual in artifacts
+                )
+                for user_file in user_files
+            )
+        )
+        self.assertFalse(
+            any(
+                actual.exists() and os.path.samefile(root_decoy, actual)
+                for actual in artifacts
+            )
+        )
 
     def test_delete_partial_task_preserves_same_prefix_user_files(self) -> None:
         base = self.root / "User Files [video-id]"
@@ -2614,14 +2637,30 @@ class DownloadCompletionFlowTests(unittest.TestCase):
             subtitle_language="zh-CN",
         )
 
-        manifest_by_path = {
-            Path(path): kind
+        manifest_by_kind = {
+            kind: Path(path)
             for path, kind, managed in manifest
             if managed
         }
-        self.assertEqual(manifest_by_path, expected)
-        self.assertTrue(all(path not in manifest_by_path for path in unrelated))
-        self.assertNotIn(outside, manifest_by_path)
+        expected_by_kind = {kind: path for path, kind in expected.items()}
+        self.assertEqual(set(manifest_by_kind), set(expected_by_kind))
+        for kind, expected_path in expected_by_kind.items():
+            self.assertTrue(os.path.samefile(manifest_by_kind[kind], expected_path))
+        self.assertTrue(
+            all(
+                not any(
+                    os.path.samefile(path, manifest_path)
+                    for manifest_path in manifest_by_kind.values()
+                )
+                for path in unrelated
+            )
+        )
+        self.assertFalse(
+            any(
+                os.path.samefile(outside, manifest_path)
+                for manifest_path in manifest_by_kind.values()
+            )
+        )
 
     def test_completed_entry_does_not_claim_generic_json_as_info_metadata(self) -> None:
         media_path = self.root / "metadata.mp4"

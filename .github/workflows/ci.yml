@@ -31,13 +31,14 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-build.txt
+            requirements-velopack.txt
 
       - name: Create test environment
         shell: pwsh
         run: |
           python -m venv .venv
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
-          .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+          .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt -r requirements-velopack.txt
 
       - name: Download official test runtimes
         shell: pwsh
