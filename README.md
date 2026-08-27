@@ -39,7 +39,7 @@
 ## 下载与使用
 
 1. 打开 [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest)。
-2. 便携使用请选择 `HuifaMediaDownloader-<版本>-portable-win-x64.zip`，完整解压后运行根目录的 `HuifaVideoDownloader.exe`，不要只复制 EXE。
+2. 便携使用请选择 `HuifaMediaDownloader-<版本>-portable-win-x64.zip`，完整解压后运行根目录的 `Huifa Media Downloader.exe`，不要只复制 EXE。
 3. 需要安装到系统时请选择 `HuifaMediaDownloader-<版本>-installer-win-x64.zip`，解压后运行 `HuifaMediaDownloader-Setup.exe`。
 4. 便携版数据默认保存在解压目录的 `data/`，下载内容默认保存在根目录 `downloads/`；移动软件时需要移动整个文件夹。安装版默认下载到系统“下载”目录下的 `Huifa Video Downloader/`，避免卸载软件时影响媒体文件。
 

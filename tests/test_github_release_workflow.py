@@ -67,6 +67,7 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
             "https://github.com/jwwsjlm/huifa-media-downloader/releases/download/"
             "v0.1.1/HuifaMediaDownloader-0.1.1-portable-win-x64.zip"
         )
+        self.assertIn("Huifa Media Downloader.exe", body)
         installer = (
             "https://github.com/jwwsjlm/huifa-media-downloader/releases/download/"
             "v0.1.1/HuifaMediaDownloader-0.1.1-installer-win-x64.zip"

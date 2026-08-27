@@ -39,7 +39,7 @@ Official releases provide both a portable ZIP and an installer ZIP. Both edition
 ## Download and use
 
 1. Open the [latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest).
-2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract the complete archive, and run the root `HuifaVideoDownloader.exe`. Do not copy only the EXE.
+2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract the complete archive, and run the root `Huifa Media Downloader.exe`. Do not copy only the EXE.
 3. For an installed edition, download `HuifaMediaDownloader-<version>-installer-win-x64.zip`, extract it, and run `HuifaMediaDownloader-Setup.exe`.
 4. Portable-edition state stays in `data/`, while downloads default to the root `downloads/` folder. Move the complete folder when relocating it. The installed edition downloads to `Huifa Video Downloader/` under the system Downloads folder by default, keeping media outside the application's uninstall scope.
 

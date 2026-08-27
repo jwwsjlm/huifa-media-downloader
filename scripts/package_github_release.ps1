@@ -171,6 +171,7 @@ Copy-Item -LiteralPath $ReleaseNotesFull -Destination (Join-Path $InstallerStage
 Copy-Item -LiteralPath $VelopackPortable.FullName -Destination $PortableArchive
 Compress-Archive -Path (Join-Path $InstallerStage '*') -DestinationPath $InstallerArchive -CompressionLevel Optimal
 Assert-ZipEntries $PortableArchive @(
+    'Huifa Media Downloader.exe',
     'Update.exe',
     'current/HuifaVideoDownloader.exe',
     'current/sq.version',
