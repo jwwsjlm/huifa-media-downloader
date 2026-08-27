@@ -191,8 +191,6 @@ async def hupu_cookie_gen(account_file, qrcode_callback=None, poll_interval: int
 
 async def _grab_qq_qrcode(page: Page, context: BrowserContext, account_file: str) -> dict | None:
     """从 QQ 登录 iframe 中获取二维码。"""
-    from utils.login_qrcode import decode_qrcode_from_path, print_terminal_qrcode
-
     # 等待 QQ iframe 加载（最多 15 秒）
     qq_frame = None
     for _ in range(5):
@@ -222,13 +220,6 @@ async def _grab_qq_qrcode(page: Page, context: BrowserContext, account_file: str
                     qr_path = Path(account_file).parent / f"{Path(account_file).stem}_qq_qrcode.png"
                     qr_path.parent.mkdir(parents=True, exist_ok=True)
                     qr_path.write_bytes(await resp.body())
-
-                    # 尝试解码并在终端显示
-                    qrcode_content = decode_qrcode_from_path(qr_path)
-                    if qrcode_content:
-                        print_terminal_qrcode(qrcode_content, qr_path, "QQ手机版")
-                    else:
-                        hupu_logger.warning(_msg("😵", f"终端无法显示二维码，请打开 {qr_path} 扫码"))
 
                     return {"image_path": str(qr_path), "image_data_url": ""}
                 except Exception as exc:

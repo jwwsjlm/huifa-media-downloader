@@ -40,7 +40,7 @@ class _FakeWindow:
     app_settings = _FakeSettings()
     secure_store = SimpleNamespace(backend_name="keyring.backends.Windows.WinVaultKeyring")
 
-    def __init__(self, update_mode: str = "single-exe") -> None:
+    def __init__(self, update_mode: str = "velopack") -> None:
         self.application_update_mode = update_mode
 
 
@@ -55,43 +55,41 @@ class PackagedRuntimeSmokeTests(unittest.TestCase):
                     return "2026.08.22", "程序内置 yt-dlp 模块", "内置 Python 模块"
                 return "7.1", "程序内置文件 ffmpeg.exe", "ffmpeg.exe"
 
-            for update_mode in ("single-exe", "velopack"):
-                with self.subTest(update_mode=update_mode):
-                    with (
-                        patch.object(sys, "frozen", True, create=True),
-                        patch.object(sys, "executable", str(executable)),
-                        patch.object(
-                            app_main,
-                            "download_ytdlp",
-                            SimpleNamespace(YoutubeDL=lambda *_args, **_kwargs: None),
-                        ),
-                        patch.object(
-                            app_main,
-                            "installed_component_details",
-                            side_effect=component_details,
-                        ),
-                    ):
-                        report = app_main._build_packaged_smoke_report(
-                            _FakeApplication(),
-                            _FakeWindow(update_mode),
-                        )
+            with (
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(sys, "executable", str(executable)),
+                patch.object(
+                    app_main,
+                    "download_ytdlp",
+                    SimpleNamespace(YoutubeDL=lambda *_args, **_kwargs: None),
+                ),
+                patch.object(
+                    app_main,
+                    "installed_component_details",
+                    side_effect=component_details,
+                ),
+            ):
+                report = app_main._build_packaged_smoke_report(
+                    _FakeApplication(),
+                    _FakeWindow(),
+                )
 
-                    self.assertTrue(report["ok"])
-                    self.assertTrue(report["frozen"])
-                    self.assertEqual(report["application_update_mode"], update_mode)
-                    self.assertEqual(report["application_version"], APP_VERSION)
-                    self.assertEqual(report["organization_name"], APP_PUBLISHER)
-                    self.assertEqual(report["executable"], str(executable.resolve()))
-                    self.assertTrue(report["yt_dlp"]["core_ready"])
-                    self.assertEqual(report["yt_dlp"]["version"], "2026.08.22")
-                    self.assertEqual(report["ffmpeg"]["version"], "7.1")
-                    self.assertEqual(report["ffprobe"]["version"], "7.1")
-                    self.assertTrue(report["pyside6_version"])
-                    self.assertEqual(report["qt_platform"], "offscreen")
-                    self.assertEqual(
-                        report["secure_store_backend"],
-                        "keyring.backends.Windows.WinVaultKeyring",
-                    )
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["frozen"])
+            self.assertEqual(report["application_update_mode"], "velopack")
+            self.assertEqual(report["application_version"], APP_VERSION)
+            self.assertEqual(report["organization_name"], APP_PUBLISHER)
+            self.assertEqual(report["executable"], str(executable.resolve()))
+            self.assertTrue(report["yt_dlp"]["core_ready"])
+            self.assertEqual(report["yt_dlp"]["version"], "2026.08.22")
+            self.assertEqual(report["ffmpeg"]["version"], "7.1")
+            self.assertEqual(report["ffprobe"]["version"], "7.1")
+            self.assertTrue(report["pyside6_version"])
+            self.assertEqual(report["qt_platform"], "offscreen")
+            self.assertEqual(
+                report["secure_store_backend"],
+                "keyring.backends.Windows.WinVaultKeyring",
+            )
 
     def test_report_rejects_non_packaged_update_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -152,14 +150,14 @@ class PackagedRuntimeSmokeTests(unittest.TestCase):
             self.assertFalse(target.with_name(target.name + ".tmp").exists())
 
     def test_release_build_requires_packaged_runtime_report(self) -> None:
-        script = (app_main.PROJECT_ROOT / "scripts" / "build_release.ps1").read_text(
+        script = (app_main.PROJECT_ROOT / "scripts" / "build_velopack_release.ps1").read_text(
             encoding="utf-8"
         )
         self.assertIn("HUIFA_PACKAGED_SMOKE_OUTPUT", script)
-        self.assertIn("WaitForExit(60000)", script)
-        self.assertIn("application_update_mode -ne 'single-exe'", script)
-        self.assertIn("application_version -ne $ExpectedAppVersion", script)
-        self.assertIn("organization_name -ne 'Huifa'", script)
+        self.assertIn("WaitForExit(90000)", script)
+        self.assertIn("application_update_mode -ne 'velopack'", script)
+        self.assertIn("application_version -ne $Version", script)
+        self.assertIn("organization_name -ne $ExpectedPublisher", script)
         self.assertIn("yt_dlp.core_ready", script)
         self.assertIn("ffmpeg.version", script)
         self.assertIn("ffprobe.version", script)

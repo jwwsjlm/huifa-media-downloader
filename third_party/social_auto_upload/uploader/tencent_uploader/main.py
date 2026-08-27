@@ -75,15 +75,11 @@ def _build_launch_kwargs(headless: bool) -> dict:
 
 def _get_qrcode_utils():
     from utils.login_qrcode import build_login_qrcode_path
-    from utils.login_qrcode import decode_qrcode_from_path
-    from utils.login_qrcode import print_terminal_qrcode
     from utils.login_qrcode import remove_qrcode_file
     from utils.login_qrcode import save_data_url_image
 
     return {
         "build_login_qrcode_path": build_login_qrcode_path,
-        "decode_qrcode_from_path": decode_qrcode_from_path,
-        "print_terminal_qrcode": print_terminal_qrcode,
         "remove_qrcode_file": remove_qrcode_file,
         "save_data_url_image": save_data_url_image,
     }
@@ -211,16 +207,6 @@ async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_pa
             tencent_logger.info(_msg("🧹", f"临时二维码文件已清理: {previous_qrcode_path}"))
 
     tencent_logger.info(_msg("🖼️", f"二维码已经准备好啦，已保存到: {qrcode_path}"))
-    qrcode_content = qrcode_utils["decode_qrcode_from_path"](qrcode_path)
-    if qrcode_content:
-        qrcode_utils["print_terminal_qrcode"](qrcode_content, qrcode_path, "微信")
-    else:
-        tencent_logger.warning(
-            _msg(
-                "😵",
-                f"没能从二维码图片里解析出可打印内容，所以这次没法在终端重绘二维码；请直接打开 {qrcode_path} 扫码",
-            )
-        )
 
     qrcode_info = {
         "image_path": str(qrcode_path),

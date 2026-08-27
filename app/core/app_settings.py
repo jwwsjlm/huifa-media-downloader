@@ -66,7 +66,6 @@ _DEFAULT_SETTINGS = {
     "desktop_notifications": "true",
     "appearance_theme": "system",
     "publish_target_platforms": "",
-    "update_repo": "https://github.com/jwwsjlm/huifa-media-downloader",
     "auto_check_updates": "true",
     "update_prerelease": "false",
     "update_channel": "",

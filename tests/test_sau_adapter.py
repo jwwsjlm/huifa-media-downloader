@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import argparse
+import asyncio
 import tempfile
 import threading
 import unittest
@@ -59,19 +59,30 @@ class SauAdapterCapabilityTests(unittest.TestCase):
         self.assertEqual(required_tid, {"bilibili"})
         self.assertTrue(all(item.actions == ("login", "check", "upload-video") for item in SAU_PLATFORM_CAPABILITIES.values()))
 
-    def test_all_platforms_build_the_in_process_upload_arguments(self) -> None:
+    def test_all_platforms_build_structured_upload_requests(self) -> None:
         for platform in SAU_SUPPORTED_PLATFORMS:
             with self.subTest(platform=platform):
                 adapter, payload = self.payload(platform)
-                args = adapter.build_upload_command(payload)
-                self.assertTrue(args[0].endswith("sau_cli.py"))
-                self.assertEqual(args[1:3], [platform, "upload-video"])
-                self.assertEqual(args[args.index("--account") + 1], "work")
-                self.assertEqual(args[args.index("--file") + 1], "C:/media/video.mp4")
-                self.assertEqual(args[args.index("--title") + 1], "演示标题")
+                request = adapter.build_upload_request(payload)
+                self.assertEqual(request["account_name"], "work")
+                self.assertEqual(request["video_file"], "C:/media/video.mp4")
+                self.assertEqual(request["title"], "演示标题")
+                self.assertEqual(request["tags"], ["新闻", "测试"])
 
-    def test_all_adapter_arguments_are_accepted_by_the_real_vendored_parser(self) -> None:
+    def test_all_structured_requests_are_accepted_by_the_real_vendored_dispatcher(self) -> None:
         module = runtime._load_upstream()
+        upload_functions = {
+            "douyin": "upload_video",
+            "kuaishou": "upload_kuaishou_video",
+            "xiaohongshu": "upload_xiaohongshu_video",
+            "bilibili": "upload_bilibili_video",
+            "tencent": "upload_tencent_video",
+            "baijiahao": "upload_baijiahao_video",
+            "alipay": "upload_alipay_video",
+            "weibo": "upload_weibo_video",
+            "hupu": "upload_hupu_video",
+            "youtube": "upload_youtube_video",
+        }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             video = root / "video.mp4"
@@ -88,12 +99,16 @@ class SauAdapterCapabilityTests(unittest.TestCase):
                     {"title": "title", "description": "description", "tags": ["tag"]},
                     settings,
                 )
-                arguments = adapter.build_upload_command(payload)[1:]
-                with self.subTest(platform=platform):
-                    namespace = module.build_parser().parse_args(arguments)
-                    self.assertEqual(namespace.platform, platform)
-                    self.assertEqual(namespace.action, "upload-video")
-                    self.assertEqual(namespace.account, "work")
+                request = adapter.build_upload_request(payload)
+                upload = AsyncMock(return_value=root / "account.json")
+                with self.subTest(platform=platform), patch.object(
+                    module, upload_functions[platform], upload
+                ):
+                    result = asyncio.run(module.publish_video_payload(platform, request))
+                    self.assertEqual(result, f"{platform} 发布流程已完成")
+                    uploaded_request = upload.await_args.args[0]
+                    self.assertEqual(uploaded_request.account_name, "work")
+                    self.assertEqual(uploaded_request.video_file, video)
 
     def test_account_actions_call_runtime_directly_for_every_platform(self) -> None:
         compatibility = SauCoreCompatibility(True, "embedded", "", "")
@@ -178,6 +193,8 @@ class SauAdapterCapabilityTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(message, "douyin published")
         publish.assert_called_once()
+        self.assertEqual(publish.call_args.args[0], "douyin")
+        self.assertEqual(publish.call_args.args[1]["account_name"], "work")
         self.assertEqual(publish.call_args.kwargs, {"cancel_event": None})
 
     def test_dual_cover_schedule_visibility_playlist_and_tid_arguments(self) -> None:
@@ -188,32 +205,35 @@ class SauAdapterCapabilityTests(unittest.TestCase):
             "schedule": "2026-08-24 09:30",
             "collection": "series",
         })
-        args = adapter.build_upload_command(payload)
-        for flag in ("--thumbnail", "--thumbnail-landscape", "--thumbnail-portrait", "--schedule", "--collection"):
-            self.assertIn(flag, args)
+        request = adapter.build_upload_request(payload)
+        self.assertEqual(request["thumbnail_file"], "C:/cover/generic.jpg")
+        self.assertEqual(request["thumbnail_landscape_file"], "C:/cover/landscape.jpg")
+        self.assertEqual(request["thumbnail_portrait_file"], "C:/cover/portrait.jpg")
+        self.assertEqual(request["schedule"], "2026-08-24 09:30")
+        self.assertEqual(request["collection_name"], "series")
 
         adapter, payload = self.payload("youtube", {"collection": "Playlist A", "visibility": "unlisted"})
-        args = adapter.build_upload_command(payload)
-        self.assertEqual(args[args.index("--playlist") + 1], "Playlist A")
-        self.assertEqual(args[args.index("--visibility") + 1], "unlisted")
+        request = adapter.build_upload_request(payload)
+        self.assertEqual(request["playlist"], "Playlist A")
+        self.assertEqual(request["visibility"], "unlisted")
 
         adapter, payload = self.payload("bilibili", {"tid": "171"})
-        args = adapter.build_upload_command(payload)
-        self.assertEqual(args[args.index("--tid") + 1], "171")
+        request = adapter.build_upload_request(payload)
+        self.assertEqual(request["tid"], 171)
 
     def test_invalid_schedule_tid_and_visibility_return_clear_errors(self) -> None:
         for value in ("2026/08/24 09:30", "2026-02-30 09:30", "2026-08-24 25:00"):
             adapter, payload = self.payload("douyin", {"schedule": value})
             with self.subTest(schedule=value), self.assertRaisesRegex(ValueError, "定时发布时间"):
-                adapter.build_upload_command(payload)
+                adapter.build_upload_request(payload)
 
         _, missing_tid = self.payload("bilibili", {"tid": ""})
         with self.assertRaisesRegex(ValueError, "tid"):
-            SauAdapter("bilibili").build_upload_command(missing_tid)
+            SauAdapter("bilibili").build_upload_request(missing_tid)
 
         adapter, payload = self.payload("youtube", {"visibility": "friends-only"})
         with self.assertRaisesRegex(ValueError, "public"):
-            adapter.build_upload_command(payload)
+            adapter.build_upload_request(payload)
 
 
 class SocialAutoUploadRuntimeTests(unittest.TestCase):
@@ -241,43 +261,32 @@ class SocialAutoUploadRuntimeTests(unittest.TestCase):
             login.assert_awaited_once_with("work", headless=False)
             check_functions[platform].assert_awaited_once_with("work")
 
-    def test_runtime_publish_parses_and_dispatches_in_process(self) -> None:
-        namespace = argparse.Namespace(platform="douyin", action="upload-video")
-
-        class Parser:
-            def parse_args(self, args):
-                self.args = list(args)
-                return namespace
-
-        parser = Parser()
-        dispatch = AsyncMock(return_value=0)
-        module = SimpleNamespace(build_parser=lambda: parser, dispatch=dispatch)
+    def test_runtime_publish_dispatches_structured_payload_in_process(self) -> None:
+        dispatch = AsyncMock(return_value="douyin 发布流程已完成")
+        module = SimpleNamespace(publish_video_payload=dispatch)
+        payload = {"video_file": "video.mp4", "account_name": "work"}
         with patch.object(runtime, "_load_upstream", return_value=module):
-            result = runtime.publish_video([
-                "embedded-social-auto-upload", "douyin", "upload-video", "--file", "video.mp4"
-            ])
+            result = runtime.publish_video("douyin", payload)
 
         self.assertEqual(result, "douyin 发布流程已完成")
-        self.assertEqual(parser.args[:2], ["douyin", "upload-video"])
-        dispatch.assert_awaited_once_with(namespace)
+        dispatch.assert_awaited_once_with("douyin", payload)
 
     def test_runtime_rejects_unsupported_platforms_and_failed_dispatch(self) -> None:
         with patch.object(runtime, "_load_upstream", return_value=SimpleNamespace()):
             with self.assertRaises(runtime.SocialAutoUploadError):
                 runtime.account_login("unsupported", "work")
 
-        namespace = argparse.Namespace(platform="douyin", action="upload-video")
         module = SimpleNamespace(
-            build_parser=lambda: SimpleNamespace(parse_args=lambda _args: namespace),
-            dispatch=AsyncMock(return_value=2),
+            publish_video_payload=AsyncMock(side_effect=RuntimeError("upload failed")),
         )
         with patch.object(runtime, "_load_upstream", return_value=module):
-            with self.assertRaisesRegex(runtime.SocialAutoUploadError, "失败状态"):
-                runtime.publish_video(["douyin", "upload-video"])
+            with self.assertRaisesRegex(runtime.SocialAutoUploadError, "upload failed"):
+                runtime.publish_video("douyin", {})
 
     def test_real_vendored_core_imports_with_official_playwright(self) -> None:
         runtime._load_upstream.cache_clear()
         module = runtime._load_upstream()
+        self.assertTrue(callable(module.publish_video_payload))
         self.assertTrue(callable(module.build_parser))
         self.assertTrue(callable(module.dispatch))
         self.assertTrue(all(hasattr(module, name) for name in runtime._LOGIN_FUNCTIONS.values()))

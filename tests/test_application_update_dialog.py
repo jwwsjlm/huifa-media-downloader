@@ -78,6 +78,8 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
         self.assertIn("0.3.0", dialog.status.text())
         self.assertIn("已下载", dialog.status.text())
         self.assertIn("修复下载恢复", dialog.notes.toPlainText())
+        labels = [label.text() for label in dialog.findChildren(QLabel)]
+        self.assertIn("GitHub Releases 发布说明", labels)
         self.assertEqual(dialog.install_button.text(), "重启安装")
         self.assertTrue(dialog.install_button.isEnabled())
         self.assertEqual(dialog.download_button.text(), "已下载")
@@ -98,43 +100,19 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
         self.assertEqual(self.host.install_calls, [(update, True)])
         self.assertEqual(dialog.result(), QDialog.Accepted)
 
-    def test_single_exe_update_uses_portable_copy_and_restart_wording(self) -> None:
+    def test_download_can_pause_and_continue_from_saved_range(self) -> None:
         update = ApplicationUpdate(
-            token="single-exe-0.3.0",
-            current_version="0.2.0",
-            version="0.3.0",
-            package_id="Huifa.VideoDownloader",
-            file_name="HuifaVideoDownloader.exe",
-            size_bytes=300 * 1024 * 1024,
-            sha256="c" * 64,
-            release_notes_markdown="- 单 EXE 安全替换",
-            is_downgrade=False,
-            is_portable=True,
-            downloaded=True,
-            delivery_kind="single-exe",
-        )
-        dialog = ApplicationUpdateDialog(update, self.service, self.host)
-
-        summary_labels = [label.text() for label in dialog.findChildren(QLabel)]
-        self.assertTrue(any("单 EXE 便携版" in text for text in summary_labels))
-        self.assertEqual(dialog.install_button.text(), "重启更新")
-
-        dialog.close()
-
-    def test_single_exe_download_can_pause_and_continue_from_saved_range(self) -> None:
-        update = ApplicationUpdate(
-            token="single-exe-0.4.0",
+            token="download-0.4.0",
             current_version="0.3.0",
             version="0.4.0",
             package_id="Huifa.VideoDownloader",
-            file_name="HuifaVideoDownloader.exe",
+            file_name="Huifa.VideoDownloader-0.4.0-full.nupkg",
             size_bytes=317 * 1024 * 1024,
             sha256="d" * 64,
             release_notes_markdown="- 支持断点续传",
             is_downgrade=False,
             is_portable=True,
             downloaded=False,
-            delivery_kind="single-exe",
         )
         dialog = ApplicationUpdateDialog(update, self.service, self.host)
 
@@ -164,14 +142,13 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
             current_version="0.3.0",
             version="0.4.0",
             package_id="Huifa.VideoDownloader",
-            file_name="HuifaVideoDownloader.exe",
+            file_name="Huifa.VideoDownloader-0.4.0-full.nupkg",
             size_bytes=1024,
             sha256="e" * 64,
             release_notes_markdown="- Resume",
             is_downgrade=False,
             is_portable=True,
             downloaded=False,
-            delivery_kind="single-exe",
         )
         dialog = ApplicationUpdateDialog(update, self.service, self.host)
         dialog.on_download_cancelled()
@@ -201,14 +178,13 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
             current_version="0.3.0",
             version="0.4.0",
             package_id="Huifa.VideoDownloader",
-            file_name="HuifaVideoDownloader.exe",
+            file_name="Huifa.VideoDownloader-0.4.0-full.nupkg",
             size_bytes=1024,
             sha256="f" * 64,
             release_notes_markdown="- Retry",
             is_downgrade=False,
             is_portable=True,
             downloaded=False,
-            delivery_kind="single-exe",
         )
         dialog = ApplicationUpdateDialog(update, self.service, self.host)
 
@@ -244,7 +220,7 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
             from_version="0.2.0",
             to_version="0.3.0",
             current_version="0.3.0",
-            delivery_kind="single-exe",
+            delivery_kind="velopack",
             message="SHA-256 verified",
             finished_at="2026-08-24T12:00:00+00:00",
         )

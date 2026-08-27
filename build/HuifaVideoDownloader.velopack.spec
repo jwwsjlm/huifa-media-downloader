@@ -1,8 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller onedir build consumed by Velopack.
 
-This intentionally coexists with HuifaVideoDownloader.lean.spec. Velopack
-updates a directory and is not compatible with PyInstaller's onefile mode.
+Velopack updates the packaged application directory produced by this spec.
 """
 
 from pathlib import Path
@@ -68,12 +67,7 @@ hiddenimports = [
     "yt_dlp",
     "yt_dlp.version",
     "velopack",
-    "cv2",
-    "loguru",
-    "numpy",
-    "segno",
     *playwright_hidden,
-    *collect_submodules("cv2"),
 ]
 
 a = Analysis(

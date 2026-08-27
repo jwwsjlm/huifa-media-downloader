@@ -15,8 +15,6 @@ from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.login_qrcode import build_login_qrcode_path
-from utils.login_qrcode import decode_qrcode_from_path
-from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import xiaohongshu_logger
@@ -146,11 +144,6 @@ async def _save_xhs_qrcode(
             xiaohongshu_logger.info(_msg("🧹", f"临时二维码文件已清理: {previous_qrcode_path}"))
 
     xiaohongshu_logger.info(_msg("🖼️", f"二维码已经准备好啦，已保存到: {qrcode_path}"))
-    qrcode_content = decode_qrcode_from_path(qrcode_path)
-    if qrcode_content:
-        print_terminal_qrcode(qrcode_content, qrcode_path, "小红书APP")
-    else:
-        xiaohongshu_logger.warning(_msg("😵", f"终端没法完整显示二维码，请打开 {qrcode_path} 扫码"))
 
     qrcode_info = {
         "image_path": str(qrcode_path),

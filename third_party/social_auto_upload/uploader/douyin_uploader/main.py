@@ -15,8 +15,6 @@ from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.login_qrcode import build_login_qrcode_path
-from utils.login_qrcode import decode_qrcode_from_path
-from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import douyin_logger
@@ -187,7 +185,7 @@ async def _extract_douyin_qrcode_src(page: Page) -> str:
 
 
 async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None, qrcode_callback=None) -> dict:
-    # 提取二维码 src 仅为了保存/终端显示；定位不到时不致命——有头浏览器里二维码可见，直接扫码即可
+    # 提取二维码 src 用于保存并交给桌面界面显示；定位不到时有头浏览器仍可直接扫码。
     try:
         qrcode_src = await _extract_douyin_qrcode_src(page)
     except Exception as exc:
@@ -198,11 +196,6 @@ async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_pat
         if remove_qrcode_file(previous_qrcode_path):
             douyin_logger.info(_msg("🧹", f"临时二维码文件已清理: {previous_qrcode_path}"))
     douyin_logger.info(_msg("🖼️", f"二维码已经准备好啦，已保存到: {qrcode_path}"))
-    qrcode_content = decode_qrcode_from_path(qrcode_path)
-    if qrcode_content:
-        print_terminal_qrcode(qrcode_content, qrcode_path, "抖音APP")
-    else:
-        douyin_logger.warning(_msg("😵", f"终端没法完整显示二维码，请打开 {qrcode_path} 扫码"))
     qrcode_info = {
         "image_path": str(qrcode_path),
         "image_data_url": qrcode_src,

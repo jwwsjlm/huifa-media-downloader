@@ -362,17 +362,20 @@ def validate_language_packs() -> list[str]:
     en = _load_translations(EN_OUTPUT)
     errors: list[str] = []
     missing_zh = sorted(key for key in keys if not zh.get(key))
-    missing_en = sorted(key for key in keys if not en.get(key))
     invalid_en = sorted(
-        key for key in keys
-        if key in en and en[key] != key.split("::", 1)[-1]
+        key for key, value in en.items()
+        if value != key.split("::", 1)[-1]
+    )
+    legacy = sorted(
+        key for key in {*zh, *en}
+        if key.startswith("legacy:")
     )
     if missing_zh:
         errors.append("zh-CN.json 缺少语言键：\n" + "\n".join(missing_zh))
-    if missing_en:
-        errors.append("en-US.json 缺少语言键：\n" + "\n".join(missing_en))
     if invalid_en:
-        errors.append("en-US.json 的键值不是英文原文：\n" + "\n".join(invalid_en))
+        errors.append("en-US.json 包含无效覆写：\n" + "\n".join(invalid_en))
+    if legacy:
+        errors.append("语言包包含已废弃 legacy 键：\n" + "\n".join(legacy))
     return errors
 
 

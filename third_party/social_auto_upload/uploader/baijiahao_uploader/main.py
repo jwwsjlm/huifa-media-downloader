@@ -21,7 +21,7 @@ from playwright.async_api import Page, Playwright, TimeoutError as PWTimeoutErro
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.log import baijiahao_logger
-from utils.login_qrcode import build_login_qrcode_path, decode_qrcode_from_path, print_terminal_qrcode, remove_qrcode_file
+from utils.login_qrcode import build_login_qrcode_path, remove_qrcode_file
 
 
 BAIJIAHAO_LOGIN_URL = "https://baijiahao.baidu.com/builder/theme/bjh/login"
@@ -93,12 +93,7 @@ async def _grab_qr(page: Page, account_file: str) -> dict:
     else:
         await qr.screenshot(path=str(qrcode_path))
 
-    qrcode_content = decode_qrcode_from_path(qrcode_path)
     baijiahao_logger.info(_msg("🖼️", f"二维码已保存到: {qrcode_path}"))
-    if qrcode_content:
-        print_terminal_qrcode(qrcode_content, qrcode_path, "百度APP/手机百度")
-    else:
-        baijiahao_logger.warning(_msg("😵", f"终端没法完整显示二维码，请打开 {qrcode_path} 扫码"))
     return {"image_path": str(qrcode_path), "image_data_url": ""}
 
 

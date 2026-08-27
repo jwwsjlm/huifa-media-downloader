@@ -19,7 +19,7 @@ EXPECTED_SETTING_KEYS = frozenset({
     "ffmpeg_build_channel", "deno_path", "ytdlp_ejs_source", "ytdlp_core_mode",
     "github_download_route", "github_mirror_urls", "github_route_profiles",
     "ui_language", "desktop_notifications", "appearance_theme",
-    "publish_target_platforms", "update_repo", "auto_check_updates",
+    "publish_target_platforms", "auto_check_updates",
     "update_prerelease", "update_channel", "cover_preset", "cover_fit_mode",
     "cover_focus_x", "cover_focus_y", "download_cover_convert_jpeg",
     "cover_jpeg_quality", "prepend_cover_enabled", "prepend_cover_frames",
@@ -48,10 +48,6 @@ class AppSettingsTests(unittest.TestCase):
         self.assertEqual(frozenset(first), EXPECTED_SETTING_KEYS)
         self.assertEqual(first, second)
         self.assertIsNot(first, second)
-        self.assertEqual(
-            first["update_repo"],
-            "https://github.com/jwwsjlm/huifa-media-downloader",
-        )
         first["quality"] = "360p"
         self.assertEqual(second["quality"], "best")
 

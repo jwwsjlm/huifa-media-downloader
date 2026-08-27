@@ -10,12 +10,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd('\')
-$SingleExeRoot = Join-Path $Root 'releases'
 $VelopackRoot = Join-Path $Root 'releases-velopack'
 $OutputRoot = Join-Path $Root 'release-assets'
 $StageRoot = Join-Path $Root "build\github-release-$Version"
 $InstallerStage = Join-Path $StageRoot 'installer'
-$SingleExe = Join-Path $SingleExeRoot 'HuifaVideoDownloader.exe'
 $PortableName = "HuifaMediaDownloader-$Version-portable-win-x64.zip"
 $InstallerName = "HuifaMediaDownloader-$Version-installer-win-x64.zip"
 $PortableArchive = Join-Path $OutputRoot $PortableName
@@ -111,10 +109,6 @@ if (-not (Test-Path -LiteralPath $ReleaseNotesFull -PathType Leaf)) {
 if ([string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $ReleaseNotesFull -Raw -Encoding UTF8))) {
     throw "Release notes file is empty: $ReleaseNotesFull"
 }
-if (-not (Test-Path -LiteralPath $SingleExe -PathType Leaf) -or (Get-Item -LiteralPath $SingleExe).Length -le 0) {
-    throw "Single-file portable executable is missing or empty: $SingleExe"
-}
-
 $SetupMatches = @(
     Get-ChildItem -LiteralPath $VelopackRoot -Filter 'Huifa.VideoDownloader*-Setup.exe' -File -ErrorAction SilentlyContinue
 )
@@ -189,10 +183,6 @@ Assert-ZipEntryPattern `
     'yt-dlp-ejs wheel'
 Assert-ZipEntries $InstallerArchive @('HuifaMediaDownloader-Setup.exe', 'RELEASE_NOTES.md')
 
-# Keep the raw one-file executable only as a compatibility asset for users of
-# the legacy v0.1.1 portable updater. New portable downloads use Velopack's
-# directory layout and update the complete application plus bundled tools.
-Copy-Item -LiteralPath $SingleExe -Destination (Join-Path $OutputRoot 'HuifaVideoDownloader.exe')
 Copy-Item -LiteralPath $ReleaseNotesFull -Destination (Join-Path $OutputRoot 'RELEASE_NOTES.md')
 
 # The installed build uses Velopack's GitHub source. Publish its feed and full
@@ -213,7 +203,6 @@ foreach ($File in $VelopackUpdateFiles) {
 foreach ($RequiredOutput in @(
     $PortableName,
     $InstallerName,
-    'HuifaVideoDownloader.exe',
     'RELEASE_NOTES.md',
     'releases.win.json',
     'assets.win.json',

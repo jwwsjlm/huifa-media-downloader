@@ -1131,11 +1131,10 @@ class EnglishUiTests(unittest.TestCase):
         self.assertEqual(secret.value, "")
         self.assertTrue(secret.placeholder)
 
-    def test_update_settings_store_canonical_repository_before_applying_routes(self) -> None:
+    def test_update_settings_do_not_persist_an_application_repository(self) -> None:
         value = lambda item: SimpleNamespace(currentData=lambda: item)
         checked = lambda item: SimpleNamespace(isChecked=lambda: item)
         page = SimpleNamespace(
-            update_repo=SimpleNamespace(text=lambda: "yt-dlp/yt-dlp.git"),
             auto_check_updates=checked(True),
             update_prerelease=checked(False),
             github_download_route=value("auto"),
@@ -1158,32 +1157,28 @@ class EnglishUiTests(unittest.TestCase):
         with patch("app.ui.settings_save_controller.QMessageBox.information"):
             _settings_save_controller(host).save(page, "updates")
 
-        self.assertEqual(
-            settings.get("update_repo"),
-            "https://github.com/yt-dlp/yt-dlp",
-        )
+        self.assertNotIn("update_repo", settings.values)
         self.assertEqual(calls, [("auto", "", "{}")])
         self.assertEqual(settings.sync_count, 1)
 
-    def test_clearing_update_repository_detaches_previous_runtime_updater(self) -> None:
+    def test_supported_update_settings_reconfigure_the_fixed_updater(self) -> None:
         value = lambda item: SimpleNamespace(currentData=lambda: item)
         checked = lambda item: SimpleNamespace(isChecked=lambda: item)
         page = SimpleNamespace(
-            update_repo=SimpleNamespace(text=lambda: ""),
             auto_check_updates=checked(True),
             update_prerelease=checked(False),
             github_download_route=value("auto"),
             github_mirror_urls="",
             github_route_profiles="{}",
         )
-        cleared: list[bool] = []
+        configured: list[bool] = []
         host = SimpleNamespace(
-            app_settings=_Settings(update_repo="https://github.com/old/project"),
+            app_settings=_Settings(),
             update_service=SimpleNamespace(
                 set_download_routes=lambda *_args: None,
             ),
-            application_update_service=SimpleNamespace(
-                clear_configuration=lambda: cleared.append(True),
+            application_update_controller=SimpleNamespace(
+                configure=lambda **_kwargs: configured.append(True),
             ),
             application_updates_supported=True,
         )
@@ -1192,8 +1187,8 @@ class EnglishUiTests(unittest.TestCase):
             saved = _settings_save_controller(host).save(page, "updates")
 
         self.assertTrue(saved)
-        self.assertEqual(host.app_settings.get("update_repo"), "")
-        self.assertEqual(cleared, [True])
+        self.assertNotIn("update_repo", host.app_settings.values)
+        self.assertEqual(configured, [True])
 
     def test_compact_runtime_path_field_preserves_real_path_without_displaying_it(self) -> None:
         full_path = "D:/code/yt-release/tools/ffmpeg/x64/ffmpeg.exe"

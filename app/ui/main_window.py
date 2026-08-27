@@ -14,11 +14,7 @@ from PySide6.QtWidgets import (
 
 from app.core.app_settings import AppSettings
 from app.core.application_update_service import ApplicationUpdateService
-from app.core.application_updater import (
-    PortableExeApplicationUpdater,
-    portable_single_exe_supported,
-    velopack_persistent_data_dir,
-)
+from app.core.application_updater import velopack_persistent_data_dir
 from app.core.cover_service import (
     CoverService,
 )
@@ -149,14 +145,6 @@ class MainWindow(QMainWindow):
         if managed_update_data is not None:
             self.application_update_mode = "velopack"
             updater_factory = None
-        elif portable_single_exe_supported():
-            self.application_update_mode = "single-exe"
-            updater_factory = lambda config: PortableExeApplicationUpdater(
-                config,
-                application_update_dir,
-                executable_path=sys.executable,
-                current_version=APP_VERSION,
-            )
         else:
             self.application_update_mode = ""
             updater_factory = None

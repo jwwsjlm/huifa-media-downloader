@@ -758,6 +758,228 @@ async def upload_hupu_video(request: HupuVideoUploadRequest) -> Path:
     return account_file
 
 
+def _payload_text(payload: dict, key: str, *, required: bool = False) -> str:
+    value = str(payload.get(key) or "").strip()
+    if required and not value:
+        raise ValueError(f"Missing required upload field: {key}")
+    return value
+
+
+def _payload_file(payload: dict, key: str, *, required: bool = False) -> Path | None:
+    value = _payload_text(payload, key, required=required)
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_file():
+        raise ValueError(f"File not found: {value}")
+    return path
+
+
+def _payload_tags(payload: dict) -> list[str]:
+    value = payload.get("tags")
+    if isinstance(value, (list, tuple, set)):
+        return [
+            tag
+            for tag in (str(item).strip().lstrip("#") for item in value)
+            if tag
+        ]
+    return parse_tags(str(value or ""))
+
+
+async def publish_video_payload(platform: str, payload: dict) -> str:
+    """Publish one video from the desktop app's structured in-process request."""
+
+    platform_key = str(platform or "").strip().casefold()
+    if not isinstance(payload, dict):
+        raise TypeError("Upload payload must be a mapping")
+
+    account = _payload_text(payload, "account_name", required=True)
+    video = _payload_file(payload, "video_file", required=True)
+    title = _payload_text(payload, "title", required=True)
+    description = _payload_text(payload, "description")
+    tags = _payload_tags(payload)
+    schedule_text = _payload_text(payload, "schedule")
+    publish_date = parse_schedule(schedule_text)
+    thumbnail = _payload_file(payload, "thumbnail_file")
+    landscape = _payload_file(payload, "thumbnail_landscape_file")
+    portrait = _payload_file(payload, "thumbnail_portrait_file")
+    collection = _payload_text(payload, "collection_name") or None
+    debug = bool(payload.get("debug", False))
+    headless = bool(payload.get("headless", True))
+
+    if platform_key == "douyin":
+        strategy = (
+            DOUYIN_PUBLISH_STRATEGY_SCHEDULED
+            if publish_date
+            else DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
+        )
+        await upload_video(DouyinVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            publish_date=publish_date,
+            thumbnail_file=thumbnail,
+            thumbnail_landscape_file=landscape,
+            thumbnail_portrait_file=portrait,
+            product_link=_payload_text(payload, "product_link"),
+            product_title=_payload_text(payload, "product_title"),
+            declaration=_payload_text(payload, "declaration") or None,
+            collection_name=collection,
+            publish_strategy=strategy,
+            debug=debug,
+            headless=headless,
+        ))
+    elif platform_key == "kuaishou":
+        strategy = (
+            KUAISHOU_PUBLISH_STRATEGY_SCHEDULED
+            if publish_date
+            else KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE
+        )
+        await upload_kuaishou_video(KuaishouVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            publish_date=publish_date,
+            thumbnail_file=thumbnail,
+            collection_name=collection,
+            publish_strategy=strategy,
+            debug=debug,
+            headless=headless,
+        ))
+    elif platform_key == "xiaohongshu":
+        if len(tags) > 10:
+            raise ValueError(f"Xiaohongshu accepts at most 10 tags; received {len(tags)}")
+        strategy = (
+            XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED
+            if publish_date
+            else XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
+        )
+        await upload_xiaohongshu_video(XiaohongshuVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            publish_date=publish_date,
+            thumbnail_file=thumbnail,
+            publish_strategy=strategy,
+            debug=debug,
+            headless=headless,
+        ))
+    elif platform_key == "bilibili":
+        try:
+            tid = int(payload.get("tid") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Bilibili tid must be a positive integer") from exc
+        if tid <= 0:
+            raise ValueError("Bilibili tid must be a positive integer")
+        await upload_bilibili_video(BilibiliVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tid=tid,
+            tags=tags,
+            publish_date=publish_date,
+            thumbnail_file=thumbnail,
+        ))
+    elif platform_key == "tencent":
+        strategy = (
+            TENCENT_PUBLISH_STRATEGY_SCHEDULED
+            if publish_date
+            else TENCENT_PUBLISH_STRATEGY_IMMEDIATE
+        )
+        await upload_tencent_video(TencentVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            publish_date=publish_date,
+            thumbnail_file=thumbnail,
+            thumbnail_landscape_file=landscape,
+            thumbnail_portrait_file=portrait,
+            short_title=_payload_text(payload, "short_title") or None,
+            category=_payload_text(payload, "category") or None,
+            is_draft=bool(payload.get("is_draft", False)),
+            collection_name=collection,
+            publish_strategy=strategy,
+            debug=debug,
+            headless=headless,
+        ))
+    elif platform_key == "baijiahao":
+        await upload_baijiahao_video(BaijiahaoVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            thumbnail_file=thumbnail,
+            collection_name=collection,
+            debug=debug,
+            headless=headless,
+        ))
+    elif platform_key == "alipay":
+        await upload_alipay_video(AlipayVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            thumbnail_file=thumbnail,
+            collection_name=collection,
+            debug=debug,
+            headless=headless,
+        ))
+    elif platform_key == "weibo":
+        await upload_weibo_video(WeiboVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            thumbnail_file=thumbnail,
+            collection_name=collection,
+            debug=debug,
+            headless=headless,
+        ))
+    elif platform_key == "hupu":
+        await upload_hupu_video(HupuVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            thumbnail_file=thumbnail,
+            debug=debug,
+            headless=headless,
+        ))
+    elif platform_key == "youtube":
+        visibility = _payload_text(payload, "visibility") or "public"
+        if visibility not in {"public", "unlisted", "private"}:
+            raise ValueError("YouTube visibility must be public, unlisted, or private")
+        await upload_youtube_video(YouTubeVideoUploadRequest(
+            account_name=account,
+            video_file=video,
+            title=title,
+            description=description,
+            tags=tags,
+            thumbnail_file=thumbnail,
+            playlist=_payload_text(payload, "playlist") or None,
+            visibility=visibility,
+            debug=debug,
+            headless=headless,
+        ))
+    else:
+        raise ValueError(f"Unsupported platform: {platform_key or platform}")
+
+    return f"{platform_key} 发布流程已完成"
+
+
 def existing_file_path(value: str) -> Path:
     path = Path(value)
     if not path.is_file():

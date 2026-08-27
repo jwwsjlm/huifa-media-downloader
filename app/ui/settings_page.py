@@ -62,7 +62,7 @@ from app.core.update_service import (
     FFMPEG_BUILD_NVENC_LEGACY,
     normalize_ffmpeg_build_channel,
 )
-from app.core.version import APP_VERSION
+from app.core.version import APP_UPDATE_REPOSITORY, APP_VERSION
 from app.core.ytdlp_core_selection import normalize_ytdlp_core_mode
 from app.core.ytdlp_ejs import normalize_ytdlp_ejs_source
 from app.ui.cover_studio import populate_cover_preset_combo
@@ -1130,13 +1130,10 @@ class SettingsPage(QWidget):
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(8)
 
-        self.update_repo = QLineEdit(window.app_settings.get("update_repo"))
-        self.update_repo.setClearButtonEnabled(True)
-        self.update_repo.setPlaceholderText(ui_text(
-            'GitHub repository, e.g. owner/repository',
-        ))
+        self.update_repo = QLabel(APP_UPDATE_REPOSITORY)
+        self.update_repo.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.update_repo.setToolTip(ui_text(
-            'Installed and directory-portable builds update through Velopack. A single-EXE portable build downloads the matching EXE, verifies its GitHub SHA-256 and replaces it safely after exit.',
+            'Application updates use Velopack for both installed and portable builds; user data and independently updated tools remain outside the replaced current directory.',
         ))
         layout.addWidget(QLabel(ui_text('Current Version')), 0, 0)
         layout.addWidget(QLabel(APP_VERSION), 0, 1)
@@ -1173,16 +1170,11 @@ class SettingsPage(QWidget):
         self.application_update_status.setObjectName("mutedText")
         layout.addWidget(self.application_update_status, 3, 0, 1, 3)
         if not window.application_updates_supported:
-            self.update_repo.setEnabled(False)
             self.application_update_button.setEnabled(False)
             self.auto_check_updates.setEnabled(False)
             self.update_prerelease.setEnabled(False)
             self.application_update_status.setText(ui_text(
                 'The app is running from source/development mode; application updates are available in official releases.',
-            ))
-        elif window.application_update_mode == "single-exe":
-            self.application_update_status.setText(ui_text(
-                'Single-EXE secure update: download, verify SHA-256, then exit, replace and restart after confirmation.',
             ))
         else:
             self.application_update_status.setText(ui_text(

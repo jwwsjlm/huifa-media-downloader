@@ -52,18 +52,23 @@ class LanguagePackCoverageTests(unittest.TestCase):
             [],
         )
 
-    def test_english_pack_contains_every_source_language_key(self) -> None:
+    def test_english_pack_only_contains_explicit_context_overrides(self) -> None:
         payload = json.loads(EN_PACK.read_text(encoding="utf-8"))
         self.assertEqual(payload["locale"], "en-US")
-        expected = {
-            key: key.split("::", 1)[-1]
-            for key in collect_translation_keys()
-        }
-        self.assertEqual(
-            {key: payload["translations"].get(key) for key in expected},
-            expected,
+        translations = payload["translations"]
+        self.assertTrue(translations)
+        self.assertTrue(all("::" in key for key in translations))
+        self.assertTrue(
+            all(value == key.split("::", 1)[-1] for key, value in translations.items())
         )
+        self.assertFalse(any(key.startswith("legacy:") for key in translations))
         self.assertEqual(validate_language_packs(), [])
+
+    def test_language_packs_do_not_keep_legacy_keys(self) -> None:
+        for path in (ZH_PACK, EN_PACK):
+            translations = json.loads(path.read_text(encoding="utf-8"))["translations"]
+            with self.subTest(pack=path.name):
+                self.assertFalse(any(key.startswith("legacy:") for key in translations))
 
     def test_visible_ui_calls_do_not_bypass_language_pack(self) -> None:
         self.assertEqual(find_bare_chinese_ui_strings(), [])

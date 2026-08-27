@@ -86,7 +86,7 @@ class QtBundleFilterTests(unittest.TestCase):
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[1]
-        for spec_name in ("HuifaVideoDownloader.lean.spec", "HuifaVideoDownloader.velopack.spec"):
+        for spec_name in ("HuifaVideoDownloader.velopack.spec",):
             with self.subTest(spec=spec_name):
                 spec = (root / "build" / spec_name).read_text(encoding="utf-8")
                 analysis_position = spec.index("a = Analysis(")
@@ -108,7 +108,7 @@ class QtBundleFilterTests(unittest.TestCase):
         self.assertNotIn("copy_metadata", hook)
         self.assertIn("setuptools", EXCLUDED_WINDOWS_RUNTIME_MODULES)
         self.assertIn("keyring.backends.macOS", EXCLUDED_WINDOWS_RUNTIME_MODULES)
-        for spec_name in ("HuifaVideoDownloader.lean.spec", "HuifaVideoDownloader.velopack.spec"):
+        for spec_name in ("HuifaVideoDownloader.velopack.spec",):
             with self.subTest(spec=spec_name):
                 spec = (root / "build" / spec_name).read_text(encoding="utf-8")
                 self.assertIn("EXCLUDED_WINDOWS_RUNTIME_MODULES", spec)

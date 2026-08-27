@@ -1,6 +1,9 @@
+from __future__ import annotations
+
+import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from loguru import logger
 
 from conf import BASE_DIR
 
@@ -11,53 +14,65 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-def log_formatter(record: dict) -> str:
-    """
-    Formatter for log records.
-    :param dict record: Log object containing log metadata & message.
-    :returns: str
-    """
-    colors = {
-        "TRACE": "#cfe2f3",
-        "INFO": "#9cbfdd",
-        "DEBUG": "#8598ea",
-        "WARNING": "#dcad5a",
-        "SUCCESS": "#3dd08d",
-        "ERROR": "#ae2c2c"
-    }
-    color = colors.get(record["level"].name, "#b3cfe7")
-    return f"<fg #70acde>{{time:YYYY-MM-DD HH:mm:ss}}</fg #70acde> | <fg {color}>{{level}}</fg {color}>: <light-white>{{message}}</light-white>\n"
+class UploadLogger:
+    """Small compatibility wrapper for uploader logging calls."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+
+    def debug(self, message, *args, **kwargs) -> None:
+        self._logger.debug(message, *args, **kwargs)
+
+    def info(self, message, *args, **kwargs) -> None:
+        self._logger.info(message, *args, **kwargs)
+
+    def success(self, message, *args, **kwargs) -> None:
+        self._logger.info(message, *args, **kwargs)
+
+    def warning(self, message, *args, **kwargs) -> None:
+        self._logger.warning(message, *args, **kwargs)
+
+    def error(self, message, *args, **kwargs) -> None:
+        self._logger.error(message, *args, **kwargs)
 
 
-def create_logger(log_name: str, file_path: str):
-    """
-    Create custom logger for different business modules.
-    :param str log_name: name of log
-    :param str file_path: Optional path to log file
-    :returns: Configured logger
-    """
-    def filter_record(record):
-        return record["extra"].get("business_name") == log_name
+def create_logger(log_name: str, file_path: str) -> UploadLogger:
+    logger = logging.getLogger(f"social_auto_upload.{log_name}")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    if not logger.handlers:
+        formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        console = logging.StreamHandler(sys.stdout)
+        console.setLevel(logging.DEBUG)
+        console.setFormatter(formatter)
+        logger.addHandler(console)
 
-    Path(BASE_DIR / file_path).parent.mkdir(exist_ok=True)
-    logger.add(Path(BASE_DIR / file_path), filter=filter_record, level="INFO", rotation="10 MB", retention="10 days", backtrace=True, diagnose=True)
-    return logger.bind(business_name=log_name)
+        target = Path(BASE_DIR) / file_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        rotating_file = RotatingFileHandler(
+            target,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=10,
+            encoding="utf-8",
+        )
+        rotating_file.setLevel(logging.INFO)
+        rotating_file.setFormatter(formatter)
+        logger.addHandler(rotating_file)
+    return UploadLogger(logger)
 
 
-# Remove all existing handlers
-logger.remove()
-# Add a standard console handler
-logger.add(sys.stdout, colorize=True, format=log_formatter)
-
-douyin_logger = create_logger('douyin', 'logs/douyin.log')
-tencent_logger = create_logger('tencent', 'logs/tencent.log')
-xhs_logger = create_logger('xhs', 'logs/xhs.log')
-tiktok_logger = create_logger('tiktok', 'logs/tiktok.log')
-bilibili_logger = create_logger('bilibili', 'logs/bilibili.log')
-kuaishou_logger = create_logger('kuaishou', 'logs/kuaishou.log')
-baijiahao_logger = create_logger('baijiahao', 'logs/baijiahao.log')
-xiaohongshu_logger = create_logger('xiaohongshu', 'logs/xiaohongshu.log')
-youtube_logger = create_logger('youtube', 'logs/youtube.log')
-alipay_logger = create_logger('alipay', 'logs/alipay.log')
-weibo_logger = create_logger('weibo', 'logs/weibo.log')
-hupu_logger = create_logger('hupu', 'logs/hupu.log')
+douyin_logger = create_logger("douyin", "logs/douyin.log")
+tencent_logger = create_logger("tencent", "logs/tencent.log")
+xhs_logger = create_logger("xhs", "logs/xhs.log")
+tiktok_logger = create_logger("tiktok", "logs/tiktok.log")
+bilibili_logger = create_logger("bilibili", "logs/bilibili.log")
+kuaishou_logger = create_logger("kuaishou", "logs/kuaishou.log")
+baijiahao_logger = create_logger("baijiahao", "logs/baijiahao.log")
+xiaohongshu_logger = create_logger("xiaohongshu", "logs/xiaohongshu.log")
+youtube_logger = create_logger("youtube", "logs/youtube.log")
+alipay_logger = create_logger("alipay", "logs/alipay.log")
+weibo_logger = create_logger("weibo", "logs/weibo.log")
+hupu_logger = create_logger("hupu", "logs/hupu.log")

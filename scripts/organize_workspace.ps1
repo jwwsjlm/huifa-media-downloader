@@ -18,7 +18,6 @@ $keepNames = [System.Collections.Generic.HashSet[string]]::new(
 )
 foreach ($name in @(
     '01_velopack_hook.py',
-    'HuifaVideoDownloader.lean.spec',
     'HuifaVideoDownloader.velopack.spec'
 )) {
     [void]$keepNames.Add($name)

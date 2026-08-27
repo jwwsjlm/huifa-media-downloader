@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, QTimer, Slot
 from PySide6.QtWidgets import QMessageBox
 
 from app.core.application_updater import ApplicationUpdate
-from app.core.version import APP_VERSION
+from app.core.version import APP_UPDATE_REPOSITORY, APP_VERSION
 from app.core.update_receipt import UpdateInstallReceipt, consume_update_install_receipt
 from app.ui.application_update_dialog import ApplicationUpdateDialog
 from app.ui.i18n import format_text as ui_format
@@ -117,20 +117,9 @@ class ApplicationUpdateController(QObject):
                     message,
                 )
             return False
-        repository = self.app_settings.get("update_repo").strip()
-        if not repository:
-            if not silent:
-                QMessageBox.information(
-                    self.parent,
-                    ui_text('Repository Not Configured'),
-                    ui_text(
-                        'Enter a GitHub repository such as owner/repository in Settings, then save the configuration.',
-                    ),
-                )
-            return False
         try:
             self.service.configure(
-                repository,
+                APP_UPDATE_REPOSITORY,
                 prerelease=self.app_settings.get_bool(
                     "update_prerelease",
                     False,

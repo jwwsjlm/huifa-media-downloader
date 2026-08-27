@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from app.core.application_updater import (
     AutoUpdateCheckThrottle,
@@ -129,10 +130,13 @@ class FakeVelopackModule:
 
 
 class ApplicationUpdaterTests(unittest.TestCase):
-    def create_updater(self, **kwargs):
+    def create_updater(self, session=None, **kwargs):
         module = FakeVelopackModule()
         config = VelopackUpdaterConfig(repository="huifa/yt-release", **kwargs)
-        return VelopackApplicationUpdater(config, module), module
+        if session is None:
+            session = Mock()
+            session.get.return_value.json.return_value = {}
+        return VelopackApplicationUpdater(config, module, session), module
 
     def test_repository_normalization_accepts_shorthand_and_https(self) -> None:
         expected = "https://github.com/huifa/yt-release"
@@ -162,6 +166,43 @@ class ApplicationUpdaterTests(unittest.TestCase):
         self.assertIn("Faster startup", update.release_notes_markdown)
         self.assertTrue(update.is_portable)
         self.assertFalse(update.downloaded)
+
+    def test_check_prefers_matching_github_release_body(self) -> None:
+        response = Mock()
+        response.json.return_value = {
+            "tag_name": "v0.2.0",
+            "draft": False,
+            "body": "# GitHub Release\n\n- Direct release notes",
+        }
+        session = Mock()
+        session.get.return_value = response
+        updater, _module = self.create_updater(session=session, access_token="token")
+
+        update = updater.check_for_updates()
+
+        self.assertEqual(
+            update.release_notes_markdown,
+            "# GitHub Release\n\n- Direct release notes",
+        )
+        request = session.get.call_args
+        self.assertIn("/releases/tags/v0.2.0", request.args[0])
+        self.assertEqual(
+            request.kwargs["headers"]["Authorization"],
+            "Bearer token",
+        )
+        response.close.assert_called_once_with()
+
+    def test_check_falls_back_to_embedded_notes_when_github_notes_fail(self) -> None:
+        response = Mock()
+        response.raise_for_status.side_effect = RuntimeError("rate limited")
+        session = Mock()
+        session.get.return_value = response
+        updater, _module = self.create_updater(session=session)
+
+        update = updater.check_for_updates()
+
+        self.assertIn("Faster startup", update.release_notes_markdown)
+        response.close.assert_called_once_with()
 
     def test_constructing_updater_does_not_require_managed_install(self) -> None:
         module = FakeVelopackModule()

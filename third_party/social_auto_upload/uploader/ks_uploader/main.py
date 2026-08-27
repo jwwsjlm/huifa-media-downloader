@@ -16,8 +16,6 @@ from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.files_times import get_absolute_path
 from utils.login_qrcode import build_login_qrcode_path
-from utils.login_qrcode import decode_qrcode_from_path
-from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import kuaishou_logger
@@ -92,16 +90,6 @@ async def _focus_desc_editor(page) -> None:
 
 
 
-def _print_ks_qrcode(qrcode_content: str, qrcode_path: Path) -> None:
-    try:
-        print_terminal_qrcode(qrcode_content, qrcode_path, "快手APP", compact=False, border=2)
-    except TypeError as exc:
-        if "unexpected keyword argument 'compact'" not in str(exc):
-            raise
-        kuaishou_logger.warning(_msg("😵", "检测到旧版二维码打印函数，小人切回兼容模式继续登录"))
-        print_terminal_qrcode(qrcode_content, qrcode_path, "快手APP")
-
-
 async def _emit_qrcode_callback(qrcode_callback, payload: dict):
     if not qrcode_callback:
         return
@@ -172,11 +160,6 @@ async def _save_ks_qrcode(page: Page, account_file: str, previous_qrcode_path: P
             kuaishou_logger.info(_msg("🧹", f"临时二维码文件已清理: {previous_qrcode_path}"))
 
     kuaishou_logger.info(_msg("🖼️", f"二维码已经准备好啦，已保存到: {qrcode_path}"))
-    qrcode_content = decode_qrcode_from_path(qrcode_path)
-    if qrcode_content:
-        _print_ks_qrcode(qrcode_content, qrcode_path)
-    else:
-        kuaishou_logger.warning(_msg("😵", f"终端没法完整显示二维码，请打开 {qrcode_path} 扫码"))
 
     qrcode_info = {
         "image_path": str(qrcode_path),

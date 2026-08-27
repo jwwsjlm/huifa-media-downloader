@@ -45,7 +45,7 @@ def build_windows_version_info(
     description: str,
     copyright_text: str,
 ) -> VSVersionInfo:
-    """Create the VERSIONINFO resource shared by onefile and Velopack builds."""
+    """Create the VERSIONINFO resource for the packaged Windows executable."""
     version_tuple, product_version, is_prerelease = normalize_windows_version(app_version)
     file_version = ".".join(str(part) for part in version_tuple)
     return VSVersionInfo(

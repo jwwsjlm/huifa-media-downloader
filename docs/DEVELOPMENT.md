@@ -21,7 +21,7 @@ python -m app.main
 官方仓库为 `jwwsjlm/huifa-media-downloader`。推送与 `APP_VERSION` 一致的
 `v<版本号>` 标签后，GitHub Actions 会在 `windows-latest` 上安装固定构建依赖，
 从 `yt-dlp/FFmpeg-Builds` 和 Playwright 官方源准备发行运行时，执行完整测试、
-构建及打包烟雾检查，然后生成便携版 ZIP、安装包 ZIP、两种更新机制所需的技术资产和
+构建及打包烟雾检查，然后生成便携版 ZIP、安装包 ZIP、Velopack 更新所需的技术资产和
 `SHA256SUMS.txt`。应用默认通过 GitHub REST API
 `releases/latest` 检查稳定版，并使用 Release 资产中由 GitHub 提供的 SHA-256
 digest 验证下载内容；启用预发布更新时才读取 Release 列表。
@@ -33,11 +33,10 @@ git tag v0.1.1
 git push origin v0.1.1
 ```
 
-便携版 ZIP 包含单文件 `HuifaVideoDownloader.exe`，解压后可直接运行；安装包 ZIP 包含
-Velopack `Setup.exe`，由安装程序管理应用目录。PySide6/Qt 是本程序界面运行时，不能从程序内部删除；内置 yt-dlp 模块和 FFmpeg
-会随 EXE 提供，用户无需另装 Python 或 PySide6。程序也支持从官方 Release 自动安装并优先调用
-可独立更新的外置 `yt-dlp.exe`，内置模块保留为安全回退。单文件首次启动会将运行库临时
-解包，这是正常行为。Deno 不是程序启动的硬依赖，但它是 yt-dlp 推荐的 JavaScript
+便携版 ZIP 和安装包 ZIP 都使用 Velopack 管理的目录式程序。便携版解压后运行根目录入口，
+安装版 ZIP 内含 `Setup.exe`。PySide6/Qt、Python 运行时、内置 yt-dlp 模块和 FFmpeg
+均随程序提供，用户无需另装 Python 或 PySide6。程序也支持从官方 Release 自动安装并优先调用
+可独立更新的外置 `yt-dlp.exe`，内置模块保留为安全回退。Deno 不是程序启动的硬依赖，但它是 yt-dlp 推荐的 JavaScript
 运行时，用于 `yt-dlp-ejs` 的 YouTube 格式解析。程序数据默认保存在 EXE 同目录的 `data/`，不会写入当前命令行目录。
 程序不再打包或启动 QtWebEngine，也不会调用用户电脑中安装的 Chrome/Edge。登录、Cookie
 检查和发布统一使用软件本地 `social-auto-upload` 源码与官方 Playwright 管理的一套 Chromium。
@@ -48,39 +47,18 @@ SAU 登录状态持久保存在 `data/browser/sau-cookies/cookies/`，核心更�
 biliup 所需的专用账号文件。
 首次运行若触发 Windows Defender/SmartScreen，请确认文件来源后选择允许。
 
-开发者可使用 `scripts/build_release.ps1` 重建单文件便携核心；脚本会先运行编译检查和单元测试，
-再生成 `releases/HuifaVideoDownloader.exe`。该脚本本身不创建 ZIP，GitHub Release 的统一封装由
-`scripts/package_github_release.ps1` 完成。
-每次构建使用独立的 `build/single-exe-dist-<运行编号>/` 暂存目录，只替换最终 EXE；如果 `releases/data/` 中已有本地
-数据库和设置，脚本会保留它们，但这些运行数据不是交付附件。成功替换后会自动删除
-PyInstaller 工作目录和暂存副本，避免保留重复的大文件。发布前脚本还会在隔离目录真实启动
-刚生成的 EXE，由程序创建完整主窗口并输出烟雾测试报告，确认 PySide6、内置 yt-dlp 下载核心和
-单 EXE 自动更新模式均可加载后才替换正式发行文件；该测试不会读取或修改 `releases/data/`。
-最后还会执行单文件核心目录校验：`releases/` 顶层文件必须只有非空的
-`HuifaVideoDownloader.exe`；`releases/data/` 等本地运行目录不参与交付，也不会被构建脚本删除。
-
-单 EXE 不使用 Velopack，因为 Velopack 的更新单位是完整的 onedir 应用目录。便携版使用
-独立的 GitHub Release 单 EXE 更新流程：查找名称严格为 `HuifaVideoDownloader.exe` 的资产，
-下载到 `data/updates/application/`，按 GitHub 资产 `digest` 强制校验 SHA-256，用户确认后
-安全停止任务，退出主程序，再由临时 PowerShell 替换器备份、替换、复验并自动重启；失败时
-恢复旧 EXE。替换器会原子写入成功或失败回执；新进程启动后核对实际运行版本与目标版本，
-只提示一次真实安装结果，避免把“已下载”误认为“已安装”。安装版使用 Velopack 的 feed、
-完整包和受管目录更新；二者共享检查、下载、更新内容、确认界面和安装结果回执，但使用各自适合的替换机制。
-
-单 EXE 的大文件下载支持标准 HTTP `Range` 断点续传。网络中断或程序安全退出时会保留
-`.part` 与仅包含版本、大小、GitHub URL、SHA-256 和 HTTP 校验标识的恢复记录；再次下载时
-使用 `Range`/`If-Range` 继续。若 CDN 忽略范围、ETag/Last-Modified 变化或返回矛盾的
-`Content-Range`，程序会清除旧断点并安全地从零下载，不会拼接不同版本。无论是否续传，
-最终文件都必须再次通过完整大小、GitHub SHA-256、MZ/PE 签名验证后才会进入安装确认。
-构建 Velopack 安装版前可先运行
+开发者使用 `scripts/build_velopack_release.ps1` 生成安装器、可自更新便携包、更新 feed 和完整包，
+再由 `scripts/package_github_release.ps1` 统一封装两个面向用户的 ZIP 和技术资产。构建脚本会在
+隔离目录启动便携包做烟雾检查，并真实执行一次本地 Velopack apply，确认 `current/` 能完整替换、
+外置工具能恢复且根目录 `data/` 不丢失。构建前可先运行
 `.\scripts\build_velopack_release.ps1 -Version <APP_VERSION> -ValidateEnvironmentOnly`；脚本会优先
 选择 64 位 Program Files 中真正安装了 SDK 的 dotnet，而不是误用 PATH 中仅有 Runtime 的
 x86 host。稳定版使用 `win` 通道，预发布版需显式指定例如 `win-beta`，构建完成后脚本还会
 校验安装器、便携包、更新 feed 和完整更新包，不会执行 GitHub 上传。
 
 The x64 release embeds only the FFmpeg runtime under `tools/ffmpeg/x64/`;
-legacy root and x86 copies are not added to the deliverable. For the primary
-single-EXE build, external portable tools are resolved in this order:
+legacy root and x86 copies are not added to the deliverable. External portable
+tools are resolved in this order:
 
 1. files beside `HuifaVideoDownloader.exe` (`yt-dlp.exe`, `ffmpeg.exe`, `deno.exe`, `sau.exe`),
    followed by their documented subdirectories under that same EXE folder;
@@ -96,7 +74,7 @@ including its reported version, so a portable local installation is no longer
 shown as missing. A usable standalone executable is the active download core;
 the Python `yt_dlp` module embedded in the main EXE is retained as a fallback.
 PySide6 is likewise required
-internally by the GUI but is already embedded in the single EXE; users do not
+internally by the GUI but is already embedded in the packaged app; users do not
 install it separately.
 
 If Deno is installed, the downloader automatically enables yt-dlp's EJS
@@ -113,13 +91,10 @@ GitHub Release. If no usable executable is present, the bundled Python module
 is used as a fallback. Tool
 version detection for FFmpeg, Deno and `sau` first checks files beside
 `HuifaVideoDownloader.exe`, then their documented `tools/` subdirectories and
-system `PATH`. The in-app updater supports both release families: Velopack
-manages installer/onedir portable builds, while the primary single-EXE build
-downloads the exact `HuifaVideoDownloader.exe` GitHub Release asset, requires
-its SHA-256 digest, and replaces it only after clean shutdown and explicit
-confirmation. Both paths persist the confirmed source/target versions and show
-a one-time post-restart success or failure result after verifying the version
-that is actually running.
+system `PATH`. The in-app updater uses one Velopack flow for both installer and
+portable distributions. It downloads the selected feed package, installs only
+after a clean shutdown and explicit confirmation, and shows a one-time
+post-restart result after verifying the version that is actually running.
 
 Component checks persist a bounded `data/update-component-cache.json` file.
 GitHub `ETag`/`Last-Modified` validators are sent on the next check, and a

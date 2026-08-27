@@ -49,9 +49,7 @@ class ApplicationUpdateDialog(QDialog):
         heading.setObjectName("pageTitle")
         layout.addWidget(heading)
         mode = (
-            ui_text('Single-EXE portable')
-            if update.delivery_kind == "single-exe"
-            else ui_text('Velopack self-updating portable')
+            ui_text('Velopack self-updating portable')
             if update.is_portable
             else ui_text('Velopack installer')
         )
@@ -68,7 +66,7 @@ class ApplicationUpdateDialog(QDialog):
         checksum.setObjectName("mutedText")
         checksum.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(checksum)
-        layout.addWidget(QLabel(ui_text('Release Notes')))
+        layout.addWidget(QLabel(ui_text('Release Notes from GitHub Releases')))
         self.notes = QTextEdit()
         self.notes.setReadOnly(True)
         notes = update.release_notes_markdown.strip() or ui_text('No release notes were provided for this release.')
@@ -104,7 +102,7 @@ class ApplicationUpdateDialog(QDialog):
         self.download_button.setObjectName("primaryButton")
         self.download_button.setEnabled(not update.downloaded)
         self.download_button.clicked.connect(self.start_download)
-        self.install_button = QPushButton(ui_text('Restart to Update') if update.delivery_kind == "single-exe" else ui_text('Restart to Install'))
+        self.install_button = QPushButton(ui_text('Restart to Install'))
         self.install_button.setObjectName("primaryButton")
         self.install_button.setEnabled(update.downloaded)
         self.install_button.clicked.connect(self.install)

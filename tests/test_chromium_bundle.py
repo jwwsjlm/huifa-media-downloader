@@ -17,13 +17,6 @@ class ChromiumBundleTests(unittest.TestCase):
         cls.root = Path(__file__).resolve().parents[1]
 
     def test_release_builds_ship_only_the_complete_chromium_runtime(self) -> None:
-        legacy_spec = (
-            self.root / "build" / "HuifaVideoDownloader.lean.spec"
-        ).read_text(encoding="utf-8")
-        self.assertIn("chromium-*/chrome-win64/chrome.exe", legacy_spec)
-        self.assertIn("tools/chromium/chrome-win64", legacy_spec)
-        self.assertNotIn("datas.append((str(chromium_dir)", legacy_spec)
-
         managed_spec = (
             self.root / "build" / "HuifaVideoDownloader.velopack.spec"
         ).read_text(encoding="utf-8")
@@ -35,7 +28,7 @@ class ChromiumBundleTests(unittest.TestCase):
         self.assertIn("tools\\chromium\\chrome-win64", managed_build)
         self.assertIn("chrome.exe", managed_build)
 
-        for source in (legacy_spec, managed_spec, managed_build):
+        for source in (managed_spec, managed_build):
             self.assertNotIn("chromium_headless_shell", source)
             self.assertNotIn("ffmpeg-1011", source)
             self.assertNotIn("winldd-1007", source)
@@ -58,10 +51,7 @@ class ChromiumBundleTests(unittest.TestCase):
                 self.assertNotIn("import patchright", source)
         self.assertTrue(production_sources)
 
-        for spec_name in (
-            "HuifaVideoDownloader.lean.spec",
-            "HuifaVideoDownloader.velopack.spec",
-        ):
+        for spec_name in ("HuifaVideoDownloader.velopack.spec",):
             source = (self.root / "build" / spec_name).read_text(encoding="utf-8")
             with self.subTest(spec=spec_name):
                 self.assertIn("collect_all('playwright')".replace("'", "\""), source.replace("'", "\""))

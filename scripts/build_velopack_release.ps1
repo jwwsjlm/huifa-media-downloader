@@ -1,7 +1,6 @@
 [CmdletBinding()]
-# Managed installer pipeline used by the GitHub tag release workflow. The
-# separate scripts/build_release.ps1 still owns the one-file portable build;
-# this command produces Setup.exe plus the Velopack feeds and update packages.
+# Managed Windows release pipeline used by the GitHub tag workflow. This
+# command produces Setup.exe, the portable package, feeds, and update packages.
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')]
@@ -262,6 +261,10 @@ $AppVersion = (& $Python -c "from app.core.version import APP_VERSION; print(APP
 if ($LASTEXITCODE -ne 0 -or $AppVersion -ne $Version) {
     throw "Package version '$Version' must match app.core.version.APP_VERSION '$AppVersion'"
 }
+$ExpectedPublisher = (& $Python -c "from app.core.version import APP_PUBLISHER; print(APP_PUBLISHER)").Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($ExpectedPublisher)) {
+    throw 'Unable to resolve app.core.version.APP_PUBLISHER'
+}
 
 $DotnetResolution = Resolve-DotnetSdkExecutable
 $DotnetExe = $DotnetResolution.Path
@@ -285,8 +288,7 @@ if (-not $SkipTests) {
     }
 }
 
-# Velopack requires PyInstaller onedir. Keep this staging area independent of
-# the existing onefile release directory so neither build can mask the other.
+# Velopack requires a PyInstaller onedir staging area.
 foreach ($Target in @($StageRoot, $WorkRoot, $ReleaseRoot)) {
     $TargetFull = [System.IO.Path]::GetFullPath($Target).TrimEnd('\')
     if (-not $TargetFull.StartsWith($Root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -485,7 +487,17 @@ try {
         throw "Velopack portable smoke test failed with exit code $($SmokeProcess.ExitCode)."
     }
     $SmokeResult = Get-Content -LiteralPath $PortableSmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json
-    if (-not $SmokeResult.ok -or $SmokeResult.application_update_mode -ne 'velopack') {
+    if (
+        -not $SmokeResult.ok -or
+        $SmokeResult.application_update_mode -ne 'velopack' -or
+        $SmokeResult.application_version -ne $Version -or
+        $SmokeResult.organization_name -ne $ExpectedPublisher -or
+        -not $SmokeResult.yt_dlp.core_ready -or
+        [string]::IsNullOrWhiteSpace([string]$SmokeResult.ffmpeg.version) -or
+        [string]::IsNullOrWhiteSpace([string]$SmokeResult.ffprobe.version) -or
+        [string]::IsNullOrWhiteSpace([string]$SmokeResult.pyside6_version) -or
+        [string]::IsNullOrWhiteSpace([string]$SmokeResult.secure_store_backend)
+    ) {
         throw 'Velopack portable smoke report did not confirm a managed portable runtime.'
     }
     foreach ($ToolPath in @($SmokeResult.ffmpeg.runtime_path, $SmokeResult.ffprobe.runtime_path)) {

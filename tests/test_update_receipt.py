@@ -23,7 +23,7 @@ class UpdateInstallReceiptTests(unittest.TestCase):
         self.update = SimpleNamespace(
             current_version="0.1.0",
             version="0.2.0",
-            delivery_kind="single-exe",
+            delivery_kind="velopack",
         )
 
     def test_success_receipt_preserves_confirmed_versions_and_is_consumed_once(self) -> None:
@@ -40,7 +40,7 @@ class UpdateInstallReceiptTests(unittest.TestCase):
         self.assertTrue(receipt.installed_version_matches("v0.2.0"))
         self.assertEqual(receipt.from_version, "0.1.0")
         self.assertEqual(receipt.to_version, "0.2.0")
-        self.assertEqual(receipt.delivery_kind, "single-exe")
+        self.assertEqual(receipt.delivery_kind, "velopack")
         self.assertFalse((self.state_dir / INSTALL_INTENT_FILENAME).exists())
         consumed = consume_update_install_receipt(self.state_dir)
         self.assertEqual(consumed, receipt)

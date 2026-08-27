@@ -167,7 +167,7 @@ def _load_upstream() -> ModuleType:
         except ModuleNotFoundError as exc:
             missing = str(getattr(exc, "name", "") or exc)
             raise SocialAutoUploadError(
-                f"程序缺少内置发布核心依赖 {missing}，请安装完整 requirements.txt 后重试"
+                f"程序缺少内置发布核心依赖 {missing}，请重新下载完整程序后重试"
             ) from exc
         except Exception as exc:
             raise SocialAutoUploadError(f"内置 social-auto-upload 初始化失败：{exc}") from exc
@@ -183,7 +183,7 @@ def core_status() -> tuple[bool, str]:
     try:
         root = vendor_root()
         commit = vendor_commit()
-        for dependency in ("playwright", "loguru", "cv2", "segno", "requests"):
+        for dependency in ("playwright", "requests"):
             if importlib.util.find_spec(dependency) is None:
                 return False, f"内置源码存在，但缺少 Python 依赖：{dependency}"
         if resolve_chromium_executable() is None:
@@ -456,22 +456,25 @@ def open_download_cookie_browser(
 
 
 def publish_video(
-    argv: list[str],
+    platform: str,
+    payload: dict[str, Any],
     *,
     cancel_event: threading.Event | None = None,
 ) -> str:
-    """Dispatch one validated upload in-process without invoking ``sau.exe``."""
+    """Dispatch one structured upload in-process without CLI argument parsing."""
     module = _load_upstream()
-    args = list(argv)
-    if args and args[0] not in _LOGIN_FUNCTIONS:
-        args = args[1:]
+    platform_key = str(platform or "").strip().casefold()
+    if platform_key not in _LOGIN_FUNCTIONS:
+        raise SocialAutoUploadError(
+            f"平台 {platform_key or '未知'} 尚未接入内置发布核心"
+        )
+    publish = getattr(module, "publish_video_payload", None)
+    if not callable(publish):
+        raise SocialAutoUploadError("内置发布核心缺少结构化视频发布接口")
     try:
-        namespace = module.build_parser().parse_args(args)
-    except SystemExit as exc:
-        raise SocialAutoUploadError("发布参数无效") from exc
-    if namespace.action != "upload-video":
-        raise SocialAutoUploadError("内部发布接口仅接受 upload-video 操作")
-    result = int(_run(module.dispatch(namespace), cancel_event))
-    if result != 0:
-        raise SocialAutoUploadError(f"内置发布核心返回失败状态：{result}")
-    return f"{namespace.platform} 发布流程已完成"
+        result = _run(publish(platform_key, dict(payload)), cancel_event)
+    except InterruptedError:
+        raise
+    except Exception as exc:
+        raise SocialAutoUploadError(f"内置发布核心执行失败：{exc}") from exc
+    return str(result or f"{platform_key} 发布流程已完成")

@@ -153,7 +153,10 @@ class ApplicationUpdateControllerTests(unittest.TestCase):
     def test_manual_check_configures_and_starts_service(self) -> None:
         self.controller.check()
 
-        self.assertEqual(self.service.configure_calls[0][0], "owner/project")
+        self.assertEqual(
+            self.service.configure_calls[0][0],
+            "https://github.com/jwwsjlm/huifa-media-downloader",
+        )
         self.assertEqual(self.service.check_calls, [False])
         self.assertIn("GitHub", self.status_label.text())
 

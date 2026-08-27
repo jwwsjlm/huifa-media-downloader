@@ -11,6 +11,3 @@ keyring>=25.7.0
 # In-process dependencies of the vendored social-auto-upload source. They run
 # on the application's Python runtime; no separate Python 3.12 is downloaded.
 playwright==1.62.0
-loguru==0.7.3
-opencv-python>=4.13.0.92
-segno>=1.6.6

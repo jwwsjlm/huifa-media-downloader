@@ -38,7 +38,7 @@ from app.ui.i18n import application_name_text, runtime_text
 
 
 PACKAGED_SMOKE_OUTPUT_ENV = "HUIFA_PACKAGED_SMOKE_OUTPUT"
-PACKAGED_UPDATE_MODES = frozenset({"single-exe", "velopack"})
+PACKAGED_UPDATE_MODES = frozenset({"velopack"})
 
 
 def _build_packaged_smoke_report(app: QApplication, window: MainWindow) -> dict[str, Any]:

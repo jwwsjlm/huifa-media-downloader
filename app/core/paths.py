@@ -81,7 +81,7 @@ def _managed_release_root(application_root: str | Path | None = None) -> Path | 
 def portable_deployment(application_root: str | Path | None = None) -> bool:
     """Return whether downloads should travel with the application folder.
 
-    Source runs and the legacy single-file build are portable by definition.
+    Source runs are portable by definition.
     A managed Velopack package is portable only when its root contains the
     marker created by Velopack's portable pack command.
     """

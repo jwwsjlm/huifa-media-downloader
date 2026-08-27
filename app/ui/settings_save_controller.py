@@ -15,9 +15,6 @@ from app.adapters.openai_cover_provider import (
     OpenAICoverGenerationError,
     normalize_openai_image_endpoint,
 )
-from app.core.application_updater import (
-    normalize_github_repository,
-)
 from app.core.cookie_sources import (
     COOKIE_SOURCE_FILE,
     normalize_cookie_browser,
@@ -92,9 +89,6 @@ class SettingsSaveController:
         )
         self.configure_application_updater = lambda: (
             window.application_update_controller.configure(silent=True)
-        )
-        self.clear_application_updater = (
-            window.application_update_service.clear_configuration
         )
 
     def save(self, page: SettingsPage, scope: str) -> bool:
@@ -514,17 +508,6 @@ class SettingsSaveController:
         )
 
     def prepare_updates(self, page: SettingsPage) -> SettingsSavePlan | None:
-        repository = page.update_repo.text().strip()
-        if repository:
-            try:
-                repository = normalize_github_repository(repository)
-            except ValueError as exc:
-                QMessageBox.warning(
-                    self.parent,
-                    ui_text('Invalid GitHub Repository Format'),
-                    runtime_text(exc),
-                )
-                return None
         try:
             mirror_urls = "\n".join(parse_custom_mirror_urls(page.github_mirror_urls))
         except ValueError as exc:
@@ -544,14 +527,10 @@ class SettingsSaveController:
                 route_profiles,
             )
             if self.application_updates_supported:
-                if repository:
-                    self.configure_application_updater()
-                else:
-                    self.clear_application_updater()
+                self.configure_application_updater()
 
         return SettingsSavePlan(
             values={
-                "update_repo": repository,
                 "auto_check_updates": (
                     "true" if page.auto_check_updates.isChecked() else "false"
                 ),

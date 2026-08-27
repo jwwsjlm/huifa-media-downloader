@@ -117,7 +117,7 @@ class CancellableDownloadUpdater(FakeUpdater):
 
 
 class UnmanagedVelopackModule:
-    """Minimal SDK shape for a source checkout or legacy onefile build."""
+    """Minimal SDK shape for a source checkout not managed by Velopack."""
 
     def GithubSource(self, repository, access_token=None, prerelease=False):
         return repository, access_token, prerelease
@@ -626,7 +626,7 @@ class ApplicationUpdateServiceTests(unittest.TestCase):
         self.assertIsNone(service._worker)
         self.assertEqual(busy_changes, [False])
 
-    def test_source_or_legacy_onefile_build_reports_clear_not_managed_error(self) -> None:
+    def test_source_build_reports_clear_not_managed_error(self) -> None:
         module = UnmanagedVelopackModule()
 
         def factory(config):

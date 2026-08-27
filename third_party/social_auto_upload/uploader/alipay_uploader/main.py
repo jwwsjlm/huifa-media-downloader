@@ -16,8 +16,6 @@ from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.log import alipay_logger
 from utils.login_qrcode import build_login_qrcode_path
-from utils.login_qrcode import decode_qrcode_from_path
-from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 
 ALIPAY_HOME_URL = "https://c.alipay.com/"
@@ -118,22 +116,17 @@ async def _capture_alipay_qr(page: Page, account_file: str, previous_qrcode_path
     qr_canvas = frame.locator("#J-barcode-container canvas.barcode, #J-barcode-container canvas").first
     await qr_canvas.screenshot(path=str(qrcode_path), timeout=15000)
 
-    qrcode_content = decode_qrcode_from_path(qrcode_path)
     if previous_qrcode_path and previous_qrcode_path != qrcode_path:
         if remove_qrcode_file(previous_qrcode_path):
             alipay_logger.info(_msg("🧹", f"临时二维码文件已清理: {previous_qrcode_path}"))
     alipay_logger.info(_msg("🖼️", f"二维码已保存到: {qrcode_path}"))
-    if qrcode_content:
-        print_terminal_qrcode(qrcode_content, qrcode_path, "支付宝APP")
-    else:
-        alipay_logger.warning(_msg("😵", f"终端没法完整显示二维码，请打开 {qrcode_path} 扫码"))
     return {"image_path": str(qrcode_path), "image_data_url": ""}
 
 
 async def alipay_cookie_gen(account_file, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 100, headless: bool = LOCAL_CHROME_HEADLESS):
     """打开浏览器，用户扫码登录支付宝生活号，登录成功后保存 cookie（镜像 douyin_cookie_gen）。
 
-    二维码 png 落 cookies 目录（*login_qrcode*.png）供终端显示/告知位置；qrcode_callback 可选（如 relogin 推飞书）。
+    二维码 png 落 cookies 目录（*login_qrcode*.png）并通过 qrcode_callback 提供给界面。
     headless=False 时也可直接在弹出的浏览器里扫码。
     返回 _build_login_result 结果 dict。
     """

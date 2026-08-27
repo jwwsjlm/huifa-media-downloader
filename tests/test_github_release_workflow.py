@@ -4,7 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from app.core.app_settings import default_settings
+from app.core.version import APP_UPDATE_REPOSITORY
 from app.core.version import APP_VERSION
 
 
@@ -19,7 +19,7 @@ from create_github_release_body import build_release_body
 class GithubReleaseWorkflowTests(unittest.TestCase):
     def test_default_application_update_repository_is_the_public_project(self) -> None:
         self.assertEqual(
-            default_settings("data/downloads")["update_repo"],
+            APP_UPDATE_REPOSITORY,
             "https://github.com/jwwsjlm/huifa-media-downloader",
         )
 
@@ -41,7 +41,6 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("v[0-9]+.[0-9]+.[0-9]+*", release)
         self.assertIn("contents: write", release)
         self.assertIn("prepare_release_runtime.ps1", release)
-        self.assertIn("build_release.ps1", release)
         self.assertIn("build_velopack_release.ps1", release)
         self.assertIn("package_github_release.ps1", release)
         self.assertIn("create_github_release_body.py", release)

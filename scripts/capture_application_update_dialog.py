@@ -37,7 +37,7 @@ def main() -> int:
             current_version="0.3.0",
             version="0.4.0",
             package_id="Huifa.VideoDownloader",
-            file_name="HuifaVideoDownloader.exe",
+            file_name="Huifa.VideoDownloader-0.4.0-full.nupkg",
             size_bytes=318 * 1024 * 1024,
             sha256="a" * 64,
             release_notes_markdown=(
@@ -49,7 +49,6 @@ def main() -> int:
             is_downgrade=False,
             is_portable=True,
             downloaded=True,
-            delivery_kind="single-exe",
         )
         dialog = ApplicationUpdateDialog(update, service, host)
         dialog.resize(700, 540)

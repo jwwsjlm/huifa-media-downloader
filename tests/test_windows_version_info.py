@@ -52,22 +52,25 @@ class WindowsVersionInfoTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, rendered)
 
-    def test_both_specs_attach_shared_version_resource(self) -> None:
-        for name in ("HuifaVideoDownloader.lean.spec", "HuifaVideoDownloader.velopack.spec"):
-            source = (ROOT / "build" / name).read_text(encoding="utf-8")
-            with self.subTest(spec=name):
-                self.assertIn("build_windows_version_info", source)
-                self.assertIn("version=windows_version_info", source)
+    def test_release_spec_attaches_shared_version_resource(self) -> None:
+        source = (ROOT / "build" / "HuifaVideoDownloader.velopack.spec").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("build_windows_version_info", source)
+        self.assertIn("version=windows_version_info", source)
 
     def test_release_script_validates_windows_product_identity(self) -> None:
-        source = (ROOT / "scripts" / "build_release.ps1").read_text(encoding="utf-8")
+        spec = (ROOT / "build" / "HuifaVideoDownloader.velopack.spec").read_text(
+            encoding="utf-8"
+        )
+        version_helper = (ROOT / "scripts" / "windows_version_info.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("APP_NAME", spec)
+        self.assertIn("APP_PUBLISHER", spec)
         for field in ("ProductVersion", "FileVersion", "ProductName", "CompanyName", "OriginalFilename"):
             with self.subTest(field=field):
-                self.assertIn(field, source)
-        self.assertIn("from app.core.version import APP_NAME", source)
-        self.assertIn("base64.b64encode(APP_NAME.encode('utf-8'))", source)
-        self.assertIn("from app.core.version import APP_PUBLISHER", source)
-        self.assertIn("[StringComparison]::Ordinal", source)
+                self.assertIn(field, version_helper)
 
 
 if __name__ == "__main__":
