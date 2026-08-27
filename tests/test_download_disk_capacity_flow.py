@@ -239,6 +239,7 @@ class DownloadDiskCapacityFlowTests(unittest.TestCase):
             task.url,
             task.output_dir,
             self.db,
+            ytdlp_core_mode="builtin",
             playlist_mode=playlist_mode,
             disk_lease=lease,
         )

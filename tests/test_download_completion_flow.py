@@ -583,6 +583,7 @@ class DownloadCompletionFlowTests(unittest.TestCase):
             task.url,
             task.output_dir,
             self.db,
+            ytdlp_core_mode="builtin",
             quality=task.quality,
             playlist_mode=task.playlist_mode,
             transcode_codec=task.transcode_codec,
