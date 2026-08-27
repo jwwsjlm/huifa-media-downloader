@@ -41,7 +41,7 @@ Official releases provide both a portable ZIP and an installer ZIP. Both edition
 1. Open the [latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest).
 2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract the complete archive, and run the root `HuifaVideoDownloader.exe`. Do not copy only the EXE.
 3. For an installed edition, download `HuifaMediaDownloader-<version>-installer-win-x64.zip`, extract it, and run `HuifaMediaDownloader-Setup.exe`.
-4. Portable-edition data stays in `data/` inside the extracted root. Move the complete folder when relocating it. The installed edition lets its installer manage the application directory and updates.
+4. Portable-edition state stays in `data/`, while downloads default to the root `downloads/` folder. Move the complete folder when relocating it. The installed edition downloads to `Huifa Video Downloader/` under the system Downloads folder by default, keeping media outside the application's uninstall scope.
 
 The portable edition uses a self-updating directory layout. FFmpeg, FFprobe, yt-dlp, Deno, yt-dlp-ejs, and Chromium are shipped in the application's own `current/tools/` directory. If Windows SmartScreen reports an unknown publisher, verify that the file came from this repository's Release page before deciding whether to run it.
 
@@ -52,9 +52,10 @@ The application keeps its main runtime data beside the executable instead of req
 - `data/app.db`: download, media, and publishing task database.
 - `data/settings.ini`: application settings.
 - `data/browser/`: app-managed browser profiles and encrypted cookie copies.
-- `data/downloads/`: default download directory.
 - `data/logs/`: task diagnostics.
 - `data/tools/`: independently updatable local runtime components.
+
+The portable edition's default media folder is the root `downloads/` directory, separate from private runtime state such as the database and cookies. yt-dlp-ejs updates follow the exact companion version declared by the bundled yt-dlp; the official external `yt-dlp.exe` already includes EJS.
 
 Do not publicly upload the complete `data/` directory. It may contain signed-in account state and private task information.
 

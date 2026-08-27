@@ -8,7 +8,7 @@ updates a directory and is not compatible with PyInstaller's onefile mode.
 from pathlib import Path
 import sys
 
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules, copy_metadata
 
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parent
@@ -56,6 +56,7 @@ for vendor_name, vendor_destination in (
 ):
     datas.append((str(vendor_sau / vendor_name), vendor_destination))
 datas += collect_data_files("yt_dlp")
+datas += copy_metadata("yt-dlp")
 playwright_datas, playwright_binaries, playwright_hidden = collect_all("playwright")
 datas += playwright_datas
 

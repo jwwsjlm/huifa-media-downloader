@@ -5,6 +5,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+from PySide6.QtCore import QStandardPaths
+
+from app.core.version import APP_NAME_EN
+
 
 class PortableDataDirectoryError(RuntimeError):
     """Raised when the app-local data directory cannot be used safely."""
@@ -61,8 +65,52 @@ def data_dir() -> Path:
     return _ensure_writable_directory(_portable_data_path())
 
 
+def _managed_release_root(application_root: str | Path | None = None) -> Path | None:
+    """Return the Velopack root containing ``current`` when managed."""
+
+    app_root = Path(application_root) if application_root is not None else application_dir()
+    try:
+        from app.core.application_updater import velopack_persistent_data_dir
+
+        persistent = velopack_persistent_data_dir(app_root)
+    except Exception:
+        persistent = None
+    return persistent.parent if persistent is not None else None
+
+
+def portable_deployment(application_root: str | Path | None = None) -> bool:
+    """Return whether downloads should travel with the application folder.
+
+    Source runs and the legacy single-file build are portable by definition.
+    A managed Velopack package is portable only when its root contains the
+    marker created by Velopack's portable pack command.
+    """
+
+    managed_root = _managed_release_root(application_root)
+    return managed_root is None or (managed_root / ".portable").is_file()
+
+
+def system_downloads_dir() -> Path:
+    """Return the operating system's user Downloads location."""
+
+    value = str(QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or "").strip()
+    return Path(value).expanduser() if value else Path.home() / "Downloads"
+
+
 def downloads_dir() -> Path:
-    return _ensure_writable_directory(data_dir() / "downloads")
+    app_root = application_dir()
+    managed_root = _managed_release_root(app_root)
+    if managed_root is not None and not portable_deployment(app_root):
+        # Installed editions must not keep user media in Velopack's uninstall
+        # scope. The application-owned subfolder also avoids mixing files
+        # directly into the user's general Downloads directory.
+        target = system_downloads_dir() / APP_NAME_EN
+    else:
+        # For source, legacy portable and directory-portable builds, keep the
+        # media folder beside the application rather than inside data/. This
+        # separates replaceable/private state from user-created content.
+        target = (managed_root or app_root) / "downloads"
+    return _ensure_writable_directory(target)
 
 
 def resolve_portable_path(

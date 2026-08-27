@@ -8,7 +8,7 @@ Velopack-managed release; Velopack requires the separate onedir spec.
 
 from pathlib import Path
 import sys
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules, copy_metadata
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -84,6 +84,7 @@ for vendor_name, vendor_destination in (
 # WinLDD installer helper alongside it.
 datas.append((str(chromium_runtime_dir), 'tools/chromium/chrome-win64'))
 datas += collect_data_files('yt_dlp')
+datas += copy_metadata('yt-dlp')
 playwright_datas, playwright_binaries, playwright_hidden = collect_all('playwright')
 datas += playwright_datas
 hiddenimports = [

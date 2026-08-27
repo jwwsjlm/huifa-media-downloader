@@ -1,6 +1,6 @@
 APP_NAME = "汇发视频下载工具"
 APP_NAME_EN = "Huifa Video Downloader"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 APP_PUBLISHER = "Huifa"
 APP_DESCRIPTION = "视频与播放列表下载、封面处理和多平台发布工具"
 APP_COPYRIGHT = "Copyright © 2026 Huifa"

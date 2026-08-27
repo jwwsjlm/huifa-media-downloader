@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.core.paths import application_dir, tool_runtime_roots
+from app.core.ytdlp_ejs import required_ytdlp_ejs_version, ytdlp_ejs_version_compatible
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,27 +73,41 @@ def local_ejs_wheels() -> list[Path]:
 
 
 def local_ejs_component() -> LocalPythonComponent | None:
-    wheels = local_ejs_wheels()
-    if not wheels:
-        return None
-    path = wheels[0]
-    version = wheel_distribution_version(path, "yt-dlp-ejs")
-    return LocalPythonComponent(
-        name="yt-dlp-ejs",
-        version=version,
-        path=str(path),
-        source="软件本地核心目录",
-    )
+    for path in local_ejs_wheels():
+        version = wheel_distribution_version(path, "yt-dlp-ejs")
+        if ytdlp_ejs_version_compatible(version):
+            return LocalPythonComponent(
+                name="yt-dlp-ejs",
+                version=version,
+                path=str(path),
+                source="软件本地核心目录",
+            )
+    return None
+
+
+def incompatible_local_ejs_versions() -> tuple[str, ...]:
+    """Return installed EJS versions rejected by the bundled yt-dlp pin."""
+
+    required = required_ytdlp_ejs_version()
+    if not required:
+        return ()
+    versions = {
+        wheel_distribution_version(path, "yt-dlp-ejs")
+        for path in local_ejs_wheels()
+    }
+    return tuple(sorted((version for version in versions if version and version != required), key=_version_key, reverse=True))
 
 
 def activate_local_ejs() -> LocalPythonComponent | None:
-    """Put the newest app-owned EJS wheel ahead of system Python packages."""
-    component = local_ejs_component()
-    if component is None:
-        return None
-    selected = str(Path(component.path))
+    """Put the yt-dlp-compatible app-owned EJS wheel first on sys.path."""
+
     known = {str(path) for path in local_ejs_wheels()}
     sys.path[:] = [entry for entry in sys.path if entry not in known]
+    component = local_ejs_component()
+    if component is None:
+        importlib.invalidate_caches()
+        return None
+    selected = str(Path(component.path))
     sys.path.insert(0, selected)
     importlib.invalidate_caches()
     return component

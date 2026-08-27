@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from app.core.local_components import wheel_distribution_version
 from app.core.paths import application_dir, data_dir
+from app.core.ytdlp_ejs import required_ytdlp_ejs_version, ytdlp_ejs_version_compatible
 
 
 class ToolInstallError(RuntimeError):
@@ -205,6 +206,11 @@ def _install_ejs_wheel(
     cancel_event: threading.Event | None,
 ) -> ToolInstallResult:
     version = _validate_ejs_wheel(source)
+    if not ytdlp_ejs_version_compatible(version):
+        required = required_ytdlp_ejs_version()
+        raise ToolInstallError(
+            f"yt-dlp-ejs {version} 与当前内置 yt-dlp 不兼容，需要配套版本 {required}"
+        )
     last_permission_error: Exception | None = None
     for root in _install_roots():
         target_dir = root / "tools" / "yt-dlp-ejs"

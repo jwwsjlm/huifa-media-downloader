@@ -64,6 +64,56 @@ class ToolInstallerTests(unittest.TestCase):
             if str(target.resolve()) in sys.path:
                 sys.path.remove(str(target.resolve()))
 
+    def test_incompatible_ejs_wheel_is_rejected_without_replacing_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "updates" / "yt_dlp_ejs-0.9.0-py3-none-any.whl"
+            install_root = root / "portable"
+            current = (
+                install_root
+                / "tools"
+                / "yt-dlp-ejs"
+                / "yt_dlp_ejs-0.8.0-py3-none-any.whl"
+            )
+            self._write_ejs_wheel(source, "0.9.0")
+            self._write_ejs_wheel(current, "0.8.0")
+
+            with patch("app.core.tool_installer._install_roots", return_value=(install_root,)), patch(
+                "app.core.tool_installer.required_ytdlp_ejs_version", return_value="0.8.0"
+            ), patch(
+                "app.core.tool_installer.ytdlp_ejs_version_compatible",
+                side_effect=lambda version: version == "0.8.0",
+            ):
+                with self.assertRaisesRegex(ToolInstallError, "需要配套版本 0.8.0"):
+                    install_tool_component("yt-dlp-ejs", source)
+
+            self.assertTrue(source.is_file())
+            self.assertTrue(current.is_file())
+
+    def test_local_ejs_activates_matching_pin_instead_of_newest_wheel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compatible = root / "tools" / "yt-dlp-ejs" / "yt_dlp_ejs-0.8.0-py3-none-any.whl"
+            newer = root / "tools" / "yt-dlp-ejs" / "yt_dlp_ejs-0.9.0-py3-none-any.whl"
+            self._write_ejs_wheel(compatible, "0.8.0")
+            self._write_ejs_wheel(newer, "0.9.0")
+
+            with patch("app.core.local_components.application_dir", return_value=root), patch(
+                "app.core.local_components.tool_runtime_roots", return_value=[root]
+            ), patch(
+                "app.core.local_components.ytdlp_ejs_version_compatible",
+                side_effect=lambda version: version == "0.8.0",
+            ):
+                component = local_ejs_component()
+                activated = activate_local_ejs()
+
+            self.assertIsNotNone(component)
+            self.assertEqual(component.version, "0.8.0")
+            self.assertEqual(activated.path, str(compatible.resolve()))
+            self.assertNotIn(str(newer.resolve()), sys.path)
+            if str(compatible.resolve()) in sys.path:
+                sys.path.remove(str(compatible.resolve()))
+
     def test_fresh_pc_resolves_every_download_core_from_app_local_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

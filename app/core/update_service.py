@@ -39,7 +39,11 @@ from app.core.external_ytdlp import (
     clear_external_ytdlp_version_cache,
     remember_external_ytdlp_version,
 )
-from app.core.local_components import activate_local_ejs, local_ejs_component
+from app.core.local_components import (
+    activate_local_ejs,
+    incompatible_local_ejs_versions,
+    local_ejs_component,
+)
 from app.core.github_mirrors import (
     GithubDownloadRoute,
     ROUTE_AUTO,
@@ -54,6 +58,7 @@ from app.core.github_mirrors import (
 from app.core.tool_installer import ToolInstallResult, install_tool_component
 from app.core.tool_resolver import normalize_runtime_component, resolve_ffprobe_tool, resolve_runtime_tool
 from app.core.version import APP_VERSION
+from app.core.ytdlp_ejs import required_ytdlp_ejs_version
 
 
 GITHUB_RELEASE_REPOS = {
@@ -691,6 +696,15 @@ def _detect_external_tool_installation(
 def _detect_local_ejs_installation() -> tuple[str, str, str]:
     component = local_ejs_component()
     if component is None:
+        incompatible = incompatible_local_ejs_versions()
+        required = required_ytdlp_ejs_version()
+        if incompatible and required:
+            found = "、".join(incompatible)
+            return (
+                "未安装",
+                f"已忽略不兼容版本 {found}；当前内置 yt-dlp 需要 {required}",
+                "",
+            )
         return "未安装", "未检测到软件本地 yt-dlp-ejs wheel", ""
     return component.version, component.source, component.path
 
@@ -1672,6 +1686,44 @@ class UpdateWorker(QObject):
             )
         return _InstalledComponentState(*self._installed_component(name))
 
+    def _compatible_ejs_release_payload(
+        self,
+        repo: str,
+        payload: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Resolve the EJS release pinned by the bundled Python yt-dlp."""
+
+        required = required_ytdlp_ejs_version()
+        if not required:
+            return dict(payload)
+        latest = str(payload.get("tag_name") or payload.get("name") or "").strip()
+        if normalize_version(latest) == normalize_version(required):
+            return dict(payload)
+
+        compatible = dict(payload)
+        compatible.update({
+            "tag_name": required,
+            "name": required,
+            "html_url": f"https://github.com/{repo}/releases/tag/{quote(required, safe='')}",
+            "published_at": "",
+        })
+        try:
+            assets, release_tag = self._release_assets_for_tag(repo, required, headers)
+        except Exception as exc:
+            compatible["assets"] = []
+            warning = str(compatible.get("_metadata_warning") or "").strip("；")
+            pairing_warning = f"无法读取与内置 yt-dlp 配套的 EJS {required} 资源：{exc}"
+            compatible["_metadata_warning"] = "；".join(
+                part for part in (warning, pairing_warning) if part
+            )
+        else:
+            compatible["assets"] = assets
+            compatible["html_url"] = (
+                f"https://github.com/{repo}/releases/tag/{quote(release_tag or required, safe='%')}"
+            )
+        return compatible
+
     @staticmethod
     def _moving_release_has_update(
         local_build_date: str,
@@ -1924,6 +1976,8 @@ class UpdateWorker(QObject):
 
         self._raise_if_cancelled()
         payload = dict(payload)
+        if component_key == "yt-dlp-ejs":
+            payload = self._compatible_ejs_release_payload(repo, payload, headers)
         installed = self._installed_component_state(name)
         self._raise_if_cancelled()
         release = self._component_release_state(
