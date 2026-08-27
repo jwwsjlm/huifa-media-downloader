@@ -26,7 +26,7 @@ class DeploymentDownloadPathTests(unittest.TestCase):
             current = self._managed_layout(root, portable=True)
             with patch("app.core.paths.application_dir", return_value=current):
                 self.assertTrue(portable_deployment())
-                self.assertEqual(downloads_dir(), root / "downloads")
+                self.assertEqual(downloads_dir().resolve(), (root / "downloads").resolve())
                 self.assertFalse((root / "data" / "downloads").exists())
 
     def test_installed_downloads_live_outside_velopack_root(self) -> None:
@@ -38,7 +38,10 @@ class DeploymentDownloadPathTests(unittest.TestCase):
                 "app.core.paths.system_downloads_dir", return_value=user_downloads
             ):
                 self.assertFalse(portable_deployment())
-                self.assertEqual(downloads_dir(), user_downloads / APP_NAME_EN)
+                self.assertEqual(
+                    downloads_dir().resolve(),
+                    (user_downloads / APP_NAME_EN).resolve(),
+                )
                 self.assertFalse((base / "installed" / "data" / "downloads").exists())
 
     def test_source_and_legacy_portable_keep_root_downloads(self) -> None:
@@ -46,7 +49,7 @@ class DeploymentDownloadPathTests(unittest.TestCase):
             root = Path(directory)
             with patch("app.core.paths.application_dir", return_value=root):
                 self.assertTrue(portable_deployment())
-                self.assertEqual(downloads_dir(), root / "downloads")
+                self.assertEqual(downloads_dir().resolve(), (root / "downloads").resolve())
 
 
 if __name__ == "__main__":
