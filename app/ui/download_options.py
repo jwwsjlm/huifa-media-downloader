@@ -875,7 +875,6 @@ class CollectionSelectionPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.model = CollectionEntryModel(self)
-        self.model.dataChanged.connect(lambda *_args: self._update_summary())
         self.model.selection_changed.connect(self._update_summary)
         self._storage_preview_provider: Callable[[], str] | None = None
         self.proxy = CollectionFilterProxy(self)
@@ -986,6 +985,8 @@ class CollectionSelectionPage(QWidget):
         self.proxy.set_query('')
         self.proxy.set_state('all')
         self.proxy.set_limits('', '', 0, 0)
+        if self.proxy.sourceModel() is not self.model:
+            self.proxy.setSourceModel(self.model)
         if self.table.model() is not self.proxy:
             self.table.setModel(self.proxy)
         self.table.setSortingEnabled(True)
@@ -1010,6 +1011,8 @@ class CollectionSelectionPage(QWidget):
         view_loader: Callable[[int, int, Mapping[str, Any]], list[dict[str, Any]]] | None = None,
         view_counter: Callable[[Mapping[str, Any]], int] | None = None,
     ) -> None:
+        self.table.setSortingEnabled(False)
+        self.proxy.setSourceModel(None)
         self.model.set_paged_source(
             total_count,
             loader,
@@ -1020,7 +1023,6 @@ class CollectionSelectionPage(QWidget):
             view_loader=view_loader,
             view_counter=view_counter,
         )
-        self.table.setSortingEnabled(False)
         self.table.setModel(self.model)
         self.table.horizontalHeader().setSortIndicatorShown(True)
         self.table.horizontalHeader().setSortIndicator(1, Qt.AscendingOrder)

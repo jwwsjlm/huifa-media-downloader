@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
 import os
 import time
 from datetime import datetime
@@ -40,15 +39,6 @@ def _resolve_account_file(account_file: str | Path) -> str:
         return str((Path(BASE_DIR) / "cookies" / "tencent_uploader" / path).resolve())
 
     return str(path.resolve())
-
-
-async def _emit_qrcode_callback(qrcode_callback, payload: dict):
-    if not qrcode_callback:
-        return
-
-    callback_result = qrcode_callback(payload)
-    if inspect.isawaitable(callback_result):
-        await callback_result
 
 
 def _build_login_result(
@@ -195,7 +185,7 @@ async def _extract_tencent_qrcode_src(page: Page) -> str:
     raise RuntimeError("未获取到视频号登录二维码地址")
 
 
-async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None, qrcode_callback=None) -> dict:
+async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None) -> dict:
     qrcode_utils = _get_qrcode_utils()
     qrcode_src = await _extract_tencent_qrcode_src(page)
     qrcode_path = qrcode_utils["save_data_url_image"](
@@ -212,7 +202,6 @@ async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_pa
         "image_path": str(qrcode_path),
         "image_data_url": qrcode_src,
     }
-    await _emit_qrcode_callback(qrcode_callback, qrcode_info)
     return qrcode_info
 
 
@@ -327,7 +316,6 @@ async def _wait_for_tencent_login(
     page: Page,
     account_file: str,
     qrcode_info: dict | None,
-    qrcode_callback=None,
     poll_interval: int = 3,
     max_checks: int = 100,
 ) -> dict:
@@ -351,7 +339,6 @@ async def _wait_for_tencent_login(
                     page,
                     account_file,
                     previous_qrcode_path=qrcode_path,
-                    qrcode_callback=qrcode_callback,
                 )
                 qrcode_path = Path(qrcode_info["image_path"])
             except Exception as exc:
@@ -364,7 +351,6 @@ async def _wait_for_tencent_login(
 
 async def tencent_cookie_gen(
     account_file,
-    qrcode_callback=None,
     poll_interval: int = 3,
     max_checks: int = 100,
     headless: bool = LOCAL_CHROME_HEADLESS,
@@ -381,7 +367,7 @@ async def tencent_cookie_gen(
             page = await context.new_page()
             await page.goto(TENCENT_LOGIN_URL)
             try:
-                qrcode_info = await _save_tencent_qrcode(page, account_file, qrcode_callback=qrcode_callback)
+                qrcode_info = await _save_tencent_qrcode(page, account_file)
                 qrcode_path = Path(qrcode_info["image_path"])
             except Exception as exc:
                 tencent_logger.warning(
@@ -394,7 +380,6 @@ async def tencent_cookie_gen(
                 page,
                 account_file,
                 qrcode_info,
-                qrcode_callback=qrcode_callback,
                 poll_interval=poll_interval,
                 max_checks=max_checks,
             )
@@ -434,7 +419,6 @@ async def tencent_setup(
     account_file,
     handle=False,
     return_detail=False,
-    qrcode_callback=None,
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
     account_file = _resolve_account_file(account_file)
@@ -444,29 +428,27 @@ async def tencent_setup(
             return result if return_detail else False
 
         tencent_logger.info(_msg("🥹", "cookie 失效了，准备打开浏览器重新登录"))
-        result = await tencent_cookie_gen(account_file, qrcode_callback=qrcode_callback, headless=headless)
+        result = await tencent_cookie_gen(account_file, headless=headless)
         return result if return_detail else result["success"]
 
     result = _build_login_result(True, "cookie_valid", "cookie有效", account_file)
     return result if return_detail else True
 
 
-async def get_tencent_cookie(account_file, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS):
-    return await tencent_cookie_gen(account_file, qrcode_callback=qrcode_callback, headless=headless)
+async def get_tencent_cookie(account_file, headless: bool = LOCAL_CHROME_HEADLESS):
+    return await tencent_cookie_gen(account_file, headless=headless)
 
 
 async def weixin_setup(
     account_file,
     handle=False,
     return_detail=False,
-    qrcode_callback=None,
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
     return await tencent_setup(
         account_file,
         handle=handle,
         return_detail=return_detail,
-        qrcode_callback=qrcode_callback,
         headless=headless,
     )
 
@@ -1123,103 +1105,3 @@ class TencentVideo(TencentBaseUploader):
 
     async def main(self):
         await self.tencent_upload_video()
-
-
-class TencentNote(TencentBaseUploader):
-    def __init__(
-        self,
-        image_paths,
-        note,
-        tags,
-        publish_date: datetime | int,
-        account_file,
-        title: str | None = None,
-        publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
-        debug: bool = DEBUG_MODE,
-        headless: bool = LOCAL_CHROME_HEADLESS,
-        is_draft: bool = False,
-    ):
-        super().__init__(
-            publish_date=publish_date,
-            account_file=account_file,
-            publish_strategy=publish_strategy,
-            debug=debug,
-            headless=headless,
-        )
-        self.image_paths = image_paths
-        self.note = note or ""
-        self.title = title or (self.note[:30] if self.note else "")
-        self.tags = tags or []
-        self.is_draft = is_draft
-
-    async def validate_upload_args(self):
-        await self.validate_base_args()
-        if not self.title or not str(self.title).strip():
-            raise ValueError("图文模式下，title 是必须的")
-        if not self.image_paths:
-            raise ValueError("图文模式下，图片是必须的")
-
-        if isinstance(self.image_paths, (str, Path)):
-            self.image_paths = [self.image_paths]
-
-        normalized_image_paths = []
-        for image_path in self.image_paths:
-            normalized_image_paths.append(str(self.validate_image_file(image_path)))
-        self.image_paths = normalized_image_paths
-
-    async def switch_to_note_mode(self, page: Page) -> None:
-        raise NotImplementedError("请在 TencentNote.switch_to_note_mode 中补充视频号切换到图文发布模式的逻辑")
-
-    async def upload_note_images(self, page: Page) -> None:
-        raise NotImplementedError("请在 TencentNote.upload_note_images 中补充视频号图文图片上传逻辑")
-
-    async def fill_note_title_and_tags(self, page: Page) -> None:
-        raise NotImplementedError("请在 TencentNote.fill_note_title_and_tags 中补充视频号图文标题/话题填写逻辑")
-
-    async def fill_note_body(self, page: Page) -> None:
-        return None
-
-    async def prepare_note_for_publish(self, page: Page) -> None:
-        await self.fill_note_title_and_tags(page)
-        await self.fill_note_body(page)
-        await self.apply_collection(page)
-        await self.apply_original_statement(page)
-
-    async def upload_note_content(self, page: Page) -> None:
-        await self.switch_to_note_mode(page)
-        await self.upload_note_images(page)
-        await self.prepare_note_for_publish(page)
-
-    async def upload(self, playwright: Playwright) -> None:
-        tencent_logger.info(_msg("🧍", "小人先检查 cookie、图文图片和发布时间"))
-        await self.validate_upload_args()
-        tencent_logger.info(_msg("🥳", "图文上传前检查通过"))
-
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
-        context = await set_init_script(context)
-
-        try:
-            page = await context.new_page()
-            await self.open_upload_page(page)
-            tencent_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
-
-            await self.upload_note_content(page)
-
-            if self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
-                await self.set_schedule_time_tencent(page, self.publish_date)
-
-            await self.submit_publish(page)
-
-            await context.storage_state(path=self.account_file)
-            tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
-        finally:
-            await context.close()
-            await browser.close()
-
-    async def tencent_upload_note(self):
-        async with async_playwright() as playwright:
-            await self.upload(playwright)
-
-    async def main(self):
-        await self.tencent_upload_note()

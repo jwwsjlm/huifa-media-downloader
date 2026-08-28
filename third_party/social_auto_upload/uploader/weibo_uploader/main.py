@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import re
 import time
@@ -50,14 +49,6 @@ def _build_login_result(success: bool, status: str, message: str, account_file: 
         "qrcode": qrcode,
         "current_url": current_url,
     }
-
-
-async def _emit_qrcode_callback(qrcode_callback, payload: dict):
-    if not qrcode_callback:
-        return
-    callback_result = qrcode_callback(payload)
-    if inspect.isawaitable(callback_result):
-        await callback_result
 
 
 def _build_launch_kwargs(headless: bool) -> dict:
@@ -150,7 +141,7 @@ async def _is_login_completed(page: Page) -> bool:
     return False
 
 
-async def weibo_cookie_gen(account_file, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 120, headless: bool = LOCAL_CHROME_HEADLESS):
+async def weibo_cookie_gen(account_file, poll_interval: int = 3, max_checks: int = 120, headless: bool = LOCAL_CHROME_HEADLESS):
     """无头/有头扫码登录微博，保存 cookie。
 
     流程：直接打开微博 passport 扫码页 → 截取二维码 → 等待扫码完成（跳转回首页）→ 保存 storage_state。
@@ -178,7 +169,6 @@ async def weibo_cookie_gen(account_file, qrcode_callback=None, poll_interval: in
             # 截取二维码
             qrcode_info = await _grab_qr(page, account_file)
             qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
-            await _emit_qrcode_callback(qrcode_callback, qrcode_info)
 
             weibo_logger.info(_msg("🧍", "请扫码，正在耐心等待登录完成"))
 
@@ -247,7 +237,7 @@ async def cookie_auth(account_file):
             await browser.close()
 
 
-async def weibo_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS):
+async def weibo_setup(account_file, handle=False, return_detail=False, headless: bool = LOCAL_CHROME_HEADLESS):
     """统一入口：检查 cookie → 如无效且 handle=True 则触发扫码登录。"""
     account_file = _resolve_account_file(account_file)
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
@@ -255,7 +245,7 @@ async def weibo_setup(account_file, handle=False, return_detail=False, qrcode_ca
             result = _build_login_result(False, "cookie_invalid", "cookie 文件不存在或已失效", account_file)
             return result if return_detail else False
         weibo_logger.info(_msg("🥹", "cookie 文件不存在或已失效，自动打开浏览器请扫码登录"))
-        result = await weibo_cookie_gen(account_file, qrcode_callback=qrcode_callback, headless=headless)
+        result = await weibo_cookie_gen(account_file, headless=headless)
         return result if return_detail else result["success"]
 
     result = _build_login_result(True, "cookie_valid", "cookie 有效", account_file)

@@ -2,7 +2,6 @@
 from datetime import datetime
 
 import asyncio
-import inspect
 import os
 import sys
 from pathlib import Path
@@ -87,15 +86,6 @@ async def _native_click(page, locator) -> bool:
         return False
 
 
-async def _emit_qrcode_callback(qrcode_callback, payload: dict):
-    if not qrcode_callback:
-        return
-
-    callback_result = qrcode_callback(payload)
-    if inspect.isawaitable(callback_result):
-        await callback_result
-
-
 def _build_login_result(success: bool, status: str, message: str, account_file: str, qrcode: dict | None = None, current_url: str = "") -> dict:
     return {
         "success": success,
@@ -136,13 +126,13 @@ async def cookie_auth(account_file):
     return False
 
 
-async def douyin_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS, cdp_url: str | None = None):
+async def douyin_setup(account_file, handle=False, return_detail=False, headless: bool = LOCAL_CHROME_HEADLESS, cdp_url: str | None = None):
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
             return result if return_detail else False
         douyin_logger.info(_msg("🥹", "cookie 失效了，准备打开浏览器重新登录"))
-        result = await douyin_cookie_gen(account_file, qrcode_callback=qrcode_callback, headless=headless, cdp_url=cdp_url)
+        result = await douyin_cookie_gen(account_file, headless=headless, cdp_url=cdp_url)
         return result if return_detail else result["success"]
 
     result = _build_login_result(True, "cookie_valid", "cookie有效", account_file)
@@ -184,8 +174,8 @@ async def _extract_douyin_qrcode_src(page: Page) -> str:
     raise RuntimeError(f"未获取到抖音登录二维码地址 (last_err={last_err})")
 
 
-async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None, qrcode_callback=None) -> dict:
-    # 提取二维码 src 用于保存并交给桌面界面显示；定位不到时有头浏览器仍可直接扫码。
+async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None) -> dict:
+    # 提取二维码 src 用于保存；定位不到时有头浏览器仍可直接扫码。
     try:
         qrcode_src = await _extract_douyin_qrcode_src(page)
     except Exception as exc:
@@ -200,7 +190,6 @@ async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_pat
         "image_path": str(qrcode_path),
         "image_data_url": qrcode_src,
     }
-    await _emit_qrcode_callback(qrcode_callback, qrcode_info)
     return qrcode_info
 
 
@@ -228,7 +217,7 @@ async def _is_douyin_login_completed(page: Page) -> bool:
     return True
 
 
-async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dict, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 100) -> dict:
+async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dict, poll_interval: int = 3, max_checks: int = 100) -> dict:
     qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
     original_url = page.url
     saw_2fa = False
@@ -252,7 +241,7 @@ async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dic
             douyin_logger.warning(_msg("😵", "二维码失效了，小人马上去刷新"))
             await expired_box.click()
             await asyncio.sleep(1)
-            qrcode_info = await _save_douyin_qrcode(page, account_file, qrcode_path, qrcode_callback=qrcode_callback)
+            qrcode_info = await _save_douyin_qrcode(page, account_file, qrcode_path)
             qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
 
         await asyncio.sleep(poll_interval)
@@ -261,7 +250,6 @@ async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dic
 
 async def douyin_cookie_gen(
     account_file,
-    qrcode_callback=None,
     poll_interval: int = 2,
     max_checks: int = 60,
     headless: bool = LOCAL_CHROME_HEADLESS,
@@ -285,14 +273,13 @@ async def douyin_cookie_gen(
         try:
             page = await context.new_page()
             await page.goto("https://creator.douyin.com/")
-            qrcode_info = await _save_douyin_qrcode(page, account_file, qrcode_callback=qrcode_callback)
+            qrcode_info = await _save_douyin_qrcode(page, account_file)
             qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
             douyin_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
             result = await _wait_for_douyin_login(
                 page,
                 account_file,
                 qrcode_info,
-                qrcode_callback=qrcode_callback,
                 poll_interval=poll_interval,
                 max_checks=max_checks,
             )
@@ -1125,145 +1112,3 @@ class DouYinVideo(DouYinBaseUploader):
 
     async def main(self):
         await self.douyin_upload_video()
-
-
-class DouYinNote(DouYinBaseUploader):
-    def __init__(
-        self,
-        image_paths,
-        note,
-        tags,
-        publish_date: datetime | int,
-        account_file,
-        title: str | None = None,
-        publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
-        debug: bool = DEBUG_MODE,
-        headless: bool = LOCAL_CHROME_HEADLESS,
-        bgm: str = "",
-    ):
-        super().__init__(
-            publish_date=publish_date,
-            account_file=account_file,
-            publish_strategy=publish_strategy,
-            debug=debug,
-            headless=headless,
-        )
-        self.image_paths = image_paths
-        self.note = note or ""
-        self.title = title or (self.note[:30] if self.note else "")
-        self.tags = tags or []
-        self.bgm = bgm or ""
-
-    async def validate_upload_args(self):
-        await self.validate_base_args()
-        if not self.title or not str(self.title).strip():
-            raise ValueError("图文模式下，title 是必须的")
-
-        if len(self.title) > 20:
-            raise ValueError(f"标题不能超过20字符，当前: {len(self.title)}字符")
-
-        if not self.image_paths:
-            raise ValueError("图文模式下，图片是必须的")
-
-        if isinstance(self.image_paths, (str, Path)):
-            self.image_paths = [self.image_paths]
-
-        if len(self.image_paths) > 35:
-            raise ValueError("图文模式下最多只支持上传 35 张图片")
-
-        note_len = len(self.note) if self.note else 0
-        if note_len > 1000:
-            raise ValueError(f"正文不能超过1000字符，当前: {note_len}字符")
-
-        normalized_image_paths = []
-        for image_path in self.image_paths:
-            normalized_image_paths.append(str(self.validate_image_file(image_path)))
-        self.image_paths = normalized_image_paths
-
-    async def upload_note_content(self, page: Page) -> None:
-        douyin_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
-        douyin_logger.info(_msg("🔀", "小人正在切换到图文发布"))
-        await page.get_by_text("发布图文", exact=True).click()
-        await page.wait_for_timeout(1000)
-
-        douyin_logger.info(_msg("📤", "小人正在上传图片"))
-        await page.locator("div[class^='container'] input[accept*='image']").set_input_files(self.image_paths)
-
-        while True:
-            try:
-                await page.wait_for_url(
-                    "**/creator-micro/content/post/image?**",
-                    timeout=3000,
-                )
-                douyin_logger.info(_msg("🥳", "已经进入图文发布页面"))
-                break
-            except Exception:
-                douyin_logger.debug(_msg("🧍", "小人还在等图片上传完成"))
-                await asyncio.sleep(0.5)
-
-        await asyncio.sleep(1)
-        douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
-        await self.fill_title_and_description(page, self.title, self.note, self.tags)
-        title_len = len(self.title) if self.title else 0
-        tags_text = " ".join(f"#{t}" for t in self.tags) if self.tags else ""
-        desc_and_tags_len = len(self.note or "") + (len(tags_text) + 2 if self.tags else 0)
-        douyin_logger.info(_msg("📝", f"标题总字数: {title_len}，描述+话题总字数: {desc_and_tags_len}"))
-        douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
-
-        if self.bgm:
-            await self.select_bgm(page, self.bgm)
-
-        if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
-            await self.set_schedule_time_douyin(page, self.publish_date)
-
-        while True:
-            try:
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    await publish_button.click()
-                await page.wait_for_url(
-                    "**/creator-micro/content/manage?enter_from=publish**",
-                    timeout=3000,
-                )
-                douyin_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
-                break
-            except Exception:
-                douyin_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
-                await asyncio.sleep(0.5)
-
-    async def upload(self, playwright: Playwright) -> None:
-        douyin_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
-        await self.validate_upload_args()
-        douyin_logger.info(_msg("🥳", "图文上传前检查通过"))
-
-        browser = await playwright.chromium.launch(
-            headless=self.headless,
-            executable_path=self.local_executable_path,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
-        context = await browser.new_context(
-            storage_state=f"{self.account_file}",
-            permissions=["geolocation"],
-        )
-        context = await set_init_script(context)
-
-        upload_success = False
-        try:
-            page = await context.new_page()
-            await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
-            douyin_logger.info(_msg("🧭", "小人正在赶往图文发布页"))
-            await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=90000)
-
-            await self.upload_note_content(page)
-            upload_success = True
-        finally:
-            if upload_success:
-                await context.storage_state(path=self.account_file)
-                douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
-                await asyncio.sleep(2)
-            await context.close()
-            await browser.close()
-
-    async def douyin_upload_note(self):
-        async with async_playwright() as playwright:
-            await self.upload(playwright)

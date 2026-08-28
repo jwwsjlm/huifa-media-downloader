@@ -311,6 +311,14 @@ class CollectionProbeWorker(QObject):
         source_key, completed = self._entry_completed(info, url)
         duration = non_negative_float(info.get("duration"))
         estimated_bytes = self._entry_estimated_bytes(info, duration)
+        thumbnails = info.get("thumbnails")
+        thumbnail = str(info.get("thumbnail") or "")
+        if not thumbnail and isinstance(thumbnails, list):
+            thumbnail = next((
+                str(item.get("url") or "")
+                for item in reversed(thumbnails)
+                if isinstance(item, Mapping) and item.get("url")
+            ), "")
         return CollectionEntry(
             source_key=source_key,
             url=url,
@@ -318,7 +326,7 @@ class CollectionProbeWorker(QObject):
             uploader=str(info.get("uploader") or info.get("channel") or info.get("creator") or ""),
             duration=duration,
             upload_date=str(info.get("upload_date") or info.get("release_date") or ""),
-            thumbnail=str(info.get("thumbnail") or ""),
+            thumbnail=thumbnail,
             live_status=str(info.get("live_status") or ("is_live" if info.get("is_live") else "")),
             availability=availability,
             index=index,

@@ -493,9 +493,9 @@ async def upload_tencent_video(request: TencentVideoUploadRequest) -> Path:
     return account_file
 
 
-async def login_baijiahao_account(account_name: str, headless: bool = True, qrcode_callback=None) -> dict:
+async def login_baijiahao_account(account_name: str, headless: bool = True) -> dict:
     account_file = resolve_account_file("baijiahao", account_name)
-    return await baijiahao_setup(str(account_file), handle=True, return_detail=True, headless=headless, qrcode_callback=qrcode_callback)
+    return await baijiahao_setup(str(account_file), handle=True, return_detail=True, headless=headless)
 
 
 async def check_baijiahao_account(account_name: str) -> bool:
@@ -528,9 +528,9 @@ async def upload_baijiahao_video(request: BaijiahaoVideoUploadRequest) -> Path:
     return account_file
 
 
-async def login_alipay_account(account_name: str, headless: bool = True, qrcode_callback=None) -> dict:
+async def login_alipay_account(account_name: str, headless: bool = True) -> dict:
     account_file = resolve_account_file("alipay", account_name)
-    return await alipay_setup(str(account_file), handle=True, return_detail=True, headless=headless, qrcode_callback=qrcode_callback)
+    return await alipay_setup(str(account_file), handle=True, return_detail=True, headless=headless)
 
 
 async def check_alipay_account(account_name: str) -> bool:
@@ -563,9 +563,9 @@ async def upload_alipay_video(request: AlipayVideoUploadRequest) -> Path:
     return account_file
 
 
-async def login_weibo_account(account_name: str, headless: bool = True, qrcode_callback=None) -> dict:
+async def login_weibo_account(account_name: str, headless: bool = True) -> dict:
     account_file = resolve_account_file("weibo", account_name)
-    return await weibo_setup(str(account_file), handle=True, return_detail=True, headless=headless, qrcode_callback=qrcode_callback)
+    return await weibo_setup(str(account_file), handle=True, return_detail=True, headless=headless)
 
 
 async def check_weibo_account(account_name: str) -> bool:
@@ -598,9 +598,9 @@ async def upload_weibo_video(request: WeiboVideoUploadRequest) -> Path:
     return account_file
 
 
-async def login_hupu_account(account_name: str, headless: bool = False, qrcode_callback=None) -> dict:
+async def login_hupu_account(account_name: str, headless: bool = False) -> dict:
     account_file = resolve_account_file("hupu", account_name)
-    return await hupu_setup(str(account_file), handle=True, return_detail=True, headless=headless, qrcode_callback=qrcode_callback)
+    return await hupu_setup(str(account_file), handle=True, return_detail=True, headless=headless)
 
 
 async def check_hupu_account(account_name: str) -> bool:

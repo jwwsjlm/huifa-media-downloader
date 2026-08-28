@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 from datetime import datetime
 from pathlib import Path
@@ -62,15 +61,6 @@ async def _js_click_by_text(page: Page, text: str) -> bool:
     )
 
 
-async def _emit_qrcode_callback(qrcode_callback, payload: dict):
-    if not qrcode_callback:
-        return
-
-    callback_result = qrcode_callback(payload)
-    if inspect.isawaitable(callback_result):
-        await callback_result
-
-
 def _build_login_result(
     success: bool,
     status: str,
@@ -127,7 +117,6 @@ async def _save_xhs_qrcode(
     page: Page,
     account_file: str,
     previous_qrcode_path: Path | None = None,
-    qrcode_callback=None,
 ) -> dict:
     qrcode_src = await _extract_xhs_qrcode_src(page)
     qrcode_path = build_login_qrcode_path(account_file, suffix="xhs_login_qrcode")
@@ -149,7 +138,6 @@ async def _save_xhs_qrcode(
         "image_path": str(qrcode_path),
         "image_data_url": qrcode_src,
     }
-    await _emit_qrcode_callback(qrcode_callback, qrcode_info)
     return qrcode_info
 
 
@@ -213,7 +201,6 @@ async def xiaohongshu_setup(
     account_file,
     handle=False,
     return_detail=False,
-    qrcode_callback=None,
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
@@ -223,7 +210,6 @@ async def xiaohongshu_setup(
         xiaohongshu_logger.info(_msg("🥹", "cookie 失效了，准备打开浏览器重新登录"))
         result = await xiaohongshu_cookie_gen(
             account_file,
-            qrcode_callback=qrcode_callback,
             headless=headless,
         )
         return result if return_detail else result["success"]
@@ -234,7 +220,6 @@ async def xiaohongshu_setup(
 
 async def xiaohongshu_cookie_gen(
     account_file,
-    qrcode_callback=None,
     poll_interval: int = 3,
     max_checks: int = 100,
     headless: bool = LOCAL_CHROME_HEADLESS,
@@ -258,7 +243,7 @@ async def xiaohongshu_cookie_gen(
         try:
             page = await context.new_page()
             await page.goto(_build_xhs_creator_url("/login"))
-            qrcode_info = await _save_xhs_qrcode(page, account_file, qrcode_callback=qrcode_callback)
+            qrcode_info = await _save_xhs_qrcode(page, account_file)
             qrcode_path = Path(qrcode_info["image_path"])
             xiaohongshu_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
 
@@ -723,129 +708,3 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
     async def main(self):
         await self.xiaohongshu_upload_video()
-
-
-class XiaoHongShuNote(XiaoHongShuBaseUploader):
-    def __init__(
-        self,
-        image_paths,
-        note,
-        tags,
-        publish_date: datetime | int,
-        account_file,
-        title: str | None = None,
-        desc: str | None = None,
-        publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
-        debug: bool = DEBUG_MODE,
-        headless: bool = LOCAL_CHROME_HEADLESS,
-    ):
-        super().__init__(
-            publish_date=publish_date,
-            account_file=account_file,
-            publish_strategy=publish_strategy,
-            debug=debug,
-            headless=headless,
-        )
-        self.image_paths = image_paths
-        self.note = note or ""
-        self.tags = tags or []
-        self.desc = desc if desc is not None else self.note
-        self.title = title or ((self.desc or self.note)[:20] if (self.desc or self.note) else "")
-
-    async def validate_upload_args(self):
-        await self.validate_base_args()
-        if not self.image_paths:
-            raise ValueError("图文模式下，图片是必须的")
-        if not self.title or not str(self.title).strip():
-            raise ValueError("图文模式下，title 是必须的")
-
-        if isinstance(self.image_paths, (str, Path)):
-            self.image_paths = [self.image_paths]
-
-        normalized_image_paths = []
-        for image_path in self.image_paths:
-            normalized_image_paths.append(str(self.validate_image_file(image_path)))
-        self.image_paths = normalized_image_paths
-
-    async def upload_note_content(self, page: Page) -> None:
-        xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
-        xiaohongshu_logger.info(_msg("🧭", "小人正在赶往图文发布页"))
-        publish_url = _build_xhs_creator_url(
-            "/publish/publish?from=homepage&target=image"
-        )
-        await page.goto(publish_url)
-        await page.wait_for_url(publish_url)
-
-        upload_input = page.locator('input[type="file"][accept*="image"]').first
-        if not await upload_input.count():
-            upload_input = page.locator("div[class^='upload-content'] input[class='upload-input']").first
-
-        await upload_input.wait_for(state="attached", timeout=30000)
-        xiaohongshu_logger.info(_msg("📤", "小人正在上传图片"))
-        await upload_input.set_input_files(self.image_paths)
-
-        while True:
-            try:
-                title_container = page.locator('input[placeholder*="填写标题"]').first
-                await title_container.wait_for(state="visible", timeout=3000)
-                xiaohongshu_logger.success(_msg("🥳", "图文素材已经传完，可以开始填写内容了"))
-                break
-            except Exception:
-                xiaohongshu_logger.debug(_msg("🧍", "图文素材还在上传，小人继续等一会"))
-                await asyncio.sleep(1)
-
-        xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
-        await self.fill_meta(page)
-
-        await self.check_original_declaration(page)
-
-        if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
-            await self.set_schedule_time_xiaohongshu(page, self.publish_date)
-
-        while True:
-            try:
-                if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                    await page.locator('button:has-text("定时发布")').click()
-                else:
-                    await page.locator('button:has-text("发布")').click()
-                await page.wait_for_url(
-                    XHS_PUBLISH_SUCCESS_URL_PATTERN,
-                    timeout=3000
-                )
-                xiaohongshu_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
-                break
-            except Exception:
-                xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
-                if self.debug:
-                    await page.screenshot(full_page=True)
-                await asyncio.sleep(0.5)
-
-    async def upload(self, playwright: Playwright) -> None:
-        xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
-        await self.validate_upload_args()
-        xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
-        browser = await playwright.chromium.launch(
-            headless=self.headless,
-            executable_path=self.local_executable_path,
-        )
-        context = await browser.new_context(
-            permissions=["geolocation"],
-            storage_state=self.account_file,
-        )
-        context = await set_init_script(context)
-
-        try:
-            page = await context.new_page()
-            await self.upload_note_content(page)
-            await context.storage_state(path=self.account_file)
-            xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
-        finally:
-            await context.close()
-            await browser.close()
-
-    async def xiaohongshu_upload_note(self):
-        async with async_playwright() as playwright:
-            await self.upload(playwright)
-
-    async def main(self):
-        await self.xiaohongshu_upload_note()

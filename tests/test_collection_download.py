@@ -318,6 +318,23 @@ class DownloadOptionsTests(unittest.TestCase):
 
         self.assertEqual(entry.estimated_bytes, (1 << 63) - 1)
 
+    def test_collection_entry_uses_best_flat_playlist_thumbnail(self) -> None:
+        worker = CollectionProbeWorker(CollectionProbeRequest(
+            request_id='flat-thumbnail',
+            url='https://example.test/list',
+        ))
+
+        entry = worker._entry({
+            'id': 'video',
+            'url': 'https://example.test/video',
+            'thumbnails': [
+                {'url': 'https://img.example.test/small.jpg', 'width': 168},
+                {'url': 'https://img.example.test/large.jpg', 'width': 336},
+            ],
+        }, 1, DownloadOptions())
+
+        self.assertEqual(entry.thumbnail, 'https://img.example.test/large.jpg')
+
     def test_nested_collection_does_not_override_missing_or_private_state(self) -> None:
         worker = CollectionProbeWorker(CollectionProbeRequest(
             request_id='nested-unavailable',
@@ -1890,7 +1907,7 @@ class CollectionModelTests(unittest.TestCase):
         page = CollectionSelectionPage()
         self.addCleanup(page.close)
         queries: list[str] = []
-        page.model.set_paged_source(
+        page.set_paged_entries(
             100,
             lambda _offset, _limit: [],
             selection_updater=lambda _index, _selected: None,
@@ -1900,6 +1917,7 @@ class CollectionModelTests(unittest.TestCase):
             view_loader=lambda _offset, _limit, _view: [],
             view_counter=lambda view: queries.append(str(view.get('query') or '')) or 0,
         )
+        self.assertIsNone(page.proxy.sourceModel())
         page.search.setText('a')
         page.search.setText('ab')
         page.search.setText('abc')
@@ -1908,6 +1926,8 @@ class CollectionModelTests(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.005)
         self.assertEqual(queries, ['abc'])
+        page.reset()
+        self.assertIs(page.proxy.sourceModel(), page.model)
 
     def test_stale_background_count_cannot_replace_newer_filter_result(self) -> None:
         model = CollectionEntryModel()

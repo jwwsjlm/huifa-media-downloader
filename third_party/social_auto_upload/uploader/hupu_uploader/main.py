@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import re
 import time
@@ -59,14 +58,6 @@ def _build_login_result(success: bool, status: str, message: str, account_file: 
     }
 
 
-async def _emit_qrcode_callback(qrcode_callback, payload: dict):
-    if not qrcode_callback:
-        return
-    callback_result = qrcode_callback(payload)
-    if inspect.isawaitable(callback_result):
-        await callback_result
-
-
 def _build_launch_kwargs(headless: bool) -> dict:
     launch_kwargs = {
         "headless": headless,
@@ -104,7 +95,7 @@ async def _new_stealth_page(context: BrowserContext) -> Page:
     return page
 
 
-async def hupu_cookie_gen(account_file, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 120, headless: bool = False):
+async def hupu_cookie_gen(account_file, poll_interval: int = 3, max_checks: int = 120, headless: bool = False):
     """QQ 扫码登录虎扑，保存 cookie。
 
     流程：打开虎扑登录页 → 点击 QQ 登录 → 截取 QQ 二维码 → 等待扫码完成 → 保存 storage_state。
@@ -137,7 +128,6 @@ async def hupu_cookie_gen(account_file, qrcode_callback=None, poll_interval: int
             qrcode_info = await _grab_qq_qrcode(page, context, account_file)
 
             if qrcode_info:
-                await _emit_qrcode_callback(qrcode_callback, qrcode_info)
                 hupu_logger.info(_msg("🧍", "请用 QQ 手机版扫码登录"))
             else:
                 hupu_logger.warning(_msg("⚠️", "未能获取 QQ 二维码，请在浏览器中手动扫码"))
@@ -266,7 +256,7 @@ async def cookie_auth(account_file):
             await browser.close()
 
 
-async def hupu_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = False):
+async def hupu_setup(account_file, handle=False, return_detail=False, headless: bool = False):
     """统一入口：检查 cookie → 如无效且 handle=True 则触发手动登录。"""
     account_file = _resolve_account_file(account_file)
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
@@ -274,7 +264,7 @@ async def hupu_setup(account_file, handle=False, return_detail=False, qrcode_cal
             result = _build_login_result(False, "cookie_invalid", "cookie 文件不存在或已失效", account_file)
             return result if return_detail else False
         hupu_logger.info(_msg("🥹", "cookie 文件不存在或已失效，打开浏览器请手动登录"))
-        result = await hupu_cookie_gen(account_file, qrcode_callback=qrcode_callback, headless=headless)
+        result = await hupu_cookie_gen(account_file, headless=headless)
         return result if return_detail else result["success"]
 
     result = _build_login_result(True, "cookie_valid", "cookie 有效", account_file)
