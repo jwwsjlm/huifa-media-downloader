@@ -776,10 +776,11 @@ class EnglishUiTests(unittest.TestCase):
             self.assertEqual(page.ytdlp_ejs_source.itemData(1), "npm")
             self.assertEqual(page.ytdlp_ejs_source.itemData(2), "github")
             self.assertEqual(page.ytdlp_ejs_source.itemData(3), "local")
-            self.assertEqual(page.ffmpeg_build_channel.itemData(0), "latest")
-            self.assertEqual(page.ffmpeg_build_channel.itemData(1), "nvenc_13_0")
-            self.assertEqual(page.ffmpeg_build_channel.itemText(0), "Latest build (recommended)")
-            self.assertIn("NVENC API 13.0", page.ffmpeg_build_channel.itemText(1))
+            self.assertEqual(page.ffmpeg_build_channel.itemData(0), "nvenc_13_0")
+            self.assertEqual(page.ffmpeg_build_channel.itemData(1), "latest")
+            self.assertIn("recommended", page.ffmpeg_build_channel.itemText(0))
+            self.assertIn("NVENC API 13.0", page.ffmpeg_build_channel.itemText(0))
+            self.assertEqual(page.ffmpeg_build_channel.itemText(1), "Latest build")
             self.assertIn("2026-05-31", page.ffmpeg_build_channel.toolTip())
             group_save_buttons = [
                 button
@@ -792,6 +793,11 @@ class EnglishUiTests(unittest.TestCase):
                 saved_settings,
                 [(page, group_save_buttons[0].property("settingsScope"))],
             )
+            page.ffmpeg_build_channel.setCurrentIndex(
+                page.ffmpeg_build_channel.findData("latest")
+            )
+            self.app.processEvents()
+            selected_ffmpeg_channels.clear()
             with patch.object(page.runtime_component_updates, "refresh") as refresh_status:
                 page.ffmpeg_build_channel.setCurrentIndex(
                     page.ffmpeg_build_channel.findData("nvenc_13_0")
@@ -865,8 +871,8 @@ class EnglishUiTests(unittest.TestCase):
                 },
                 {
                     "name": "FFmpeg",
-                    "ffmpeg_build_channel": "nvenc_13_0",
-                    "latest": "legacy",
+                    "ffmpeg_build_channel": "latest",
+                    "latest": "rolling",
                 },
             ])
 

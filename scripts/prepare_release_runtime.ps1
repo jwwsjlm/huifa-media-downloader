@@ -191,11 +191,16 @@ function Install-EjsWheel {
 }
 
 if (-not $SkipFFmpeg) {
-    $Release = Get-GitHubRelease -Repository 'yt-dlp/FFmpeg-Builds'
-    $Asset = Get-SingleReleaseAsset `
-        -Release $Release `
-        -Filter { $_.name -eq 'ffmpeg-master-latest-win64-gpl.zip' } `
-        -Label 'yt-dlp FFmpeg win64 GPL'
+    $AssetName = 'ffmpeg-N-124716-g054dffd133-win64-gpl.zip'
+    $Asset = [pscustomobject]@{
+        name = $AssetName
+        browser_download_url = (
+            'https://github.com/yt-dlp/FFmpeg-Builds/releases/download/' +
+            'autobuild-2026-05-31-15-28/' + $AssetName
+        )
+        digest = 'sha256:b368f2dd90d460f9a0836dd6faacf9d084a603d99d60ac01cc8d6ff69308cac0'
+        size = 221454403
+    }
 
     $Work = Assert-ProjectChildPath (Join-Path $RuntimeTemp ([guid]::NewGuid().ToString('N')))
     $Archive = Join-Path $Work 'ffmpeg.zip'

@@ -48,6 +48,7 @@ class AppSettingsTests(unittest.TestCase):
         self.assertEqual(frozenset(first), EXPECTED_SETTING_KEYS)
         self.assertEqual(first, second)
         self.assertIsNot(first, second)
+        self.assertEqual(first["ffmpeg_build_channel"], "nvenc_13_0")
         first["quality"] = "360p"
         self.assertEqual(second["quality"], "best")
 

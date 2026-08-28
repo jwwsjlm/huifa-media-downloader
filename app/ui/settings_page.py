@@ -603,12 +603,12 @@ class SettingsPage(QWidget):
 
         self.ffmpeg_build_channel = QComboBox()
         self.ffmpeg_build_channel.addItem(
-            ui_text('Latest build (recommended)'),
-            FFMPEG_BUILD_LATEST,
+            ui_text('Compatibility build (recommended, NVENC API 13.0, 2026-05-31)'),
+            FFMPEG_BUILD_NVENC_LEGACY,
         )
         self.ffmpeg_build_channel.addItem(
-            ui_text('Legacy GPU build (NVENC API 13.0, 2026-05-31)'),
-            FFMPEG_BUILD_NVENC_LEGACY,
+            ui_text('Latest build'),
+            FFMPEG_BUILD_LATEST,
         )
         saved_ffmpeg_channel = normalize_ffmpeg_build_channel(
             window.app_settings.get("ffmpeg_build_channel")
@@ -618,7 +618,7 @@ class SettingsPage(QWidget):
             self.ffmpeg_build_channel.findData(saved_ffmpeg_channel),
         ))
         self.ffmpeg_build_channel.setToolTip(ui_text(
-            'Latest follows the rolling yt-dlp/FFmpeg-Builds release. The legacy GPU option is pinned to the tested 2026-05-31 build for older NVIDIA drivers that provide NVENC API 13.0; switching replaces the app-local FFmpeg/FFprobe.',
+            'The compatibility build is bundled by default and pinned to the tested 2026-05-31 release for older NVIDIA drivers that provide NVENC API 13.0. Latest follows the rolling yt-dlp/FFmpeg-Builds release; switching replaces the app-local FFmpeg/FFprobe.',
         ))
         self.ffmpeg_build_channel.currentIndexChanged.connect(
             self._ffmpeg_build_channel_changed

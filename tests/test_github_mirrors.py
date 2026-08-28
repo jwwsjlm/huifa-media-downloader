@@ -480,6 +480,33 @@ class GithubMirrorTests(unittest.TestCase):
             "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
         ])
 
+    def test_forbidden_metadata_uses_public_release_page_without_rate_limit_header(self) -> None:
+        class Response:
+            status_code = 403
+            headers = {}
+
+        worker = UpdateWorker(
+            {"yt-dlp": "yt-dlp/yt-dlp"},
+            github_route_mode="direct",
+        )
+        route = next(route for route in github_download_routes() if route.id == "direct")
+        fallback = {"tag_name": "v4.0.0", "assets": []}
+        with patch(
+            "app.core.update_service.read_component_cache", return_value=None
+        ), patch(
+            "app.core.update_service.requests.get", return_value=Response()
+        ), patch.object(
+            worker, "_fetch_rate_limit_fallback", return_value=fallback
+        ) as public_page:
+            payload = worker._fetch_latest_payload_from_route(
+                "yt-dlp/yt-dlp",
+                {"User-Agent": "test"},
+                route,
+            )
+
+        self.assertEqual(payload, fallback)
+        public_page.assert_called_once()
+
     def test_empty_tags_response_is_not_accepted_as_a_latest_version(self) -> None:
         class Response:
             headers = {}

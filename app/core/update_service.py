@@ -139,9 +139,9 @@ _BACKGROUND_ROUTE_PROBE_FRESH_SECONDS = 60 * 60
 
 def normalize_ffmpeg_build_channel(value: str | None) -> str:
     normalized = str(value or "").strip().casefold()
-    if normalized == FFMPEG_BUILD_NVENC_LEGACY:
-        return FFMPEG_BUILD_NVENC_LEGACY
-    return FFMPEG_BUILD_LATEST
+    if normalized == FFMPEG_BUILD_LATEST:
+        return FFMPEG_BUILD_LATEST
+    return FFMPEG_BUILD_NVENC_LEGACY
 
 
 def _ffmpeg_nvenc_legacy_release_payload() -> dict[str, Any]:
@@ -920,7 +920,7 @@ class UpdateWorker(QObject):
         github_route_mode: str = ROUTE_AUTO,
         github_mirror_urls: str = "",
         route_probe_results: Mapping[str, Mapping[str, Any]] | None = None,
-        ffmpeg_build_channel: str = FFMPEG_BUILD_LATEST,
+        ffmpeg_build_channel: str = FFMPEG_BUILD_NVENC_LEGACY,
     ):
         super().__init__()
         self.repos = repos
@@ -1305,11 +1305,7 @@ class UpdateWorker(QObject):
 
     @staticmethod
     def _rate_limited(response: Any) -> bool:
-        return bool(
-            getattr(response, "status_code", 0) == 403
-            and str((getattr(response, "headers", {}) or {}).get("X-RateLimit-Remaining") or "")
-            == "0"
-        )
+        return getattr(response, "status_code", 0) in {403, 429}
 
     def _conditional_request_headers(
         self,
@@ -2375,7 +2371,7 @@ class UpdateService(QObject):
         self,
         updates_dir: str | Path,
         tool_overrides: dict[str, str] | None = None,
-        ffmpeg_build_channel: str = FFMPEG_BUILD_LATEST,
+        ffmpeg_build_channel: str = FFMPEG_BUILD_NVENC_LEGACY,
     ):
         super().__init__()
         self.updates_dir = Path(updates_dir)

@@ -55,7 +55,7 @@ _DEFAULT_SETTINGS = {
     "download_cookie_container": "",
     "ffmpeg_path": "",
     "ffprobe_path": "",
-    "ffmpeg_build_channel": "latest",
+    "ffmpeg_build_channel": "nvenc_13_0",
     "deno_path": "",
     "ytdlp_ejs_source": "auto",
     "ytdlp_core_mode": "auto",
