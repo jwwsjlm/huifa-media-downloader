@@ -61,8 +61,6 @@ class VelopackUpdaterConfig:
     prerelease: bool = False
     access_token: str | None = field(default=None, repr=False)
     channel: str | None = None
-    allow_downgrade: bool = False
-    maximum_deltas: int = 10
 
     def repository_url(self) -> str:
         return normalize_github_repository(self.repository)
@@ -83,7 +81,6 @@ class ApplicationUpdate:
     is_downgrade: bool
     is_portable: bool
     downloaded: bool = False
-    delivery_kind: str = "velopack"
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,7 +230,6 @@ def run_velopack_startup(
                     state_dir,
                     status="succeeded",
                     current_version=APP_VERSION,
-                    delivery_kind="velopack",
                     message="Velopack 已完成更新并重新启动程序",
                 )
         except Exception:
@@ -333,8 +329,8 @@ class VelopackApplicationUpdater:
             config.prerelease,
         )
         self._options = self._velopack.UpdateOptions(
-            config.allow_downgrade,
-            config.maximum_deltas,
+            False,
+            10,
             config.channel,
         )
         # UpdateManager resolves the Velopack manifest in its constructor and

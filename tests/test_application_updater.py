@@ -86,7 +86,9 @@ class FakeManager:
     def apply_updates_and_restart_with_args(self, update, args):
         self.applied.append((update, args))
 
-    def wait_exit_then_apply_updates(self, update, silent=False, restart=True, restart_args=None):
+    def wait_exit_then_apply_updates(
+        self, update, silent=False, restart=True, restart_args=None
+    ):
         self.scheduled.append((update, silent, restart, restart_args))
 
 
@@ -154,11 +156,13 @@ class ApplicationUpdaterTests(unittest.TestCase):
                 normalize_github_repository(invalid)
 
     def test_check_maps_github_release_to_ui_safe_model(self) -> None:
-        updater, module = self.create_updater(prerelease=True, channel="beta", maximum_deltas=4)
+        updater, module = self.create_updater(prerelease=True, channel="beta")
         update = updater.check_for_updates()
         self.assertIsNotNone(update)
-        self.assertEqual(module.source_args, ("https://github.com/huifa/yt-release", None, True))
-        self.assertEqual(module.option_args, (False, 4, "beta"))
+        self.assertEqual(
+            module.source_args, ("https://github.com/huifa/yt-release", None, True)
+        )
+        self.assertEqual(module.option_args, (False, 10, "beta"))
         self.assertEqual(update.current_version, "0.1.0")
         self.assertEqual(update.version, "0.2.0")
         self.assertEqual(update.package_id, "Huifa.VideoDownloader")
@@ -211,7 +215,9 @@ class ApplicationUpdaterTests(unittest.TestCase):
             module,
         )
         self.assertIsNone(module.manager)
-        self.assertEqual(updater.config.repository_url(), "https://github.com/huifa/yt-release")
+        self.assertEqual(
+            updater.config.repository_url(), "https://github.com/huifa/yt-release"
+        )
 
     def test_download_reports_progress_and_explicit_confirmation_applies(self) -> None:
         updater, module = self.create_updater()
@@ -222,7 +228,9 @@ class ApplicationUpdaterTests(unittest.TestCase):
         self.assertTrue(downloaded.downloaded)
         with self.assertRaises(UpdateConfirmationRequired):
             updater.install_and_restart(downloaded, confirmed=False)
-        updater.install_and_restart(downloaded, confirmed=True, restart_args=["--updated"])
+        updater.install_and_restart(
+            downloaded, confirmed=True, restart_args=["--updated"]
+        )
         self.assertEqual(module.manager.applied[0][1], ["--updated"])
 
     def test_velopack_download_can_be_cancelled_between_progress_updates(self) -> None:
@@ -253,7 +261,9 @@ class ApplicationUpdaterTests(unittest.TestCase):
         updater, module = self.create_updater(access_token=token)
         self.assertNotIn(token, repr(updater.config))
         update = updater.check_for_updates()
-        module.manager.download_error = RuntimeError(f"request failed Authorization: Bearer {token}")
+        module.manager.download_error = RuntimeError(
+            f"request failed Authorization: Bearer {token}"
+        )
         with self.assertRaises(UpdateDownloadError) as context:
             updater.download_update(update)
         self.assertNotIn(token, str(context.exception))
@@ -291,7 +301,6 @@ class ApplicationUpdaterTests(unittest.TestCase):
                 SimpleNamespace(
                     current_version="0.1.0",
                     version=APP_VERSION,
-                    delivery_kind="velopack",
                 ),
             )
             module = FakeVelopackModule()
@@ -304,7 +313,6 @@ class ApplicationUpdaterTests(unittest.TestCase):
             self.assertTrue(receipt.succeeded)
             self.assertEqual(receipt.from_version, "0.1.0")
             self.assertEqual(receipt.to_version, APP_VERSION)
-            self.assertEqual(receipt.delivery_kind, "velopack")
             self.assertIsNone(consume_update_install_receipt(state_dir))
 
     def test_auto_check_throttle_is_repository_scoped_and_atomic(self) -> None:
@@ -314,13 +322,21 @@ class ApplicationUpdaterTests(unittest.TestCase):
             now = datetime(2026, 8, 23, 9, 0, tzinfo=timezone.utc)
             self.assertTrue(throttle.is_due("huifa/yt-release", now))
             throttle.mark_checked("huifa/yt-release", now)
-            self.assertFalse(throttle.is_due("huifa/yt-release", now + timedelta(hours=23)))
-            self.assertTrue(throttle.is_due("huifa/yt-release", now + timedelta(hours=24)))
-            self.assertTrue(throttle.is_due("huifa/yt-release", now - timedelta(minutes=1)))
+            self.assertFalse(
+                throttle.is_due("huifa/yt-release", now + timedelta(hours=23))
+            )
+            self.assertTrue(
+                throttle.is_due("huifa/yt-release", now + timedelta(hours=24))
+            )
+            self.assertTrue(
+                throttle.is_due("huifa/yt-release", now - timedelta(minutes=1))
+            )
             self.assertTrue(throttle.is_due("other/project", now + timedelta(hours=1)))
             self.assertFalse(path.with_name("update-check.json.tmp").exists())
             payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["repository"], "https://github.com/huifa/yt-release")
+            self.assertEqual(
+                payload["repository"], "https://github.com/huifa/yt-release"
+            )
 
     def test_managed_data_directory_lives_outside_replaceable_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -337,11 +353,19 @@ class ApplicationUpdaterTests(unittest.TestCase):
 
     def test_build_foundation_is_onedir_pinned_and_never_uploads(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        spec = (root / "build" / "HuifaVideoDownloader.velopack.spec").read_text(encoding="utf-8")
-        script = (root / "scripts" / "build_velopack_release.ps1").read_text(encoding="utf-8")
-        manifest = json.loads((root / ".config" / "dotnet-tools.json").read_text(encoding="utf-8"))
+        spec = (root / "build" / "HuifaVideoDownloader.velopack.spec").read_text(
+            encoding="utf-8"
+        )
+        script = (root / "scripts" / "build_velopack_release.ps1").read_text(
+            encoding="utf-8"
+        )
+        manifest = json.loads(
+            (root / ".config" / "dotnet-tools.json").read_text(encoding="utf-8")
+        )
         requirements = (root / "requirements-velopack.txt").read_text(encoding="utf-8")
-        runtime_hook = (root / "build" / "01_velopack_hook.py").read_text(encoding="utf-8")
+        runtime_hook = (root / "build" / "01_velopack_hook.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("exclude_binaries=True", spec)
         self.assertIn("COLLECT(", spec)
         self.assertIn("01_velopack_hook.py", spec)
@@ -364,10 +388,20 @@ class ApplicationUpdaterTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Velopack build script is Windows-only")
     def test_build_environment_probe_prefers_x64_sdk_over_x86_path_host(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        x64_dotnet = Path(os.environ.get("ProgramW6432", r"C:\Program Files")) / "dotnet" / "dotnet.exe"
-        x86_dotnet = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "dotnet" / "dotnet.exe"
+        x64_dotnet = (
+            Path(os.environ.get("ProgramW6432", r"C:\Program Files"))
+            / "dotnet"
+            / "dotnet.exe"
+        )
+        x86_dotnet = (
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+            / "dotnet"
+            / "dotnet.exe"
+        )
         if not x64_dotnet.is_file() or not x86_dotnet.is_file():
-            self.skipTest("both x64 and x86 dotnet hosts are required for this regression test")
+            self.skipTest(
+                "both x64 and x86 dotnet hosts are required for this regression test"
+            )
         sdk_probe = subprocess.run(
             [str(x64_dotnet), "--list-sdks"],
             cwd=root,
@@ -380,7 +414,9 @@ class ApplicationUpdaterTests(unittest.TestCase):
             self.skipTest("the x64 dotnet host has no SDK")
 
         environment = os.environ.copy()
-        environment["PATH"] = str(x86_dotnet.parent) + os.pathsep + environment.get("PATH", "")
+        environment["PATH"] = (
+            str(x86_dotnet.parent) + os.pathsep + environment.get("PATH", "")
+        )
         result = subprocess.run(
             [
                 "powershell.exe",

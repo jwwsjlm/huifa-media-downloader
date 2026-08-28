@@ -54,6 +54,3 @@ class ProgressPersistenceBuffer:
         self.pending.clear()
         self.persisted_at.clear()
         self.last_error_at = 0.0
-
-
-__all__ = ["ProgressPersistenceBuffer"]

@@ -70,7 +70,9 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
         self.host.close()
         self.app.processEvents()
 
-    def test_pending_update_shows_version_notes_and_restart_install_action(self) -> None:
+    def test_pending_update_shows_version_notes_and_restart_install_action(
+        self,
+    ) -> None:
         update = make_pending_update()
         dialog = ApplicationUpdateDialog(update, self.service, self.host)
 
@@ -172,7 +174,9 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
         self.assertTrue(dialog.install_button.isEnabled())
         dialog.close()
 
-    def test_download_start_failure_restores_controls_and_progress_is_bounded(self) -> None:
+    def test_download_start_failure_restores_controls_and_progress_is_bounded(
+        self,
+    ) -> None:
         update = ApplicationUpdate(
             token="start-error-0.4.0",
             current_version="0.3.0",
@@ -188,7 +192,9 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
         )
         dialog = ApplicationUpdateDialog(update, self.service, self.host)
 
-        with patch.object(self.service, "download", side_effect=RuntimeError("not configured")):
+        with patch.object(
+            self.service, "download", side_effect=RuntimeError("not configured")
+        ):
             dialog.start_download()
 
         self.assertTrue(dialog.download_button.isEnabled())
@@ -220,17 +226,20 @@ class ApplicationUpdateDialogTests(unittest.TestCase):
             from_version="0.2.0",
             to_version="0.3.0",
             current_version="0.3.0",
-            delivery_kind="velopack",
             message="SHA-256 verified",
             finished_at="2026-08-24T12:00:00+00:00",
         )
 
-        succeeded, title, message = application_update_receipt_presentation(receipt, "0.3.0")
+        succeeded, title, message = application_update_receipt_presentation(
+            receipt, "0.3.0"
+        )
         self.assertTrue(succeeded)
         self.assertEqual(title, "更新安装成功")
         self.assertIn("0.3.0", message)
 
-        succeeded, title, message = application_update_receipt_presentation(receipt, "0.2.0")
+        succeeded, title, message = application_update_receipt_presentation(
+            receipt, "0.2.0"
+        )
         self.assertFalse(succeeded)
         self.assertEqual(title, "更新结果需要确认")
         self.assertIn("目标版本：0.3.0", message)

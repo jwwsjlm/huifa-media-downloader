@@ -20,7 +20,6 @@ from app.adapters.openai_cover_provider import (
 )
 from app.core.cover_service import CoverGenerationRequest
 
-
 SOURCE_PNG = b"\x89PNG\r\n\x1a\nsource-cover"
 GENERATED_PNG = b"\x89PNG\r\n\x1a\ngenerated-cover"
 
@@ -75,7 +74,7 @@ class FakeResponse:
         for offset in range(0, len(self.body), max(1, chunk_size)):
             if self.on_chunk is not None:
                 self.on_chunk(offset)
-            yield self.body[offset:offset + chunk_size]
+            yield self.body[offset : offset + chunk_size]
 
 
 class FakeSession:
@@ -118,17 +117,17 @@ def generation_request(
         width=width,
         height=height,
         count=count,
-        provider_options={"quality": "high", "input_fidelity": "high"},
+        quality="high",
+        input_fidelity="high",
     )
 
 
-def success_response(*, revised_prompt: str = "增强对比度") -> FakeResponse:
+def success_response() -> FakeResponse:
     return FakeResponse(
         {
             "data": [
                 {
                     "b64_json": base64.b64encode(GENERATED_PNG).decode("ascii"),
-                    "revised_prompt": revised_prompt,
                 }
             ]
         }
@@ -174,7 +173,9 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         request = generation_request(count=1)
         progress: list[tuple[int, str]] = []
 
-        results = provider.generate(request, progress=lambda *args: progress.append(args))
+        results = provider.generate(
+            request, progress=lambda *args: progress.append(args)
+        )
 
         self.assertEqual(len(session.calls), 1)
         url, kwargs = session.calls[0]
@@ -182,7 +183,9 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"], {"Authorization": f"Bearer {self.API_KEY}"})
         self.assertEqual(kwargs["timeout"], (10, 300))
         self.assertTrue(kwargs["stream"])
-        self.assertEqual(kwargs["files"]["image"], ("source-cover.png", SOURCE_PNG, "image/png"))
+        self.assertEqual(
+            kwargs["files"]["image"], ("source-cover.png", SOURCE_PNG, "image/png")
+        )
         non_header_request = (url, kwargs["data"], kwargs["files"], kwargs["timeout"])
         self.assertNotIn(self.API_KEY, repr(non_header_request))
         self.assertNotIn(self.API_KEY, repr(request))
@@ -190,19 +193,32 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         self.assertNotIn(self.API_KEY, repr(results))
         self.assertEqual(results[0].image_bytes, GENERATED_PNG)
         self.assertEqual(results[0].mime_type, "image/png")
-        self.assertEqual(results[0].revised_prompt, "增强对比度")
-        self.assertEqual(results[0].metadata["size"], "1536x1024")
-        self.assertEqual(progress, [(5, "正在准备原始封面"), (15, "正在调用 GPT Image 创作封面"), (100, "AI 封面创作完成")])
+        self.assertEqual(results[0].provider_id, "openai-gpt-image")
+        self.assertEqual(kwargs["data"]["size"], "1536x1024")
+        self.assertEqual(kwargs["data"]["quality"], "high")
+        self.assertEqual(kwargs["data"]["input_fidelity"], "high")
+        self.assertEqual(
+            progress,
+            [
+                (5, "正在准备原始封面"),
+                (15, "正在调用 GPT Image 创作封面"),
+                (100, "AI 封面创作完成"),
+            ],
+        )
         self.assertEqual(response.close_count, 1)
 
     def test_custom_api_base_url_is_normalized_to_images_edits_endpoint(self) -> None:
-        self.assertEqual(normalize_openai_image_endpoint(""), DEFAULT_OPENAI_IMAGE_ENDPOINT)
+        self.assertEqual(
+            normalize_openai_image_endpoint(""), DEFAULT_OPENAI_IMAGE_ENDPOINT
+        )
         self.assertEqual(
             normalize_openai_image_endpoint("https://api.example.com/v1/"),
             "https://api.example.com/v1/images/edits",
         )
         self.assertEqual(
-            normalize_openai_image_endpoint("https://api.example.com/openai/v1/images/edits"),
+            normalize_openai_image_endpoint(
+                "https://api.example.com/openai/v1/images/edits"
+            ),
             "https://api.example.com/openai/v1/images/edits",
         )
 
@@ -220,7 +236,9 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
             "https://gateway.example.com/openai/v1/images/edits",
         )
 
-    def test_custom_api_url_rejects_credentials_and_accepts_user_supplied_http(self) -> None:
+    def test_custom_api_url_rejects_credentials_and_accepts_user_supplied_http(
+        self,
+    ) -> None:
         with self.assertRaisesRegex(OpenAICoverGenerationError, "用户名或密码"):
             normalize_openai_image_endpoint("https://user:secret@example.com/v1")
         self.assertEqual(
@@ -245,7 +263,7 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
                 provider = self.create_provider(session)
                 result = provider.generate(generation_request(*dimensions))
                 self.assertEqual(session.calls[0][1]["data"]["size"], expected)
-                self.assertEqual(result[0].metadata["size"], expected)
+                self.assertEqual(result[0].provider_id, "openai-gpt-image")
                 self.assertEqual(response.close_count, 1)
 
     def test_cancel_before_request_does_not_open_network_connection(self) -> None:
@@ -276,12 +294,12 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         self.assertEqual(result, ())
         self.assertEqual(response.close_count, 1)
 
-    def test_cancel_while_streaming_response_stops_before_full_body_is_read(self) -> None:
+    def test_cancel_while_streaming_response_stops_before_full_body_is_read(
+        self,
+    ) -> None:
         cancelled = threading.Event()
         payload = {
-            "data": [
-                {"b64_json": base64.b64encode(GENERATED_PNG).decode("ascii")}
-            ]
+            "data": [{"b64_json": base64.b64encode(GENERATED_PNG).decode("ascii")}]
         }
         body = json.dumps(payload).encode("utf-8") + (b" " * 70_000)
         seen_offsets: list[int] = []
@@ -300,12 +318,12 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         self.assertEqual(seen_offsets, [0, 64 * 1024])
         self.assertEqual(response.close_count, 1)
 
-    def test_announced_oversized_response_is_rejected_without_reading_body(self) -> None:
+    def test_announced_oversized_response_is_rejected_without_reading_body(
+        self,
+    ) -> None:
         response = success_response()
         provider = self.create_provider(FakeSession(response))
-        response.headers["content-length"] = str(
-            provider._response_size_limit(1) + 1
-        )
+        response.headers["content-length"] = str(provider._response_size_limit(1) + 1)
         response.on_chunk = lambda _offset: self.fail(
             "oversized response body should not be read"
         )
@@ -368,7 +386,9 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         response = FakeResponse({"error": "account is not permitted"}, status_code=403)
         provider = self.create_provider(FakeSession(response))
 
-        with self.assertRaisesRegex(OpenAICoverGenerationError, "account is not permitted"):
+        with self.assertRaisesRegex(
+            OpenAICoverGenerationError, "account is not permitted"
+        ):
             provider.generate(generation_request())
 
         self.assertEqual(response.close_count, 1)
@@ -407,11 +427,7 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         response = FakeResponse(
             {
                 "data": [
-                    {
-                        "b64_json": base64.b64encode(
-                            b"not-a-png-image"
-                        ).decode("ascii")
-                    }
+                    {"b64_json": base64.b64encode(b"not-a-png-image").decode("ascii")}
                 ]
             }
         )
@@ -434,7 +450,9 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
 
         self.assertEqual(response.close_count, 1)
 
-    def test_json_decode_failure_is_generic_closes_response_and_does_not_leak_key(self) -> None:
+    def test_json_decode_failure_is_generic_closes_response_and_does_not_leak_key(
+        self,
+    ) -> None:
         response = FakeResponse(
             None,
             json_error=ValueError(f"decoder saw {self.API_KEY}"),
@@ -449,7 +467,9 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         self.assertIsNone(context.exception.__cause__)
         self.assertEqual(response.close_count, 1)
 
-    def test_network_exception_is_redacted_and_does_not_keep_raw_cause_in_logs(self) -> None:
+    def test_network_exception_is_redacted_and_does_not_keep_raw_cause_in_logs(
+        self,
+    ) -> None:
         network_error = requests.ConnectionError(
             f"socket failed with Authorization: Bearer {self.API_KEY}"
         )
@@ -465,9 +485,13 @@ class OpenAICoverGenerationProviderTests(unittest.TestCase):
         self.assertNotIn(self.API_KEY, formatted_exception(context.exception))
         self.assertIsNone(context.exception.__cause__)
 
-    def test_response_close_failure_does_not_override_successful_generation(self) -> None:
+    def test_response_close_failure_does_not_override_successful_generation(
+        self,
+    ) -> None:
         response = success_response()
-        response.close_error = requests.ConnectionError(f"close failed with {self.API_KEY}")
+        response.close_error = requests.ConnectionError(
+            f"close failed with {self.API_KEY}"
+        )
         provider = self.create_provider(FakeSession(response))
 
         results = provider.generate(generation_request())

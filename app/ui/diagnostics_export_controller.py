@@ -204,10 +204,3 @@ def export_diagnostics(
         ui_text("Export Complete"),
         ui_format("Diagnostic bundle saved to:\n{path}", path=bundle),
     )
-
-
-__all__ = [
-    "collect_diagnostic_summary",
-    "export_diagnostics",
-    "normalized_diagnostics_target",
-]

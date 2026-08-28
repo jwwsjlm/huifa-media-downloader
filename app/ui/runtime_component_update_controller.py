@@ -240,8 +240,3 @@ class RuntimeComponentUpdateController(QObject):
             ui_text('Component Installation Failed'),
             runtime_text(error),
         )
-
-
-__all__ = [
-    "RuntimeComponentUpdateController",
-]

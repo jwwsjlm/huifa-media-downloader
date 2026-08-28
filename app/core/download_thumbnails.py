@@ -304,10 +304,3 @@ def thumbnail_suffix(prefix: bytes) -> str:
     ):
         return ".avif"
     return ""
-
-
-__all__ = [
-    "DownloadThumbnailManager",
-    "MAX_THUMBNAIL_BYTES",
-    "thumbnail_suffix",
-]

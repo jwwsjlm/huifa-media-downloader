@@ -227,7 +227,7 @@ class PublishPage(QWidget):
             self.visibility: any(item.supports_visibility for item in capabilities),
             self.collection: any(item.supports_collection for item in capabilities),
             self.playlist: any(item.supports_playlist for item in capabilities),
-            self.partition: any(item.requires_tid for item in capabilities),
+            self.partition: any(item.tid_required for item in capabilities),
             self.schedule: any(item.supports_schedule for item in capabilities),
             self.thumbnail_row: bool(capabilities),
             self.thumbnail_landscape_row: any(
@@ -356,7 +356,7 @@ class PublishPage(QWidget):
             settings["collection"] = self.collection.text().strip()
         if capability.supports_playlist:
             settings["playlist"] = self.playlist.text().strip()
-        if capability.requires_tid:
+        if capability.tid_required:
             settings["partition"] = partition
         if capability.supports_schedule:
             settings["schedule"] = schedule

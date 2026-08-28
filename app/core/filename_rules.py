@@ -56,10 +56,3 @@ def stable_ascii_component(
     prefix_length = max(1, max_length - len(digest) - 1)
     prefix = readable[:prefix_length].rstrip(" .") or fallback
     return f"{prefix}-{digest}"
-
-
-__all__ = [
-    "is_windows_reserved_stem",
-    "stable_ascii_component",
-    "windows_filename_stem",
-]

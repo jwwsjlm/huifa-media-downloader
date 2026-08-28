@@ -256,6 +256,3 @@ class TaskRowController:
                 item.setSelected(True)
         self.sync_selection()
         self.apply_filter()
-
-
-__all__ = ["TaskRowController"]

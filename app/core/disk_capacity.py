@@ -881,21 +881,3 @@ class DiskReservationManager:
             self._volume_state_locked(active.volume.key)
             self._condition.notify_all()
             return True
-
-
-__all__ = [
-    "APPROXIMATE_SIZE_FACTOR",
-    "BITRATE_SIZE_FACTOR",
-    "CapacityEstimate",
-    "DEFAULT_ESTIMATE_MARGIN_BYTES",
-    "DEFAULT_LOW_WATERMARK_BYTES",
-    "DiskCapacityError",
-    "DiskCapacityErrorCode",
-    "DiskCapacitySnapshot",
-    "DiskReservation",
-    "DiskReservationManager",
-    "FRAGMENT_SIZE_FACTOR",
-    "VolumeIdentity",
-    "estimate_download_capacity",
-    "resolve_volume_identity",
-]

@@ -321,6 +321,3 @@ class CompletedMediaTranscodeWorker(QObject):
                 self._cleanup_run_state(state)
             finally:
                 self.finished.emit()
-
-
-__all__ = ["CompletedMediaTranscodeWorker", "transcode_capacity_estimate"]

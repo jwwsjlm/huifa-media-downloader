@@ -339,9 +339,3 @@ class ApplicationUpdateController(QObject):
             0,
         )
         QTimer.singleShot(0, self, self.close_application)
-
-
-__all__ = [
-    "ApplicationUpdateController",
-    "application_update_receipt_presentation",
-]

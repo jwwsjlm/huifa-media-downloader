@@ -218,6 +218,3 @@ class DownloadCookieController:
         if embedded_index >= 0:
             page.download_cookie_source.setCurrentIndex(embedded_index)
         page.window.dashboard.refresh_settings()
-
-
-__all__ = ["DownloadCookieController"]

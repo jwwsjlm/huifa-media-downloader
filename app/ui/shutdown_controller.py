@@ -444,6 +444,3 @@ class ShutdownController(QObject):
                 stream.write("\n".join(self._errors) + "\n")
         except Exception:
             pass
-
-
-__all__ = ["ShutdownController"]

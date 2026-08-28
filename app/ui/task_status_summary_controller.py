@@ -119,9 +119,3 @@ class TaskStatusSummaryController(QObject):
             self.stop()
             return
         self._last_text = text
-
-
-__all__ = [
-    "TaskStatusSummaryController",
-    "format_transfer_speed",
-]

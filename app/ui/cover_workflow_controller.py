@@ -143,9 +143,3 @@ class CoverWorkflowController(QObject):
                 size=format_file_size(result.byte_size),
             ),
         )
-
-
-__all__ = [
-    "CoverWorkflowController",
-    "cover_options_from_settings",
-]

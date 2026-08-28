@@ -104,11 +104,3 @@ class SilentYtdlpProbeLogger:
 
     def error(self, _message: str) -> None:
         return
-
-
-__all__ = [
-    "SilentYtdlpProbeLogger",
-    "YtdlpLogger",
-    "normalize_ytdlp_log_message",
-    "ytdlp_log_level",
-]

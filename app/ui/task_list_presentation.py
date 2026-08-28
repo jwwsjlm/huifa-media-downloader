@@ -183,8 +183,3 @@ class TaskListPresentationController:
         self.pause_all_button.setEnabled(int(stats["pausable"]) > 0)
         self.resume_all_button.setEnabled(int(stats["resumable"]) > 0)
         self.cleanup_button.setEnabled(int(stats["cleanable"]) > 0)
-
-
-__all__ = [
-    "TaskListPresentationController",
-]

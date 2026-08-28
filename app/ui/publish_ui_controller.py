@@ -168,6 +168,3 @@ class PublishUiController(QObject):
             )
         except RuntimeError:
             pass
-
-
-__all__ = ["PublishUiController"]

@@ -23,10 +23,11 @@ class UpdateInstallReceiptTests(unittest.TestCase):
         self.update = SimpleNamespace(
             current_version="0.1.0",
             version="0.2.0",
-            delivery_kind="velopack",
         )
 
-    def test_success_receipt_preserves_confirmed_versions_and_is_consumed_once(self) -> None:
+    def test_success_receipt_preserves_confirmed_versions_and_is_consumed_once(
+        self,
+    ) -> None:
         write_update_install_intent(self.state_dir, self.update)
 
         receipt = record_update_install_result(
@@ -40,7 +41,6 @@ class UpdateInstallReceiptTests(unittest.TestCase):
         self.assertTrue(receipt.installed_version_matches("v0.2.0"))
         self.assertEqual(receipt.from_version, "0.1.0")
         self.assertEqual(receipt.to_version, "0.2.0")
-        self.assertEqual(receipt.delivery_kind, "velopack")
         self.assertFalse((self.state_dir / INSTALL_INTENT_FILENAME).exists())
         consumed = consume_update_install_receipt(self.state_dir)
         self.assertEqual(consumed, receipt)
@@ -64,7 +64,9 @@ class UpdateInstallReceiptTests(unittest.TestCase):
     def test_malformed_receipt_is_removed_instead_of_reappearing_forever(self) -> None:
         self.state_dir.mkdir(parents=True)
         path = self.state_dir / INSTALL_RECEIPT_FILENAME
-        path.write_text(json.dumps({"schema_version": 1, "status": "unknown"}), encoding="utf-8")
+        path.write_text(
+            json.dumps({"schema_version": 1, "status": "unknown"}), encoding="utf-8"
+        )
 
         self.assertIsNone(consume_update_install_receipt(self.state_dir))
         self.assertFalse(path.exists())
@@ -73,7 +75,7 @@ class UpdateInstallReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "目标版本"):
             write_update_install_intent(
                 self.state_dir,
-                SimpleNamespace(current_version="0.1.0", version="", delivery_kind="velopack"),
+                SimpleNamespace(current_version="0.1.0", version=""),
             )
 
 

@@ -213,6 +213,3 @@ class DiskReservationLease:
     def active_count(self) -> int:
         with self._condition:
             return len(self._reservations)
-
-
-__all__ = ["DiskReservationLease"]

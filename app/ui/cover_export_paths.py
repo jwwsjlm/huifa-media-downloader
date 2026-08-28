@@ -42,10 +42,3 @@ def normalized_jpeg_target(target: str | Path) -> Path:
     if path.suffix.casefold() not in {".jpg", ".jpeg"}:
         path = path.with_suffix(".jpg")
     return path
-
-
-__all__ = [
-    "default_cover_export_path",
-    "normalized_jpeg_target",
-    "safe_cover_stem",
-]

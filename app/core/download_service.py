@@ -16,6 +16,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
@@ -2575,14 +2576,7 @@ class DownloadWorker(QObject):
             else [preview]
         )
 
-        class _FilenameResolver:
-            def __init__(self, worker: "DownloadWorker"):
-                self.worker = worker
-
-            def prepare_filename(self, item: Mapping[str, Any]) -> str:
-                return self.worker._external_prepare_filename(item)
-
-        resolver = _FilenameResolver(self)
+        resolver = SimpleNamespace(prepare_filename=self._external_prepare_filename)
         for entry in preview_entries or []:
             if isinstance(entry, Mapping):
                 self._capacity_match_filter(resolver, entry)

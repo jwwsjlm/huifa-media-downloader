@@ -218,9 +218,3 @@ class DatabaseLifecycleController(QObject):
             ),
             5000,
         )
-
-
-__all__ = [
-    "DatabaseLifecycleController",
-    "database_recovery_notice",
-]

@@ -198,9 +198,3 @@ class TaskListRestoreController:
         remaining = len(matching)
         self._set_load_more_available(remaining)
         return remaining
-
-
-__all__ = [
-    "TaskListRestoreController",
-    "enrich_completed_task_metadata",
-]

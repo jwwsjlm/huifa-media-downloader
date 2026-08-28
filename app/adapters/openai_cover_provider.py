@@ -200,21 +200,10 @@ class OpenAICoverGenerationProvider:
         self,
         request: CoverGenerationRequest,
     ) -> _GenerationParameters:
-        options = dict(request.provider_options)
-        quality = str(options.get("quality") or "high").strip().lower()
-        if quality not in {"auto", "low", "medium", "high"}:
-            raise OpenAICoverGenerationError(
-                "GPT Image 质量仅支持 auto、low、medium 或 high"
-            )
-        input_fidelity = str(
-            options.get("input_fidelity") or "high"
-        ).strip().lower()
-        if input_fidelity not in {"low", "high"}:
-            raise OpenAICoverGenerationError("输入保真度仅支持 low 或 high")
         return _GenerationParameters(
             size=self._api_size(request.width, request.height),
-            quality=quality,
-            input_fidelity=input_fidelity,
+            quality=request.quality,
+            input_fidelity=request.input_fidelity,
         )
 
     def _request_data(
@@ -315,12 +304,6 @@ class OpenAICoverGenerationProvider:
                     image_bytes=image_bytes,
                     mime_type="image/png",
                     provider_id=self.provider_id,
-                    revised_prompt=str(item.get("revised_prompt") or "")[:8_000],
-                    metadata={
-                        "model": self.model,
-                        "size": parameters.size,
-                        "quality": parameters.quality,
-                    },
                 )
             )
         return tuple(generated)

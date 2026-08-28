@@ -470,18 +470,15 @@ class CollectionWorkflowController(QObject):
             parsed_count=current_count,
         )
         options = DownloadOptions.from_mapping(state['context'].get('options_json'))
-        selection_opened_for_batch = False
         if not self.active_request_id and options.collection_mode == 'select':
             self.show_selection(request_id)
-            selection_opened_for_batch = self.active_request_id == request_id
-        if self.active_request_id == request_id and not selection_opened_for_batch:
-            if current_count > old_count:
-                appended = self.window.db.list_collection_probe_entries(
-                    parent_id,
-                    offset=old_count,
-                    limit=current_count - old_count,
-                )
-                self.selection_view.append_entries(appended)
+        elif self.active_request_id == request_id and current_count > old_count:
+            appended = self.window.db.list_collection_probe_entries(
+                parent_id,
+                offset=old_count,
+                limit=current_count - old_count,
+            )
+            self.selection_view.append_entries(appended)
 
     def show_selection(self, request_id: str) -> None:
         state = self.coordinator.states.get(request_id)

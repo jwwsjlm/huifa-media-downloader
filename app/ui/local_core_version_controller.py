@@ -132,6 +132,3 @@ class LocalCoreVersionController(QObject):
     @property
     def running(self) -> bool:
         return self._runtime is not None
-
-
-__all__ = ["LocalCoreVersionController"]

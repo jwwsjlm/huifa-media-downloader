@@ -627,7 +627,6 @@ class CoverStudioDialog(QDialog):
                 self.current,
                 prompt,
                 options=self.export_options(),
-                provider_options={"quality": "high", "input_fidelity": "high"},
             )
             provider = OpenAICoverGenerationProvider(
                 api_key,

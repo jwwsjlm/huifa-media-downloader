@@ -11,9 +11,12 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 
 from app.adapters.sau_adapter import (
-    SauAdapter,
     UPLOAD_VIDEO_ACTION,
+    account_action,
+    build_upload_request,
     get_sau_platform_capability,
+    probe_sau_compatibility,
+    publish,
 )
 from app.core.media_identity import media_identity
 from app.core.qt_lifecycle import delete_unstarted_worker
@@ -47,26 +50,26 @@ class PublishWorker(QObject):
             settings = json.loads(self.row["settings"] or "{}")
             platform = str(self.row["platform"] or "").strip().casefold()
             capability = get_sau_platform_capability(platform)
-            if capability is None or not capability.supports_upload_video:
+            if capability is None:
                 self.result.emit(
                     self.task_id,
                     False,
                     f"平台 {platform or '未知'} 尚未接入视频发布",
                 )
                 return
-            adapter = SauAdapter(platform)
-            payload = adapter.build_payload(self.media.__dict__, metadata, settings)
+            payload = {"media": self.media.__dict__, "metadata": metadata, "settings": settings}
             if self._cancel.is_set():
                 self.result.emit(self.task_id, False, "发布任务已取消")
                 return
             account = str(settings.get("account") or self.row["account"] or "default").strip() or "default"
-            compatibility = adapter.core_compatibility(UPLOAD_VIDEO_ACTION)
+            compatibility = probe_sau_compatibility(platform, UPLOAD_VIDEO_ACTION)
             if not compatibility.compatible:
                 self.result.emit(self.task_id, False, compatibility.user_message())
                 return
             # Publishing accounts use SAU's per-platform store. Validate them
             # immediately before upload so an expired login cannot start work.
-            cookie_ok, cookie_result = adapter.account_action(
+            cookie_ok, cookie_result = account_action(
+                platform,
                 "check",
                 account,
                 cancel_event=self._cancel,
@@ -84,7 +87,7 @@ class PublishWorker(QObject):
                     message += f"\n{detail}"
                 self.result.emit(self.task_id, False, message)
                 return
-            ok, result = adapter.publish(payload, cancel_event=self._cancel)
+            ok, result = publish(platform, payload, cancel_event=self._cancel)
             self.result.emit(self.task_id, ok, result)
         except Exception as exc:
             self.result.emit(self.task_id, False, str(exc))
@@ -126,8 +129,9 @@ class AccountWorker(QObject):
                 output = str(result.get("message") or ("登录完成" if ok else "登录失败"))
                 self.result.emit(self.platform, self.account, self.action, ok, output)
                 return
-            adapter = SauAdapter(self.platform)
-            ok, output = adapter.account_action(self.action, self.account, cancel_event=self._cancel)
+            ok, output = account_action(
+                self.platform, self.action, self.account, cancel_event=self._cancel
+            )
             # Publishing-account login is followed by that platform's own
             # validation. The generic download-cookie browser returned above
             # intentionally has no platform-specific login check.
@@ -137,7 +141,8 @@ class AccountWorker(QObject):
                 and not self._cancel.is_set()
                 and not self.vault_profile_id
             ):
-                check_ok, check_output = adapter.account_action(
+                check_ok, check_output = account_action(
+                    self.platform,
                     "check",
                     self.account,
                     cancel_event=self._cancel,

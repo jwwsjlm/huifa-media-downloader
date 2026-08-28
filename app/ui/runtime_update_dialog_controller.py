@@ -119,6 +119,3 @@ class RuntimeUpdateDialogController(QObject):
             ui_text('Update Check Failed'),
             ui_text('Unable to connect to the GitHub API:\n') + runtime_text(error),
         )
-
-
-__all__ = ["RuntimeUpdateDialogController"]

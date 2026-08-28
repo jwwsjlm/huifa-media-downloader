@@ -156,5 +156,3 @@ class DownloadTaskIndex:
             "resumable": resumable_paused + failed,
             "cleanable": completed,
         }
-
-__all__ = ["DownloadTaskIndex", "TaskIndexState"]

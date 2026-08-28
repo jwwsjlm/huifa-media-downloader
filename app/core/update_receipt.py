@@ -21,7 +21,6 @@ class UpdateInstallReceipt:
     from_version: str
     to_version: str
     current_version: str
-    delivery_kind: str
     message: str
     finished_at: str
 
@@ -45,8 +44,6 @@ def write_update_install_intent(state_dir: str | Path, update: Any) -> Path:
         "schema_version": 1,
         "from_version": _safe_text(getattr(update, "current_version", ""), 128),
         "to_version": _safe_text(getattr(update, "version", ""), 128),
-        "delivery_kind": _safe_text(getattr(update, "delivery_kind", "velopack"), 64)
-        or "velopack",
         "scheduled_at": _utc_now(),
     }
     if not payload["to_version"]:
@@ -65,7 +62,6 @@ def record_update_install_result(
     status: str,
     current_version: str,
     message: str = "",
-    delivery_kind: str = "",
 ) -> UpdateInstallReceipt:
     """Finalize a locally scheduled update into a one-shot startup receipt."""
 
@@ -80,17 +76,11 @@ def record_update_install_result(
     effective_current = _safe_text(current_version, 128)
     if not to_version:
         to_version = effective_current
-    effective_delivery = (
-        _safe_text(delivery_kind, 64)
-        or _safe_text(intent.get("delivery_kind"), 64)
-        or "unknown"
-    )
     receipt = UpdateInstallReceipt(
         status=normalized_status,
         from_version=from_version,
         to_version=to_version,
         current_version=effective_current,
-        delivery_kind=effective_delivery,
         message=_safe_text(message, 2000),
         finished_at=_utc_now(),
     )
@@ -118,7 +108,6 @@ def consume_update_install_receipt(state_dir: str | Path) -> UpdateInstallReceip
             from_version=_safe_text(payload.get("from_version"), 128),
             to_version=_safe_text(payload.get("to_version"), 128),
             current_version=_safe_text(payload.get("current_version"), 128),
-            delivery_kind=_safe_text(payload.get("delivery_kind"), 64) or "unknown",
             message=_safe_text(payload.get("message"), 2000),
             finished_at=_safe_text(payload.get("finished_at"), 128),
         )
@@ -138,7 +127,6 @@ def _receipt_payload(receipt: UpdateInstallReceipt) -> dict[str, Any]:
         "from_version": receipt.from_version,
         "to_version": receipt.to_version,
         "current_version": receipt.current_version,
-        "delivery_kind": receipt.delivery_kind,
         "message": receipt.message,
         "finished_at": receipt.finished_at,
     }

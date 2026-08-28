@@ -108,6 +108,3 @@ class TaskFormatSelectionController:
         self._status_label.setText(ui_text(
             'Quality preview closed; no download task was created',
         ))
-
-
-__all__ = ["TaskFormatSelectionController"]

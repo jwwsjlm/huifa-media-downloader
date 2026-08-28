@@ -129,13 +129,17 @@ class CoverServiceTests(unittest.TestCase):
             changed.fill(QColor("red"))
             self.assertEqual(cover.image.pixelColor(0, 0), QColor("#336699"))
 
-    def test_remote_cover_streams_with_timeout_proxy_and_redirect_metadata(self) -> None:
+    def test_remote_cover_streams_with_timeout_proxy_and_redirect_metadata(
+        self,
+    ) -> None:
         encoder = CoverService()
         try:
             png = encoder.prepare_clipboard(solid_image(64, 32, "green")).png_bytes
         finally:
             encoder.close()
-        response = FakeResponse(png, url="https://images.example.test/final.png", content_length=len(png))
+        response = FakeResponse(
+            png, url="https://images.example.test/final.png", content_length=len(png)
+        )
         session = FakeSession(response)
         service = CoverService(session=session)
         cover = service.load_url(
@@ -158,17 +162,21 @@ class CoverServiceTests(unittest.TestCase):
     def test_remote_cover_rejects_non_image_and_oversized_content(self) -> None:
         html_response = FakeResponse(b"<html></html>", content_type="text/html")
         with self.assertRaisesRegex(CoverLoadError, "不是图像"):
-            CoverService(session=FakeSession(html_response)).load_url("https://example.test/page")
+            CoverService(session=FakeSession(html_response)).load_url(
+                "https://example.test/page"
+            )
         self.assertTrue(html_response.closed)
 
         large_response = FakeResponse(b"x", content_length=1025)
         with self.assertRaisesRegex(CoverLoadError, "超过"):
-            CoverService(session=FakeSession(large_response), max_download_bytes=1024).load_url(
-                "https://example.test/large.png"
-            )
+            CoverService(
+                session=FakeSession(large_response), max_download_bytes=1024
+            ).load_url("https://example.test/large.png")
         self.assertTrue(large_response.closed)
 
-    def test_source_loader_rejects_unsupported_uri_schemes_and_empty_images(self) -> None:
+    def test_source_loader_rejects_unsupported_uri_schemes_and_empty_images(
+        self,
+    ) -> None:
         service = CoverService()
         try:
             with self.assertRaisesRegex(CoverLoadError, "HTTP"):
@@ -230,7 +238,9 @@ class CoverServiceTests(unittest.TestCase):
             )
             service = CoverService()
             try:
-                result = service.save_jpeg(solid_image(300, 300, "#cc5500"), target_without_suffix, options)
+                result = service.save_jpeg(
+                    solid_image(300, 300, "#cc5500"), target_without_suffix, options
+                )
                 with self.assertRaisesRegex(CoverSaveError, "已存在"):
                     service.save_jpeg(
                         solid_image(300, 300, "red"),
@@ -269,7 +279,7 @@ class CoverServiceTests(unittest.TestCase):
         self.assertTrue(mime_data.hasImage())
         self.assertTrue(mime_data.hasFormat("image/png"))
 
-    def test_generation_request_is_provider_neutral_immutable_and_has_no_credentials(self) -> None:
+    def test_generation_request_validates_explicit_provider_controls(self) -> None:
         service = CoverService()
         try:
             request = service.prepare_generation_request(
@@ -277,46 +287,37 @@ class CoverServiceTests(unittest.TestCase):
                 "  保留主体，增强标题可读性  ",
                 options=CoverExportOptions(160, 90),
                 count=2,
-                provider_options={"model": "gpt-image", "style": {"strength": 0.7}},
+                quality=" Medium ",
+                input_fidelity="low",
             )
         finally:
             service.close()
         self.assertEqual(request.prompt, "保留主体，增强标题可读性")
         self.assertEqual((request.width, request.height, request.count), (160, 90, 2))
-        self.assertEqual(request.provider_options["model"], "gpt-image")
-        with self.assertRaises(TypeError):
-            request.provider_options["model"] = "changed"  # type: ignore[index]
-        with self.assertRaises(TypeError):
-            request.provider_options["style"]["strength"] = 1  # type: ignore[index]
-
-        with self.assertRaisesRegex(CoverValidationError, "API Key"):
+        self.assertEqual(request.quality, "medium")
+        self.assertEqual(request.input_fidelity, "low")
+        with self.assertRaisesRegex(CoverValidationError, "质量"):
             CoverGenerationRequest(
                 request.source_png,
                 "prompt",
                 160,
                 90,
-                provider_options={"auth": {"api_key": "must-not-live-here"}},
+                quality="ultra",
             )
-        with self.assertRaisesRegex(CoverValidationError, "API Key"):
+        with self.assertRaisesRegex(CoverValidationError, "保真度"):
             CoverGenerationRequest(
                 request.source_png,
                 "prompt",
                 160,
                 90,
-                provider_options={"openai_api_key": "must-not-live-here"},
+                input_fidelity="medium",
             )
-        # Non-secret generation controls that merely contain the word token
-        # must remain usable by future providers.
-        token_budget_request = CoverGenerationRequest(
-            request.source_png,
-            "prompt",
-            160,
-            90,
-            provider_options={"max_tokens": 1024},
+        request_fields = {
+            item.name.casefold() for item in fields(CoverGenerationRequest)
+        }
+        self.assertFalse(
+            request_fields & {"api_key", "token", "password", "authorization"}
         )
-        self.assertEqual(token_budget_request.provider_options["max_tokens"], 1024)
-        request_fields = {item.name.casefold() for item in fields(CoverGenerationRequest)}
-        self.assertFalse(request_fields & {"api_key", "token", "password", "authorization"})
 
     def test_export_option_validation_is_actionable(self) -> None:
         with self.assertRaisesRegex(CoverValidationError, "质量"):

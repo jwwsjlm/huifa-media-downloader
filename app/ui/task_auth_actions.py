@@ -123,6 +123,3 @@ class TaskAuthActionController:
             task_id,
             quality_override=quality_override,
         )
-
-
-__all__ = ["TaskAuthActionController"]

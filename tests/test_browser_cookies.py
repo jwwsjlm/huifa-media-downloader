@@ -62,16 +62,22 @@ class BrowserCookieFormatTests(unittest.TestCase):
                 temporary.unlink(missing_ok=True)
 
     def test_playwright_cookie_import_normalizes_browser_state(self) -> None:
-        restored = cookies_from_playwright({"cookies": [{
-            "name": "session",
-            "value": "secret",
-            "domain": ".example.com",
-            "path": "/",
-            "expires": 2_000_000_000,
-            "httpOnly": True,
-            "secure": True,
-            "sameSite": "Strict",
-        }]})
+        restored = cookies_from_playwright(
+            {
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "secret",
+                        "domain": ".example.com",
+                        "path": "/",
+                        "expires": 2_000_000_000,
+                        "httpOnly": True,
+                        "secure": True,
+                        "sameSite": "Strict",
+                    }
+                ]
+            }
+        )
         self.assertEqual(len(restored), 1)
         self.assertEqual(restored[0].name, "session")
         self.assertTrue(restored[0].http_only)
@@ -93,7 +99,9 @@ class BrowserCookieFormatTests(unittest.TestCase):
 
     def test_cookie_viewer_groups_domains_and_hides_values_by_default(self) -> None:
         cookies = [
-            BrowserCookie("sid", "private-douyin", ".douyin.com", secure=True, http_only=True),
+            BrowserCookie(
+                "sid", "private-douyin", ".douyin.com", secure=True, http_only=True
+            ),
             BrowserCookie("theme", "dark", ".douyin.com", path="/creator"),
             BrowserCookie("session", "private-youtube", ".youtube.com"),
         ]
@@ -117,7 +125,10 @@ class BrowserCookieFormatTests(unittest.TestCase):
                 for index in range(dialog.tree.topLevelItemCount())
                 if dialog.tree.topLevelItem(index).text(0) == ".douyin.com"
             )
-            visible_values = {douyin_group.child(index).text(1) for index in range(douyin_group.childCount())}
+            visible_values = {
+                douyin_group.child(index).text(1)
+                for index in range(douyin_group.childCount())
+            }
             self.assertIn("private-douyin", visible_values)
 
             dialog.search.setText("youtube")
@@ -132,7 +143,12 @@ class BrowserCookieFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "vault"
             source = [
-                BrowserCookie("sid", "secret", ".douyin.com", expires=int(datetime.now().timestamp()) + 3600)
+                BrowserCookie(
+                    "sid",
+                    "secret",
+                    ".douyin.com",
+                    expires=int(datetime.now().timestamp()) + 3600,
+                )
             ]
             first_session = CookieVault(root)
             first_session.save("download", source)
@@ -163,7 +179,9 @@ class BrowserCookieFormatTests(unittest.TestCase):
             self.assertIn("请重新登录", notice)
             self.assertEqual(restarted.consume_recovery_notice("download"), "")
 
-    def test_transient_read_failure_preserves_vault_instead_of_quarantining_it(self) -> None:
+    def test_transient_read_failure_preserves_vault_instead_of_quarantining_it(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "vault"
             vault = CookieVault(root)
@@ -182,7 +200,9 @@ class BrowserCookieFormatTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"encrypted-cookie-vault")
             self.assertEqual(list(root.glob(path.name + ".unreadable-*.bak")), [])
 
-    def test_failed_quarantine_never_returns_an_empty_overwritable_session(self) -> None:
+    def test_failed_quarantine_never_returns_an_empty_overwritable_session(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "vault"
             vault = CookieVault(root)
@@ -263,7 +283,9 @@ class BrowserCookieFormatTests(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), b"corrupt-cookie-vault")
 
-    def test_first_temp_export_cleans_previous_process_plaintext_only_once(self) -> None:
+    def test_first_temp_export_cleans_previous_process_plaintext_only_once(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             app_data = Path(directory)
             temp_root = app_data / "temp"
@@ -331,7 +353,7 @@ class BrowserCookieFormatTests(unittest.TestCase):
             "app.core.publish_service.open_download_cookie_browser",
             return_value={"success": True, "message": "已持久化保存 3 条 Cookie"},
         ) as open_browser, patch(
-            "app.core.publish_service.SauAdapter.account_action",
+            "app.core.publish_service.account_action",
         ) as account_action:
             worker.run()
 
@@ -339,6 +361,7 @@ class BrowserCookieFormatTests(unittest.TestCase):
         self.assertIn("3", results[0][4])
         open_browser.assert_called_once_with("download", cancel_event=worker._cancel)
         account_action.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

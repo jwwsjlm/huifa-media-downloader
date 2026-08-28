@@ -122,8 +122,6 @@ class CoverExportOptions:
     background_color: str = "#000000"
     focus_x: float = 0.5
     focus_y: float = 0.5
-    optimized: bool = True
-    progressive: bool = True
 
     def __post_init__(self) -> None:
         _validated_dimension(self.width, "封面宽度")
@@ -149,9 +147,6 @@ class CoverExportOptions:
                 raise CoverValidationError(f"{name}必须是 0 到 1 之间的数字")
             if not 0.0 <= float(value) <= 1.0:
                 raise CoverValidationError(f"{name}必须在 0 到 1 之间")
-        if not isinstance(self.optimized, bool) or not isinstance(self.progressive, bool):
-            raise CoverValidationError("JPG 优化和渐进式选项必须是布尔值")
-
     @classmethod
     def from_preset(
         cls,
@@ -162,8 +157,6 @@ class CoverExportOptions:
         background_color: str = "#000000",
         focus_x: float = 0.5,
         focus_y: float = 0.5,
-        optimized: bool = True,
-        progressive: bool = True,
     ) -> "CoverExportOptions":
         resolved = resolve_cover_preset(preset)
         return cls(
@@ -174,8 +167,6 @@ class CoverExportOptions:
             background_color=background_color,
             focus_x=focus_x,
             focus_y=focus_y,
-            optimized=optimized,
-            progressive=progressive,
         )
 
 
@@ -244,96 +235,15 @@ class ClipboardImageData:
         return mime_data
 
 
-_SECRET_OPTION_KEYS = frozenset(
-    {
-        "apikey",
-        "auth",
-        "authentication",
-        "authorization",
-        "bearer",
-        "clientsecret",
-        "credential",
-        "credentials",
-        "idtoken",
-        "password",
-        "refreshtoken",
-        "secret",
-        "sessiontoken",
-        "token",
-        "accesstoken",
-    }
-)
-
-
-def _normalized_option_key(key: object) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(key).casefold())
-
-
-def _is_secret_option_key(key: object) -> bool:
-    normalized = _normalized_option_key(key)
-    return normalized in _SECRET_OPTION_KEYS or normalized.endswith(
-        (
-            "apikey",
-            "accesstoken",
-            "authtoken",
-            "bearertoken",
-            "clientsecret",
-            "credential",
-            "credentials",
-            "idtoken",
-            "password",
-            "refreshtoken",
-            "sessiontoken",
-        )
-    )
-
-
-def _contains_secret_option(value: object) -> bool:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if _is_secret_option_key(key) or _contains_secret_option(item):
-                return True
-    elif isinstance(value, (list, tuple)):
-        return any(_contains_secret_option(item) for item in value)
-    return False
-
-
-def _freeze_json_value(value: object, path: str = "provider_options") -> object:
-    """Validate and detach provider-facing metadata as immutable JSON data."""
-
-    if isinstance(value, Mapping):
-        frozen: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str) or not key:
-                raise CoverValidationError(f"{path} 的键必须是非空字符串")
-            frozen[key] = _freeze_json_value(item, f"{path}.{key}")
-        return MappingProxyType(frozen)
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json_value(item, f"{path}[]") for item in value)
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise CoverValidationError(f"{path} 不允许 NaN 或无限值")
-        return value
-    raise CoverValidationError(f"{path} 包含不可序列化的值：{type(value).__name__}")
-
-
 @dataclass(frozen=True, slots=True)
 class CoverGenerationRequest:
-    """Provider-neutral request for a future image-generation adapter.
-
-    Authentication is intentionally absent. A provider implementation should
-    receive credentials through its constructor from the application's secure
-    store and must never add them to this serializable request model.
-    """
-
     source_png: bytes = field(repr=False)
     prompt: str
     width: int
     height: int
     count: int = 1
-    provider_options: Mapping[str, Any] = field(default_factory=dict)
+    quality: str = "high"
+    input_fidelity: str = "high"
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_png, bytes) or not self.source_png.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -352,10 +262,14 @@ class CoverGenerationRequest:
             raise CoverValidationError(f"AI 输出像素总数不能超过 {DEFAULT_MAX_PIXELS:,}")
         if isinstance(self.count, bool) or not isinstance(self.count, int) or not 1 <= self.count <= 4:
             raise CoverValidationError("AI 二创数量必须在 1 到 4 之间")
-        options = dict(self.provider_options or {})
-        if _contains_secret_option(options):
-            raise CoverValidationError("provider_options 不允许包含 API Key、Token 或密码")
-        object.__setattr__(self, "provider_options", _freeze_json_value(options))
+        quality = str(self.quality or "high").strip().lower()
+        if quality not in {"auto", "low", "medium", "high"}:
+            raise CoverValidationError("GPT Image 质量仅支持 auto、low、medium 或 high")
+        fidelity = str(self.input_fidelity or "high").strip().lower()
+        if fidelity not in {"low", "high"}:
+            raise CoverValidationError("输入保真度仅支持 low 或 high")
+        object.__setattr__(self, "quality", quality)
+        object.__setattr__(self, "input_fidelity", fidelity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,8 +277,6 @@ class GeneratedCover:
     image_bytes: bytes = field(repr=False)
     mime_type: str
     provider_id: str
-    revised_prompt: str = ""
-    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.image_bytes:
@@ -379,10 +291,6 @@ class GeneratedCover:
             raise CoverValidationError("AI provider 标识不能为空")
         object.__setattr__(self, "mime_type", mime_type)
         object.__setattr__(self, "provider_id", provider_id)
-        metadata = dict(self.metadata or {})
-        if _contains_secret_option(metadata):
-            raise CoverValidationError("AI 二创结果元数据不允许包含密钥或 Token")
-        object.__setattr__(self, "metadata", _freeze_json_value(metadata, "metadata"))
 
 
 GenerationProgressCallback = Callable[[int, str], None]
@@ -646,8 +554,8 @@ class CoverService:
             rendered,
             b"JPEG",
             quality=options.quality,
-            optimized=options.optimized,
-            progressive=options.progressive,
+            optimized=True,
+            progressive=True,
         )
         temporary_path: Path | None = None
         try:
@@ -700,7 +608,8 @@ class CoverService:
         *,
         options: CoverExportOptions | None = None,
         count: int = 1,
-        provider_options: Mapping[str, Any] | None = None,
+        quality: str = "high",
+        input_fidelity: str = "high",
     ) -> CoverGenerationRequest:
         image = self.render(source, options) if options is not None else self._source_image(source)
         source_png = self._encode_image(image, b"PNG")
@@ -710,7 +619,8 @@ class CoverService:
             width=image.width(),
             height=image.height(),
             count=count,
-            provider_options=provider_options or {},
+            quality=quality,
+            input_fidelity=input_fidelity,
         )
 
     def _source_image(self, source: LoadedCover | QImage) -> QImage:

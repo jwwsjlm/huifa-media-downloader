@@ -90,6 +90,3 @@ def redact_secret_text(
     if limit is not None:
         text = text[:max(0, int(limit))]
     return text
-
-
-__all__ = ["redact_secret_text", "redact_url"]

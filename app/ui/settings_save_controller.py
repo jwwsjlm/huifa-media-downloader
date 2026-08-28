@@ -592,11 +592,3 @@ class SettingsSaveController:
             success_message,
         )
         return True
-
-
-__all__ = [
-    "DownloadPerformancePlan",
-    "DownloadSettingsPaths",
-    "SettingsSaveController",
-    "SettingsSavePlan",
-]

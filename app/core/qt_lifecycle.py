@@ -19,6 +19,3 @@ def delete_unstarted_worker(worker: QObject, thread: QThread) -> None:
             delete_qt_object(obj)
         except RuntimeError:
             pass
-
-
-__all__ = ["delete_unstarted_worker"]

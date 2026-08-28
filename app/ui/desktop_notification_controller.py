@@ -260,9 +260,3 @@ class DesktopNotificationController(QObject):
                 QSystemTrayIcon.MessageIcon.Critical,
                 ("publish", int(task_id)),
             )
-
-
-__all__ = [
-    "DesktopNotificationController",
-    "desktop_notification_should_show",
-]
