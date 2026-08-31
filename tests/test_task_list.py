@@ -73,6 +73,7 @@ class TaskListRulesTests(unittest.TestCase):
 
         self.assertEqual(state.ordered_ids, ["c", "b", "a"])
         self.assertEqual(list(state.pending_ids), ["c", "a"])
+        self.assertFalse(state.append_pending)
 
         matching = state.prioritize(lambda task_id: task_id == "a")
         self.assertEqual(matching, ["a"])
@@ -95,6 +96,7 @@ class TaskListRulesTests(unittest.TestCase):
         state.begin_restore((str(index) for index in range(75)), 50)
 
         self.assertTrue(state.loading)
+        self.assertTrue(state.append_pending)
         self.assertEqual(state.render_goal, 50)
         state.finish()
         self.assertTrue(state.begin_more(50, 25, 50))
@@ -103,6 +105,7 @@ class TaskListRulesTests(unittest.TestCase):
 
         state.clear()
         self.assertFalse(state.loading)
+        self.assertFalse(state.append_pending)
         self.assertEqual(state.render_goal, 0)
         self.assertFalse(state.begin_more(0, 0, 50))
 

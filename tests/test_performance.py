@@ -30,6 +30,12 @@ class PerformancePersistenceTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_download_task_uses_bounded_slot_storage(self) -> None:
+        task = DownloadTask("slot-task", "https://example.com", ".")
+
+        self.assertFalse(hasattr(task, "__dict__"))
+        self.assertIsInstance(task.speed_samples, list)
+
     def test_component_update_checks_are_bounded_concurrent_and_ordered(self) -> None:
         names = [f"component-{index}" for index in range(8)]
         worker = UpdateWorker({name: f"owner/{name}" for name in names})
@@ -782,6 +788,10 @@ class PerformancePersistenceTests(unittest.TestCase):
             self.assertEqual(same_stage.speed_bps, 4 * 1024 * 1024)
             self.assertEqual(same_stage.eta, "00:20")
             self.assertEqual(list(same_stage.speed_samples), [4.0, 4.0])
+
+            for speed in range(1, 9):
+                service._apply_transfer_rate(same_stage, {"speed": float(speed)})
+            self.assertEqual(same_stage.speed_samples, [3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
 
             service.shutdown(timeout_ms=0)
             db.close()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 import math
 import re
 from typing import Any, Mapping
@@ -43,6 +43,8 @@ SPONSORBLOCK_CATEGORIES = frozenset({
 
 
 def _choice(value: object, allowed: frozenset[str], default: str) -> str:
+    if type(value) is str and value in allowed:
+        return value
     normalized = str(value or "").strip().casefold()
     return normalized if normalized in allowed else default
 
@@ -198,7 +200,9 @@ class DownloadOptions:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = {name: getattr(self, name) for name in self.__slots__}
+        values["sponsorblock_categories"] = list(self.sponsorblock_categories)
+        return values
 
     def effective_container(self) -> str:
         """Return the explicit container or the selected compatibility preset."""

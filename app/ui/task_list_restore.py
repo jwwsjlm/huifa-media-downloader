@@ -6,7 +6,11 @@ from typing import Any
 
 from app.core.download_service import DownloadTask
 from app.ui.i18n import text as ui_text
-from app.ui.task_list import TaskListPagingState, ordered_top_level_tasks
+from app.ui.task_list import (
+    TaskListPagingState,
+    ordered_top_level_tasks,
+    task_matches_filter,
+)
 
 
 def enrich_completed_task_metadata(
@@ -87,9 +91,6 @@ class TaskListRestoreController:
     def create_row(self, task: DownloadTask, row: int | None) -> None:
         self.page.task_rows.create(task, row)
 
-    def task_matches(self, task: DownloadTask) -> bool:
-        return self.page.task_presentation.task_matches(task)
-
     def apply_filter(self) -> None:
         self.page.task_presentation.apply_filter()
 
@@ -129,8 +130,17 @@ class TaskListRestoreController:
             task = self.service.tasks.get(task_id)
             if task is None or task.parent_task_id:
                 continue
-            row = self.paging.materialized_row(task_id, self.items)
-            self.create_row(task, row if row >= 0 else None)
+            if self.paging.append_pending:
+                next_row = len(self.items)
+                self.paging.append_pending = (
+                    next_row < len(self.paging.ordered_ids)
+                    and self.paging.ordered_ids[next_row] == task_id
+                )
+            row = None
+            if not self.paging.append_pending:
+                canonical_row = self.paging.materialized_row(task_id, self.items)
+                row = canonical_row if canonical_row >= 0 else None
+            self.create_row(task, row)
             added += 1
         if (
             self.paging.pending_ids
@@ -140,15 +150,15 @@ class TaskListRestoreController:
         self.render_timer.stop()
         self.paging.finish()
         self.apply_filter()
-        self.update_load_more_button()
         self.status_label.setText(ui_text('Task history loaded'))
 
     def remaining_count(self) -> int:
+        filter_name, query = self.page.task_presentation.filter_values()
         return sum(
             1
             for task_id in self.paging.pending_ids
             if (task := self.service.tasks.get(task_id)) is not None
-            and self.task_matches(task)
+            and task_matches_filter(task, filter_name, query)
         )
 
     def update_load_more_button(self) -> None:
@@ -176,17 +186,22 @@ class TaskListRestoreController:
         if not self.paging.pending_ids:
             self._set_load_more_available(0)
             return 0
+        filter_name, query = self.page.task_presentation.filter_values()
 
         def matches(task_id: str) -> bool:
             task = self.service.tasks.get(task_id)
-            return task is not None and self.task_matches(task)
+            return task is not None and task_matches_filter(
+                task,
+                filter_name,
+                query,
+            )
 
         matching = self.paging.prioritize(matches)
         materialized_matches = sum(
             1
             for task_id in self.items
             if (task := self.service.tasks.get(task_id)) is not None
-            and self.task_matches(task)
+            and task_matches_filter(task, filter_name, query)
         )
         if matching and materialized_matches == 0 and not self.render_timer.isActive():
             if self.paging.begin_more(

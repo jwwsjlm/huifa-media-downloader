@@ -577,9 +577,21 @@ class DashboardOverviewTests(unittest.TestCase):
             for index in range(10_000)
         ]
         self.service.tasks = {task.id: task for task in tasks}
-        self.page.begin_task_restore(tasks)
-        while self.page._task_render_timer.isActive():
-            self.app.processEvents()
+        with patch(
+            "app.ui.task_list.TaskListPagingState.materialized_row",
+            side_effect=AssertionError("canonical restore must append rows"),
+        ), patch(
+            "app.ui.task_list_restore.TaskListRestoreController.remaining_count",
+            side_effect=AssertionError("filtering already updates the load button"),
+        ), patch.object(
+            self.page.task_presentation,
+            "filter_values",
+            wraps=self.page.task_presentation.filter_values,
+        ) as filter_values:
+            self.page.begin_task_restore(tasks)
+            while self.page._task_render_timer.isActive():
+                self.app.processEvents()
+        self.assertEqual(filter_values.call_count, 2)
 
         self.assertEqual(len(self.service.tasks), 10_000)
         self.assertEqual(self.page.task_list.count(), 50)
@@ -618,9 +630,13 @@ class DashboardOverviewTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.page.task_list.item(0).data(Qt.UserRole), "task-00000")
         before = self.page.task_list.count()
-        self.page.task_restore.load_more()
-        while self.page._task_render_timer.isActive():
-            self.app.processEvents()
+        with patch(
+            "app.ui.task_list.TaskListPagingState.materialized_row",
+            side_effect=AssertionError("canonical page must append rows"),
+        ):
+            self.page.task_restore.load_more()
+            while self.page._task_render_timer.isActive():
+                self.app.processEvents()
         self.assertGreater(self.page.task_list.count(), before)
         self.assertLessEqual(self.page.task_list.count(), before + 50)
         self.page.remove_task("task-05000")

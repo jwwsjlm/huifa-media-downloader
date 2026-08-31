@@ -26,6 +26,21 @@ from app.ui.download_options import CollectionDetailPage, CollectionEntryModel, 
 
 
 class DownloadOptionsTests(unittest.TestCase):
+    def test_default_task_options_skip_mapping_and_keep_lists_independent(self) -> None:
+        with patch.object(
+            DownloadOptions,
+            'from_mapping',
+            side_effect=AssertionError('empty defaults must not be reparsed'),
+        ):
+            task = DownloadTask('default-options', 'https://example.test/video', '.')
+
+        options = DownloadOptions(sponsorblock_categories=['sponsor'])
+        mapped = options.to_dict()
+        mapped['sponsorblock_categories'].append('intro')
+
+        self.assertTrue(task.options_json['write_thumbnail'])
+        self.assertEqual(options.sponsorblock_categories, ['sponsor'])
+
     def test_persisted_boolean_strings_are_normalized_explicitly(self) -> None:
         options = DownloadOptions.from_mapping({
             'live_from_start': 'false',

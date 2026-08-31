@@ -79,9 +79,8 @@ class TaskListPresentationController:
                 continue
         self.log_button.setEnabled(len(selected) == 1)
 
-    def task_matches(self, task: Any) -> bool:
-        return task_matches_filter(
-            task,
+    def filter_values(self) -> tuple[str, str]:
+        return (
             str(self.filter_box.currentData() or "全部"),
             self.search_box.text(),
         )
@@ -89,10 +88,15 @@ class TaskListPresentationController:
     def apply_filter(self) -> None:
         self.search_filter_timer.stop()
         self.prioritize_pending_matches()
+        filter_name, query = self.filter_values()
         selection_changed = False
         for task_id, item in list(self.items.items()):
             task = self.service.tasks.get(task_id)
-            hidden = task is None or not self.task_matches(task)
+            hidden = task is None or not task_matches_filter(
+                task,
+                filter_name,
+                query,
+            )
             if hidden and item.isSelected():
                 item.setSelected(False)
                 selection_changed = True

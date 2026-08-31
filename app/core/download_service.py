@@ -13,11 +13,12 @@ from functools import partial
 from math import isfinite
 from uuid import uuid4
 from collections import defaultdict, deque
-from dataclasses import dataclass, field, replace
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 
@@ -306,7 +307,7 @@ def format_duration(seconds: float) -> str:
     return f"{seconds}s"
 
 
-@dataclass
+@dataclass(slots=True)
 class DownloadTask:
     id: str
     url: str
@@ -339,7 +340,7 @@ class DownloadTask:
     progress: float = 0.0
     speed: str = ""
     speed_bps: float = 0.0
-    speed_samples: deque[float] = field(default_factory=lambda: deque(maxlen=6), repr=False)
+    speed_samples: list[float] = field(default_factory=list, repr=False)
     downloaded_bytes: int = 0
     total_bytes: int = 0
     eta: str = ""
@@ -398,10 +399,15 @@ class DownloadTask:
         self.source_key = normalize_source_key(self.source_key)
         self.collection_index = max(0, int(self.collection_index or 0))
         raw_options = dict(self.options_json or {})
-        self.options_json = DownloadOptions.from_mapping(raw_options).to_dict()
-        for internal_key in ("_collection", "_storage_preview", "_collection_materialization"):
-            if isinstance(raw_options.get(internal_key), Mapping):
-                self.options_json[internal_key] = dict(raw_options[internal_key])
+        options = (
+            DownloadOptions.from_mapping(raw_options)
+            if raw_options else DownloadOptions()
+        )
+        self.options_json = options.to_dict()
+        if raw_options:
+            for internal_key in ("_collection", "_storage_preview", "_collection_materialization"):
+                if isinstance(raw_options.get(internal_key), Mapping):
+                    self.options_json[internal_key] = dict(raw_options[internal_key])
         self.transcode_encoder = (
             normalize_transcode_encoder(self.transcode_encoder)
             if str(self.transcode_encoder or "").strip() else ""
@@ -412,6 +418,11 @@ class DownloadTask:
         else:
             self.transcode_codec = normalize_transcode_codec(self.transcode_codec)
             self.transcode_device = normalize_transcode_device(self.transcode_device)
+
+
+_DOWNLOAD_TASK_FIELD_NAMES = tuple(
+    item.name for item in fields(DownloadTask)
+)
 
 
 @dataclass(slots=True)
@@ -3982,15 +3993,18 @@ class DownloadService(QObject):
 
     @staticmethod
     def _snapshot_task_state(task: DownloadTask) -> dict[str, Any]:
-        return deepcopy(task.__dict__)
+        return deepcopy({
+            name: getattr(task, name)
+            for name in _DOWNLOAD_TASK_FIELD_NAMES
+        })
 
     def _restore_task_state(
         self,
         task: DownloadTask,
         snapshot: Mapping[str, Any],
     ) -> None:
-        task.__dict__.clear()
-        task.__dict__.update(snapshot)
+        for name, value in snapshot.items():
+            setattr(task, name, value)
         self._sync_task_indexes(task)
 
     @contextmanager
@@ -6939,9 +6953,7 @@ class DownloadService(QObject):
                 and sample > 0.0
             ]
             valid_samples.append(raw_speed)
-            task.speed_samples.clear()
-            sample_limit = task.speed_samples.maxlen or 6
-            task.speed_samples.extend(valid_samples[-sample_limit:])
+            task.speed_samples[:] = valid_samples[-6:]
             task.speed_bps = sum(task.speed_samples) / len(task.speed_samples)
         else:
             task.speed_bps = self._progress_float(task.speed_bps)

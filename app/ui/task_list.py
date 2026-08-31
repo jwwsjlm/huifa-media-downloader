@@ -51,6 +51,7 @@ class TaskListPagingState:
     pending_ids: deque[str] = field(default_factory=deque)
     render_goal: int = 0
     loading: bool = True
+    append_pending: bool = False
 
     def set_ordered(
         self,
@@ -63,12 +64,20 @@ class TaskListPagingState:
             task_id for task_id in self.ordered_ids
             if task_id not in materialized
         )
+        self.append_pending = (
+            len(materialized) <= len(self.ordered_ids)
+            and all(
+                task_id in materialized
+                for task_id in self.ordered_ids[:len(materialized)]
+            )
+        )
 
     def begin_restore(self, ordered_ids: Iterable[str], page_size: int) -> None:
         self.ordered_ids = [str(task_id) for task_id in ordered_ids]
         self.pending_ids = deque(self.ordered_ids)
         self.render_goal = min(max(0, int(page_size)), len(self.ordered_ids))
         self.loading = self.render_goal > 0
+        self.append_pending = True
 
     def begin_more(
         self,
@@ -92,6 +101,8 @@ class TaskListPagingState:
         for task_id in self.pending_ids:
             (matching if matches(task_id) else remaining).append(task_id)
         self.pending_ids = deque([*matching, *remaining])
+        if matching and remaining:
+            self.append_pending = False
         return matching
 
     def remove(self, task_id: str) -> None:
@@ -127,6 +138,7 @@ class TaskListPagingState:
         self.pending_ids.clear()
         self.render_goal = 0
         self.loading = False
+        self.append_pending = False
 
 
 def task_matches_filter(
