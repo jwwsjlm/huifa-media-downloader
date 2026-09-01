@@ -26,19 +26,31 @@ from app.ui.download_options import CollectionDetailPage, CollectionEntryModel, 
 
 
 class DownloadOptionsTests(unittest.TestCase):
+    def test_empty_mapping_matches_declared_download_option_defaults(self) -> None:
+        self.assertEqual(DownloadOptions.from_mapping({}), DownloadOptions())
+
     def test_default_task_options_skip_mapping_and_keep_lists_independent(self) -> None:
         with patch.object(
             DownloadOptions,
             'from_mapping',
             side_effect=AssertionError('empty defaults must not be reparsed'),
+        ), patch.object(
+            DownloadOptions,
+            'to_sparse_dict',
+            side_effect=AssertionError('empty defaults must not be scanned'),
         ):
             task = DownloadTask('default-options', 'https://example.test/video', '.')
 
         options = DownloadOptions(sponsorblock_categories=['sponsor'])
         mapped = options.to_dict()
         mapped['sponsorblock_categories'].append('intro')
+        sparse = options.to_sparse_dict()
+        sparse['sponsorblock_categories'].append('outro')
 
-        self.assertTrue(task.options_json['write_thumbnail'])
+        self.assertEqual(task.options_json, {})
+        self.assertTrue(
+            DownloadOptions.from_mapping(task.options_json).write_thumbnail
+        )
         self.assertEqual(options.sponsorblock_categories, ['sponsor'])
 
     def test_persisted_boolean_strings_are_normalized_explicitly(self) -> None:
@@ -708,8 +720,9 @@ class CollectionPersistenceTests(unittest.TestCase):
         ])
         self.assertEqual(len(child_ids), 2)
         first = self.service.tasks[child_ids[0]]
-        self.assertEqual(first.options_json['content_mode'], 'video')
-        self.assertEqual(first.options_json['container'], 'mkv')
+        first_options = DownloadOptions.from_mapping(first.options_json)
+        self.assertEqual(first_options.content_mode, 'video')
+        self.assertEqual(first_options.container, 'mkv')
         first_media = Path(self.temp.name) / 'one.mp4'
         first_media.write_bytes(b'video')
         first.status = 'completed'
@@ -1002,7 +1015,10 @@ class CollectionPersistenceTests(unittest.TestCase):
 
         child = self.service.tasks[child_ids[0]]
         self.assertEqual(child.quality, 'best')
-        self.assertEqual(child.options_json['content_mode'], 'video')
+        self.assertEqual(
+            DownloadOptions.from_mapping(child.options_json).content_mode,
+            'video',
+        )
         self.assertNotIn('_collection', child.options_json)
         self.assertNotIn('_collection_materialization', child.options_json)
 

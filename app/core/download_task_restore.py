@@ -72,6 +72,8 @@ class TaskRowReader:
 
     def options(self) -> dict[str, Any]:
         raw = self.value("options_json", "{}")
+        if not raw or raw == "{}":
+            return {}
         try:
             document = json.loads(str(raw or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):

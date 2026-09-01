@@ -41,8 +41,7 @@ class ThemeTests(unittest.TestCase):
             self.assertIn("QFrame#mainSidebar", stylesheet)
             self.assertIn('QToolButton[navigationItem="true"]:checked', stylesheet)
             self.assertIn('QFrame#mainSidebar[collapsed="true"]', stylesheet)
-        self.assertIn("background: #2f7bdc", light)
-        self.assertIn("background: #357fc9", dark)
+            self.assertIn("background: #225ea8", stylesheet)
 
     def test_quick_download_controls_center_text_before_the_indicator(self) -> None:
         light = build_application_stylesheet(THEME_LIGHT)
@@ -70,7 +69,7 @@ class ThemeTests(unittest.TestCase):
         dark = build_application_stylesheet(THEME_DARK)
         selector = (
             "QLineEdit:disabled, QComboBox:disabled, QTextEdit:disabled, "
-            "QSpinBox:disabled, QDoubleSpinBox:disabled"
+            "QPlainTextEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled"
         )
 
         self.assertIn(
@@ -85,6 +84,19 @@ class ThemeTests(unittest.TestCase):
             "QComboBox#quickDownloadCombo { padding: 0 28px 0 16px; }",
             light,
         )
+
+    def test_shared_visual_system_has_clear_focus_press_and_surface_states(self) -> None:
+        light = build_application_stylesheet(THEME_LIGHT)
+        dark = build_application_stylesheet(THEME_DARK)
+
+        self.assertIn('font-family: "Segoe UI Variable", "Microsoft YaHei UI", "Segoe UI"', light)
+        self.assertIn("QMainWindow, QDialog { background: #f6f8fb", light)
+        self.assertIn("QPushButton:pressed", light)
+        self.assertIn('QToolButton[navigationItem="true"]:focus', light)
+        self.assertIn("QFrame#taskMetricCard:focus", light)
+        for stylesheet in (light, dark):
+            self.assertIn("QStatusBar", stylesheet)
+            self.assertIn("QLineEdit:focus, QComboBox:focus", stylesheet)
 
     def test_supported_sites_selection_keeps_readable_text_in_both_themes(self) -> None:
         light = build_application_stylesheet(THEME_LIGHT)

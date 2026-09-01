@@ -1703,7 +1703,10 @@ class DashboardOverviewTests(unittest.TestCase):
         self.assertEqual(snapshot, persisted_options)
         self.assertIsNot(snapshot, task.options_json)
         task.options_json["collection_mode"] = "all"
-        self.assertEqual(snapshot["collection_mode"], "select")
+        self.assertEqual(
+            DownloadOptions.from_mapping(snapshot).collection_mode,
+            "select",
+        )
         show_selection.assert_called_once()
         set_finished.assert_called_once()
 

@@ -19,6 +19,7 @@ from app.core.download_service import (
     DownloadTask,
     DownloadWorker,
 )
+from app.core.download_task_restore import TaskRowReader
 from app.core.paths import tool_runtime_roots
 from app.core.update_service import UpdateWorker
 from app.storage.database import Database
@@ -34,7 +35,7 @@ class PerformancePersistenceTests(unittest.TestCase):
         task = DownloadTask("slot-task", "https://example.com", ".")
 
         self.assertFalse(hasattr(task, "__dict__"))
-        self.assertIsInstance(task.speed_samples, list)
+        self.assertIsInstance(task.speed_samples, tuple)
 
     def test_component_update_checks_are_bounded_concurrent_and_ordered(self) -> None:
         names = [f"component-{index}" for index in range(8)]
@@ -141,7 +142,7 @@ class PerformancePersistenceTests(unittest.TestCase):
         main_thread_id = threading.get_ident()
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "app.db")
-            service = DownloadService(db)
+            service = DownloadService(db, ytdlp_core_mode="builtin")
             progress_thread_ids: list[int] = []
             finished_thread_ids: list[int] = []
             service.task_progress.connect(lambda *_args: progress_thread_ids.append(threading.get_ident()))
@@ -290,6 +291,42 @@ class PerformancePersistenceTests(unittest.TestCase):
             self.assertEqual(len(rows), 75)
             self.assertEqual({row["id"] for row in rows}, {task.id for task in tasks})
             db.close()
+
+    def test_download_task_batch_update_rolls_back_when_one_row_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "app.db")
+            stored = DownloadTask("stored", "https://example.com/stored", directory)
+            missing = DownloadTask("missing", "https://example.com/missing", directory)
+            db.insert_download_task(stored)
+            stored.status = "paused"
+
+            with self.assertRaises(LookupError):
+                db.update_download_tasks((stored, missing))
+
+            rows = db.list_download_tasks()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "queued")
+            db.close()
+
+    def test_default_download_task_serialization_skips_json_encoder(self) -> None:
+        task = DownloadTask("empty-options", "https://example.com", ".")
+
+        with patch(
+            "app.storage.database.json.dumps",
+            side_effect=AssertionError("empty options must not enter JSON encoder"),
+        ):
+            values = Database._download_task_upsert_values(task)
+
+        self.assertEqual(values[6], "{}")
+
+    def test_empty_download_options_restore_skips_json_decoder(self) -> None:
+        reader = TaskRowReader({"options_json": "{}"})
+
+        with patch(
+            "app.core.download_task_restore.json.loads",
+            side_effect=AssertionError("empty options must not enter JSON decoder"),
+        ):
+            self.assertEqual(reader.options(), {})
 
     def test_media_catalog_page_and_distribution_counts_avoid_full_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -708,7 +745,7 @@ class PerformancePersistenceTests(unittest.TestCase):
                 speed_bps=8 * 1024 * 1024,
                 eta="00:01",
             )
-            task.speed_samples.extend((8 * 1024 * 1024, 8 * 1024 * 1024))
+            task.speed_samples = (8 * 1024 * 1024, 8 * 1024 * 1024)
             service._register_task(task)
             service._progress_persistence.persisted_at[task.id] = time.monotonic()
             service._last_progress_emit[task.id] = time.monotonic()
@@ -756,7 +793,7 @@ class PerformancePersistenceTests(unittest.TestCase):
                         speed_bps=8 * 1024 * 1024,
                         eta="00:10",
                     )
-                    task.speed_samples.extend((7.0, 8.0))
+                    task.speed_samples = (7.0, 8.0)
 
                     changed = service._apply_stage_progress(task, {
                         "stage": next_stage,
@@ -779,7 +816,7 @@ class PerformancePersistenceTests(unittest.TestCase):
                 speed_bps=4 * 1024 * 1024,
                 eta="00:20",
             )
-            same_stage.speed_samples.extend((4.0, 4.0))
+            same_stage.speed_samples = (4.0, 4.0)
             changed = service._apply_stage_progress(same_stage, {
                 "stage": "downloading",
                 "stage_text": "Still downloading",
@@ -791,7 +828,7 @@ class PerformancePersistenceTests(unittest.TestCase):
 
             for speed in range(1, 9):
                 service._apply_transfer_rate(same_stage, {"speed": float(speed)})
-            self.assertEqual(same_stage.speed_samples, [3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+            self.assertEqual(same_stage.speed_samples, (3.0, 4.0, 5.0, 6.0, 7.0, 8.0))
 
             service.shutdown(timeout_ms=0)
             db.close()

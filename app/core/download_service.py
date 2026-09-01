@@ -340,7 +340,7 @@ class DownloadTask:
     progress: float = 0.0
     speed: str = ""
     speed_bps: float = 0.0
-    speed_samples: list[float] = field(default_factory=list, repr=False)
+    speed_samples: tuple[float, ...] = field(default=(), repr=False)
     downloaded_bytes: int = 0
     total_bytes: int = 0
     eta: str = ""
@@ -399,15 +399,15 @@ class DownloadTask:
         self.source_key = normalize_source_key(self.source_key)
         self.collection_index = max(0, int(self.collection_index or 0))
         raw_options = dict(self.options_json or {})
-        options = (
-            DownloadOptions.from_mapping(raw_options)
-            if raw_options else DownloadOptions()
-        )
-        self.options_json = options.to_dict()
         if raw_options:
+            self.options_json = DownloadOptions.from_mapping(
+                raw_options
+            ).to_sparse_dict()
             for internal_key in ("_collection", "_storage_preview", "_collection_materialization"):
                 if isinstance(raw_options.get(internal_key), Mapping):
                     self.options_json[internal_key] = dict(raw_options[internal_key])
+        else:
+            self.options_json = {}
         self.transcode_encoder = (
             normalize_transcode_encoder(self.transcode_encoder)
             if str(self.transcode_encoder or "").strip() else ""
@@ -3716,7 +3716,7 @@ class DownloadService(QObject):
     @staticmethod
     def _apply_restored_presentation(task: DownloadTask) -> None:
         if task.status != "downloading":
-            task.speed_samples.clear()
+            task.speed_samples = ()
             task.speed_bps = 0.0
             task.speed = ""
             task.eta = ""
@@ -4587,12 +4587,12 @@ class DownloadService(QObject):
 
     @staticmethod
     def _collection_child_options(parent: DownloadTask) -> dict[str, Any]:
-        options = DownloadOptions.from_mapping(parent.options_json).to_dict()
-        if options.get("content_mode") == "manual":
+        options = DownloadOptions.from_mapping(parent.options_json)
+        if options.content_mode == "manual":
             # Content confirmation is a single-video interaction. A collection
             # must not open one blocking dialog for every selected child.
-            options["content_mode"] = "video"
-        return options
+            options.content_mode = "video"
+        return options.to_sparse_dict()
 
     @staticmethod
     def _collection_entry_spec(
@@ -4956,7 +4956,7 @@ class DownloadService(QObject):
         task.error = ""
         task.pause_requested = False
         task.cancel_requested = False
-        task.speed_samples.clear()
+        task.speed_samples = ()
         task.speed_bps = 0.0
         task.speed = ""
 
@@ -4978,7 +4978,7 @@ class DownloadService(QObject):
         task.visible_size = ""
         task.visible_speed = ""
         task.visible_eta = ""
-        task.speed_samples.clear()
+        task.speed_samples = ()
         task.speed_bps = 0.0
         task.speed = ""
 
@@ -6476,7 +6476,9 @@ class DownloadService(QObject):
                     selected_options["content_mode"] = content_mode
                 if audio_format:
                     selected_options["audio_format"] = audio_format
-                task.options_json = DownloadOptions.from_mapping(selected_options).to_dict()
+                task.options_json = DownloadOptions.from_mapping(
+                    selected_options
+                ).to_sparse_dict()
             task.error = ""
             task.pause_requested = False
             task.cancel_requested = False
@@ -6665,7 +6667,7 @@ class DownloadService(QObject):
             task.speed_bps = 0.0
             task.speed = ""
             task.eta = ""
-            task.speed_samples.clear()
+            task.speed_samples = ()
             self._sync_task_indexes(task)
             self.task_updated.emit(task)
             self._best_effort_service_log(
@@ -6816,7 +6818,7 @@ class DownloadService(QObject):
             task.speed_bps = 0.0
             task.speed = ""
             task.eta = ""
-            task.speed_samples.clear()
+            task.speed_samples = ()
             self._sync_task_indexes(task)
         self.task_media_completed.emit(task_id, media)
         if task and task.parent_task_id:
@@ -6909,7 +6911,7 @@ class DownloadService(QObject):
             task.speed_bps = 0.0
             task.speed = ""
             task.eta = ""
-            task.speed_samples.clear()
+            task.speed_samples = ()
         return merged.stage_changed
 
     def _apply_transfer_counters(self, task: DownloadTask, data: Mapping[str, Any]) -> None:
@@ -6953,7 +6955,7 @@ class DownloadService(QObject):
                 and sample > 0.0
             ]
             valid_samples.append(raw_speed)
-            task.speed_samples[:] = valid_samples[-6:]
+            task.speed_samples = tuple(valid_samples[-6:])
             task.speed_bps = sum(task.speed_samples) / len(task.speed_samples)
         else:
             task.speed_bps = self._progress_float(task.speed_bps)
@@ -7065,7 +7067,7 @@ class DownloadService(QObject):
         task.speed_bps = 0.0
         task.speed = ""
         task.eta = ""
-        task.speed_samples.clear()
+        task.speed_samples = ()
         self._persist(task)
         self.task_updated.emit(task)
         category = DownloadLogService.classify_error(error)
@@ -7272,7 +7274,7 @@ class DownloadService(QObject):
         task.speed_bps = 0.0
         task.speed = ""
         task.eta = ""
-        task.speed_samples.clear()
+        task.speed_samples = ()
 
     def _publish_finished_download_state(self, task: DownloadTask) -> bool:
         task_id = task.id

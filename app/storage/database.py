@@ -902,17 +902,13 @@ class Database:
     def update_download_tasks(self, tasks: Iterable) -> None:
         """Atomically update existing tasks without UPSERT resurrection."""
 
-        prepared = [
-            (task, self._download_task_update_values(task))
-            for task in tasks
-        ]
-        if not prepared:
+        rows = [self._download_task_update_values(task) for task in tasks]
+        if not rows:
             return
         with self._immediate_transaction() as connection:
-            for task, values in prepared:
-                cursor = connection.execute(_DOWNLOAD_TASK_UPDATE_SQL, values)
-                if cursor.rowcount != 1:
-                    raise LookupError(f"下载任务记录不存在：{task.id}")
+            cursor = connection.executemany(_DOWNLOAD_TASK_UPDATE_SQL, rows)
+            if cursor.rowcount != len(rows):
+                raise LookupError("部分下载任务记录不存在")
 
     def materialize_download_tasks(self, parent, children: Iterable) -> None:
         """Atomically update a collection parent and insert only new children."""
@@ -930,6 +926,7 @@ class Database:
     def _download_task_upsert_values(task) -> tuple[Any, ...]:
         """Serialize one task before acquiring SQLite's write lock."""
 
+        options = getattr(task, "options_json", {}) or {}
         return (
             task.id,
             getattr(task, "task_kind", "video"),
@@ -937,10 +934,8 @@ class Database:
             getattr(task, "root_task_id", ""),
             getattr(task, "source_key", ""),
             int(getattr(task, "collection_index", 0) or 0),
-            json.dumps(
-                getattr(task, "options_json", {}) or {},
-                ensure_ascii=False,
-                separators=(",", ":"),
+            "{}" if not options else json.dumps(
+                options, ensure_ascii=False, separators=(",", ":")
             ),
             task.url,
             task.output_dir,

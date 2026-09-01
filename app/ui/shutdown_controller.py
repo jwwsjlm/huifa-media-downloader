@@ -51,6 +51,7 @@ class ShutdownController(QObject):
         self.complete = False
         self._force_exit_requested = False
         self._database_available = False
+        self._database_task_ids: set[str] | None = None
         self._started_at = 0.0
         self._last_wait_seconds = -1
         self._error_keys: set[str] = set()
@@ -157,6 +158,7 @@ class ShutdownController(QObject):
         )
 
     def _prepare_database_state(self) -> None:
+        self._database_task_ids = None
         try:
             database_available = bool(
                 self.database_lifecycle.persistence_available
@@ -193,6 +195,8 @@ class ShutdownController(QObject):
                     "清理已删除数据库的任务界面失败",
                     self.dashboard.clear_tasks,
                 )
+            elif live_ids is not None:
+                self._database_task_ids = set(live_ids)
         self._database_available = database_available
 
     def poll(self) -> None:
@@ -375,14 +379,19 @@ class ShutdownController(QObject):
 
     def _persist_interrupted_tasks(self) -> None:
         tasks = []
-        for task in self.download_service.tasks.values():
+        for task_id, task in self.download_service.tasks.items():
+            if (
+                self._database_task_ids is not None
+                and task_id not in self._database_task_ids
+            ):
+                continue
             if task.status in {"downloading", "暂停中"}:
                 task.status = "paused"
                 tasks.append(task)
         if not tasks:
             return
         try:
-            self.download_service.db.upsert_download_tasks(tasks)
+            self.download_service.db.update_download_tasks(tasks)
         except Exception:
             self._record_current_exception(
                 "persist-interrupted-tasks",

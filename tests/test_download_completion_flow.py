@@ -3917,7 +3917,7 @@ class DownloadCompletionFlowTests(unittest.TestCase):
                     progress=42.0,
                 )
                 task.options_json["_storage_preview"] = {"path": "original"}
-                task.speed_samples.extend((10.0, 20.0))
+                task.speed_samples = (10.0, 20.0)
                 self.db.upsert_download_task(task)
                 service = DownloadService(self.db)
                 service._register_task(task)
@@ -3992,8 +3992,9 @@ class DownloadCompletionFlowTests(unittest.TestCase):
         self.assertEqual(format_task.status, "waiting_selection")
         self.assertEqual(format_task.stage, "waiting_selection")
         self.assertEqual(format_task.format_selector, "old-selector")
-        self.assertEqual(format_task.options_json["content_mode"], "video")
-        self.assertEqual(format_task.options_json["audio_format"], "mp3")
+        restored_options = DownloadOptions.from_mapping(format_task.options_json)
+        self.assertEqual(restored_options.content_mode, "video")
+        self.assertEqual(restored_options.audio_format, "mp3")
         self.assertEqual(selections, [])
         self.assertEqual(delete_task.status, "downloading")
         self.assertFalse(delete_task.cancel_requested)

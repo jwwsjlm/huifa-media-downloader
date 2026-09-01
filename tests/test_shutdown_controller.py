@@ -51,10 +51,10 @@ class _Database:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.closed = False
-        self.upserts: list[list[object]] = []
+        self.updates: list[list[object]] = []
 
-    def upsert_download_tasks(self, tasks) -> None:
-        self.upserts.append(list(tasks))
+    def update_download_tasks(self, tasks) -> None:
+        self.updates.append(list(tasks))
 
     def close(self) -> None:
         self.closed = True
@@ -244,7 +244,7 @@ class ShutdownControllerTests(unittest.TestCase):
         self.assertEqual(self.download_service.reset_calls, 0)
         self.assertEqual(self.dashboard.clear_calls, 0)
         self.assertEqual(task.status, "paused")
-        self.assertEqual(self.database.upserts, [[task]])
+        self.assertEqual(self.database.updates, [[task]])
 
     def test_confirmed_empty_database_discards_stale_cache_without_rewrite(self) -> None:
         self.download_service.tasks["stale"] = SimpleNamespace(status="downloading")
@@ -255,7 +255,20 @@ class ShutdownControllerTests(unittest.TestCase):
 
         self.assertEqual(self.download_service.reset_calls, 1)
         self.assertEqual(self.dashboard.clear_calls, 1)
-        self.assertEqual(self.database.upserts, [])
+        self.assertEqual(self.database.updates, [])
+
+    def test_shutdown_skips_cache_tasks_already_deleted_from_database(self) -> None:
+        live = SimpleNamespace(status="downloading")
+        stale = SimpleNamespace(status="downloading")
+        self.download_service.tasks.update({"live": live, "stale": stale})
+        self.dashboard.live_ids = {"live"}
+
+        self.controller.begin()
+        self.controller.finish()
+
+        self.assertEqual(live.status, "paused")
+        self.assertEqual(stale.status, "downloading")
+        self.assertEqual(self.database.updates, [[live]])
 
     def test_poll_exception_isolated_and_zero_activity_can_still_finish(self) -> None:
         self.update_service.shutdown_error = RuntimeError("poll failed")

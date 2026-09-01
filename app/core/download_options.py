@@ -204,6 +204,14 @@ class DownloadOptions:
         values["sponsorblock_categories"] = list(self.sponsorblock_categories)
         return values
 
+    def to_sparse_dict(self) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        for key in self.__slots__:
+            value = getattr(self, key)
+            if value != _DEFAULT_DOWNLOAD_OPTION_VALUES[key]:
+                values[key] = list(value) if key == "sponsorblock_categories" else value
+        return values
+
     def effective_container(self) -> str:
         """Return the explicit container or the selected compatibility preset."""
 
@@ -484,3 +492,6 @@ class DownloadOptions:
         if self.date_before and normalized_date and normalized_date > self.date_before.replace("-", ""):
             return False, "date_new"
         return True, ""
+
+
+_DEFAULT_DOWNLOAD_OPTION_VALUES = DownloadOptions().to_dict()
