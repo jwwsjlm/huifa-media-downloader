@@ -72,7 +72,6 @@ jobs:
           .\scripts\build_velopack_release.ps1
           -Version $env:RELEASE_VERSION
           -ReleaseNotes $env:RELEASE_NOTES
-          -SkipTests
 
       - name: Package portable and installer ZIP files
         shell: pwsh

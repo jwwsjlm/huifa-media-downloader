@@ -33,6 +33,16 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("actions/setup-python@v7", source)
         self.assertIn("actions/upload-artifact@v7", release)
 
+    def test_ci_is_manual_and_tag_release_runs_tests(self) -> None:
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("workflow_dispatch:", ci)
+        self.assertNotIn("push:", ci)
+        self.assertNotIn("pull_request:", ci)
+        self.assertNotIn("-SkipTests", release)
+
     def test_tag_release_builds_both_zip_editions_and_update_assets(self) -> None:
         release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
