@@ -84,6 +84,7 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("## 直接下载 / Direct downloads", body)
         self.assertIn(portable, body)
         self.assertIn(installer, body)
+        self.assertIn("HuifaMediaDownloader-Setup.msi", body)
         self.assertIn("普通用户只需选择下面一种版本", body)
         self.assertLess(body.index(portable), body.index("# Huifa Media Downloader"))
 
@@ -99,7 +100,9 @@ class GithubReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("current/tools/deno/x64/deno.exe", source)
         self.assertIn("current/tools/yt-dlp-ejs/yt_dlp_ejs-", source)
         self.assertIn("current/tools/chromium/chrome-win64/chrome.exe", source)
-        self.assertIn("HuifaMediaDownloader-Setup.exe", source)
+        self.assertIn("HuifaMediaDownloader-Setup.msi", source)
+        self.assertIn("Huifa.VideoDownloader-win.msi", source)
+        self.assertIn("*.msi", source)
         self.assertIn("RELEASE_NOTES.md", source)
         self.assertIn("HuifaVideoDownloader.exe", source)
         self.assertIn("releases.win.json", source)

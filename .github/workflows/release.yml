@@ -66,7 +66,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: .\scripts\prepare_release_runtime.ps1
 
-      - name: Build and verify installer
+      - name: Build and verify MSI installer
         shell: pwsh
         run: >-
           .\scripts\build_velopack_release.ps1

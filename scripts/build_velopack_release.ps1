@@ -1,6 +1,6 @@
 [CmdletBinding()]
 # Managed Windows release pipeline used by the GitHub tag workflow. This
-# command produces Setup.exe, the portable package, feeds, and update packages.
+# command produces an MSI installer, the portable package, feeds, and update packages.
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')]
@@ -17,7 +17,6 @@ param(
     [ValidatePattern('^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$')]
     [string]$PreviousReleaseRepo = '',
 
-    [switch]$BuildMsi,
     [switch]$SkipTests,
     [switch]$ValidateEnvironmentOnly
 )
@@ -126,6 +125,68 @@ function Get-SingleNonEmptyReleaseFile {
         throw "Velopack output is invalid; $Label is empty: $($Matches[0].FullName)"
     }
     return $Matches[0]
+}
+
+function Add-MsiCustomInstallDirectoryUi {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo]$Msi
+    )
+
+    # Velopack's MSI already includes BrowseDlg, but its default scope page
+    # does not link to it. Add the one missing control so end users can choose
+    # an arbitrary directory rather than only a per-user/per-machine default.
+    $Installer = $null
+    $Database = $null
+    $ExistingView = $null
+    try {
+        $Installer = New-Object -ComObject WindowsInstaller.Installer
+        $Database = $Installer.OpenDatabase($Msi.FullName, 1)
+        $ExistingView = $Database.OpenView(
+            'SELECT `Control` FROM `Control` WHERE `Dialog_`=''InstallScopeDlg'' AND `Control`=''BrowseInstallFolder'''
+        )
+        $ExistingView.Execute()
+        if ($null -ne $ExistingView.Fetch()) {
+            return
+        }
+        $ExistingView.Close()
+        $ExistingView = $null
+
+        foreach ($Statement in @(
+            'INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''PushButton'', 92, 243, 80, 17, 3, '''', ''Browse...'', ''Back'', '''')',
+            'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''SetProperty'', ''_BrowseProperty=INSTALLFOLDER'', 1, ''1'')',
+            'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''SetProperty'', ''HUIFA_CUSTOM_INSTALLDIR=1'', 2, ''1'')',
+            'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''NewDialog'', ''BrowseDlg'', 3, ''1'')',
+            'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''Next'', ''SetProperty'', ''VELOPACK_INSTALLDIR=[INSTALLFOLDER]'', 3, ''HUIFA_CUSTOM_INSTALLDIR=1'')'
+        )) {
+            $View = $null
+            try {
+                $View = $Database.OpenView($Statement)
+                $View.Execute()
+            }
+            finally {
+                if ($null -ne $View) {
+                    $View.Close()
+                    [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($View)
+                }
+            }
+        }
+        $Database.Commit()
+    }
+    catch {
+        throw "Unable to add the MSI installation-directory picker: $($Msi.FullName) ($($_.Exception.Message))"
+    }
+    finally {
+        if ($null -ne $ExistingView) {
+            $ExistingView.Close()
+            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ExistingView)
+        }
+        if ($null -ne $Database) {
+            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($Database)
+        }
+        if ($null -ne $Installer) {
+            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($Installer)
+        }
+    }
 }
 
 function Assert-ValidZipArchive {
@@ -372,9 +433,10 @@ try {
     if ($ReleaseNotesFull) {
         $PackArgs += @('--releaseNotes', $ReleaseNotesFull)
     }
-    if ($BuildMsi) {
-        $PackArgs += @('--msi', '--instLocation', 'Either')
-    }
+    # Setup.exe is deliberately a one-click installer. Publish the MSI instead
+    # so Windows provides an install wizard, uninstall registration, and a
+    # selectable per-user/per-machine install location.
+    $PackArgs += @('--msi', '--instLocation', 'Either')
     & $DotnetExe @PackArgs
     if ($LASTEXITCODE -ne 0) {
         throw "vpk pack failed with exit code $LASTEXITCODE"
@@ -388,9 +450,10 @@ $Setup = Get-SingleNonEmptyReleaseFile -Pattern 'Huifa.VideoDownloader*-Setup.ex
 $Portable = Get-SingleNonEmptyReleaseFile -Pattern 'Huifa.VideoDownloader*-Portable.zip' -Label 'portable package'
 $ReleaseFeed = Get-SingleNonEmptyReleaseFile -Pattern "releases.$Channel.json" -Label 'release feed'
 $AssetsFeed = Get-SingleNonEmptyReleaseFile -Pattern "assets.$Channel.json" -Label 'assets feed'
-if ($BuildMsi) {
-    $Msi = Get-SingleNonEmptyReleaseFile -Pattern 'Huifa.VideoDownloader*-Setup.msi' -Label 'MSI installer'
-}
+$Msi = Get-SingleNonEmptyReleaseFile -Pattern "Huifa.VideoDownloader-$Channel.msi" -Label 'MSI installer'
+# Must run before any future post-build MSI signing step because it updates the
+# Windows Installer tables.
+Add-MsiCustomInstallDirectoryUi -Msi $Msi
 
 try {
     $ReleaseIndex = (Get-Content -LiteralPath $ReleaseFeed.FullName -Raw) | ConvertFrom-Json
@@ -565,8 +628,6 @@ Write-Host "Velopack release directory: $ReleaseRoot"
 Write-Host "Installer: $($Setup.Name) ($($Setup.Length) bytes)"
 Write-Host "Portable: $($Portable.Name) ($($Portable.Length) bytes)"
 Write-Host "Full package: $($FullPackage.Name) ($($FullPackage.Length) bytes)"
-if ($BuildMsi) {
-    Write-Host "MSI: $($Msi.Name) ($($Msi.Length) bytes)"
-}
-Write-Host 'Created installer, self-updating portable package, full update package and release feeds.'
+Write-Host "MSI: $($Msi.Name) ($($Msi.Length) bytes)"
+Write-Host 'Created MSI installer, self-updating portable package, full update package and release feeds.'
 Write-Host 'Nothing was uploaded to GitHub.'

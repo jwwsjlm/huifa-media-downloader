@@ -44,7 +44,7 @@ def build_release_body(
 | 版本 / Edition | 下载 / Download | 使用方式 / Usage |
 | --- | --- | --- |
 | 便携版 / Portable | **[下载便携版 ZIP / Download portable ZIP]({portable_url})** | 完整解压后运行根目录的 `Huifa Media Downloader.exe`；请勿只复制 EXE / Extract the complete folder and run the root EXE |
-| 安装版 / Installer | **[下载安装包 ZIP / Download installer ZIP]({installer_url})** | 解压后运行 `HuifaMediaDownloader-Setup.exe` / Extract and run Setup |
+| 安装版 / Installer | **[下载安装包 ZIP / Download installer ZIP]({installer_url})** | 解压后运行 `HuifaMediaDownloader-Setup.msi`，可选择安装范围和目录，并可从 Windows“已安装的应用”卸载 / Extract and run the MSI; choose the scope and folder, then uninstall from Windows Installed apps |
 
 ---
 """
