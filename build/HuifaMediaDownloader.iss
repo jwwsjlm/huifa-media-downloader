@@ -12,7 +12,7 @@
 AppName=Huifa Media Downloader
 AppVersion={#AppVersion}
 AppPublisher=Huifa
-DefaultDirName={autopf}\Huifa Media Downloader
+DefaultDirName={sd}\Huifa_Media_Downloader
 DisableWelcomePage=no
 DisableDirPage=no
 DisableReadyPage=no
