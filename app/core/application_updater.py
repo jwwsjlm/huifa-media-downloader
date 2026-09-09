@@ -159,7 +159,7 @@ def normalize_github_repository(value: str) -> str:
 
     Settings may contain either ``owner/repository`` or the full HTTPS URL.
     Credentials, query strings, fragments, non-GitHub hosts and extra path
-    components are rejected before they reach ``GithubSource``.
+    components are rejected before they reach the update source.
     """
     raw = str(value or "").strip().rstrip("/")
     if not raw:
@@ -196,7 +196,9 @@ def load_velopack() -> Any:
         raise UpdaterUnavailableError(
             f"缺少 Velopack {VELOPACK_VERSION} 运行库；请使用 Velopack 发行构建"
         ) from exc
-    required = ("App", "GithubSource", "UpdateManager", "UpdateOptions")
+    required = (
+        "App", "GithubSource", "HttpSource", "UpdateManager", "UpdateOptions",
+    )
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
         raise UpdaterUnavailableError(
@@ -323,10 +325,20 @@ class VelopackApplicationUpdater:
         self.config = config
         self._velopack = velopack_module or load_velopack()
         self._session = session or requests.Session()
-        self._source = self._velopack.GithubSource(
-            config.repository_url(),
-            config.access_token,
-            config.prerelease,
+        repository_url = config.repository_url()
+        self._uses_static_feed = not config.prerelease and not config.channel
+        # Stable releases publish Velopack's feed as a normal release asset.
+        # This avoids GitHub REST API quotas shared by users behind one IP.
+        self._source = (
+            self._velopack.HttpSource(
+                f"{repository_url}/releases/latest/download/"
+            )
+            if self._uses_static_feed
+            else self._velopack.GithubSource(
+                repository_url,
+                config.access_token,
+                config.prerelease,
+            )
         )
         self._options = self._velopack.UpdateOptions(
             False,
@@ -370,9 +382,13 @@ class VelopackApplicationUpdater:
             return None
         asset = getattr(native, "TargetFullRelease", native)
         embedded_notes = str(getattr(asset, "NotesMarkdown", "") or "")
-        release_notes = self._fetch_github_release_notes(
-            str(getattr(asset, "Version", "") or ""),
-            embedded_notes,
+        release_notes = (
+            embedded_notes
+            if self._uses_static_feed
+            else self._fetch_github_release_notes(
+                str(getattr(asset, "Version", "") or ""),
+                embedded_notes,
+            )
         )
         return self._register(
             native,

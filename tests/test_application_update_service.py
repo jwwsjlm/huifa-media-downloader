@@ -122,6 +122,9 @@ class UnmanagedVelopackModule:
     def GithubSource(self, repository, access_token=None, prerelease=False):
         return repository, access_token, prerelease
 
+    def HttpSource(self, url):
+        return url
+
     def UpdateOptions(self, allow_downgrade, maximum_deltas, channel=None):
         return allow_downgrade, maximum_deltas, channel
 

@@ -94,7 +94,8 @@ class FakeManager:
 
 class FakeVelopackModule:
     def __init__(self):
-        self.source_args = None
+        self.github_source_args = None
+        self.http_source_url = None
         self.option_args = None
         self.manager = None
         self.auto_apply = None
@@ -102,8 +103,12 @@ class FakeVelopackModule:
         self.restart_callback = None
 
     def GithubSource(self, repo_url, token=None, prerelease=False):
-        self.source_args = (repo_url, token, prerelease)
-        return self.source_args
+        self.github_source_args = (repo_url, token, prerelease)
+        return self.github_source_args
+
+    def HttpSource(self, url):
+        self.http_source_url = url
+        return url
 
     def UpdateOptions(self, allow_downgrade, maximum_deltas, channel=None):
         self.option_args = (allow_downgrade, maximum_deltas, channel)
@@ -160,8 +165,10 @@ class ApplicationUpdaterTests(unittest.TestCase):
         update = updater.check_for_updates()
         self.assertIsNotNone(update)
         self.assertEqual(
-            module.source_args, ("https://github.com/huifa/yt-release", None, True)
+            module.github_source_args,
+            ("https://github.com/huifa/yt-release", None, True),
         )
+        self.assertIsNone(module.http_source_url)
         self.assertEqual(module.option_args, (False, 10, "beta"))
         self.assertEqual(update.current_version, "0.1.0")
         self.assertEqual(update.version, "0.2.0")
@@ -170,6 +177,19 @@ class ApplicationUpdaterTests(unittest.TestCase):
         self.assertIn("Faster startup", update.release_notes_markdown)
         self.assertTrue(update.is_portable)
         self.assertFalse(update.downloaded)
+
+    def test_stable_check_uses_static_release_feed_without_github_rest_api(self) -> None:
+        session = Mock()
+        updater, module = self.create_updater(session=session)
+
+        updater.check_for_updates()
+
+        self.assertIsNone(module.github_source_args)
+        self.assertEqual(
+            module.http_source_url,
+            "https://github.com/huifa/yt-release/releases/latest/download/",
+        )
+        session.get.assert_not_called()
 
     def test_check_prefers_matching_github_release_body(self) -> None:
         response = Mock()
@@ -180,7 +200,11 @@ class ApplicationUpdaterTests(unittest.TestCase):
         }
         session = Mock()
         session.get.return_value = response
-        updater, _module = self.create_updater(session=session, access_token="token")
+        updater, _module = self.create_updater(
+            session=session,
+            access_token="token",
+            prerelease=True,
+        )
 
         update = updater.check_for_updates()
 
@@ -201,7 +225,7 @@ class ApplicationUpdaterTests(unittest.TestCase):
         response.raise_for_status.side_effect = RuntimeError("rate limited")
         session = Mock()
         session.get.return_value = response
-        updater, _module = self.create_updater(session=session)
+        updater, _module = self.create_updater(session=session, prerelease=True)
 
         update = updater.check_for_updates()
 
