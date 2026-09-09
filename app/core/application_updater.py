@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import re
 import sys
 import uuid
@@ -14,7 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from app.core.atomic_json import write_json_atomic
-from app.core.version import APP_VERSION
+from app.core.version import APP_NAME_EN, APP_VERSION
 from app.core.update_receipt import record_update_install_result
 
 
@@ -247,21 +248,26 @@ def run_velopack_startup(
     app.run()
 
 
-def velopack_persistent_data_dir(executable_dir: str | Path | None = None) -> Path | None:
-    """Locate update-safe data storage for a managed Windows release.
-
-    Velopack replaces the complete ``current`` directory during every update.
-    Both its installed and portable Windows layouts keep ``Update.exe`` in the
-    parent directory, so persistent data must live beside ``current``, not
-    beside the real application binary.
-    """
+def velopack_release_root(executable_dir: str | Path | None = None) -> Path | None:
+    """Return the Velopack root containing the managed ``current`` release."""
     directory = Path(executable_dir or Path(sys.executable).resolve().parent).resolve()
     if directory.name.lower() != "current":
         return None
     root = directory.parent
     if not (root / "Update.exe").is_file() or not (directory / "sq.version").is_file():
         return None
-    return root / "data"
+    return root
+
+
+def velopack_persistent_data_dir(executable_dir: str | Path | None = None) -> Path | None:
+    """Locate writable update-safe storage for a managed Windows release."""
+    root = velopack_release_root(executable_dir)
+    if root is None:
+        return None
+    if (root / ".portable").is_file():
+        return root / "data"
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    return Path(local_app_data) / APP_NAME_EN if local_app_data else root / "data"
 
 
 def _velopack_application_update_state_dir() -> Path | None:

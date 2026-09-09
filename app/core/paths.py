@@ -70,12 +70,11 @@ def _managed_release_root(application_root: str | Path | None = None) -> Path | 
 
     app_root = Path(application_root) if application_root is not None else application_dir()
     try:
-        from app.core.application_updater import velopack_persistent_data_dir
+        from app.core.application_updater import velopack_release_root
 
-        persistent = velopack_persistent_data_dir(app_root)
+        return velopack_release_root(app_root)
     except Exception:
-        persistent = None
-    return persistent.parent if persistent is not None else None
+        return None
 
 
 def portable_deployment(application_root: str | Path | None = None) -> bool:
