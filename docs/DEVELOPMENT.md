@@ -20,7 +20,7 @@ python -m app.main
 
 官方仓库为 `jwwsjlm/huifa-media-downloader`。推送与 `APP_VERSION` 一致的
 `v<版本号>` 标签后，GitHub Actions 会在 `windows-latest` 上安装固定构建依赖，
-从 `yt-dlp/FFmpeg-Builds` 和 Playwright 官方源准备发行运行时，执行完整测试、
+从 `yt-dlp/FFmpeg-Builds` 和 Playwright 官方源准备发行运行时，执行构建校验、
 构建及打包烟雾检查，然后生成便携版 ZIP、安装包 ZIP、Velopack 更新所需的技术资产和
 `SHA256SUMS.txt`。应用默认通过 GitHub REST API
 `releases/latest` 检查稳定版，并使用 Release 资产中由 GitHub 提供的 SHA-256
@@ -34,8 +34,8 @@ git push origin v0.1.1
 ```
 
 便携版 ZIP 和安装包 ZIP 都使用 Velopack 管理的目录式程序。便携版解压后运行根目录入口，
-安装版 ZIP 内含 Windows Installer `Setup.msi`：安装向导可选择范围和目录，系统会写入标准
-“已安装的应用”卸载注册表项。PySide6/Qt、Python 运行时、内置 yt-dlp 模块和 FFmpeg
+安装版 ZIP 内含 Inno Setup `Setup.exe`：向导先选择目录，再静默调用内部 Windows Installer；
+系统会写入标准“已安装的应用”卸载注册表项。PySide6/Qt、Python 运行时、内置 yt-dlp 模块和 FFmpeg
 均随程序提供，用户无需另装 Python 或 PySide6。程序也支持从官方 Release 自动安装并优先调用
 可独立更新的外置 `yt-dlp.exe`，内置模块保留为安全回退。Deno 不是程序启动的硬依赖，但它是 yt-dlp 推荐的 JavaScript
 运行时，用于 `yt-dlp-ejs` 的 YouTube 格式解析。程序数据默认保存在 EXE 同目录的 `data/`，不会写入当前命令行目录。

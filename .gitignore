@@ -32,6 +32,7 @@ build/*
 !build/01_velopack_hook.py
 !build/HuifaVideoDownloader.lean.spec
 !build/HuifaVideoDownloader.velopack.spec
+!build/HuifaMediaDownloader.iss
 
 # Download archives are kept outside the repository. App-local runtime
 # payloads are reproducible release inputs and do not belong in normal Git.

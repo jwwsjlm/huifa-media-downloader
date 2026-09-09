@@ -66,7 +66,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: .\scripts\prepare_release_runtime.ps1
 
-      - name: Build and verify MSI installer
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --version=6.7.1 --no-progress --yes
+
+      - name: Build and verify installer
         shell: pwsh
         run: >-
           .\scripts\build_velopack_release.ps1

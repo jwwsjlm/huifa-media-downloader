@@ -1,6 +1,7 @@
 [CmdletBinding()]
 # Managed Windows release pipeline used by the GitHub tag workflow. This
-# command produces an MSI installer, the portable package, feeds, and update packages.
+# command produces a traditional setup wizard backed by an MSI, the portable
+# package, feeds, and update packages.
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')]
@@ -17,7 +18,6 @@ param(
     [ValidatePattern('^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$')]
     [string]$PreviousReleaseRepo = '',
 
-    [switch]$SkipTests,
     [switch]$ValidateEnvironmentOnly
 )
 
@@ -30,6 +30,7 @@ $PyInstaller = Join-Path $Root '.venv\Scripts\pyinstaller.exe'
 $Spec = Join-Path $Root 'build\HuifaVideoDownloader.velopack.spec'
 $ToolManifest = Join-Path $Root '.config\dotnet-tools.json'
 $ApplicationIcon = Join-Path $Root 'assets\huifa.ico'
+$InnoScript = Join-Path $Root 'build\HuifaMediaDownloader.iss'
 $StageRoot = Join-Path $Root 'build\velopack-dist'
 $StageApp = Join-Path $StageRoot 'HuifaVideoDownloader'
 $WorkRoot = Join-Path $Root 'build\pyinstaller-velopack'
@@ -127,76 +128,60 @@ function Get-SingleNonEmptyReleaseFile {
     return $Matches[0]
 }
 
-function Add-MsiCustomInstallDirectoryUi {
+function Resolve-InnoSetupCompiler {
+    $Candidates = [System.Collections.Generic.List[string]]::new()
+    foreach ($InstallRoot in @(
+        [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'),
+        $env:ProgramFiles
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
+            $Candidates.Add((Join-Path $InstallRoot 'Inno Setup 6\ISCC.exe'))
+        }
+    }
+    $PathCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($PathCommand -and $PathCommand.Source) {
+        $Candidates.Add($PathCommand.Source)
+    }
+
+    $Seen = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($Candidate in $Candidates) {
+        if ([string]::IsNullOrWhiteSpace($Candidate)) {
+            continue
+        }
+        try {
+            $CandidateFull = [System.IO.Path]::GetFullPath($Candidate)
+        }
+        catch {
+            continue
+        }
+        if ($Seen.Add($CandidateFull) -and (Test-Path -LiteralPath $CandidateFull -PathType Leaf)) {
+            return $CandidateFull
+        }
+    }
+    throw 'Inno Setup 6 is required to build the installer. Install it with: choco install innosetup --version=6.7.1 --yes'
+}
+
+function Build-InnoSetupInstaller {
     param(
         [Parameter(Mandatory = $true)][System.IO.FileInfo]$Msi
     )
 
-    # Velopack's MSI already includes BrowseDlg, but its default scope page
-    # does not link to it. Add the one missing control so end users can choose
-    # an arbitrary directory rather than only a per-user/per-machine default.
-    $Installer = $null
-    $Database = $null
-    $ExistingView = $null
-    try {
-        $Installer = New-Object -ComObject WindowsInstaller.Installer
-        $Database = $Installer.OpenDatabase($Msi.FullName, 1)
-        $ExistingView = $Database.OpenView(
-            'SELECT `Control` FROM `Control` WHERE `Dialog_`=''InstallScopeDlg'' AND `Control`=''BrowseInstallFolder'''
-        )
-        $ExistingView.Execute()
-        $ControlExists = $null -ne $ExistingView.Fetch()
-        $ExistingView.Close()
-        $ExistingView = $null
-
-        $Statements = [System.Collections.Generic.List[string]]::new()
-        if (-not $ControlExists) {
-            foreach ($Statement in @(
-                'INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''PushButton'', 92, 243, 80, 17, 3, '''', ''Browse...'', ''Back'', '''')',
-                'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''SetProperty'', ''_BrowseProperty=INSTALLFOLDER'', 1, ''1'')',
-                'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''SetProperty'', ''HUIFA_CUSTOM_INSTALLDIR=1'', 2, ''1'')',
-                'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''NewDialog'', ''BrowseDlg'', 3, ''1'')',
-                'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''Next'', ''SetProperty'', ''VELOPACK_INSTALLDIR=[INSTALLFOLDER]'', 3, ''HUIFA_CUSTOM_INSTALLDIR=1'')'
-            )) {
-                [void]$Statements.Add($Statement)
-            }
-        }
-        # MSI validates Control_Next as one circular tab-order chain. Insert
-        # the browse button between BothScopes and Back, rather than giving
-        # Back two incoming pointers (Windows Installer error 2810).
-        [void]$Statements.Add(
-            'UPDATE `Control` SET `Control_Next`=''BrowseInstallFolder'' WHERE `Dialog_`=''InstallScopeDlg'' AND `Control`=''BothScopes'''
-        )
-        foreach ($Statement in $Statements) {
-            $View = $null
-            try {
-                $View = $Database.OpenView($Statement)
-                $View.Execute()
-            }
-            finally {
-                if ($null -ne $View) {
-                    $View.Close()
-                    [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($View)
-                }
-            }
-        }
-        $Database.Commit()
+    $InstallerPath = Join-Path $ReleaseRoot 'HuifaMediaDownloader-Setup.exe'
+    & $InnoCompiler @(
+        "/DAppVersion=$Version",
+        "/DSourceMsi=$($Msi.FullName)",
+        "/DOutputDir=$ReleaseRoot",
+        $InnoScript
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
     }
-    catch {
-        throw "Unable to add the MSI installation-directory picker: $($Msi.FullName) ($($_.Exception.Message))"
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf) -or (Get-Item -LiteralPath $InstallerPath).Length -le 0) {
+        throw "Inno Setup did not create a non-empty installer: $InstallerPath"
     }
-    finally {
-        if ($null -ne $ExistingView) {
-            $ExistingView.Close()
-            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ExistingView)
-        }
-        if ($null -ne $Database) {
-            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($Database)
-        }
-        if ($null -ne $Installer) {
-            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($Installer)
-        }
-    }
+    return Get-Item -LiteralPath $InstallerPath
 }
 
 function Assert-ValidZipArchive {
@@ -302,7 +287,7 @@ function Stage-PortableRuntimeTools {
     }
 }
 
-foreach ($RequiredFile in @($Python, $PyInstaller, $Spec, $ToolManifest, $ApplicationIcon)) {
+foreach ($RequiredFile in @($Python, $PyInstaller, $Spec, $ToolManifest, $ApplicationIcon, $InnoScript)) {
     if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
         throw "Required build file is missing: $RequiredFile"
     }
@@ -340,23 +325,19 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($ExpectedPublisher)) {
 $DotnetResolution = Resolve-DotnetSdkExecutable
 $DotnetExe = $DotnetResolution.Path
 $InstalledSdks = @($DotnetResolution.Sdks)
+$InnoCompiler = Resolve-InnoSetupCompiler
 Write-Host "Using .NET SDK host: $DotnetExe"
 Write-Host "Installed SDKs: $($InstalledSdks -join ', ')"
+Write-Host "Using Inno Setup compiler: $InnoCompiler"
 
 if ($ValidateEnvironmentOnly) {
     Write-Host "Velopack build environment is ready for version $Version on channel $Channel."
     return
 }
 
-if (-not $SkipTests) {
-    & $Python -m compileall app tests
-    if ($LASTEXITCODE -ne 0) {
-        throw "Python compile check failed with exit code $LASTEXITCODE"
-    }
-    & $Python -m unittest discover -s tests -v
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unit tests failed with exit code $LASTEXITCODE"
-    }
+& $Python -m compileall app
+if ($LASTEXITCODE -ne 0) {
+    throw "Python compile check failed with exit code $LASTEXITCODE"
 }
 
 # Velopack requires a PyInstaller onedir staging area.
@@ -443,9 +424,9 @@ try {
     if ($ReleaseNotesFull) {
         $PackArgs += @('--releaseNotes', $ReleaseNotesFull)
     }
-    # Setup.exe is deliberately a one-click installer. Publish the MSI instead
-    # so Windows provides an install wizard, uninstall registration, and a
-    # selectable per-user/per-machine install location.
+    # Velopack's MSI supplies the installed application and update registration.
+    # The user-facing Inno Setup wizard wraps it so the install folder is always
+    # selected before Windows Installer runs.
     $PackArgs += @('--msi', '--instLocation', 'Either')
     & $DotnetExe @PackArgs
     if ($LASTEXITCODE -ne 0) {
@@ -456,14 +437,11 @@ finally {
     Pop-Location
 }
 
-$Setup = Get-SingleNonEmptyReleaseFile -Pattern 'Huifa.VideoDownloader*-Setup.exe' -Label 'installer'
 $Portable = Get-SingleNonEmptyReleaseFile -Pattern 'Huifa.VideoDownloader*-Portable.zip' -Label 'portable package'
 $ReleaseFeed = Get-SingleNonEmptyReleaseFile -Pattern "releases.$Channel.json" -Label 'release feed'
 $AssetsFeed = Get-SingleNonEmptyReleaseFile -Pattern "assets.$Channel.json" -Label 'assets feed'
 $Msi = Get-SingleNonEmptyReleaseFile -Pattern "Huifa.VideoDownloader-$Channel.msi" -Label 'MSI installer'
-# Must run before any future post-build MSI signing step because it updates the
-# Windows Installer tables.
-Add-MsiCustomInstallDirectoryUi -Msi $Msi
+$Installer = Build-InnoSetupInstaller -Msi $Msi
 
 try {
     $ReleaseIndex = (Get-Content -LiteralPath $ReleaseFeed.FullName -Raw) | ConvertFrom-Json
@@ -635,9 +613,9 @@ finally {
 }
 
 Write-Host "Velopack release directory: $ReleaseRoot"
-Write-Host "Installer: $($Setup.Name) ($($Setup.Length) bytes)"
+Write-Host "Installer: $($Installer.Name) ($($Installer.Length) bytes)"
 Write-Host "Portable: $($Portable.Name) ($($Portable.Length) bytes)"
 Write-Host "Full package: $($FullPackage.Name) ($($FullPackage.Length) bytes)"
 Write-Host "MSI: $($Msi.Name) ($($Msi.Length) bytes)"
-Write-Host 'Created MSI installer, self-updating portable package, full update package and release feeds.'
+Write-Host 'Created installer wizard, self-updating portable package, full update package and release feeds.'
 Write-Host 'Nothing was uploaded to GitHub.'

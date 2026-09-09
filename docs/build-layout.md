@@ -13,4 +13,4 @@
 
 `data/` 是运行时数据，不能当作构建产物清理；`tools/`、`third_party/`、`languages/` 是软件运行所需的本地组件和资源。
 
-需要回到干净的开发工作区时执行 `scripts/organize_workspace.ps1`。该脚本会删除可重新生成的构建/发行输出、旧组件副本和已知测试缓存；保留源码、当前运行组件、数据库、设置、有效 Cookie/Profile、下载内容与三代数据库备份。
+需要回到干净的开发工作区时执行 `scripts/organize_workspace.ps1`。该脚本会删除可重新生成的构建/发行输出、旧组件副本和已知 Python 缓存；保留源码、当前运行组件、数据库、设置、有效 Cookie/Profile、下载内容与三代数据库备份。

@@ -15,7 +15,7 @@
 - `UpdateManager` 负责检查、下载进度、待重启更新和退出后安装。
 - `vpk pack --releaseNotes` 把 Markdown 版本说明写入更新包；应用同时按目标 tag 读取
   GitHub Release 正文，API 不可用时回退包内说明。
-- `vpk pack --msi --instLocation Either` 生成带安装向导的 MSI、可自更新便携包、完整包和 JSON feed；MSI 写入 Windows 标准卸载注册表项，并允许选择安装范围和目录。
+- `vpk pack --msi --instLocation Either` 生成内部 MSI、可自更新便携包、完整包和 JSON feed；Inno Setup 外层向导先选择目录，再静默执行 MSI。MSI 写入 Windows 标准卸载注册表项。
 - Velopack 使用 PyInstaller onedir，更新单位是完整应用目录。
 - Windows 更新会替换 `current/`，因此数据库、设置、Cookie、日志和可独立更新工具必须位于
   根目录 `data/` 等持久目录。
