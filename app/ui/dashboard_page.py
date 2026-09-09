@@ -57,7 +57,7 @@ from app.ui.quick_download_controls import (
     build_quick_quality_selector,
 )
 from app.ui.supported_sites_dialog import SupportedSitesDialog
-from app.ui.task_card import DownloadTaskCard
+from app.ui.task_card import TASK_CARD_HEIGHT, DownloadTaskCard
 from app.ui.task_auth_actions import (
     TaskAuthActionController,
 )
@@ -557,6 +557,8 @@ class DashboardPage(QWidget):
         self.task_list.setObjectName("taskList")
         self.task_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.task_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        # QListWidget otherwise adopts a full task-card height per scroll step.
+        self.task_list.verticalScrollBar().setSingleStep(TASK_CARD_HEIGHT // 4)
         self.task_list.setUniformItemSizes(True)
         self.task_list.itemSelectionChanged.connect(self.sync_selection)
         self.task_list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -717,6 +719,60 @@ class DashboardPage(QWidget):
                         error=runtime_text(exc),
                     ),
                 )
+
+    def offer_local_history_import(self, folder: str | Path | None = None) -> None:
+        """Offer a bounded import after the user switches to an old folder."""
+
+        path = resolve_portable_path(
+            folder or self.window.app_settings.get("download_dir")
+        )
+        service = self.window.download_service
+        try:
+            candidates = service.scan_local_history(path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                ui_text('Import Existing Media'),
+                ui_format(
+                    'The download folder could not be scanned:\n{path}\n\n{error}',
+                    path=path,
+                    error=runtime_text(exc),
+                ),
+            )
+            return
+        if not candidates:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            ui_text('Import Existing Media'),
+            ui_format(
+                'Found {count} unrecorded media file(s) in {folder}.\n\nImport them as completed task history? The original files will remain untouched.',
+                count=len(candidates),
+                folder=path,
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            imported = service.import_local_history(candidates, path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                ui_text('Import Existing Media'),
+                ui_format(
+                    'Local history could not be imported:\n{error}',
+                    error=runtime_text(exc),
+                ),
+            )
+            return
+        if imported:
+            self.status.setText(ui_format(
+                'Imported {count} local media file(s) into task history.',
+                count=len(imported),
+            ))
 
     def _ensure_download_dir(self) -> Path | None:
         raw_path = self.window.app_settings.get("download_dir").strip()

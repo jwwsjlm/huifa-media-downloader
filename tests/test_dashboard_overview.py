@@ -39,7 +39,10 @@ from app.core.download_performance import (
 from app.core.download_service import DownloadService, DownloadTask
 from app.storage.database import Database
 from app.storage.models import MediaItem
-from app.ui.download_control_presentation import DOWNLOAD_QUALITY_VALUES
+from app.ui.download_control_presentation import (
+    DOWNLOAD_QUALITY_VALUES,
+    transcode_encoder_label,
+)
 from app.ui.download_cookie_controller import DownloadCookieController
 from app.ui.download_dialogs import FormatSelectionDialog
 from app.ui.task_card import (
@@ -367,9 +370,22 @@ class DashboardOverviewTests(unittest.TestCase):
         self.assertGreaterEqual(self.page.task_audio_track.findData("all"), 0)
 
     def test_task_list_uses_smooth_fixed_height_scrolling(self) -> None:
+        task = DownloadTask(
+            "scroll-step",
+            "https://example.com/scroll-step",
+            "D:/downloads",
+        )
+        self.service.tasks[task.id] = task
+        self.page.add_task(task)
+        self.app.processEvents()
+
         self.assertEqual(
             self.page.task_list.verticalScrollMode(),
             QAbstractItemView.ScrollPerPixel,
+        )
+        self.assertEqual(
+            self.page.task_list.verticalScrollBar().singleStep(),
+            TASK_CARD_HEIGHT // 4,
         )
         self.assertTrue(self.page.task_list.uniformItemSizes())
 
@@ -1070,6 +1086,25 @@ class DashboardOverviewTests(unittest.TestCase):
 
             popen.assert_called_once_with(["explorer.exe", "/select,", str(media_path)])
             startfile.assert_not_called()
+
+    def test_completed_card_open_folder_action_selects_the_task(self) -> None:
+        task = DownloadTask(
+            "completed-open-action",
+            "https://example.com/video",
+            "D:/downloads",
+            status="completed",
+        )
+        self.service.tasks[task.id] = task
+        self.page.add_task(task)
+        self.app.processEvents()
+
+        with patch("app.ui.dashboard_page.reveal_file_or_folder") as reveal:
+            QTest.mouseClick(self.page.cards[task.id].action, Qt.LeftButton)
+            self.app.processEvents()
+
+        self.assertTrue(self.page.items[task.id].isSelected())
+        self.assertTrue(self.page.cards[task.id].property("selected"))
+        reveal.assert_called_once_with(task.media_path, task.output_dir)
 
     def test_reveal_file_or_folder_falls_back_to_task_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2120,6 +2155,71 @@ class DashboardOverviewTests(unittest.TestCase):
         self.assertEqual(self.service.converted, [{
             "task_id": task.id,
             "encoder": "h264_nvenc",
+            "ffmpeg_path": "tools/ffmpeg/ffmpeg.exe",
+            "ffprobe_path": "tools/ffmpeg/ffprobe.exe",
+        }])
+
+    def test_completed_task_convert_action_prompts_when_default_keeps_original(self) -> None:
+        media_path = Path(self.temp_dir.name) / "completed.webm"
+        media_path.write_bytes(b"media")
+        task = DownloadTask(
+            "convert-with-picker",
+            "https://example.com/video",
+            str(media_path.parent),
+            title="completed",
+            status="completed",
+            media_path=str(media_path),
+        )
+        self.window.app_settings.values.update({
+            "transcode_encoder": "original",
+            "ffmpeg_path": "tools/ffmpeg/ffmpeg.exe",
+            "ffprobe_path": "tools/ffmpeg/ffprobe.exe",
+        })
+        self.window.settings.transcode_encoder = QComboBox()
+        self.window.settings.transcode_encoder.addItem(
+            transcode_encoder_label("original"),
+            "original",
+        )
+        self.window.settings.transcode_encoder.addItem(
+            transcode_encoder_label("libx264"),
+            "libx264",
+        )
+        self.service.tasks[task.id] = task
+        self.page.add_task(task)
+        self.page.task_restore.set_loaded()
+
+        class FakeMenu:
+            def __init__(self, _parent=None):
+                self.actions = []
+
+            def addAction(self, label):
+                action = SimpleNamespace(label=label)
+                self.actions.append(action)
+                return action
+
+            def addSeparator(self):
+                return None
+
+            def exec(self, _position):
+                return next(
+                    action
+                    for action in self.actions
+                    if action.label == ui_text("Convert Format")
+                )
+
+        with patch.object(self.page, "_database_task_ids", return_value={task.id}), patch(
+            "app.ui.task_context_menu.QMenu",
+            FakeMenu,
+        ), patch(
+            "app.ui.task_context_menu.QInputDialog.getItem",
+            return_value=(transcode_encoder_label("libx264"), True),
+        ) as picker:
+            self.page.show_task_menu(task.id, QPoint(10, 10))
+
+        picker.assert_called_once()
+        self.assertEqual(self.service.converted, [{
+            "task_id": task.id,
+            "encoder": "libx264",
             "ffmpeg_path": "tools/ffmpeg/ffmpeg.exe",
             "ffprobe_path": "tools/ffmpeg/ffprobe.exe",
         }])

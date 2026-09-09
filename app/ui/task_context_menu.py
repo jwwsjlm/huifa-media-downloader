@@ -6,7 +6,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QLabel, QMenu, QMessageBox, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QInputDialog,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QWidget,
+)
 
 from app.core.download_service import DownloadTask
 from app.core.transcode_service import normalize_transcode_encoder
@@ -63,10 +70,16 @@ class TaskContextActions:
     convert: QAction | None = None
 
 
+def _is_local_history_task(task: DownloadTask) -> bool:
+    options = getattr(task, "options_json", {})
+    return bool(options.get("_local_history")) if hasattr(options, "get") else False
+
+
 def task_menu_capabilities(task: DownloadTask) -> TaskMenuCapabilities:
     """Return context-menu actions valid for the persisted task state."""
 
     is_collection = task.task_kind == "collection"
+    is_local_history = _is_local_history_task(task)
     pause_mode = ""
     if task.status in {"downloading", "queued"} and is_collection:
         pause_mode = "pause_collection"
@@ -78,7 +91,10 @@ def task_menu_capabilities(task: DownloadTask) -> TaskMenuCapabilities:
     if is_collection:
         can_retry = task.status in {"failed", "partial_failed", "canceled", "paused"}
     else:
-        can_retry = task.status in {"failed", "canceled", "completed", "paused", "deleted"}
+        can_retry = (
+            not is_local_history
+            and task.status in {"failed", "canceled", "completed", "paused", "deleted"}
+        )
 
     media_file_exists = bool(task.media_path) and Path(task.media_path).is_file()
     return TaskMenuCapabilities(
@@ -94,10 +110,12 @@ def task_menu_capabilities(task: DownloadTask) -> TaskMenuCapabilities:
         can_retry=can_retry,
         can_custom_redownload=(
             not is_collection
+            and not is_local_history
             and task.status in {"failed", "canceled", "completed", "paused", "deleted"}
         ),
         can_convert=(
             not is_collection
+            and not is_local_history
             and task.status == "completed"
             and media_file_exists
         ),
@@ -141,10 +159,13 @@ class TaskContextMenuController:
     def build(self, task: DownloadTask) -> tuple[QMenu, TaskContextActions]:
         menu = QMenu(self.parent)
         is_collection = task.task_kind == "collection"
+        is_local_history = _is_local_history_task(task)
         capabilities = task_menu_capabilities(task)
         copy_link_action = menu.addAction(
             ui_text("Copy Collection URL")
             if is_collection
+            else ui_text("Copy Local File Path")
+            if is_local_history
             else ui_text("Copy Video URL")
         )
         copy_folder_action = menu.addAction(
@@ -217,12 +238,17 @@ class TaskContextMenuController:
         chosen: QAction,
     ) -> None:
         is_collection = task.task_kind == "collection"
+        is_local_history = _is_local_history_task(task)
         service = self.window.download_service
         if chosen is actions.copy_link:
-            QApplication.clipboard().setText(task.url)
+            QApplication.clipboard().setText(
+                task.media_path if is_local_history else task.url
+            )
             self.status_label.setText(
                 ui_text("Collection URL copied")
                 if is_collection
+                else ui_text("Local file path copied")
+                if is_local_history
                 else ui_text("Video URL copied")
             )
         elif chosen is actions.copy_folder:
@@ -254,16 +280,16 @@ class TaskContextMenuController:
         elif actions.custom_redownload is not None and chosen is actions.custom_redownload:
             self.confirm_redownload(task, quality_override="custom")
         elif actions.convert is not None and chosen is actions.convert:
-            encoder = normalize_transcode_encoder(
-                self.window.app_settings.get("transcode_encoder")
-            )
+            encoder = self._choose_conversion_encoder()
+            if not encoder:
+                return
             started = service.convert_completed_task(
                 task.id,
                 encoder,
                 ffmpeg_path=self.window.app_settings.get("ffmpeg_path"),
                 ffprobe_path=self.window.app_settings.get("ffprobe_path"),
             )
-            if started and encoder != "original":
+            if started:
                 self.status_label.setText(
                     ui_format(
                         "Format conversion started with {encoder}.",
@@ -277,6 +303,57 @@ class TaskContextMenuController:
                 self.open_folder(task.id)
         elif chosen is actions.delete_task:
             self.delete_tasks([task.id])
+
+    def _choose_conversion_encoder(self) -> str:
+        encoder = normalize_transcode_encoder(
+            self.window.app_settings.get("transcode_encoder")
+        )
+        if encoder != "original":
+            return encoder
+
+        combo = getattr(getattr(self.window, "settings", None), "transcode_encoder", None)
+        options: list[tuple[str, str]] = []
+        if combo is not None:
+            try:
+                count = int(combo.count())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                count = 0
+            for index in range(count):
+                candidate = normalize_transcode_encoder(combo.itemData(index))
+                if candidate != "original":
+                    options.append((transcode_encoder_label(candidate), candidate))
+
+        if not options:
+            message = ui_text(
+                "No common transcoding encoder was found in the current FFmpeg; only Keep original is available."
+            )
+            self.status_label.setText(message)
+            QMessageBox.information(
+                self.parent,
+                ui_text("Convert Format"),
+                message,
+            )
+            return ""
+
+        labels = [label for label, _encoder in options]
+        selected, accepted = QInputDialog.getItem(
+            self.parent,
+            ui_text("Convert Format"),
+            ui_text("Video Encoder"),
+            labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return ""
+        return next(
+            (
+                candidate
+                for label, candidate in options
+                if label == str(selected)
+            ),
+            "",
+        )
 
     def confirm_redownload(
         self,

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox, QWidget
 
 from app.adapters.openai_cover_provider import (
@@ -50,6 +51,7 @@ class SettingsSavePlan:
     warning_lines: tuple[str, ...] = ()
     secret_updates: tuple[tuple[str, str], ...] = ()
     after_commit: Callable[[], None] | None = None
+    after_success: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +162,7 @@ class SettingsSaveController:
         return DownloadOptions.from_mapping(options).to_dict()
 
     def prepare_download(self, page: SettingsPage) -> SettingsSavePlan | None:
+        previous_download_dir = self.app_settings.get("download_dir")
         paths = self.prepare_download_paths(page)
         if paths is None:
             return None
@@ -186,10 +189,28 @@ class SettingsSaveController:
             )
             self.dashboard.refresh_settings()
 
+        def offer_local_history_import() -> None:
+            try:
+                previous_path = resolve_portable_path(previous_download_dir).resolve(
+                    strict=False,
+                )
+                current_path = paths.download_path.resolve(strict=False)
+            except OSError:
+                previous_path = resolve_portable_path(previous_download_dir)
+                current_path = paths.download_path
+            if os.path.normcase(os.path.normpath(str(previous_path))) == os.path.normcase(
+                os.path.normpath(str(current_path))
+            ):
+                return
+            offer = getattr(self.dashboard, "offer_local_history_import", None)
+            if callable(offer):
+                offer(paths.download_path)
+
         return SettingsSavePlan(
             values=values,
             success_message=ui_text('Download settings were saved.'),
             after_commit=apply_download_settings,
+            after_success=offer_local_history_import,
         )
 
     def prepare_download_paths(
@@ -591,4 +612,6 @@ class SettingsSaveController:
             ui_text('Settings Saved'),
             success_message,
         )
+        if plan.after_success is not None:
+            QTimer.singleShot(0, plan.after_success)
         return True

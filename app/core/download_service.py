@@ -294,6 +294,49 @@ def ytdlp_ejs_runtime_options(
 
 _COOKIE_OPTION_KEYS = frozenset({"cookiefile", "cookiesfrombrowser"})
 
+_LOCAL_HISTORY_AUDIO_SUFFIXES = frozenset({
+    ".aac", ".aiff", ".alac", ".flac", ".m4a", ".mp3", ".oga", ".ogg",
+    ".opus", ".wav",
+})
+_LOCAL_HISTORY_MEDIA_SUFFIXES = _LOCAL_HISTORY_AUDIO_SUFFIXES | frozenset({
+    ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4",
+    ".mpeg", ".mpg", ".mts", ".ts", ".webm", ".wmv",
+})
+
+
+def _local_history_path_key(path_value: str | Path) -> str:
+    """Return one platform-aware comparison key for an existing media path."""
+
+    try:
+        path = Path(path_value).expanduser().resolve(strict=False)
+    except OSError:
+        path = Path(path_value).expanduser()
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _local_history_file(
+    root: Path,
+    path_value: str | Path,
+    known_paths: set[str],
+) -> tuple[Path, os.stat_result] | None:
+    """Validate one direct, non-empty, unrecorded local media file."""
+
+    try:
+        candidate = Path(path_value)
+        if candidate.suffix.casefold() not in _LOCAL_HISTORY_MEDIA_SUFFIXES:
+            return None
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != root or not resolved.is_file():
+            return None
+        stat = resolved.stat()
+    except OSError:
+        return None
+    if stat.st_size <= 0:
+        return None
+    if _local_history_path_key(resolved) in known_paths:
+        return None
+    return resolved, stat
+
 
 def format_duration(seconds: float) -> str:
     """Format a short human-readable duration for task/stage diagnostics."""
@@ -406,6 +449,8 @@ class DownloadTask:
             for internal_key in ("_collection", "_storage_preview", "_collection_materialization"):
                 if isinstance(raw_options.get(internal_key), Mapping):
                     self.options_json[internal_key] = dict(raw_options[internal_key])
+            if raw_options.get("_local_history") is True:
+                self.options_json["_local_history"] = True
         else:
             self.options_json = {}
         self.transcode_encoder = (
@@ -4355,6 +4400,116 @@ class DownloadService(QObject):
         self._publish_new_task(plan)
         return plan.task.id
 
+    def scan_local_history(self, output_dir: str | Path) -> list[Path]:
+        """Find unrecorded media files directly inside one download folder."""
+
+        try:
+            root = resolve_portable_path(output_dir).resolve(strict=True)
+            if not root.is_dir():
+                return []
+            known_paths = {
+                _local_history_path_key(path)
+                for path in self.db.recorded_media_paths()
+                if str(path or "").strip()
+            }
+        except OSError:
+            return []
+
+        # ponytail: direct files only for a fast, predictable recovery pass;
+        # add a bounded opt-in recursive scan if organized task folders need it.
+        discovered: list[tuple[int, str, Path]] = []
+        try:
+            for candidate in root.iterdir():
+                record = _local_history_file(root, candidate, known_paths)
+                if record is None:
+                    continue
+                path, stat = record
+                key = _local_history_path_key(path)
+                known_paths.add(key)
+                discovered.append((stat.st_mtime_ns, key, path))
+        except OSError:
+            pass
+        discovered.sort(key=lambda item: (-item[0], item[1]))
+        return [path for _modified, _key, path in discovered]
+
+    def import_local_history(
+        self,
+        files: Iterable[str | Path],
+        output_dir: str | Path,
+    ) -> list[DownloadTask]:
+        """Atomically add scanned local media as non-destructive completed history."""
+
+        if self._shutting_down:
+            return []
+        try:
+            root = resolve_portable_path(output_dir).resolve(strict=True)
+            if not root.is_dir():
+                return []
+            known_paths = {
+                _local_history_path_key(path)
+                for path in self.db.recorded_media_paths()
+                if str(path or "").strip()
+            }
+        except OSError:
+            return []
+
+        imported: list[tuple[DownloadTask, MediaItem]] = []
+        reserved_ids: set[str] = set()
+        for path_value in files:
+            record = _local_history_file(root, path_value, known_paths)
+            if record is None:
+                continue
+            path, stat = record
+            path_key = _local_history_path_key(path)
+            known_paths.add(path_key)
+            imported_at = datetime.fromtimestamp(
+                stat.st_mtime,
+            ).isoformat(timespec="seconds")
+            is_audio = path.suffix.casefold() in _LOCAL_HISTORY_AUDIO_SUFFIXES
+            options: dict[str, object] = {"_local_history": True}
+            if is_audio:
+                options["content_mode"] = "audio"
+            source_url = path.as_uri()
+            task = DownloadTask(
+                id=self._new_task_id(reserved_ids),
+                url=source_url,
+                output_dir=str(root),
+                source_key=(
+                    "local:"
+                    + hashlib.sha256(path_key.encode("utf-8", "surrogatepass"))
+                    .hexdigest()[:16]
+                ),
+                options_json=options,
+                title=path.stem,
+                status="completed",
+                progress=100.0,
+                downloaded_bytes=stat.st_size,
+                total_bytes=stat.st_size,
+                media_path=str(path),
+                stage="completed",
+                created_at=imported_at,
+                downloaded_at=imported_at,
+            )
+            media = MediaItem(
+                source_url=source_url,
+                source_platform="local",
+                title=path.stem,
+                video_path=str(path),
+                downloaded_at=imported_at,
+            )
+            imported.append((task, media))
+
+        if not imported:
+            return []
+        self.db.import_completed_local_history(imported)
+        tasks = [task for task, _media in imported]
+        for task in tasks:
+            self._register_task(task)
+        self.tasks_added.emit(tasks)
+        for task, media in imported:
+            self.task_media_completed.emit(task.id, media)
+        return tasks
+
     def enqueue(self, url: str, output_dir: str, proxy: str = "", cookie_file: str = "",
                quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
                ffmpeg_path: str = "", format_selector: str = "", download_album: bool = False,
@@ -5495,6 +5650,8 @@ class DownloadService(QObject):
         task = self.tasks.get(task_id)
         if not task:
             return None
+        if task.options_json.get("_local_history") is True:
+            return None
         # Avoid creating duplicate rows when the user double-clicks a context
         # menu action or repeats it while the previous redownload is still
         # queued/running.  A completed task can still be intentionally
@@ -5608,6 +5765,12 @@ class DownloadService(QObject):
     ) -> _CompletedConversionRequest | None:
         task = self.tasks.get(task_id)
         if task is None or task.task_kind != "video":
+            return None
+        if task.options_json.get("_local_history") is True:
+            self._reject_completed_conversion(
+                task_id,
+                "导入的本地历史不会改动原始文件",
+            )
             return None
         if self._shutting_down:
             self._reject_completed_conversion(task_id, "下载服务正在退出，无法开始格式转换")

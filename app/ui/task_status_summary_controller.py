@@ -54,9 +54,9 @@ class TaskStatusSummaryController(QObject):
         ))
         self.label.setObjectName("taskSummaryStatus")
         self.label.setMinimumWidth(0)
-        self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        status_bar.addPermanentWidget(self.label)
+        self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        status_bar.addPermanentWidget(self.label, 1)
 
         self._last_text = self.label.text()
         self._stopped = False

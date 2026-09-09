@@ -52,6 +52,10 @@ class TaskStatusSummaryControllerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.parent = QWidget()
         self.status_bar = QStatusBar(self.parent)
+        self.parent.resize(900, 40)
+        self.status_bar.setGeometry(0, 0, 900, 30)
+        self.parent.show()
+        self.status_bar.show()
         self.service = _Service()
         self.controller = TaskStatusSummaryController(
             self.parent,
@@ -81,6 +85,8 @@ class TaskStatusSummaryControllerTests(unittest.TestCase):
         self.assertIn("8", self.controller.label.text())
         self.assertIn("3.00 MiB/s", self.controller.label.text())
         self.assertEqual(self.controller.label.objectName(), "taskSummaryStatus")
+        self.app.processEvents()
+        self.assertGreater(self.controller.label.width(), 300)
 
     def test_same_event_loop_refresh_requests_are_coalesced(self) -> None:
         self.controller.schedule_refresh()

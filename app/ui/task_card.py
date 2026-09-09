@@ -258,6 +258,7 @@ class DownloadTaskCard(QFrame):
             self.pipeline,
             self.progress,
             self.details,
+            self.action,
         ):
             widget.setContextMenuPolicy(Qt.CustomContextMenu)
             widget.customContextMenuRequested.connect(
@@ -312,7 +313,10 @@ class DownloadTaskCard(QFrame):
         elif status in {"queued", "processing", "canceling", "暂停中", "waiting_selection", "parsing_collection"}:
             self.cancel_requested.emit(self.task_id)
         elif status in {"failed", "partial_failed", "canceled", "deleted"}:
-            self.retry_requested.emit(self.task_id)
+            if status == "deleted" and self._is_local_history_task(self._task):
+                self.open_requested.emit(self.task_id)
+            else:
+                self.retry_requested.emit(self.task_id)
         elif status == "completed":
             self.open_requested.emit(self.task_id)
 
@@ -354,7 +358,11 @@ class DownloadTaskCard(QFrame):
         # useful metadata but must not replace the actionable/copyable link.
         self._set_identity_text(
             media.title or self._title_text,
-            media.source_url or self._url_text,
+            (
+                self._task.media_path
+                if self._is_local_history_task(self._task)
+                else media.source_url or self._url_text
+            ),
             uploader=media.uploader,
         )
         self._render_platform_identity(self._url_text)
@@ -447,9 +455,18 @@ class DownloadTaskCard(QFrame):
         task_title = str(task.title or task.url or "")
         if task_title == "等待获取视频信息":
             task_title = ui_text('Waiting for video information')
-        task_url = str(task.url or "")
+        task_url = str(
+            task.media_path or task.url or ""
+            if self._is_local_history_task(task)
+            else task.url or ""
+        )
         self._set_identity_text(task_title, task_url)
         self._render_platform_identity(task_url)
+
+    @staticmethod
+    def _is_local_history_task(task: DownloadTask) -> bool:
+        options = task.options_json if isinstance(task.options_json, Mapping) else {}
+        return bool(options.get("_local_history"))
 
     def _render_platform_identity(self, source_url: str) -> None:
         if source_url == self._platform_source_url:
@@ -1048,7 +1065,11 @@ class DownloadTaskCard(QFrame):
         elif task.status in {"failed", "partial_failed", "canceled"}:
             text, enabled = ui_text('Retry'), True
         elif task.status == "deleted":
-            text, enabled = ui_text('Download Again'), True
+            text, enabled = (
+                (ui_text('Open Folder'), True)
+                if self._is_local_history_task(task)
+                else (ui_text('Download Again'), True)
+            )
         else:
             text, enabled = ui_text('Open Folder'), task.status == "completed"
         self.action.setText(text)

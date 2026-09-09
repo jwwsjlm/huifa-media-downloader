@@ -491,6 +491,46 @@ class Database:
             item.id = media_id
         return media_ids
 
+    def import_completed_local_history(
+        self,
+        entries: Iterable[tuple[object, MediaItem]],
+    ) -> list[int]:
+        """Persist user-owned local media as completed tasks in one transaction."""
+
+        prepared_entries: list[tuple[object, _PreparedMediaInsert, str]] = []
+        for task, item in entries:
+            task_id = str(getattr(task, "id", "") or "").strip()
+            media_path = str(
+                getattr(task, "media_path", "") or item.video_path or ""
+            ).strip()
+            if not task_id or not media_path:
+                raise ValueError("导入本地历史时缺少任务 ID 或媒体路径")
+            prepared_entries.append((task, self._prepare_media_insert(item), media_path))
+        if not prepared_entries:
+            return []
+
+        media_ids: list[int] = []
+        with self._immediate_transaction() as connection:
+            for task, prepared, media_path in prepared_entries:
+                connection.execute(
+                    _DOWNLOAD_TASK_INSERT_SQL,
+                    self._download_task_upsert_values(task),
+                )
+                cursor = connection.execute(_MEDIA_INSERT_SQL, prepared.values)
+                media_ids.append(int(cursor.lastrowid))
+                connection.execute(
+                    """INSERT INTO download_task_files(task_id,path,kind,managed)
+                    VALUES(?,?, 'media', 0)""",
+                    (str(getattr(task, "id", "")), media_path),
+                )
+
+        for (_task, prepared, _media_path), media_id in zip(
+            prepared_entries,
+            media_ids,
+        ):
+            prepared.item.id = media_id
+        return media_ids
+
     def replace_completed_media_path(
         self,
         task_id: str,
@@ -581,6 +621,19 @@ class Database:
         with self._lock:
             rows = self.conn.execute(query, parameters).fetchall()
         return [_media_item_from_row(row) for row in rows]
+
+    def recorded_media_paths(self) -> set[str]:
+        """Return media paths already owned by either persisted history view."""
+
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT media_path AS path FROM download_tasks
+                WHERE TRIM(COALESCE(media_path, '')) <> ''
+                UNION
+                SELECT video_path AS path FROM media_items
+                WHERE TRIM(COALESCE(video_path, '')) <> ''"""
+            ).fetchall()
+        return {str(row["path"]) for row in rows if str(row["path"] or "").strip()}
 
     def count_media(self) -> int:
         """Return catalog size without materializing media rows."""
@@ -1324,10 +1377,13 @@ class Database:
     def completed_media_identities(self) -> tuple[set[str], set[str], set[str]]:
         with self._lock:
             task_rows = self.conn.execute(
-                "SELECT source_key, url, title FROM download_tasks WHERE status='completed'"
+                """SELECT source_key, url, title FROM download_tasks
+                WHERE status='completed'
+                  AND LOWER(COALESCE(source_key, '')) NOT LIKE 'local:%'"""
             ).fetchall()
             media_rows = self.conn.execute(
-                "SELECT source_url, title FROM media_items"
+                """SELECT source_url, title FROM media_items
+                WHERE LOWER(COALESCE(source_platform, '')) <> 'local'"""
             ).fetchall()
         source_keys: set[str] = set()
         urls: set[str] = set()
