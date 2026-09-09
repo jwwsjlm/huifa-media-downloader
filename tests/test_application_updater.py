@@ -400,6 +400,7 @@ class ApplicationUpdaterTests(unittest.TestCase):
         self.assertIn("'--msi', '--instLocation', 'Either'", script)
         self.assertIn("Add-MsiCustomInstallDirectoryUi", script)
         self.assertIn("BrowseInstallFolder", script)
+        self.assertIn("BothScopes", script)
         self.assertIn("VELOPACK_INSTALLDIR=[INSTALLFOLDER]", script)
         self.assertIn("Resolve-DotnetSdkExecutable", script)
         self.assertIn("$env:ProgramW6432", script)

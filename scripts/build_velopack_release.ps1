@@ -145,19 +145,29 @@ function Add-MsiCustomInstallDirectoryUi {
             'SELECT `Control` FROM `Control` WHERE `Dialog_`=''InstallScopeDlg'' AND `Control`=''BrowseInstallFolder'''
         )
         $ExistingView.Execute()
-        if ($null -ne $ExistingView.Fetch()) {
-            return
-        }
+        $ControlExists = $null -ne $ExistingView.Fetch()
         $ExistingView.Close()
         $ExistingView = $null
 
-        foreach ($Statement in @(
-            'INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''PushButton'', 92, 243, 80, 17, 3, '''', ''Browse...'', ''Back'', '''')',
-            'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''SetProperty'', ''_BrowseProperty=INSTALLFOLDER'', 1, ''1'')',
-            'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''SetProperty'', ''HUIFA_CUSTOM_INSTALLDIR=1'', 2, ''1'')',
-            'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''NewDialog'', ''BrowseDlg'', 3, ''1'')',
-            'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''Next'', ''SetProperty'', ''VELOPACK_INSTALLDIR=[INSTALLFOLDER]'', 3, ''HUIFA_CUSTOM_INSTALLDIR=1'')'
-        )) {
+        $Statements = [System.Collections.Generic.List[string]]::new()
+        if (-not $ControlExists) {
+            foreach ($Statement in @(
+                'INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''PushButton'', 92, 243, 80, 17, 3, '''', ''Browse...'', ''Back'', '''')',
+                'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''SetProperty'', ''_BrowseProperty=INSTALLFOLDER'', 1, ''1'')',
+                'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''SetProperty'', ''HUIFA_CUSTOM_INSTALLDIR=1'', 2, ''1'')',
+                'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''BrowseInstallFolder'', ''NewDialog'', ''BrowseDlg'', 3, ''1'')',
+                'INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Ordering`, `Condition`) VALUES (''InstallScopeDlg'', ''Next'', ''SetProperty'', ''VELOPACK_INSTALLDIR=[INSTALLFOLDER]'', 3, ''HUIFA_CUSTOM_INSTALLDIR=1'')'
+            )) {
+                [void]$Statements.Add($Statement)
+            }
+        }
+        # MSI validates Control_Next as one circular tab-order chain. Insert
+        # the browse button between BothScopes and Back, rather than giving
+        # Back two incoming pointers (Windows Installer error 2810).
+        [void]$Statements.Add(
+            'UPDATE `Control` SET `Control_Next`=''BrowseInstallFolder'' WHERE `Dialog_`=''InstallScopeDlg'' AND `Control`=''BothScopes'''
+        )
+        foreach ($Statement in $Statements) {
             $View = $null
             try {
                 $View = $Database.OpenView($Statement)
