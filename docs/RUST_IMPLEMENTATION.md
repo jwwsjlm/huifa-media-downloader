@@ -1,0 +1,79 @@
+# Rust / Tauri / React implementation contract
+
+The approved target is one Rust business core, a Tauri desktop application for
+Windows x64 and Linux x64, and an authenticated Docker web application on port
+19491 for amd64 and arm64. Both hosts serve the same React build. Publishing
+videos and publishing accounts have no registered commands or background jobs.
+The existing Python/Electron implementation is a behavior reference, kept in
+Git as the pre-migration baseline; the new runtime never imports it.
+
+The new identity is `com.huifa.downloader.rust`; the data directory is
+`HuifaDownloaderRust`, never an old application directory. Docker uses `/data`
+and `/downloads`. Initial development version is 0.2.0; a release's version is
+provided explicitly to GitHub Actions. No version is released implicitly.
+
+## Shared command boundary
+
+`huifa_core::App` opens from explicit data/download/tool paths and is held as an
+`Arc<App>`. It exposes `command(&self, command: &str, args: serde_json::Value)`
+as an async function returning `anyhow::Result<Value>`, `subscribe()` returning
+a Tokio broadcast receiver, and an async `shutdown()` that awaits supervised
+process termination and durable task state. Core initialization must not mutate
+old application data. The core owns all media and task operations. Host file
+dialogs and environment capabilities remain in their hosts.
+
+Commands use `{command, args}`. Web `POST /api/command` returns `{value}` or a
+non-success status with `{error}`. Tauri's `command` invoke returns the same
+value, with failures returned as a string. `snapshot` returns
+`{version, tasks, media, settings, tools}`. Core events use
+`{kind, data}`: `task.upsert`, `task.remove`, `media.upsert`, `settings.updated`,
+`tools.updated`. SSE uses the default message event; Tauri emits `huifa-event`.
+DTO fields use camelCase. View state and unsaved form inputs stay in React.
+
+Core commands:
+
+- `tasks.add` `{urls: string[], options: DownloadOptions}` -> task IDs.
+- `tasks.pause`, `tasks.resume`, `tasks.cancel`, `tasks.retry`, `tasks.delete`
+  `{id: string}`; delete additionally accepts `deleteFiles: boolean`.
+- `tasks.pauseAll`, `tasks.resumeAll`; `tasks.convert` `{id, encoder}`.
+- `probe.video` `{url, options}` -> metadata and formats;
+  `probe.collection` `{url, options}` -> entries for client selection.
+- `settings.save` `{settings}` -> sanitized settings.
+- `tools.check`, `tools.update` `{name}`.
+- `cookies.import` `{text, name}`, `cookies.list`, `cookies.delete` `{id}`;
+  `cookies.browser` `{browser, profile?}` for desktop browser reading.
+- `cover.preview`, `cover.export` `{mediaId, ...editOptions}`;
+  `cover.generate` `{mediaId, prompt}` -> persistent image asset.
+- `media.list`, `media.file` `{id, kind?}` -> trusted, owned path for host use.
+
+Task DTO minimum: `{id, url, title, status, stage, progress, stageProgress,
+stageIndeterminate, speed, eta, error, createdAt, options, outputPath}`.
+`stageProgress` is nullable; statuses include queued, probing, downloading,
+waiting_processing, processing, processing_failed, paused, cancelled, failed,
+completed. A completed task is only published after validated output and its
+database transaction. Inputs, plans and publication journal are durable. Retry
+of processing_failed tasks uses saved local inputs without running yt-dlp.
+
+The media DTO uses `{id, taskId, title, filename, size, duration}`; snapshots
+never expose Cookie text, AI keys, signed media URLs or arbitrary file paths.
+`media.file` is a host-internal command: web rejects it from public command
+requests and resolves `/api/files/:id` through it after authentication.
+Hosts may define `capabilities`, upload, download and remote login endpoints;
+public web callers never get shell, arbitrary filesystem or SQL access.
+
+## Required checks and delivery
+
+Each implementation unit has meaningful tests. Real local media checks cover
+split audio/video, FFmpeg processing, offline restart, publication recovery,
+queue budgets and child process cleanup. Web tests cover sessions, CSRF/Origin,
+login limits, file ownership, secret redaction and persistent credentials.
+React tests cover virtual rows, keyboard navigation and stable form/selection
+state. Native desktop and container builds are independently verified.
+
+GitHub Actions accepts an explicit version and Markdown notes, creates one
+version commit, builds a shared frontend once, builds desktop + both container
+architectures from that commit, and publishes only after checks and signed
+desktop update artifacts succeed. Already published versions are immutable.
+
+Commit completed, checked units frequently. Never commit local acceptance
+artifacts, credentials, runtime payloads or build output.
