@@ -1,81 +1,67 @@
-# HuifaMediaDownloader
+# Huifa Media Downloader
 
-<p align="center">
-  <strong>A Windows downloader, media processor, and multi-platform publishing tool powered by yt-dlp</strong>
-</p>
+A Rust download and media processing core with a shared React interface for Tauri desktop and Docker web hosts.
 
-<p align="center">
-  <a href="README.md">简体中文</a> |
-  <a href="README_EN.md">English</a>
-</p>
+[简体中文](README.md) · [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) · [Issues](https://github.com/jwwsjlm/huifa-media-downloader/issues)
 
-<p align="center">
-  <a href="https://github.com/jwwsjlm/huifa-media-downloader/releases/latest">Download the latest release</a> ·
-  <a href="https://github.com/jwwsjlm/huifa-media-downloader/issues">Report an issue</a>
-</p>
-
-![HuifaMediaDownloader task view](docs/images/download-tasks.png)
-
-## Overview
-
-HuifaMediaDownloader is a desktop application for Windows 10/11 x64. It uses `yt-dlp` to resolve videos, playlists, channels, and other collection URLs, uses FFmpeg for merging and transcoding, and provides cookie-based sign-in, thumbnail processing, subtitles, task management, and multi-platform publishing workflows.
-
-Official releases provide both a portable ZIP and an installer ZIP. Both editions contain the Python runtime and required application components, so end users do not need to install Python, Chrome, FFmpeg, or yt-dlp.
+![Download tasks](docs/images/download-tasks.jpg)
 
 ## Features
 
-- Download individual videos, audio, playlists, channels, and collections from sites supported by yt-dlp.
-- Stream collection parsing results into a selectable list and manage selected entries as parent/child tasks.
-- Choose the best quality, a common resolution, or an exact format, with subtitle, audio-track, and audio-only options.
-- Track parsing, downloading, merging, transcoding, thumbnail, and validation stages with progress, speed, and ETA.
-- Pause, resume, retry, search, batch-manage, and organize completed media.
-- Merge and convert media with FFmpeg/FFprobe while exposing the CPU/GPU encoders and hardware decoding capabilities available on the current computer.
-- Convert thumbnails to JPG, adjust crop focus and aspect ratio, organize one task per folder, and use a custom processing directory.
-- Sign in through the app-managed Playwright Chromium and preserve cookies in the portable application data directory.
-- Independently install or update yt-dlp, FFmpeg/FFprobe, Deno, yt-dlp-ejs, and other runtime components.
-- Check for application updates through the GitHub Releases API and verify downloads with GitHub-provided SHA-256 digests.
-- Create and manage multi-platform publishing jobs from completed downloads.
+- Official yt-dlp, FFmpeg, FFprobe and Deno for videos, audio, collections and batch URLs.
+- Separate queues: three ordinary downloads, one special or live download, and one media processing job.
+- Format selection, multiple audio tracks, subtitles, chapters, cuts, SponsorBlock, transcoding and audio export.
+- Frozen per-task plans and runtime versions, retained sources, pause/resume, restart recovery and offline processing retries.
+- Completed media, JPEG crop/padding exports, and AI image editing based on the original cover.
+- Encrypted Cookies and AI keys; desktop browser Cookie import and authenticated remote browser login in Docker.
+- Chinese/English, dark/light themes, virtual task lists and responsive layouts.
+- GitHub Actions releases with SHA-256 checksums and signed desktop updates.
 
-## Download and use
+## Install
 
-1. Open the [latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest).
-2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract the complete archive, and run the root `HuifaMediaDownloader.exe`. Do not copy only the EXE.
-3. For an installed edition, download `HuifaMediaDownloader-<version>-installer-win-x64.zip`, extract it, and run `HuifaMediaDownloader-Setup.exe`; choose the install folder in the wizard, then uninstall it from Windows Installed apps.
-4. Portable-edition state stays in `data/`, while downloads default to the root `downloads/` folder. Move the complete folder when relocating it. The installed edition downloads to `HuifaMediaDownloader/` under the system Downloads folder by default, keeping media outside the application's uninstall scope.
+Choose a file from [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest):
 
-The portable edition uses a self-updating directory layout. FFmpeg, FFprobe, yt-dlp, Deno, yt-dlp-ejs, and Chromium are shipped in the application's own `current/tools/` directory. If Windows SmartScreen reports an unknown publisher, verify that the file came from this repository's Release page before deciding whether to run it.
+| Platform | Artifact |
+| --- | --- |
+| Windows 10/11 x64 | `HuifaDownloader-<version>-windows-x64-setup.exe` |
+| Linux x64 | `HuifaDownloader-<version>-linux-x64.AppImage` |
+| Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:<version>` |
 
-## Portable data
+Run the Windows installer or make the AppImage executable. Download and processing tools are included; users do not need a separate Python or FFmpeg installation. Updater signatures verify update authenticity; the Windows installer currently has no Authenticode publisher certificate.
 
-The application keeps its main runtime data beside the executable instead of requiring the Documents folder:
+The application ID is `com.huifa.downloader.rust`. State is stored under `HuifaDownloaderRust` in the system local data directory; media defaults to the same folder name in the system Downloads directory. Legacy installations and data stay in place; back them up separately. Include `.credentials.key` in Rust data backups to retain encrypted Cookies and AI keys.
 
-- `data/app.db`: download, media, and publishing task database.
-- `data/config.ini`: application settings.
-- `data/browser/`: app-managed browser profiles and encrypted cookie copies.
-- `data/logs/`: task diagnostics.
-- `data/tools/`: independently updatable local runtime components.
+Video publishing and publishing accounts are currently disabled.
 
-The portable edition's default media folder is the root `downloads/` directory, separate from private runtime state such as the database and cookies. yt-dlp-ejs updates follow the exact companion version declared by the bundled yt-dlp; the official external `yt-dlp.exe` already includes EJS.
-An existing legacy `data/settings.ini` is copied to `data/config.ini` on first launch; the original file is retained as a backup.
+## Docker
 
-Do not publicly upload the complete `data/` directory. It may contain signed-in account state and private task information.
+Use `compose.yaml` with a local `.env` file:
 
-## Run from source
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python -m playwright install chromium
-python -m app.main
+```dotenv
+HUIFA_IMAGE=ghcr.io/jwwsjlm/huifa-media-downloader:0.2.0
+HUIFA_ACCOUNT=your-account
+HUIFA_PASSWORD=your-password
+HUIFA_PUBLIC_ORIGIN=http://localhost:19491
 ```
 
-See the [development and release notes](docs/DEVELOPMENT.md) for build details, runtime layout, automatic updates, and the GitHub Release workflow.
+```sh
+docker compose up -d --no-build
+```
 
-## Automated releases
+Open the configured origin. For remote access, set it to the actual server hostname or IP. Volumes `rust-data` and `rust-downloads` preserve state and media. Avoid `docker compose down -v` when this data is needed.
 
-Pushing a `v<version>` tag matching `APP_VERSION` makes GitHub Actions perform build validation, prepare official runtimes, build the directory-updatable portable and installed editions, create a SHA-256 manifest, and publish a GitHub Release on a Windows runner.
+Direct HTTP sends login traffic in plaintext; use an HTTPS reverse proxy for public deployment. The container runs as a non-root user; remote Chromium relies on container isolation. Some sites may reject headless login. See [Docker details](docker/README.md).
 
-## Responsible use
+## Development and releases
 
-Only download, process, and publish content you are authorized to use. Some platforms may require sign-in, CAPTCHA, two-factor authentication, or manual confirmation, and their rules or available formats may change over time.
+Install Node.js 24, Rust stable and the platform's Tauri build dependencies:
+
+```sh
+npm ci --prefix frontend
+node scripts/acquire-rust-tools.mjs
+npm --prefix frontend run tauri -- dev
+```
+
+See [development and release instructions](docs/DEVELOPMENT.md) and the [implementation contract](docs/RUST_IMPLEMENTATION.md).
+
+The current tree contains the Rust application. Legacy Python, Qt and Electron code remains recoverable from Git baseline `bf79d1a`; local legacy files were moved to the Windows Recycle Bin.

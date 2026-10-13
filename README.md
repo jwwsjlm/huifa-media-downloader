@@ -1,81 +1,67 @@
 # 汇发媒体下载器
 
-<p align="center">
-  <strong>基于 yt-dlp 的 Windows 视频下载、媒体处理与多平台发布工具</strong>
-</p>
+Rust 下载与媒体处理核心，Tauri 桌面应用与 Docker 网页共用 React 界面。
 
-<p align="center">
-  <a href="README.md">简体中文</a> |
-  <a href="README_EN.md">English</a>
-</p>
+[English](README_EN.md) · [下载发行版](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) · [问题反馈](https://github.com/jwwsjlm/huifa-media-downloader/issues)
 
-<p align="center">
-  <a href="https://github.com/jwwsjlm/huifa-media-downloader/releases/latest">下载最新版本</a> ·
-  <a href="https://github.com/jwwsjlm/huifa-media-downloader/issues">反馈问题</a>
-</p>
+![下载任务界面](docs/images/download-tasks.jpg)
 
-![汇发媒体下载器下载任务界面](docs/images/download-tasks.png)
+## 功能
 
-## 软件简介
+- 官方 yt-dlp、FFmpeg、FFprobe 和 Deno，支持单个视频、音频、合集和批量链接。
+- 下载与本地处理独立排队：普通下载最多 3 项并行，特殊或直播任务 1 项，媒体处理 1 项。
+- 格式与清晰度选择、多音轨、字幕、章节、片段裁切、SponsorBlock、转码和音频导出。
+- 提交时固定处理计划和工具版本；保留原始输入，支持暂停、重启恢复和处理失败后的离线重试。
+- 已完成媒体管理、JPEG 封面裁剪与留白、基于原图的 AI 封面编辑。
+- Cookie 和 AI 密钥加密存储；桌面支持读取浏览器 Cookie，Docker 提供远程浏览器登录。
+- 深浅色主题、中文与英文界面、虚拟任务列表和窄窗口布局。
+- GitHub Actions 统一构建发行包，提供 SHA-256 校验和签名桌面更新。
 
-汇发媒体下载器是一款面向 Windows 10/11 x64 的桌面应用。它使用 `yt-dlp` 解析视频、播放列表、频道及其他聚合链接，使用 FFmpeg 完成合并和转码，并提供 Cookie 登录、封面处理、字幕、任务管理与多平台发布工作流。
+## 下载和安装
 
-正式版本同时提供便携版 ZIP 和安装包 ZIP，二者都已经包含 Python 运行时和程序所需组件。普通用户无需安装 Python、Chrome、FFmpeg 或 yt-dlp。
+在 [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) 选择对应文件：
 
-## 主要功能
+| 平台 | 文件 |
+| --- | --- |
+| Windows 10/11 x64 | `HuifaDownloader-<版本>-windows-x64-setup.exe` |
+| Linux x64 | `HuifaDownloader-<版本>-linux-x64.AppImage` |
+| Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:<版本>` |
 
-- 下载 yt-dlp 支持站点的单个视频、音频、播放列表、频道和合集。
-- 聚合链接边解析边显示，可勾选需要下载的条目并以父子任务管理。
-- 支持最高画质、常见分辨率和手动格式选择，以及字幕、音轨和仅音频下载。
-- 显示解析、下载、合并、转码、封面和校验等阶段，以及进度、速度和预计剩余时间。
-- 支持暂停、恢复、重试、批量操作、任务搜索和完成媒体管理。
-- 使用 FFmpeg/FFprobe 进行合并与格式转换，并展示当前运行时可用的 CPU/GPU 编码器和硬件解码能力。
-- 支持封面转为 JPG、裁切焦点、画面比例、任务独立文件夹和自定义临时处理目录。
-- 使用软件内置的 Playwright Chromium 登录平台，Cookie 持久保存在软件本地目录。
-- 可独立更新 yt-dlp、FFmpeg/FFprobe、Deno、yt-dlp-ejs 等运行组件。
-- 通过 GitHub Releases API 检查程序更新，下载后校验 GitHub 提供的 SHA-256 digest。
-- 下载完成后可创建多平台发布任务并在发布队列中统一管理。
+Windows 运行安装包；Linux 给 AppImage 添加执行权限后运行。应用包含所需下载和处理工具，用户无需另行安装 Python 或 FFmpeg。更新签名用于验证更新来源，Windows 安装包目前没有 Authenticode 发布者证书。
 
-## 下载与使用
+新应用标识为 `com.huifa.downloader.rust`，数据保存到系统本地数据目录下的 `HuifaDownloaderRust`，默认下载到系统下载目录下的同名文件夹。旧版本安装和数据保留在原处，需要单独备份。备份 Rust 数据时请同时备份 `.credentials.key`，否则无法恢复已加密的 Cookie 和 AI 密钥。
 
-1. 打开 [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest)。
-2. 便携使用请选择 `HuifaMediaDownloader-<版本>-portable-win-x64.zip`，完整解压后运行根目录的 `HuifaMediaDownloader.exe`，不要只复制 EXE。
-3. 需要安装到系统时请选择 `HuifaMediaDownloader-<版本>-installer-win-x64.zip`，解压后运行 `HuifaMediaDownloader-Setup.exe`，在向导中选择安装目录；之后可在 Windows“已安装的应用”中卸载。
-4. 便携版数据默认保存在解压目录的 `data/`，下载内容默认保存在根目录 `downloads/`；移动软件时需要移动整个文件夹。安装版默认下载到系统“下载”目录下的 `HuifaMediaDownloader/`，避免卸载软件时影响媒体文件。
+视频发布及发布账号功能暂时关闭。
 
-便携版采用可自动更新的目录结构，FFmpeg、FFprobe、yt-dlp、Deno、yt-dlp-ejs 和 Chromium 位于软件自身的 `current/tools/` 中。Windows SmartScreen 提示未知发布者时，请先确认文件来自本仓库 Release，再决定是否运行。
+## Docker 网页
 
-## 便携数据
+使用仓库中的 `compose.yaml`，在旁边创建 `.env` 并设置：
 
-软件不会要求用户把数据放到“文档”目录，主要运行数据均位于程序旁的 `data/`：
-
-- `data/app.db`：下载、媒体及发布任务数据库。
-- `data/config.ini`：软件设置。
-- `data/browser/`：软件管理的浏览器资料和加密 Cookie 副本。
-- `data/logs/`：任务诊断日志。
-- `data/tools/`：可独立更新的本地运行组件。
-
-便携版默认媒体目录是根目录 `downloads/`，不再与数据库、Cookie 等私有运行数据混放。yt-dlp-ejs 更新会遵循当前内置 yt-dlp 声明的固定配套版本；外置官方 `yt-dlp.exe` 已自带 EJS。
-旧版本的 `data/settings.ini` 会在首次启动时自动复制迁移到 `data/config.ini`，原文件保留作备份。
-
-请勿公开上传整个 `data/` 目录，其中可能包含账号登录状态和私人任务信息。
-
-## 从源码运行
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python -m playwright install chromium
-python -m app.main
+```dotenv
+HUIFA_IMAGE=ghcr.io/jwwsjlm/huifa-media-downloader:0.2.0
+HUIFA_ACCOUNT=your-account
+HUIFA_PASSWORD=your-password
+HUIFA_PUBLIC_ORIGIN=http://localhost:19491
 ```
 
-构建、运行时目录、自动更新和 GitHub Release 流程说明见 [开发与发布文档](docs/DEVELOPMENT.md)。
+```sh
+docker compose up -d --no-build
+```
 
-## 自动发布
+打开配置的地址登录。远程访问时将 origin 改为实际服务器域名或 IP。数据和媒体分别保存在 `rust-data`、`rust-downloads` 数据卷；不要使用 `docker compose down -v` 删除需要保留的数据。
 
-推送与 `APP_VERSION` 一致的 `v<版本号>` tag 后，GitHub Actions 会在 Windows Runner 上执行构建校验、准备官方运行时、构建可整目录更新的便携版和安装版、生成 SHA-256 清单并发布 GitHub Release。
+直接 HTTP 访问时登录信息以明文传输，公网部署建议使用 HTTPS 反向代理。容器以非 root 用户运行；远程 Chromium 受容器隔离保护，部分网站可能拒绝无头浏览器登录。完整配置见 [Docker 说明](docker/README.md)。
 
-## 使用说明
+## 从源码开发与发布
 
-请只下载、处理和发布你有权使用的内容。部分平台可能要求登录、验证码、双重验证或人工确认；平台规则和可用格式也可能随时变化。
+需要 Node.js 24、Rust stable 和对应平台的 Tauri 编译依赖。
+
+```sh
+npm ci --prefix frontend
+node scripts/acquire-rust-tools.mjs
+npm --prefix frontend run tauri -- dev
+```
+
+构建、验收与手动版本发布见 [开发与发布文档](docs/DEVELOPMENT.md)，接口约定见 [实现说明](docs/RUST_IMPLEMENTATION.md)。
+
+旧 Python、Qt 和 Electron 实现已从当前代码树移除，可从 Git 基线提交 `bf79d1a` 找回。本机清理将旧文件移入 Windows 回收站。

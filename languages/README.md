@@ -1,12 +1,10 @@
-# Huifa Video Downloader language packs
+# Huifa Media Downloader language packs
 
-Bundled `zh-CN.json` and `en-US.json` provide the complete Simplified Chinese
-and English interfaces. Copy another UTF-8 JSON file into the app-local
-`data/languages` directory, select it in Settings, and restart the application.
-Use either bundled pack as the schema template. Translation keys are the
-English strings passed to the UI. Fixed UI text exists only in JSON language
-packs; application source contains one stable key per control. Missing keys
-safely fall back to the readable English key.
+The React interface bundles `zh-CN.json` and `en-US.json`. Settings offers
+Simplified Chinese, English, or the system language. Translation keys are
+the English labels passed to `frontend/src/i18n.ts`; missing entries fall back
+to the control's Chinese or English label. Edit the bundled JSON and rebuild
+the frontend to update translations.
 
 Language packs apply only to fixed user-interface controls: labels, buttons,
 menus, dialog copy, placeholders and tooltips. Service/adaptor output, logs,

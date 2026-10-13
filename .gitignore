@@ -1,68 +1,20 @@
-/.venv
 /.idea
 /data/*
 !/data/.gitkeep
-
-# Python caches and local runtime data
-__pycache__/
-*.py[cod]
+/downloads/
+.env
+.env.*
 *.db
 *.sqlite
 *.sqlite3
 *.log
-.youtube-release-studio/
-
-# Build and packaging output
-build/
-dist/
-/release/
-/releases/
-/releases-velopack/
-/release-assets/
-/releases_debug/
-/releases_icon/
-/releases_lean/
 /.tmp/
-*.spec
-
-# Keep reproducible build recipes while ignoring generated PyInstaller output.
-!build/
-build/*
-!build/00_qtwebengine_hook.py
-!build/01_velopack_hook.py
-!build/HuifaVideoDownloader.lean.spec
-!build/HuifaVideoDownloader.velopack.spec
-!build/HuifaPythonBackend.spec
-!build/HuifaMediaDownloader.nsi
-
-# Download archives are kept outside the repository. App-local runtime
-# payloads are reproducible release inputs and do not belong in normal Git.
-# Release workflows obtain FFmpeg/FFprobe from yt-dlp/FFmpeg-Builds.
-*.zip
-/tools/chromium/
-/tools/deno/
-/tools/yt-dlp/
-/tools/yt-dlp-ejs/
-/tools/node/
-/tools/nsis/
-/tools/nsis-download/
-/desktop/node_modules/
-/desktop/dist/
-/tools/ffmpeg/**/*.exe
-/tools/ffmpeg/**/*.dll
-
-# Legacy binaries at tools/ffmpeg root.
-/tools/ffmpeg/*.exe
-/tools/ffmpeg/*.dll
-
-# Local acceptance artifacts and generated Rust/frontend output.
 /output/
-/deliveries/
-/.audit-*.png
 /*-checkpoint.md
 /target/
 /frontend/node_modules/
 /frontend/dist/
 /src-tauri/target/
+/src-tauri/gen/
 /runtime-tools/
 /rust-release-assets/
