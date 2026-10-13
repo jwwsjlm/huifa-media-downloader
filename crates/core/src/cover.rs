@@ -1,0 +1,512 @@
+use crate::{App, model::Media};
+use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use image::{
+    DynamicImage, GenericImageView, ImageReader, Rgba, RgbaImage,
+    codecs::jpeg::JpegEncoder,
+    imageops::{self, FilterType},
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{Cursor, Write},
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+const MAX_IMAGE_BYTES: usize = 40 * 1024 * 1024;
+const MAX_PIXELS: u64 = 50_000_000;
+
+#[derive(Default)]
+pub(crate) struct CoverState {
+    jobs: Mutex<HashMap<String, CancellationToken>>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct Request {
+    media_id: String,
+    asset_id: String,
+    original: bool,
+    preset: String,
+    fit_mode: String,
+    focus_x: f64,
+    focus_y: f64,
+    quality: u8,
+    background_color: String,
+    prompt: String,
+}
+impl Default for Request {
+    fn default() -> Self {
+        Self {
+            media_id: String::new(),
+            asset_id: String::new(),
+            original: false,
+            preset: "landscape_16_9".into(),
+            fit_mode: "crop".into(),
+            focus_x: 0.5,
+            focus_y: 0.5,
+            quality: 90,
+            background_color: "#000000".into(),
+            prompt: String::new(),
+        }
+    }
+}
+impl Request {
+    fn validate(&self) -> Result<(u32, u32)> {
+        ensure!(
+            Uuid::parse_str(&self.media_id)?.to_string() == self.media_id,
+            "Invalid media ID"
+        );
+        ensure!(
+            (1..=100).contains(&self.quality),
+            "JPEG quality must be 1–100"
+        );
+        ensure!(
+            matches!(self.fit_mode.as_str(), "crop" | "pad"),
+            "Invalid cover fit mode"
+        );
+        ensure!(
+            self.focus_x.is_finite()
+                && self.focus_y.is_finite()
+                && (0.0..=1.0).contains(&self.focus_x)
+                && (0.0..=1.0).contains(&self.focus_y),
+            "Cover focus must be 0–1"
+        );
+        color(&self.background_color)?;
+        match self.preset.as_str() {
+            "landscape_16_9" => Ok((1280, 720)),
+            "portrait_9_16" => Ok((1080, 1920)),
+            "portrait_3_4" => Ok((1080, 1440)),
+            "landscape_4_3" => Ok((1440, 1080)),
+            "square_1_1" => Ok((1080, 1080)),
+            _ => bail!("Unknown cover preset"),
+        }
+    }
+}
+
+pub(crate) async fn command(app: &App, command: &str, args: Value) -> Result<Value> {
+    let request: Request = serde_json::from_value(args)?;
+    if command == "cover.cancel" {
+        if let Some(token) = app.cover_state.jobs.lock().unwrap().get(&request.media_id) {
+            token.cancel();
+        }
+        return Ok(json!(true));
+    }
+    let dimensions = request.validate()?;
+    let mut media = app.db.media_by_id(&request.media_id)?;
+    let source = source_path(app, &media, &request)?;
+    let bytes = read_image(&source)?;
+    if command == "cover.generate" {
+        ensure!(
+            !request.prompt.trim().is_empty() && request.prompt.chars().count() <= 8000,
+            "AI prompt must be 1–8000 characters"
+        );
+        let token = app.shutdown_token.child_token();
+        {
+            let mut jobs = app.cover_state.jobs.lock().unwrap();
+            ensure!(
+                !jobs.contains_key(&request.media_id),
+                "Cover generation is already running"
+            );
+            jobs.insert(request.media_id.clone(), token.clone());
+        }
+        let result = generate(app, &request, bytes, &token).await;
+        app.cover_state
+            .jobs
+            .lock()
+            .unwrap()
+            .remove(&request.media_id);
+        let generated = result?;
+        ensure!(!token.is_cancelled(), "Cover generation cancelled");
+        let generated_image = decode(&generated)?;
+        let png = png_bytes(&generated_image)?;
+        let asset_id = save_asset(app, &mut media, "png", &png)?;
+        return Ok(
+            json!({"assetId":asset_id,"previewUrl":format!("data:image/png;base64,{}",STANDARD.encode(png)),"filename":"generated-cover.png"}),
+        );
+    }
+    let edit = request.clone();
+    let jpeg = tokio::task::spawn_blocking(move || {
+        let image = decode(&bytes)?;
+        let rendered = render(&image, &edit, dimensions)?;
+        jpeg_bytes(&rendered, edit.quality)
+    })
+    .await??;
+    match command {
+        "cover.preview" => Ok(
+            json!({"previewUrl":format!("data:image/jpeg;base64,{}",STANDARD.encode(&jpeg)),"width":dimensions.0,"height":dimensions.1}),
+        ),
+        "cover.export" => {
+            let asset_id = save_asset(app, &mut media, "jpg", &jpeg)?;
+            Ok(
+                json!({"assetId":asset_id,"filename":format!("cover-{}.jpg",request.preset),"previewUrl":format!("data:image/jpeg;base64,{}",STANDARD.encode(&jpeg))}),
+            )
+        }
+        _ => bail!("Unsupported cover command"),
+    }
+}
+
+fn source_path(app: &App, media: &Media, request: &Request) -> Result<PathBuf> {
+    let path = if !request.asset_id.is_empty() {
+        ensure!(
+            Uuid::parse_str(&request.asset_id)?.to_string() == request.asset_id,
+            "Invalid cover asset ID"
+        );
+        ["png", "jpg"]
+            .into_iter()
+            .map(|ext| {
+                app.config
+                    .data_dir
+                    .join("assets")
+                    .join(format!("{}.{}", request.asset_id, ext))
+            })
+            .find(|path| path.is_file())
+            .context("Cover asset does not exist")?
+    } else {
+        let mut images = media.assets.iter().filter(|path| is_image(path));
+        if request.original {
+            images.next()
+        } else {
+            images.next_back()
+        }
+        .cloned()
+        .context("This media has no original cover; upload an image first")?
+    };
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Cover must be a regular owned file"
+    );
+    let canonical = path.canonicalize()?;
+    let downloads = app.config.download_dir.canonicalize()?;
+    let assets = app.config.data_dir.join("assets");
+    let inside_assets = assets.is_dir() && canonical.starts_with(assets.canonicalize()?);
+    ensure!(
+        canonical.starts_with(downloads) || inside_assets,
+        "Cover path is outside owned storage"
+    );
+    Ok(canonical)
+}
+fn is_image(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        matches!(
+            ext.to_string_lossy().to_ascii_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp"
+        )
+    })
+}
+fn read_image(path: &Path) -> Result<Vec<u8>> {
+    ensure!(
+        fs::metadata(path)?.len() <= MAX_IMAGE_BYTES as u64,
+        "Cover is larger than 40 MiB"
+    );
+    let bytes = fs::read(path)?;
+    ensure!(
+        bytes.len() <= MAX_IMAGE_BYTES,
+        "Cover is larger than 40 MiB"
+    );
+    Ok(bytes)
+}
+fn decode(bytes: &[u8]) -> Result<DynamicImage> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES,
+        "Invalid cover size"
+    );
+    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let (width, height) = reader.into_dimensions()?;
+    ensure!(
+        width > 0
+            && height > 0
+            && width <= 16384
+            && height <= 16384
+            && u64::from(width) * u64::from(height) <= MAX_PIXELS,
+        "Cover dimensions are too large"
+    );
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(MAX_PIXELS * 8);
+    reader.limits(limits);
+    Ok(reader.decode()?)
+}
+fn color(value: &str) -> Result<Rgba<u8>> {
+    ensure!(
+        value.len() == 7
+            && value.starts_with('#')
+            && value[1..].chars().all(|c| c.is_ascii_hexdigit()),
+        "Background color must be #RRGGBB"
+    );
+    Ok(Rgba([
+        u8::from_str_radix(&value[1..3], 16)?,
+        u8::from_str_radix(&value[3..5], 16)?,
+        u8::from_str_radix(&value[5..7], 16)?,
+        255,
+    ]))
+}
+fn render(
+    source: &DynamicImage,
+    request: &Request,
+    (width, height): (u32, u32),
+) -> Result<DynamicImage> {
+    let (sw, sh) = source.dimensions();
+    let ratio = f64::from(width) / f64::from(height);
+    let prepared = if request.fit_mode == "crop" {
+        let (cw, ch) = if f64::from(sw) / f64::from(sh) > ratio {
+            (
+                (f64::from(sh) * ratio).round().max(1.0).min(f64::from(sw)) as u32,
+                sh,
+            )
+        } else {
+            (
+                sw,
+                (f64::from(sw) / ratio).round().max(1.0).min(f64::from(sh)) as u32,
+            )
+        };
+        source
+            .crop_imm(
+                ((sw - cw) as f64 * request.focus_x).round() as u32,
+                ((sh - ch) as f64 * request.focus_y).round() as u32,
+                cw,
+                ch,
+            )
+            .resize_exact(width, height, FilterType::Lanczos3)
+    } else {
+        source.resize(width, height, FilterType::Lanczos3)
+    };
+    let mut canvas = RgbaImage::from_pixel(width, height, color(&request.background_color)?);
+    imageops::overlay(
+        &mut canvas,
+        &prepared.to_rgba8(),
+        i64::from((width - prepared.width()) / 2),
+        i64::from((height - prepared.height()) / 2),
+    );
+    Ok(DynamicImage::ImageRgb8(
+        DynamicImage::ImageRgba8(canvas).to_rgb8(),
+    ))
+}
+fn jpeg_bytes(image: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, quality).encode_image(image)?;
+    Ok(bytes)
+}
+fn png_bytes(image: &DynamicImage) -> Result<Vec<u8>> {
+    let mut bytes = Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png)?;
+    Ok(bytes.into_inner())
+}
+fn save_asset(app: &App, media: &mut Media, extension: &str, bytes: &[u8]) -> Result<String> {
+    let directory = app.config.data_dir.join("assets");
+    fs::create_dir_all(&directory)?;
+    ensure!(
+        !fs::symlink_metadata(&directory)?.file_type().is_symlink(),
+        "Asset directory must be owned"
+    );
+    let id = Uuid::new_v4().to_string();
+    let target = directory.join(format!("{id}.{extension}"));
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(&target)
+        .map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(&directory)?.sync_all()?;
+    media.assets.push(target);
+    app.db.save_media(media)?;
+    app.emit("media.upsert", media.public());
+    Ok(id)
+}
+
+fn endpoint(base: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(if base.trim().is_empty() {
+        "https://api.openai.com/v1"
+    } else {
+        base
+    })?;
+    ensure!(
+        matches!(url.scheme(), "https" | "http")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "Invalid AI endpoint"
+    );
+    let path = url.path().trim_end_matches('/');
+    let path = if path.ends_with("/images/edits") {
+        path.to_string()
+    } else if path.is_empty() {
+        "/v1/images/edits".into()
+    } else {
+        format!("{path}/images/edits")
+    };
+    url.set_path(&path);
+    Ok(url)
+}
+async fn response_bytes(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    ensure!(
+        response.content_length().is_none_or(|n| n <= limit as u64),
+        "AI response is too large"
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| error.without_url())?
+    {
+        ensure!(
+            bytes.len() + chunk.len() <= limit,
+            "AI response is too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+async fn generate(
+    app: &App,
+    request: &Request,
+    source: Vec<u8>,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>> {
+    let key = app
+        .credentials
+        .secret("aiApiKey")?
+        .filter(|key| !key.trim().is_empty())
+        .context("Configure an AI API key first")?;
+    let settings = app.db.settings()?;
+    let endpoint = endpoint(settings["aiBaseUrl"].as_str().unwrap_or(""))?;
+    let model = settings["aiModel"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("gpt-image-2");
+    let source = tokio::task::spawn_blocking(move || png_bytes(&decode(&source)?)).await??;
+    let size = match request.preset.as_str() {
+        "portrait_9_16" | "portrait_3_4" => "1024x1536",
+        "square_1_1" => "1024x1024",
+        _ => "1536x1024",
+    };
+    let form = reqwest::multipart::Form::new()
+        .text("model", model.to_owned())
+        .text("prompt", request.prompt.trim().to_owned())
+        .text("size", size)
+        .text("n", "1")
+        .text("quality", "high")
+        .text("input_fidelity", "high")
+        .part(
+            "image",
+            reqwest::multipart::Part::bytes(source)
+                .file_name("original-cover.png")
+                .mime_str("image/png")?,
+        );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300))
+        .build()?;
+    let action = async {
+        let response = client
+            .post(endpoint)
+            .bearer_auth(&key)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| error.without_url())?;
+        ensure!(
+            response.status().is_success(),
+            "AI image service returned HTTP {}",
+            response.status().as_u16()
+        );
+        let document: Value = serde_json::from_slice(
+            &response_bytes(response, MAX_IMAGE_BYTES * 4 / 3 + 1024 * 1024).await?,
+        )?;
+        let record = document["data"]
+            .as_array()
+            .and_then(|data| data.first())
+            .context("AI service returned no image")?;
+        if let Some(encoded) = record["b64_json"].as_str() {
+            ensure!(
+                encoded.len() <= MAX_IMAGE_BYTES * 4 / 3 + 4,
+                "AI image is too large"
+            );
+            Ok(STANDARD.decode(encoded)?)
+        } else if let Some(address) = record["url"].as_str() {
+            let url = url::Url::parse(address)?;
+            ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                "Invalid generated image URL"
+            );
+            let response = client
+                .get(url)
+                .send()
+                .await
+                .map_err(|error| error.without_url())?;
+            ensure!(
+                response.status().is_success(),
+                "Generated image could not be downloaded"
+            );
+            response_bytes(response, MAX_IMAGE_BYTES).await
+        } else {
+            bail!("AI service returned no supported image data")
+        }
+    };
+    tokio::select! { result=action=>result, _=cancel.cancelled()=>bail!("Cover generation cancelled") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn crops_focus_and_preserves_padding_background() -> Result<()> {
+        let source = DynamicImage::ImageRgb8(image::RgbImage::from_fn(200, 100, |x, _| {
+            if x < 100 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        }));
+        let mut request = Request {
+            preset: "square_1_1".into(),
+            focus_x: 0.0,
+            ..Default::default()
+        };
+        let left = render(&source, &request, (100, 100))?.to_rgb8();
+        assert_eq!(left.get_pixel(50, 50).0, [255, 0, 0]);
+        request.focus_x = 1.0;
+        let right = render(&source, &request, (100, 100))?.to_rgb8();
+        assert_eq!(right.get_pixel(50, 50).0, [0, 0, 255]);
+        request.fit_mode = "pad".into();
+        request.background_color = "#00ff00".into();
+        let padded = render(&source, &request, (100, 100))?.to_rgb8();
+        assert_eq!(padded.get_pixel(50, 0).0, [0, 255, 0]);
+        assert!(jpeg_bytes(&DynamicImage::ImageRgb8(padded), 90)?.starts_with(&[0xff, 0xd8]));
+        Ok(())
+    }
+    #[test]
+    fn rejects_invalid_images_and_edit_arguments() {
+        assert!(decode(b"not an image").is_err());
+        assert!(color("#💜💜").is_err());
+        assert!(
+            Request {
+                media_id: Uuid::new_v4().to_string(),
+                focus_x: f64::NAN,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(endpoint("https://secret@example.com/v1").is_err());
+        assert!(endpoint("https://example.com/v1?key=secret").is_err());
+        assert_eq!(
+            endpoint("https://example.com/v1").unwrap().path(),
+            "/v1/images/edits"
+        );
+    }
+}
