@@ -19,7 +19,7 @@ export function validateNotes(notes) {
 }
 
 export function setCargoVersion(cargo, version) {
-  const result = cargo.replace(/(\[workspace\.package\][\s\S]*?\nversion\s*=\s*")[^"]+("[^\n]*)/, `$1${version}$2`);
+  const result = cargo.replace(/(\[workspace\.package\][\s\S]*?\nversion\s*=\s*")[^"]+("[^\n]*)/, (_match, prefix, suffix) => prefix + version + suffix);
   if (result === cargo && !cargo.includes(`version = "${version}"`)) throw new Error('Workspace version was not found');
   return result;
 }

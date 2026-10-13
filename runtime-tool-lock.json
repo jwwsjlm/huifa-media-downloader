@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "tools": {
+    "yt-dlp": {
+      "repository": "yt-dlp/yt-dlp",
+      "version": "2026.08.19",
+      "assets": {
+        "windows-x86_64": {
+          "name": "yt-dlp.exe",
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe",
+          "sha256": "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a"
+        },
+        "linux-x86_64": {
+          "name": "yt-dlp_linux",
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux",
+          "sha256": "58162f9bfdc27458ea47bfcb311cf47028f17d8154a8bf7d689861d46399230a"
+        },
+        "linux-aarch64": {
+          "name": "yt-dlp_linux_aarch64",
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux_aarch64",
+          "sha256": "b16e4dab368a816cd05d477d698a605a6ae87ccee1c8ffd38fa21d7254141fcc"
+        }
+      }
+    },
+    "ffmpeg": {
+      "repository": "yt-dlp/FFmpeg-Builds",
+      "version": "latest",
+      "assets": {
+        "windows-x86_64": {
+          "name": "ffmpeg-master-latest-win64-gpl.zip",
+          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+          "sha256": "549f730b6ca62f5c7d099241e37e6aaa8f66fc2fecb1dc3219802788e0ff4e43"
+        },
+        "linux-x86_64": {
+          "name": "ffmpeg-master-latest-linux64-gpl.tar.xz",
+          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
+          "sha256": "d80181ebe334add8c17b17d73e5291241e6ea243dd8eaf524d58be1b6e34f770"
+        },
+        "linux-aarch64": {
+          "name": "ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
+          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
+          "sha256": "2a17294e25d01f3742eaed9d1ae3658e165341894d265793189cd7eccef6573c"
+        }
+      }
+    },
+    "deno": {
+      "repository": "denoland/deno",
+      "version": "v2.9.7",
+      "assets": {
+        "windows-x86_64": {
+          "name": "deno-x86_64-pc-windows-msvc.zip",
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-pc-windows-msvc.zip",
+          "sha256": "a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238"
+        },
+        "linux-x86_64": {
+          "name": "deno-x86_64-unknown-linux-gnu.zip",
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-unknown-linux-gnu.zip",
+          "sha256": "c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490"
+        },
+        "linux-aarch64": {
+          "name": "deno-aarch64-unknown-linux-gnu.zip",
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-unknown-linux-gnu.zip",
+          "sha256": "c832298b1ad4422481334855f6003e0f54145762c5a134f20a489511d2f65bbf"
+        }
+      }
+    }
+  }
+}
