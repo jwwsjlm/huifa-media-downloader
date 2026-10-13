@@ -26,7 +26,7 @@ jobs:
       - run: npm run check --prefix frontend
       - run: npm test --prefix frontend
       - run: npm run build --prefix frontend
-      - run: node --test tests/rust-release.test.mjs
+      - run: node --test tests/*.test.mjs
       - run: node scripts/acquire-rust-tools.mjs --self-test
       - uses: actions/upload-artifact@v4
         with:

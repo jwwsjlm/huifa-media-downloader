@@ -8,7 +8,7 @@
 - `frontend`：两个宿主共用的 React 界面；`languages` 保存中英文语言包。
 - `scripts` 和 `.github/workflows`：工具版本、版本同步、发行产物与发布。
 
-使用 Node.js 24 和 Rust stable。Windows 需要 Visual Studio C++ Build Tools 和 WebView2；Ubuntu 桌面构建需要 `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2.0-dev patchelf libssl-dev build-essential`。Docker 依赖由 Dockerfile 提供。
+使用 Node.js 24 和 Rust stable。Windows 需要 Visual Studio C++ Build Tools 和 WebView2；Ubuntu 桌面构建需要 `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev build-essential`。Docker 依赖由 Dockerfile 提供。
 
 ## 本机运行
 
@@ -32,7 +32,7 @@ npm --prefix frontend run tauri -- dev
 npm run check --prefix frontend
 npm test --prefix frontend
 npm run build --prefix frontend
-node --test tests/rust-release.test.mjs
+node --test tests/*.test.mjs
 node scripts/acquire-rust-tools.mjs --self-test
 cargo fmt --all --check
 cargo test --locked -p huifa-core -p huifa-server -- --include-ignored --test-threads=1

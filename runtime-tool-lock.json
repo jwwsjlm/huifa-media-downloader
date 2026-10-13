@@ -24,22 +24,22 @@
     },
     "ffmpeg": {
       "repository": "yt-dlp/FFmpeg-Builds",
-      "version": "latest",
+      "version": "autobuild-2026-10-13-20-20",
       "assets": {
         "windows-x86_64": {
-          "name": "ffmpeg-master-latest-win64-gpl.zip",
-          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
-          "sha256": "dfb89d02948f94b77a89c218e6abbb16032c19a329da972886f9029b82b229e0"
+          "name": "ffmpeg-N-127511-g01cf1a5396-win64-gpl.zip",
+          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/autobuild-2026-10-13-20-20/ffmpeg-N-127511-g01cf1a5396-win64-gpl.zip",
+          "sha256": "cc4c8f3e15b317be771bce75e4f7cba40ab89991cf1a6bfc4c9385e3ae50baec"
         },
         "linux-x86_64": {
-          "name": "ffmpeg-master-latest-linux64-gpl.tar.xz",
-          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
-          "sha256": "9b1136f703bb207d7653a6504ae8dce135fec41ec9fb61eb9117d2fc2dd98d16"
+          "name": "ffmpeg-N-127511-g01cf1a5396-linux64-gpl.tar.xz",
+          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/autobuild-2026-10-13-20-20/ffmpeg-N-127511-g01cf1a5396-linux64-gpl.tar.xz",
+          "sha256": "9c1c037f28592c44fecc3cfb0c8e4b7e7d363a78680eb334231b8cdc5675c13b"
         },
         "linux-aarch64": {
-          "name": "ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
-          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
-          "sha256": "298b31e41cc11627ddcccd815dc74dc04c99ebb3a45916e23bbda5ea80699a83"
+          "name": "ffmpeg-N-127511-g01cf1a5396-linuxarm64-gpl.tar.xz",
+          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/autobuild-2026-10-13-20-20/ffmpeg-N-127511-g01cf1a5396-linuxarm64-gpl.tar.xz",
+          "sha256": "a5c6a967132bfd8846491d8c5a6c61bf7e236f0c9229de11563639c1a74b54b6"
         }
       }
     },

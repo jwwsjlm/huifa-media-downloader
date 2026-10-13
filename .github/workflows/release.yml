@@ -44,7 +44,7 @@ jobs:
         run: |
           test "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" || { echo 'Release the reviewed default branch'; exit 1; }
           test -n "$TAURI_SIGNING_PRIVATE_KEY" || { echo 'Missing Tauri updater signing secret'; exit 1; }
-          node --test tests/rust-release.test.mjs
+          node --test tests/*.test.mjs
           node --input-type=module -e 'import {validateVersion,validateNotes} from "./scripts/rust-release.mjs"; validateVersion(process.env.RELEASE_VERSION); validateNotes(process.env.RELEASE_NOTES);'
           if git show-ref --verify --quiet "refs/tags/v$RELEASE_VERSION"; then
             echo 'Version already reserved; use rerun failed jobs to resume an interrupted publication'
@@ -122,7 +122,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Linux desktop dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2.0-dev patchelf libssl-dev build-essential xvfb unzip
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev build-essential xvfb unzip
       - run: npm ci --prefix frontend
       - uses: actions/download-artifact@v4
         with:
