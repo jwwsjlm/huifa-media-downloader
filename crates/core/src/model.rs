@@ -523,6 +523,7 @@ pub(crate) struct Task {
     #[serde(default)]
     pub conversion: bool,
     #[serde(default)]
+    // Private immutable runtime references. Missing snapshots must fail when used, never resolve current tools.
     pub tools: std::collections::HashMap<String, PathBuf>,
 }
 

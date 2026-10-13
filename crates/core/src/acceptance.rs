@@ -506,7 +506,7 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         manifest: Some(manifest),
         publication: None,
         conversion: false,
-        tools: app.freeze_tools()?,
+        tools: app.freeze_tools().await?,
     };
     app.db.insert_task(&task)?;
     app.schedule(&id)?;

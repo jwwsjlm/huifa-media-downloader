@@ -53,9 +53,10 @@ fn base_args(
     options: &DownloadOptions,
     cookies: &Cookies,
     task: Option<&Task>,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut args = vec![
         "--ignore-config".into(),
+        "--no-js-runtimes".into(),
         "--no-warnings".into(),
         "--no-cache-dir".into(),
         "--socket-timeout".into(),
@@ -71,10 +72,10 @@ fn base_args(
     if !options.proxy.is_empty() {
         args.extend(["--proxy".into(), options.proxy.clone()]);
     }
-    let deno = if let Some(task) = task {
-        app.task_tool(task, "deno").ok()
-    } else {
-        app.tool("deno").ok()
+    let deno = match task {
+        Some(task) if task.tools.contains_key("deno") => Some(app.task_tool(task, "deno")?),
+        Some(_) => None,
+        None => app.tool("deno").ok(),
     };
     if let Some(deno) = deno {
         args.extend(["--js-runtimes".into(), format!("deno:{}", deno.display())]);
@@ -82,7 +83,7 @@ fn base_args(
     if options.request_delay > 0.0 {
         args.extend(["--sleep-requests".into(), options.request_delay.to_string()]);
     }
-    args
+    Ok(args)
 }
 
 pub(crate) async fn probe(
@@ -94,7 +95,7 @@ pub(crate) async fn probe(
     task: Option<&Task>,
 ) -> Result<Value> {
     let cookies = Cookies::new(app, cookies)?;
-    let mut args = base_args(app, options, &cookies, task);
+    let mut args = base_args(app, options, &cookies, task)?;
     args.extend([
         "--dump-single-json".into(),
         "--skip-download".into(),
@@ -167,7 +168,7 @@ pub(crate) async fn collection(
 ) -> Result<Value> {
     let _permit = app.network.acquire().await?;
     let cookies = Cookies::new(app, cookie_text)?;
-    let mut args = base_args(app, options, &cookies, None);
+    let mut args = base_args(app, options, &cookies, None)?;
     args.extend([
         "--dump-single-json".into(),
         "--flat-playlist".into(),
@@ -480,7 +481,7 @@ pub(crate) async fn transfer(
             None,
         )?;
         let output_template = directory.join(format!("source-{index}.%(ext)s"));
-        let mut args = base_args(app, &runtime_options, &cookies, Some(&task));
+        let mut args = base_args(app, &runtime_options, &cookies, Some(&task))?;
         args.extend([
             "--no-playlist".into(),
             "--no-simulate".into(),
@@ -747,7 +748,7 @@ async fn download_subtitles(
         selected.extend(matched);
     }
     let runtime_options = app.runtime_options(task)?;
-    let mut args = base_args(app, &runtime_options, cookies, Some(task));
+    let mut args = base_args(app, &runtime_options, cookies, Some(task))?;
     args.extend([
         "--no-playlist".into(),
         "--skip-download".into(),
@@ -977,6 +978,37 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn absent_frozen_deno_disables_default_runtime_and_invalid_snapshot_is_rejected()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let cookies = Cookies { file: None };
+        let mut task = crate::tests::paused_task(std::collections::HashMap::new());
+        let args = base_args(&app, &task.options, &cookies, Some(&task))?;
+        ensure!(
+            args.iter().any(|a| a == "--no-js-runtimes")
+                && !args.iter().any(|a| a == "--js-runtimes"),
+            "An absent Deno snapshot allowed implicit PATH fallback"
+        );
+        let mutable = root
+            .path()
+            .join(format!("deno{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&mutable, "mutable runtime")?;
+        task.tools.insert("deno".into(), mutable);
+        ensure!(
+            base_args(&app, &task.options, &cookies, Some(&task)).is_err(),
+            "An invalid frozen Deno runtime was silently omitted"
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
     #[test]
     fn exact_plan_retains_all_audio_languages_and_prefers_resolution() {
         let info = json!({"formats":[{"format_id":"v","height":1080,"fps":30,"vcodec":"avc1","acodec":"none"},{"format_id":"v-low","height":720,"fps":60,"vcodec":"avc1","acodec":"none"},{"format_id":"en-low","language":"en","abr":64,"vcodec":"none","acodec":"aac"},{"format_id":"en","language":"en","abr":128,"vcodec":"none","acodec":"aac"},{"format_id":"zh","language":"zh-Hans","abr":128,"vcodec":"none","acodec":"aac"}]});

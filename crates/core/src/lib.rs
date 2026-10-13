@@ -129,17 +129,22 @@ impl App {
             path.is_file(),
             "Frozen {name} runtime is missing; restore its saved tool version before retrying"
         );
+        tools::validate_frozen(self, path, name)?;
         Ok(path.clone())
     }
-    fn freeze_tools(&self) -> Result<HashMap<String, PathBuf>> {
-        let mut tools = HashMap::new();
-        for name in ["yt-dlp", "ffmpeg", "ffprobe"] {
-            tools.insert(name.into(), self.tool(name)?.canonicalize()?);
-        }
-        if let Ok(path) = self.tool("deno") {
-            tools.insert("deno".into(), path.canonicalize()?);
-        }
-        Ok(tools)
+    async fn freeze_tools(&self) -> Result<HashMap<String, PathBuf>> {
+        let _guard = tokio::select! {
+            guard=self.tool_update_lock.lock()=>guard,
+            _=self.shutdown_token.cancelled()=>bail!("Runtime snapshot interrupted"),
+        };
+        let app = self
+            .myself
+            .get()
+            .and_then(Weak::upgrade)
+            .context("Application is closed")?;
+        tokio::task::spawn_blocking(move || tools::freeze(&app))
+            .await
+            .context("Runtime snapshot worker stopped")?
     }
     pub(crate) fn save_task(&self, task: &Task) -> Result<()> {
         self.db.save_task(task)?;
@@ -192,11 +197,6 @@ impl App {
         let mut runners = self.runners.lock().unwrap();
         if runners.get(id).is_some_and(|r| !r.handle.is_finished()) {
             return Ok(());
-        }
-        let mut task = self.db.task(id)?;
-        if task.tools.is_empty() {
-            task.tools = self.freeze_tools()?;
-            self.save_task(&task)?;
         }
         let app = self
             .myself
@@ -294,7 +294,7 @@ impl App {
                         .unwrap_or_default();
                 }
                 let cookies = self.credential_snapshot(&options)?;
-                let frozen_tools = self.freeze_tools()?;
+                let frozen_tools = self.freeze_tools().await?;
                 let mut validated = Vec::new();
                 for url in urls {
                     let url = url.as_str().context("URL must be text")?;
@@ -698,4 +698,150 @@ pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) fn paused_task(tools: HashMap<String, PathBuf>) -> Task {
+        Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            url: "https://example.test/frozen.mp4".into(),
+            title: "Frozen runtime".into(),
+            status: "paused".into(),
+            stage: "queued".into(),
+            progress: 0.0,
+            stage_progress: None,
+            stage_indeterminate: true,
+            speed: None,
+            eta: None,
+            error: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            options: DownloadOptions::default(),
+            output_path: None,
+            cookie_snapshot: None,
+            proxy_snapshot: None,
+            manifest: None,
+            publication: None,
+            conversion: false,
+            tools,
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_tools_survive_source_upgrade_and_restart_and_reject_tampering() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let bundled = root.path().join("bundled");
+        std::fs::create_dir_all(&bundled)?;
+        let names = ["yt-dlp", "ffmpeg", "ffprobe", "deno"];
+        let source = |name: &str| bundled.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        for name in names {
+            std::fs::write(source(name), format!("{name}:version-one"))?;
+        }
+        let config = AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: Some(bundled.clone()),
+        };
+        let app = App::open(config.clone()).await?;
+        let old = paused_task(app.freeze_tools().await?);
+        ensure!(
+            old.tools["ffmpeg"].parent() == old.tools["ffprobe"].parent(),
+            "FFmpeg and FFprobe were frozen into different directories"
+        );
+        app.db.insert_task(&old)?;
+        ensure!(
+            old.public().get("tools").is_none(),
+            "Runtime paths reached the public task snapshot"
+        );
+        app.shutdown().await?;
+        drop(app);
+
+        for name in names {
+            std::fs::write(source(name), format!("{name}:version-two"))?;
+        }
+        let app = App::open(config.clone()).await?;
+        let saved = app.db.task(&old.id)?;
+        let new = paused_task(app.freeze_tools().await?);
+        app.db.insert_task(&new)?;
+        for name in names {
+            let old_path = app.task_tool(&saved, name)?;
+            let new_path = app.task_tool(&new, name)?;
+            ensure!(
+                old_path == old.tools[name] && old_path != new_path,
+                "Upgrade changed a frozen runtime or failed to adopt a new runtime"
+            );
+            ensure!(
+                std::fs::read(&old_path)? == format!("{name}:version-one").as_bytes(),
+                "An old task switched runtime bytes"
+            );
+            ensure!(
+                std::fs::read(&new_path)? == format!("{name}:version-two").as_bytes(),
+                "A new task did not adopt the upgraded runtime"
+            );
+        }
+        app.shutdown().await?;
+        drop(app);
+
+        let app = App::open(config).await?;
+        let saved = app.db.task(&old.id)?;
+        let new = app.db.task(&new.id)?;
+        for name in names {
+            ensure!(
+                app.task_tool(&saved, name)? == old.tools[name]
+                    && app.task_tool(&new, name)? == new.tools[name],
+                "Restart lost a runtime snapshot"
+            );
+        }
+        let mut unsafe_task = saved.clone();
+        unsafe_task.tools.insert("ffmpeg".into(), source("ffmpeg"));
+        ensure!(
+            app.task_tool(&unsafe_task, "ffmpeg").is_err(),
+            "A mutable runtime path was accepted"
+        );
+        let cached = &saved.tools["ffmpeg"];
+        #[cfg(windows)]
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut permissions = std::fs::metadata(cached)?.permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(cached, permissions)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(cached, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::write(cached, "tampered")?;
+        ensure!(
+            app.task_tool(&saved, "ffmpeg").is_err(),
+            "Changed frozen runtime bytes were accepted"
+        );
+
+        let missing = paused_task(HashMap::new());
+        app.db.insert_task(&missing)?;
+        app.command("tasks.resume", json!({"id":missing.id}))
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let task = app.db.task(&missing.id)?;
+                if task.status == "failed" {
+                    ensure!(
+                        task.tools.is_empty()
+                            && task
+                                .error
+                                .as_deref()
+                                .is_some_and(|e| e.contains("frozen yt-dlp")),
+                        "A missing snapshot was silently replaced"
+                    );
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        app.shutdown().await?;
+        Ok(())
+    }
 }

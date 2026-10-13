@@ -1,13 +1,132 @@
 use crate::App;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
+
+fn executable(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn file_digest(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= 512 * 1024 * 1024,
+        "Invalid runtime executable size"
+    );
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+pub(crate) fn freeze(app: &App) -> Result<HashMap<String, PathBuf>> {
+    let mut sources = BTreeMap::new();
+    for name in ["yt-dlp", "ffmpeg", "ffprobe"] {
+        sources.insert(name.to_string(), resolve(app, name)?);
+    }
+    if let Ok(path) = resolve(app, "deno") {
+        sources.insert("deno".into(), path);
+    }
+    let hashes = sources
+        .iter()
+        .map(|(name, path)| Ok((name.clone(), file_digest(path)?)))
+        .collect::<Result<BTreeMap<String, String>>>()?;
+    let manifest = serde_json::to_vec(&hashes)?;
+    let directory = app.config.data_dir.join("tools/frozen");
+    std::fs::create_dir_all(&directory)?;
+    let destination = directory.join(hex::encode(Sha256::digest(&manifest)));
+    if !destination.exists() {
+        let temporary = tempfile::tempdir_in(&directory)?;
+        for (name, source) in &sources {
+            let target = temporary.path().join(executable(name));
+            let mut input = std::fs::File::open(source)?;
+            let mut output = std::fs::File::create(&target)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+            #[cfg(unix)]
+            std::fs::set_permissions(&target, input.metadata()?.permissions())?;
+            anyhow::ensure!(
+                file_digest(&target)? == hashes[name],
+                "Runtime changed while freezing {name}"
+            );
+        }
+        let manifest_path = temporary.path().join("manifest.json");
+        let mut manifest_file = std::fs::File::create(&manifest_path)?;
+        manifest_file.write_all(&manifest)?;
+        manifest_file.sync_all()?;
+        drop(manifest_file);
+        #[cfg(unix)]
+        std::fs::File::open(temporary.path())?.sync_all()?;
+        if let Err(error) = std::fs::rename(temporary.path(), &destination)
+            && !destination.is_dir()
+        {
+            return Err(error.into());
+        }
+        #[cfg(unix)]
+        std::fs::File::open(&directory)?.sync_all()?;
+    }
+    anyhow::ensure!(
+        std::fs::read(destination.join("manifest.json"))? == manifest,
+        "Existing frozen runtime set differs"
+    );
+    let mut paths = HashMap::new();
+    for name in sources.keys() {
+        let path = destination.join(executable(name)).canonicalize()?;
+        validate_frozen(app, &path, name)?;
+        paths.insert(name.clone(), path);
+    }
+    Ok(paths)
+}
+
+pub(crate) fn validate_frozen(app: &App, path: &Path, name: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe" | "deno"),
+        "Unknown frozen runtime"
+    );
+    let path = path.canonicalize()?;
+    let directory = path.parent().context("Invalid frozen runtime path")?;
+    let root = app.config.data_dir.join("tools/frozen").canonicalize()?;
+    anyhow::ensure!(
+        directory.parent() == Some(root.as_path())
+            && path.file_name().and_then(|value| value.to_str()) == Some(executable(name).as_str()),
+        "Task runtime is outside its immutable tool cache"
+    );
+    let manifest_path = directory.join("manifest.json");
+    anyhow::ensure!(
+        std::fs::metadata(&manifest_path)?.len() <= 1024,
+        "Frozen runtime manifest is too large"
+    );
+    let manifest = std::fs::read(&manifest_path)?;
+    let expected_directory = hex::encode(Sha256::digest(&manifest));
+    anyhow::ensure!(
+        directory.file_name().and_then(|value| value.to_str()) == Some(expected_directory.as_str()),
+        "Frozen runtime manifest checksum mismatch"
+    );
+    let hashes: BTreeMap<String, String> = serde_json::from_slice(&manifest)?;
+    anyhow::ensure!(
+        hashes.get(name) == Some(&file_digest(&path)?),
+        "Frozen {name} runtime checksum mismatch; restore its saved tool version before retrying"
+    );
+    Ok(())
+}
 
 pub(crate) fn resolve(app: &App, name: &str) -> Result<PathBuf> {
     if !matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe" | "deno") {
         bail!("Unknown runtime tool");
     }
-    let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let executable = executable(name);
     if let Some(path) = managed_path(&app.config.data_dir.join("tools"), name)? {
         return Ok(path);
     }
@@ -72,7 +191,6 @@ pub(crate) async fn update(app: &App, name: &str) -> Result<Value> {
 
 async fn update_inner(app: &App, name: &str) -> Result<Value> {
     use anyhow::{Context, ensure};
-    use sha2::{Digest, Sha256};
     use std::io::Write;
     ensure!(
         matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe" | "deno"),
@@ -202,7 +320,10 @@ async fn update_inner(app: &App, name: &str) -> Result<Value> {
             None,
         )
         .await?;
-        std::fs::File::open(&path)?.sync_all()?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .sync_all()?;
     }
     if version_dir.exists() {
         for filename in &filenames {

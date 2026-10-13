@@ -1,0 +1,27 @@
+services:
+  downloader:
+    image: ${HUIFA_IMAGE:-huifa-downloader-rust:local}
+    build:
+      context: .
+    ports:
+      - "19491:19491"
+    environment:
+      HUIFA_ACCOUNT: ${HUIFA_ACCOUNT:?Set HUIFA_ACCOUNT}
+      HUIFA_PASSWORD: ${HUIFA_PASSWORD:?Set HUIFA_PASSWORD}
+      HUIFA_PUBLIC_ORIGIN: ${HUIFA_PUBLIC_ORIGIN:-http://localhost:19491}
+    volumes:
+      - rust-data:/data
+      - rust-downloads:/downloads
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  rust-data:
+  rust-downloads:
