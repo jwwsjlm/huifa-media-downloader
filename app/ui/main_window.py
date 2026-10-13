@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Slot
@@ -12,21 +11,9 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
 )
 
-from app.core.app_settings import AppSettings
-from app.core.application_update_service import ApplicationUpdateService
-from app.core.application_updater import velopack_persistent_data_dir
-from app.core.cover_service import (
-    CoverService,
-)
-from app.core.download_service import DownloadService
-from app.core.download_performance import (
-    effective_download_performance,
-)
 from app.core.language_packs import language_pack_directory
-from app.core.paths import application_dir, initialize_data_layout
-from app.core.publish_service import PublishService
-from app.core.update_service import UpdateService
-from app.core.version import APP_VERSION
+from app.core.paths import initialize_data_layout
+from app.presentation.application_runtime import ApplicationRuntime
 from app.ui.theme import (
     THEME_LIGHT,
     THEME_SYSTEM,
@@ -75,9 +62,6 @@ from app.ui.publish_ui_controller import PublishUiController
 from app.ui.task_status_summary_controller import (
     TaskStatusSummaryController,
 )
-from app.storage.database import Database
-from app.storage.secure_store import SecureStore
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -103,7 +87,18 @@ class MainWindow(QMainWindow):
             self.resize(1080, 700)
 
     def _initialize_core_services(self, data_dir: Path) -> None:
-        self.app_settings = AppSettings()
+        self.runtime = ApplicationRuntime(data_dir, self)
+        self.app_settings = self.runtime.app_settings
+        self.secure_store = self.runtime.secure_store
+        self.cover_service = self.runtime.cover_service
+        self.db = self.runtime.db
+        self.update_service = self.runtime.update_service
+        self.application_update_dir = self.runtime.application_update_dir
+        self.application_update_mode = self.runtime.application_update_mode
+        self.application_update_service = self.runtime.application_update_service
+        self.application_updates_supported = self.runtime.application_updates_supported
+        self.download_service = self.runtime.download_service
+        self.publish_service = self.runtime.publish_service
         self._theme_choice = normalize_theme(self.app_settings.get("appearance_theme"))
         self._effective_theme = THEME_LIGHT
         self._style_hints = QApplication.styleHints()
@@ -121,60 +116,6 @@ class MainWindow(QMainWindow):
             )
         except RuntimeError:
             self.desktop_notifications_available = False
-        self.secure_store = SecureStore()
-        self.cover_service = CoverService()
-        self.db = Database(data_dir / "app.db")
-        self.update_service = UpdateService(
-            data_dir / "updates",
-            {
-                "ffmpeg": self.app_settings.get("ffmpeg_path"),
-                "ffprobe": self.app_settings.get("ffprobe_path"),
-                "deno": self.app_settings.get("deno_path"),
-            },
-            ffmpeg_build_channel=self.app_settings.get("ffmpeg_build_channel"),
-        )
-        self.update_service.set_download_routes(
-            self.app_settings.get("github_download_route"),
-            self.app_settings.get("github_mirror_urls"),
-            self.app_settings.get("github_route_profiles"),
-        )
-        self.update_service.route_probe_finished.connect(self._persist_github_route_profiles)
-        application_update_dir = data_dir / "updates" / "application"
-        self.application_update_dir = application_update_dir
-        managed_update_data = velopack_persistent_data_dir(application_dir())
-        if managed_update_data is not None:
-            self.application_update_mode = "velopack"
-            updater_factory = None
-        else:
-            self.application_update_mode = ""
-            updater_factory = None
-        self.application_update_service = ApplicationUpdateService(
-            application_update_dir,
-            updater_factory=updater_factory,
-            parent=self,
-        )
-        self.application_updates_supported = bool(self.application_update_mode)
-        task_workers, fragment_workers, request_delay = effective_download_performance(
-            self.app_settings
-        )
-        self.download_service = DownloadService(
-            self.db,
-            max_concurrent=task_workers,
-            request_delay=request_delay,
-            fragment_concurrent=fragment_workers,
-            ytdlp_core_mode=self.app_settings.get("ytdlp_core_mode"),
-            deno_path=self.app_settings.get("deno_path"),
-            ffprobe_path=self.app_settings.get("ffprobe_path"),
-            ytdlp_ejs_source=self.app_settings.get("ytdlp_ejs_source"),
-            cover_convert_jpeg=self.app_settings.get_bool("download_cover_convert_jpeg", False),
-            cover_jpeg_quality=self.app_settings.get_int("cover_jpeg_quality", 90, 50, 100),
-        )
-        self.publish_service = PublishService(self.db)
-        # A forced exit can leave a persistent row in ``uploading`` even
-        # though no worker exists after restart.  Recover it before the queue
-        # is first rendered so the user can retry instead of seeing a stuck
-        # task forever.
-        self.publish_service.recover_stale_tasks()
 
     def _initialize_main_pages(self) -> None:
         self.tabs = SidebarNavigation()
@@ -188,6 +129,7 @@ class MainWindow(QMainWindow):
             self.cover_service,
         )
         self.settings = SettingsPage(self)
+        self.runtime.routeProfilesChanged.connect(self._refresh_github_route_profiles)
         self.dashboard = DashboardPage(self)
         self.account_hub = AccountHubPage(self)
         self.completed = CompletedPage(self)
@@ -318,7 +260,6 @@ class MainWindow(QMainWindow):
 
     def _navigation_collapsed_changed(self, collapsed: bool) -> None:
         self.app_settings.set("navigation_collapsed", "true" if collapsed else "false")
-        self.app_settings.sync()
 
     def _on_system_color_scheme_changed(self, *_args) -> None:
         if self._theme_choice == THEME_SYSTEM:
@@ -333,11 +274,8 @@ class MainWindow(QMainWindow):
         elif page is self.settings:
             self.settings.refresh_runtime_component_status()
 
-    @Slot(object)
-    def _persist_github_route_profiles(self, _results: object) -> None:
-        profiles = self.update_service.serialized_route_profiles()
-        self.app_settings.set("github_route_profiles", profiles)
-        self.app_settings.sync()
+    @Slot(str)
+    def _refresh_github_route_profiles(self, profiles: str) -> None:
         self.settings.github_route_profiles = profiles
 
     def check_application_update(self) -> None:

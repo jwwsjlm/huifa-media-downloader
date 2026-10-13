@@ -66,11 +66,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: .\scripts\prepare_release_runtime.ps1
 
-      - name: Install Inno Setup
+      - name: Install NSIS
         shell: pwsh
-        run: choco install innosetup --version=6.7.1 --no-progress --yes
+        run: choco install nsis --version=3.12.0 --no-progress --yes
 
-      - name: Build and verify installer
+      - name: Build installer
         shell: pwsh
         run: >-
           .\scripts\build_velopack_release.ps1
@@ -128,7 +128,7 @@ jobs:
                   --repo $env:GITHUB_REPOSITORY `
                   --latest `
                   --notes-file $ReleaseBody `
-                  --title "Huifa Media Downloader $Version"
+                  --title "HuifaMediaDownloader $Version"
           }
           else {
               gh release create $Tag @Assets `
@@ -136,6 +136,6 @@ jobs:
                   --verify-tag `
                   --notes-file $ReleaseBody `
                   --latest `
-                  --title "Huifa Media Downloader $Version"
+                  --title "HuifaMediaDownloader $Version"
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

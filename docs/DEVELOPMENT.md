@@ -21,7 +21,7 @@ python -m app.main
 官方仓库为 `jwwsjlm/huifa-media-downloader`。推送与 `APP_VERSION` 一致的
 `v<版本号>` 标签后，GitHub Actions 会在 `windows-latest` 上安装固定构建依赖，
 从 `yt-dlp/FFmpeg-Builds` 和 Playwright 官方源准备发行运行时，执行构建校验、
-构建及打包烟雾检查，然后生成便携版 ZIP、安装包 ZIP、Velopack 更新所需的技术资产和
+构建及包结构校验，然后生成便携版 ZIP、安装包 ZIP、Velopack 更新所需的技术资产和
 `SHA256SUMS.txt`。应用默认通过 GitHub REST API
 `releases/latest` 检查稳定版，并使用 Release 资产中由 GitHub 提供的 SHA-256
 digest 验证下载内容；启用预发布更新时才读取 Release 列表。
@@ -34,7 +34,9 @@ git push origin v0.1.1
 ```
 
 便携版 ZIP 和安装包 ZIP 都使用 Velopack 管理的目录式程序。便携版解压后运行根目录入口，
-安装版 ZIP 内含 Inno Setup `Setup.exe`：向导先选择目录，再静默调用内部 Windows Installer；
+安装版 ZIP 内含 NSIS `HuifaMediaDownloader-Setup.exe`，采用与 Motrix 相同的
+Windows 安装器技术。欢迎页之后显示目录选择页，默认目录为
+`Program Files\HuifaMediaDownloader`；之后向导将所选目录传给内部 Windows Installer。
 系统会写入标准“已安装的应用”卸载注册表项。PySide6/Qt、Python 运行时、内置 yt-dlp 模块和 FFmpeg
 均随程序提供，用户无需另装 Python 或 PySide6。程序也支持从官方 Release 自动安装并优先调用
 可独立更新的外置 `yt-dlp.exe`，内置模块保留为安全回退。Deno 不是程序启动的硬依赖，但它是 yt-dlp 推荐的 JavaScript
@@ -49,13 +51,24 @@ biliup 所需的专用账号文件。
 首次运行若触发 Windows Defender/SmartScreen，请确认文件来源后选择允许。
 
 开发者使用 `scripts/build_velopack_release.ps1` 生成安装器、可自更新便携包、更新 feed 和完整包，
-再由 `scripts/package_github_release.ps1` 统一封装两个面向用户的 ZIP 和技术资产。构建脚本会在
-隔离目录启动便携包做烟雾检查，并真实执行一次本地 Velopack apply，确认 `current/` 能完整替换、
-外置工具能恢复且根目录 `data/` 不丢失。构建前可先运行
+再由 `scripts/package_github_release.ps1` 统一封装两个面向用户的 ZIP 和技术资产。
+安装 NSIS 编译器使用 `choco install nsis --version=3.12.0 --yes`。
+默认构建和 tag 发布不启动程序或执行烟雾测试；只有明确指定 `-RunSmokeChecks` 时，
+构建脚本才会在隔离目录启动便携包并执行一次本地 Velopack apply，检查 `current/`、
+外置工具和根目录 `data/`。默认构建也不单独执行 `compileall`，PyInstaller 负责
+构建期语法检查。构建前可先运行
 `.\scripts\build_velopack_release.ps1 -Version <APP_VERSION> -ValidateEnvironmentOnly`；脚本会优先
 选择 64 位 Program Files 中真正安装了 SDK 的 dotnet，而不是误用 PATH 中仅有 Runtime 的
 x86 host。稳定版使用 `win` 通道，预发布版需显式指定例如 `win-beta`，构建完成后脚本还会
 校验安装器、便携包、更新 feed 和完整更新包，不会执行 GitHub 上传。
+
+NSIS 使用 `build/HuifaMediaDownloader.nsi` 和系统原生向导控件，
+不需要 Electron 或 electron-builder 运行时。外层不另建卸载注册表项：
+文件安装、快捷方式、卸载与升级登记仍由 Velopack MSI 统一管理。
+安装失败显示 MSI 错误码，日志位于 `%TEMP%\HuifaMediaDownloader-install.log`。
+单独检查 NSIS 脚本编译时，可明确执行
+`python tests/check_nsis_installer.py "C:/Program Files (x86)/NSIS/makensis.exe"`；
+它只在临时目录编译带占位 MSI 的安装器，不运行安装器，不验证安装、卸载或更新。
 
 The x64 release embeds only the FFmpeg runtime under `tools/ffmpeg/x64/`;
 legacy root and x86 copies are not added to the deliverable. External portable
@@ -144,11 +157,14 @@ Runtime data is stored beside the application under `data/`:
 - `data/app.db` — download, media and publishing task database;
 - `data/backups/app.backup-1.db` … `app.backup-3.db` — rotating, transactionally consistent SQLite snapshots;
 - `data/recovery/database-*` — damaged database files isolated during automatic recovery; they are preserved for support instead of deleted;
-- `data/settings.ini` — download directory, quality, download-only proxy and tool settings;
+- `data/config.ini` — download directory, quality, download-only proxy and tool settings;
 - `data/browser/cookies/` — 下载功能使用的 Windows DPAPI 加密 Cookie 副本；
 - `data/browser/sau-cookies/` — SAU/Playwright Chromium Profile 与平台账号文件，更新核心或重启软件后继续保留；
 - `data/downloads/` — default download directory.
 - `data/logs/downloads/` — per-task diagnostic logs in JSON Lines format;
+
+On first launch after this layout change, a legacy `data/settings.ini` is copied
+to `data/config.ini`; the legacy file is retained as a recovery copy.
 
 On startup, an existing database is checked with SQLite `quick_check`. A damaged
 database and its WAL/journal sidecars are moved together into `data/recovery/`,
@@ -188,7 +204,7 @@ scope only when needed. Live status signals update an already visible row
 without rebuilding the entire queue.
 The `设置 → 外观` section provides `跟随系统`, `浅色` and `深色` themes;
 the system option follows Qt/Windows color-scheme changes while the program is
-running and the choice is stored in `data/settings.ini`.
+running and the choice is stored in `data/config.ini`.
 
 “下载环境”按钮执行纯本地预检，不会访问 GitHub 或视频站点：它会显示实际使用的
 外置 yt-dlp 或内置回退模块、FFmpeg/FFprobe、推荐的 Deno、下载目录和下载 Cookie 状态。若下载核心或

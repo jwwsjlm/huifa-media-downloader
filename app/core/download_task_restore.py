@@ -229,7 +229,7 @@ def build_task_restore_plan(
     plan.hierarchy = _resolve_hierarchy_records(records)
     terminal_child_budget = max(0, int(initial_terminal_children))
     terminal_statuses = frozenset({
-        "completed", "deleted", "failed", "canceled", "partial_failed",
+        "completed", "deleted", "failed", "processing_failed", "canceled", "partial_failed",
     })
     seen_media_urls: set[str] = set()
 
@@ -284,5 +284,6 @@ def restored_status(
     if status in {"downloading", "canceling", "暂停中", "waiting_selection"}:
         status = "paused"
     elif status == "processing":
-        status = "completed"
+        checkpoint = reader.options().get("_processing")
+        status = "processing" if isinstance(checkpoint, Mapping) and checkpoint.get("version") == 1 else "paused"
     return original_status, status

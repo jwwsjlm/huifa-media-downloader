@@ -58,7 +58,7 @@ from app.ui.quick_download_controls import (
 )
 from app.ui.supported_sites_dialog import SupportedSitesDialog
 from app.ui.task_card import TASK_CARD_HEIGHT, DownloadTaskCard
-from app.ui.task_auth_actions import (
+from app.presentation.task_auth_actions import (
     TaskAuthActionController,
 )
 from app.ui.task_context_menu import (
@@ -286,7 +286,6 @@ class DashboardPage(QWidget):
         self.task_auth_actions = TaskAuthActionController(
             self.window.download_service,
             self.window.app_settings,
-            lambda: self.window.db,
             self.resume_collection_probes,
         )
         self.task_format_selection = TaskFormatSelectionController(
@@ -952,11 +951,6 @@ class DashboardPage(QWidget):
     def media_completed(self, task_id: str, media: MediaItem) -> None:
         task = self.window.download_service.tasks.get(task_id)
         if task:
-            task.title = media.title or task.title
-            task.media_path = media.video_path
-            task.thumbnail_path = media.thumbnail_path
-            task.uploader = media.uploader or ""
-            task.downloaded_at = media.downloaded_at or ""
             if task.parent_task_id:
                 if self.collection_detail.parent_task_id == task.parent_task_id:
                     self.collection_detail.upsert_task(task)
@@ -1047,8 +1041,8 @@ class DashboardPage(QWidget):
         if task_id not in live_ids:
             if not live_ids:
                 self._drop_all_stale_tasks()
-            else:
-                self._drop_stale_task(task_id)
+            elif not self.window.download_service.delete_task(task_id, False):
+                self.remove_task(task_id)
             return
         task = self.window.download_service.tasks.get(task_id)
         if not task:
@@ -1146,16 +1140,6 @@ class DashboardPage(QWidget):
         # A fresh read-only connection detects externally replaced databases
         # without relying on the long-lived application connection's view.
         return read_download_task_ids(self.window.db.path)
-
-    def _drop_stale_task(self, task_id: str) -> None:
-        self.window.download_service._unregister_task(task_id)
-        self.window.download_service.queue = type(self.window.download_service.queue)(
-            queued_id for queued_id in self.window.download_service.queue if queued_id != task_id
-        )
-        self.remove_task(task_id)
-        self.status.setText(ui_text(
-            'The task record no longer exists and was removed from the list',
-        ))
 
     def _drop_all_stale_tasks(self) -> None:
         self.window.download_service.reset_task_cache()

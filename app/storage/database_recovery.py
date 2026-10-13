@@ -126,7 +126,7 @@ def recover_database_file(
     if healthy:
         return DatabaseRecoveryReport(status="healthy", detail="SQLite quick_check 通过")
 
-    quarantine = _quarantine_database(database)
+    quarantine = quarantine_database_file(database)
     for backup in database_backup_paths(database, count=backup_count):
         backup_healthy, _backup_detail = database_integrity(backup)
         if not backup_healthy:
@@ -237,7 +237,7 @@ def _database_files(database: Path) -> tuple[Path, ...]:
     )
 
 
-def _quarantine_database(database: Path) -> Path:
+def quarantine_database_file(database: Path) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     quarantine = database.parent / "recovery" / f"database-{timestamp}-{uuid.uuid4().hex[:8]}"
     quarantine.mkdir(parents=True, exist_ok=False)

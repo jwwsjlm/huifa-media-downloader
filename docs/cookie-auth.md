@@ -13,7 +13,7 @@ requirements.txt 使用 yt-dlp[default,curl-cffi]，由 yt-dlp 自己拉取并�
 - `file`：读取用户选择的 Netscape Cookie 文件；
 - `browser`：通过 yt-dlp 的 `cookiesfrombrowser` 直接读取当前 Windows 用户的 Chrome、Edge、Firefox 或 Brave Cookie 数据库。
 
-外部浏览器 Cookie 的解密、临时数据库复制和 DPAPI/NSS 兼容仍由 yt-dlp 负责。内置 Cookie 由应用使用 DPAPI 加密，下载任务启动时生成临时 Netscape 文件，任务结束立即删除。Cookie 值不会写入 SQLite、settings.ini、任务日志或诊断包。
+外部浏览器 Cookie 的解密、临时数据库复制和 DPAPI/NSS 兼容仍由 yt-dlp 负责。内置 Cookie 由应用使用 DPAPI 加密，下载任务启动时生成临时 Netscape 文件，任务结束立即删除。Cookie 值不会写入 SQLite、config.ini、任务日志或诊断包。
 
 ## 登录流程
 

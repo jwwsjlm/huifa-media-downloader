@@ -4,7 +4,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import TypedDict
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Slot
 
 from app.core.collection_service import CollectionProbeRequest, CollectionProbeWorker
 from app.core.qt_lifecycle import delete_unstarted_worker
@@ -24,6 +24,7 @@ class ProbeState(TypedDict, total=False):
     collection_index: int
     visited_source_keys: set[str]
     source_key_registered: bool
+    selection_shown: bool
     finished: bool
 
 
@@ -59,7 +60,7 @@ class CollectionProbeCoordinator(QObject):
 
     @property
     def running(self) -> bool:
-        return any(
+        return bool(self.queue) or any(
             request_id in self.deferred_finishes
             or self.thread_is_running(state.get("thread"))
             for request_id, state in self.states.items()
@@ -99,6 +100,15 @@ class CollectionProbeCoordinator(QObject):
                     pass
             if not self.thread_is_running(state.get("thread")):
                 self.states.pop(request_id, None)
+
+    def clear_inactive_states(self) -> bool:
+        """Drop stale selection state after its task database was replaced."""
+
+        if self.running:
+            return False
+        self.queue.clear()
+        self.states.clear()
+        return True
 
     def cancel(self, request_id: str) -> bool:
         """Cancel one queued/running probe without allowing it to start later."""
@@ -152,6 +162,7 @@ class CollectionProbeCoordinator(QObject):
         worker: CollectionProbeWorker | None = None
         try:
             thread = QThread(self)
+            thread.setProperty("collection_probe_request_id", request_id)
             worker = CollectionProbeWorker(state["request"])
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
@@ -162,11 +173,7 @@ class CollectionProbeCoordinator(QObject):
             worker.finished.connect(self._on_finished, Qt.QueuedConnection)
             worker.finished.connect(thread.quit)
             worker.finished.connect(worker.deleteLater)
-            thread.finished.connect(
-                lambda request_id=request_id, thread=thread:
-                self.defer_thread_finish(request_id, thread),
-                Qt.QueuedConnection,
-            )
+            thread.finished.connect(self._thread_finished, Qt.QueuedConnection)
         except Exception as exc:
             if worker is not None and thread is not None:
                 delete_unstarted_worker(worker, thread)
@@ -192,6 +199,15 @@ class CollectionProbeCoordinator(QObject):
                 self.states.pop(request_id, None)
             return False
         return True
+
+    @Slot()
+    def _thread_finished(self) -> None:
+        thread = self.sender()
+        if not isinstance(thread, QThread):
+            return
+        request_id = str(thread.property("collection_probe_request_id") or "")
+        if request_id:
+            self.defer_thread_finish(request_id, thread)
 
     def defer_thread_finish(self, request_id: str, thread: QThread) -> None:
         """Let queued result signals settle before releasing a concurrency slot."""

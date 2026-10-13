@@ -4,11 +4,13 @@ import json
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from uuid import uuid4
 
 
 PROGRESS_PREFIX = "__HUIFA_PROGRESS__"
@@ -20,6 +22,257 @@ _OUTPUT_POLL_SECONDS = 0.1
 _OUTPUT_DRAIN_GRACE_SECONDS = 1.0
 _PROCESS_WAIT_TIMEOUT_SECONDS = 5.0
 _READER_JOIN_TIMEOUT_SECONDS = 1.0
+_GATE_PREFIX = "__HUIFA_PROCESSING_GATE__"
+
+# Both cores use the same fixed helper definitions; the standalone plugin
+# receives this source because it cannot import the application's modules.
+_NATIVE_CHECKPOINT_HELPERS = r'''
+import copy
+import os
+from yt_dlp.postprocessor.movefilesafterdownload import MoveFilesAfterDownloadPP
+
+_INFO_FIELDS = {
+    'id', 'title', 'description', 'tags', 'uploader', 'uploader_id', 'channel',
+    'artist', 'artists', 'album', 'album_artist', 'track', 'track_number',
+    'release_year', 'release_date', 'upload_date', 'timestamp', 'duration',
+    'vcodec', 'acodec', 'ext', 'protocol', 'webpage_url', 'extractor', 'extractor_key',
+    'playlist_id', 'playlist_index', 'playlist_title', 'playlist', 'format_id',
+    'width', 'height', 'fps', 'container', 'stretched_ratio', 'chapters',
+    'sponsorblock_chapters', '__files_to_merge', '__files_to_move', '__finaldir',
+    'filepath', '_filename', 'filename', 'infojson_filename', '__real_download',
+}
+_LOCAL_OPTIONS = {
+    'keepvideo', 'overwrites', 'postoverwrites',
+    'writeinfojson', 'writethumbnail', 'writesubtitles', 'clean_infojson', 'compat_opts',
+}
+_PROCESSOR_ATTRIBUTES = {
+    'FFmpegExtractAudio': {'preferredcodec': 'mapping', 'preferredquality': '_preferredquality', 'nopostoverwrites': '_nopostoverwrites'},
+    'FFmpegVideoConvertor': {'preferedformat': 'mapping'},
+    'FFmpegVideoRemuxer': {'preferedformat': 'mapping'},
+    'FFmpegEmbedSubtitle': {'already_have_subtitle': '_already_have_subtitle'},
+    'FFmpegMetadata': {'add_metadata': '_add_metadata', 'add_chapters': '_add_chapters', 'add_infojson': '_add_infojson'},
+    'EmbedThumbnail': {'already_have_thumbnail': '_already_have_thumbnail'},
+    'FFmpegSplitChapters': {'force_keyframes': '_force_keyframes'},
+    'FFmpegSubtitlesConvertor': {'format': 'format'},
+    'FFmpegThumbnailsConvertor': {'format': 'mapping'},
+    'FFmpegFixupTimestamp': {'trim': 'trim'},
+    'MoveFilesAfterDownload': {'downloaded': '_downloaded'},
+    'ModifyChapters': {'remove_sponsor_segments': '_sponsorblock_chapters_to_remove', 'remove_ranges': '_ranges_to_remove', 'sponsorblock_chapter_title': '_sponsorblock_chapter_title', 'force_keyframes': '_force_keyframes'},
+    'SponsorBlock': {'categories': '_categories', 'api': '_API_URL'},
+}
+
+def _native_info(ydl, info):
+    result = {key: copy.deepcopy(value) for key, value in info.items() if key in _INFO_FIELDS}
+    for key in ('requested_formats', 'requested_downloads'):
+        result[key] = [
+            {field: value for field, value in item.items() if field in {'filepath', 'filename', 'format_id', 'vcodec', 'acodec', 'ext', 'protocol', 'duration', 'language'}}
+            for item in info.get(key) or [] if isinstance(item, dict)
+        ]
+    result['requested_subtitles'] = {
+        language: {field: value for field, value in item.items() if field in {'filepath', 'ext', 'name'}}
+        for language, item in (info.get('requested_subtitles') or {}).items() if isinstance(item, dict)
+    }
+    result['thumbnails'] = [
+        {field: value for field, value in item.items() if field in {'filepath', 'id', 'ext', 'width', 'height'}}
+        for item in info.get('thumbnails') or [] if isinstance(item, dict)
+    ]
+    return ydl.sanitize_info(result)
+
+def _native_plain(ydl, value):
+    # sanitize_info adds media metadata to its top-level mapping. Keep PP
+    # arguments and local options nested so constructors receive only args.
+    return ydl.sanitize_info({'value': value})['value']
+
+def _native_spec(ydl, processor):
+    key = type(processor).__name__.removesuffix('PP')
+    for configured in ydl.params.get('postprocessors') or []:
+        if configured.get('key') == key:
+            return _native_plain(ydl, {name: value for name, value in configured.items() if name != 'when'})
+    spec = {'key': key}
+    for argument, attribute in _PROCESSOR_ATTRIBUTES.get(key, {}).items():
+        if hasattr(processor, attribute):
+            spec[argument] = getattr(processor, attribute)
+    if key == 'FFmpegFixupTimestamp' and 'trim' in spec:
+        spec['trim'] = float(spec['trim'])
+    return _native_plain(ydl, spec)
+
+def _native_move_journal(info):
+    source = info['filepath']
+    finaldir = info.get('__finaldir', os.path.dirname(source))
+    moves = info.setdefault('__files_to_move', {})
+    moves[source] = os.path.join(finaldir, os.path.basename(source))
+    for oldfile, newfile in list(moves.items()):
+        if not newfile:
+            moves[oldfile] = os.path.join(finaldir, os.path.basename(oldfile))
+
+def _install_native_checkpointing(ydl, checkpoint):
+    original_post_process, original_run_pp = ydl.post_process, ydl.run_pp
+    state = {'plan': None, 'index': 0}
+
+    def save(info):
+        checkpoint({
+            'info': _native_info(ydl, info),
+            'processors': copy.deepcopy(state['plan'][state['index']:]),
+            'options': _native_plain(ydl, {key: value for key, value in ydl.params.items() if key in _LOCAL_OPTIONS}),
+        })
+
+    def post_process(filename, info, files_to_move=None):
+        plan = [*(info.get('__postprocessors') or []), *ydl._pps['post_process'], MoveFilesAfterDownloadPP(ydl), *ydl._pps['after_move']]
+        state['plan'] = [_native_spec(ydl, processor) for processor in plan if type(processor).__name__ not in {'HuifaBudgetPP', 'HuifaNetworkPermitPP', 'PrintPP'}]
+        state['index'] = 0
+        info['filepath'], info['__files_to_move'] = filename, files_to_move or {}
+        try:
+            return original_post_process(filename, info, files_to_move)
+        finally:
+            state['plan'] = None
+
+    def run_pp(processor, info):
+        plan, index = state['plan'], state['index']
+        key = type(processor).__name__.removesuffix('PP')
+        if plan is None or index >= len(plan) or plan[index]['key'] != key:
+            return original_run_pp(processor, info)
+        if key == 'MoveFilesAfterDownload':
+            # Persist every deterministic move before the PP removes its old
+            # path, so a crash before the result acknowledgement can replay it.
+            _native_move_journal(info)
+        save(info)
+        # Persist the result before deleting inputs needed for crash replay.
+        original_delete = ydl._delete_downloaded_files
+        pending_deletes = []
+
+        def defer_delete(*files, **kwargs):
+            pending_deletes.append((files, kwargs))
+            for filename in files:
+                info.get('__files_to_move', {}).pop(filename, None)
+
+        ydl._delete_downloaded_files = defer_delete
+        try:
+            result = original_run_pp(processor, info)
+        finally:
+            ydl._delete_downloaded_files = original_delete
+        state['index'] += 1
+        save(result)
+        for files, kwargs in pending_deletes:
+            original_delete(*files, **kwargs)
+        return result
+
+    ydl.post_process, ydl.run_pp = post_process, run_pp
+'''
+_NATIVE_CHECKPOINT_NAMESPACE: dict[str, Any] | None = None
+
+
+def _native_checkpoint_namespace() -> dict[str, Any]:
+    global _NATIVE_CHECKPOINT_NAMESPACE
+    if _NATIVE_CHECKPOINT_NAMESPACE is None:
+        namespace: dict[str, Any] = {}
+        exec(_NATIVE_CHECKPOINT_HELPERS, namespace)
+        _NATIVE_CHECKPOINT_NAMESPACE = namespace
+    return _NATIVE_CHECKPOINT_NAMESPACE
+
+
+def install_native_checkpointing(ydl: Any, checkpoint: Callable[[dict[str, Any]], None]) -> None:
+    _native_checkpoint_namespace()["_install_native_checkpointing"](ydl, checkpoint)
+
+
+def prepare_native_move_checkpoint(info: dict[str, Any]) -> None:
+    _native_checkpoint_namespace()["_native_move_journal"](info)
+
+
+_GATE_PLUGIN = '''import json
+import sys
+from yt_dlp.postprocessor.common import PostProcessor
+from yt_dlp.utils import PostProcessingError
+
+_TOKEN = {token!r}
+_PREFIX = {prefix!r}
+
+def _request(action, key, checkpoint=None):
+    payload = {{"token": _TOKEN, "action": action, "postprocessor": key}}
+    if checkpoint is not None:
+        payload["checkpoint"] = checkpoint
+    sys.stdout.write(_PREFIX + json.dumps(payload) + "\\n")
+    sys.stdout.flush()
+    if sys.stdin.readline().rstrip("\\r\\n") != _TOKEN + ":ok":
+        raise PostProcessingError("Huifa processing permit was not acknowledged")
+
+class HuifaBudgetPP(PostProcessor):
+    def __init__(self, downloader=None):
+        super().__init__(downloader)
+        _install_native_checkpointing(downloader, lambda snapshot: _request("checkpoint", "HuifaBudget", snapshot))
+
+    def run(self, info):
+        _request("network", self.pp_key())
+        return [], info
+
+_original_hook = PostProcessor._hook_progress
+
+def _gated_hook(self, status, info_dict):
+    key = self.pp_key()
+    if key == "HuifaBudget":
+        return _original_hook(self, status, info_dict)
+    action = status.get("status")
+    if action == "started":
+        _request(action, key)
+    result = _original_hook(self, status, info_dict)
+    if action == "finished":
+        _request(action, key)
+    return result
+
+PostProcessor._hook_progress = _gated_hook
+'''
+
+
+class _ExternalProcessingGate:
+    """Use an official plugin to pause the child before a PP launches FFmpeg."""
+
+    def __init__(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        self.callback = callback
+        self.token = uuid4().hex
+        self.saw_network_gate = False
+        self.directory = tempfile.TemporaryDirectory(prefix="huifa-ytdlp-gate-")
+        plugin = Path(self.directory.name) / "huifa" / "yt_dlp_plugins" / "postprocessor" / "huifa_budget.py"
+        try:
+            plugin.parent.mkdir(parents=True)
+            plugin.write_text(_NATIVE_CHECKPOINT_HELPERS + "\n" + _GATE_PLUGIN.format(token=self.token, prefix=_GATE_PREFIX), encoding="utf-8")
+        except BaseException:
+            self.directory.cleanup()
+            raise
+
+    def configure(self, command: list[str]) -> None:
+        command[-2:-2] = [
+            "--plugin-dirs", self.directory.name,
+            "--use-postprocessor", "HuifaBudget:when=before_dl",
+        ]
+
+    def consume(self, line: str, process: subprocess.Popen[str]) -> bool:
+        if not line.startswith(_GATE_PREFIX):
+            return False
+        if len(line) > 4 * 1024 * 1024:
+            raise ExternalYtdlpError("外置 yt-dlp 处理通道请求过长")
+        try:
+            payload = json.loads(line[len(_GATE_PREFIX):])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ExternalYtdlpError("外置 yt-dlp 处理通道请求不可解析") from exc
+        if not isinstance(payload, dict) or payload.pop("token", None) != self.token:
+            raise ExternalYtdlpError("外置 yt-dlp 处理通道认证失败")
+        if payload.get("action") == "network":
+            self.saw_network_gate = True
+        self.callback(payload)
+        if process.stdin is None:
+            raise ExternalYtdlpError("外置 yt-dlp 处理通道不可用")
+        try:
+            process.stdin.write(self.token + ":ok\n")
+            process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise ExternalYtdlpError("外置 yt-dlp 处理通道已关闭") from exc
+        return True
+
+    def verify(self) -> None:
+        if not self.saw_network_gate:
+            raise ExternalYtdlpError("外置 yt-dlp 未加载处理通道插件，请更新官方 yt-dlp 下载核心")
+
+    def close(self) -> None:
+        self.directory.cleanup()
 
 
 class ExternalYtdlpError(RuntimeError):
@@ -408,7 +661,11 @@ def terminate_external_ytdlp_process(process: subprocess.Popen[str]) -> None:
                 timeout=5,
             )
             if result.returncode == 0:
-                return
+                try:
+                    process.wait(timeout=3)
+                    return
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
         except (OSError, subprocess.SubprocessError):
             pass
     try:
@@ -432,7 +689,7 @@ def terminate_external_ytdlp_process(process: subprocess.Popen[str]) -> None:
         pass
 
 
-def start_external_ytdlp_process(command: list[str]) -> subprocess.Popen[str]:
+def start_external_ytdlp_process(command: list[str], *, stdin_pipe: bool = False) -> subprocess.Popen[str]:
     """Start yt-dlp with the process-group policy shared by every workflow."""
 
     creationflags = 0
@@ -441,6 +698,7 @@ def start_external_ytdlp_process(command: list[str]) -> subprocess.Popen[str]:
     try:
         return subprocess.Popen(
             command,
+            **({"stdin": subprocess.PIPE} if stdin_pipe else {}),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -551,31 +809,44 @@ def run_external_ytdlp(
     log_line: Callable[[str], None] | None = None,
     progress_hook: Callable[[dict[str, Any]], None] | None = None,
     postprocess_hook: Callable[[dict[str, Any]], None] | None = None,
+    processing_gate: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run the official standalone executable and return its JSON metadata."""
     command = build_external_ytdlp_command(executable, url, options, download=download)
-    process = start_external_ytdlp_process(command)
-    lines, reader = start_external_ytdlp_output_reader(process)
-    output = _ExternalOutputState(download=download)
+    gate = _ExternalProcessingGate(processing_gate) if download and processing_gate is not None else None
+    process: subprocess.Popen[str] | None = None
     try:
-        return_code = pump_external_ytdlp_output(
-            process,
-            reader,
-            lines,
-            cancel_event=cancel_event,
-            consume_line=lambda line: output.consume(
-                line,
-                progress_hook=progress_hook,
-                postprocess_hook=postprocess_hook,
-                log_line=log_line,
-            ),
-        )
-    except BaseException:
-        terminate_external_ytdlp_process(process)
-        raise
-    finally:
-        finish_external_ytdlp_output_reader(process, reader)
+        if gate is not None:
+            gate.configure(command)
+        process = start_external_ytdlp_process(command, stdin_pipe=gate is not None)
+        lines, reader = start_external_ytdlp_output_reader(process)
+        output = _ExternalOutputState(download=download)
 
-    if return_code != 0:
-        raise _external_process_error(output, return_code)
-    return output.result(str(url))
+        def consume(line: str) -> None:
+            if gate is not None and gate.consume(line, process):
+                return
+            output.consume(line, progress_hook=progress_hook, postprocess_hook=postprocess_hook, log_line=log_line)
+
+        try:
+            return_code = pump_external_ytdlp_output(
+                process, reader, lines, cancel_event=cancel_event, consume_line=consume,
+            )
+        except BaseException:
+            terminate_external_ytdlp_process(process)
+            raise
+        finally:
+            finish_external_ytdlp_output_reader(process, reader)
+
+        if return_code != 0:
+            raise _external_process_error(output, return_code)
+        if gate is not None:
+            gate.verify()
+        return output.result(str(url))
+    finally:
+        if process is not None and process.stdin is not None:
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+        if gate is not None:
+            gate.close()

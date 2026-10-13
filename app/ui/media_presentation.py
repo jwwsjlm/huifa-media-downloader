@@ -13,32 +13,15 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 
-from app.ui.i18n import runtime_text, text as ui_text
-
-
-def format_file_size(value: int) -> str:
-    size = max(0.0, float(value or 0))
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return "0 B"
-
-
-PLATFORM_TEXT = {
-    "douyin": "Douyin",
-    "bilibili": "Bilibili",
-    "tencent": "WeChat Channels",
-    "kuaishou": "Kuaishou",
-    "toutiao": "Toutiao",
-    "xiaohongshu": "Xiaohongshu",
-    "baijiahao": "Baijiahao",
-    "alipay": "Alipay Life",
-    "weibo": "Weibo",
-    "hupu": "Hupu",
-    "youtube": "YouTube",
-    "tiktok": "TikTok",
-}
+from app.presentation.media_text import (
+    PLATFORM_TEXT,
+    compact_path_display,
+    error_category_text,
+    format_file_size,
+    format_media_timestamp,
+    platform_label,
+    publish_status_label,
+)
 
 
 PLATFORM_ICON_META = {
@@ -58,12 +41,6 @@ PLATFORM_ICON_META = {
     "tiktok": ("TK", "#111111"),
     "generic": ("WEB", "#7d8796"),
 }
-
-
-def platform_label(platform: str) -> str:
-    if platform in PLATFORM_TEXT:
-        return ui_text(PLATFORM_TEXT[platform])
-    return runtime_text(platform)
 
 
 def platform_icon_pixmap(platform: str, size: int = 30) -> QPixmap:
@@ -208,25 +185,3 @@ def thumbnail_pixmap(
         pixmap = pixmap.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
     QPixmapCache.insert(cache_key, pixmap)
     return pixmap
-
-
-def error_category_text(category: str) -> str:
-    return str(category or "未知")
-
-
-def compact_path_display(value: str) -> str:
-    """Keep absolute runtime paths out of the normal settings presentation."""
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    normalized = raw.replace("/", "\\")
-    parts = [part for part in normalized.split("\\") if part]
-    tools_index = next(
-        (index for index, part in enumerate(parts) if part.casefold() == "tools"),
-        -1,
-    )
-    if tools_index >= 0:
-        return "\\".join(parts[tools_index:])
-    if len(parts) >= 2:
-        return f"…\\{parts[-2]}\\{parts[-1]}"
-    return parts[-1] if parts else raw

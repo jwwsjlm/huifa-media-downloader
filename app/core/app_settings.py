@@ -24,6 +24,8 @@ _PORTABLE_PATH_KEYS = frozenset({
     "deno_path",
 })
 _COMMAND_PATH_KEYS = frozenset({"ffmpeg_path", "ffprobe_path", "deno_path"})
+_CONFIG_FILENAME = "config.ini"
+_LEGACY_SETTINGS_FILENAME = "settings.ini"
 
 
 def is_transient_bundle_path(value: str) -> bool:
@@ -88,17 +90,58 @@ def default_settings(default_download_dir: str) -> dict[str, str]:
 
 
 class AppSettings:
-    """Portable preferences stored in data/settings.ini beside the software."""
+    """Portable preferences stored in data/config.ini beside the software."""
 
     def __init__(self) -> None:
-        settings_path = data_dir() / "settings.ini"
-        self._settings = QSettings(str(settings_path), QSettings.IniFormat)
-        app_root = application_dir()
         persistent_root = data_dir()
+        self._settings = self._open_config(
+            persistent_root / _CONFIG_FILENAME,
+            persistent_root / _LEGACY_SETTINGS_FILENAME,
+        )
+        app_root = application_dir()
         default_dir = portable_path_value(
             downloads_dir(), application_root=app_root, persistent_root=persistent_root
         )
         self.defaults = default_settings(default_dir)
+        self._ensure_defaults()
+
+    @staticmethod
+    def _open_config(config_path: Path, legacy_path: Path) -> QSettings:
+        config = QSettings(str(config_path), QSettings.IniFormat)
+        if config_path.exists() or not legacy_path.is_file():
+            return config
+
+        legacy = QSettings(str(legacy_path), QSettings.IniFormat)
+        values = {key: legacy.value(key) for key in legacy.allKeys()}
+        if not values:
+            return config
+        try:
+            for key, value in values.items():
+                config.setValue(key, value)
+            AppSettings._sync_settings(config)
+        except Exception:
+            try:
+                config_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return legacy
+        return config
+
+    @staticmethod
+    def _sync_settings(settings: QSettings) -> None:
+        settings.sync()
+        status = settings.status()
+        if status != QSettings.NoError:
+            raise OSError(f"QSettings write failed with status {status}")
+
+    def _ensure_defaults(self) -> None:
+        missing = {
+            key: value
+            for key, value in self.defaults.items()
+            if not self._settings.contains(key)
+        }
+        if missing:
+            self.set_many(missing)
 
     def _portable_path_value(self, value: str) -> str:
         return portable_path_value(
@@ -112,7 +155,7 @@ class AppSettings:
         return str(value) if value is not None else self.defaults.get(key, "")
 
     def normalize_value(self, key: str, value: str) -> str:
-        """Normalize one value exactly as it will be stored in settings.ini."""
+        """Normalize one value exactly as it will be stored in config.ini."""
 
         value = str(value if value is not None else "")
         if key in _PORTABLE_PATH_KEYS:
@@ -124,8 +167,7 @@ class AppSettings:
         return value
 
     def set(self, key: str, value: str) -> None:
-        value = self.normalize_value(key, value)
-        self._settings.setValue(key, value)
+        self.set_many({key: value})
 
     def set_many(self, values: dict[str, str]) -> dict[str, str]:
         """Persist one logical settings group and roll it back on write failure."""
@@ -141,17 +183,17 @@ class AppSettings:
         try:
             for key, value in normalized.items():
                 self._settings.setValue(key, value)
-            self._settings.sync()
-            status = self._settings.status()
-            if status != QSettings.NoError:
-                raise OSError(f"QSettings write failed with status {status}")
+            self._sync_settings(self._settings)
         except Exception:
             for key, (existed, old_value) in previous.items():
                 if existed:
                     self._settings.setValue(key, old_value)
                 else:
                     self._settings.remove(key)
-            self._settings.sync()
+            try:
+                self._sync_settings(self._settings)
+            except Exception:
+                pass
             raise
         return normalized
 
@@ -208,4 +250,4 @@ class AppSettings:
         return value
 
     def sync(self) -> None:
-        self._settings.sync()
+        self._sync_settings(self._settings)

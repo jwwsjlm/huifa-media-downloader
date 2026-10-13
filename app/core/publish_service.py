@@ -187,16 +187,25 @@ class PublishService(QObject):
         self._deferred_publish_finishes: set[QThread] = set()
         self._deferred_account_finishes: set[QThread] = set()
         self._pending_publish_retries: set[int] = set()
+        self._pending_publish_results: dict[int, tuple[bool, str]] = {}
         self._shutting_down = False
         # Runtime-only validation state. Raw cookies remain in the encrypted
         # browser vault and SAU's required account file; they are never copied
-        # to SQLite, settings.ini, logs or signals.
+        # to SQLite, config.ini, logs or signals.
         self.account_states: dict[str, dict[str, object]] = {}
 
     @property
     def active_thread_count(self) -> int:
+        # Keep SQLite replacement behind queued worker-result and cleanup
+        # callbacks, not merely behind the QThread's running flag.
         threads = set(self.threads.values()) | set(self.account_threads.values())
-        return sum(1 for thread in threads if thread.isRunning())
+        return len(threads)
+
+    def reset_database_state(self) -> None:
+        """Discard retry state that belongs to an externally replaced database."""
+
+        self._pending_publish_retries.clear()
+        self._pending_publish_results.clear()
 
     def request_shutdown(self) -> None:
         """Cooperatively cancel publishing and account workers."""
@@ -344,17 +353,55 @@ class PublishService(QObject):
 
     @Slot(int, bool, str)
     def _on_result(self, task_id: int, ok: bool, result: str) -> None:
+        self._pending_publish_results[task_id] = (bool(ok), str(result or ""))
+        self._persist_pending_publish_result(task_id)
+
+    def _persist_pending_publish_result(self, task_id: int) -> None:
+        outcome = self._pending_publish_results.get(task_id)
+        if outcome is None:
+            return
+        ok, result = outcome
         state = "success" if ok else "failed"
-        self.db.update_publish_status(task_id, state, result)
+        try:
+            self.db.update_publish_status(task_id, state, result)
+        except Exception as exc:
+            self.status.emit(task_id, "uploading", f"发布结果保存失败，正在重试：{exc}")
+            if not self._shutting_down:
+                QTimer.singleShot(
+                    1000,
+                    partial(self._persist_pending_publish_result, task_id),
+                )
+            return
+        self._pending_publish_results.pop(task_id, None)
         self.status.emit(task_id, state, result)
 
     def _thread_finished(self, task_id: int) -> None:
+        self._recover_unreported_publish_result(task_id)
         self.threads.pop(task_id, None)
         self.workers.pop(task_id, None)
         if task_id in self._pending_publish_retries:
             self._pending_publish_retries.discard(task_id)
             if not self._shutting_down:
                 self.run_task(task_id)
+
+    def _recover_unreported_publish_result(self, task_id: int) -> None:
+        """Make a worker that exited without a durable result retryable."""
+
+        if task_id in self._pending_publish_results:
+            return
+        try:
+            row = self.db.get_publish_task(task_id)
+        except Exception as exc:
+            self.status.emit(task_id, "failed", f"无法确认发布结果：{exc}")
+            return
+        if not row or row["status"] != "uploading":
+            return
+        message = "发布线程已结束但未返回结果，可重试发布"
+        try:
+            self.db.update_publish_status(task_id, "failed", message)
+        except Exception as exc:
+            message += f"；保存失败状态时出错：{exc}"
+        self.status.emit(task_id, "failed", message)
 
     def _defer_publish_thread_finished(
         self,

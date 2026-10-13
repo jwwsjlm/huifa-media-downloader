@@ -26,6 +26,9 @@ _WRITABLE_DATA_DIRECTORIES: set[str] = set()
 
 def application_dir() -> Path:
     """Return the portable application directory for source and packaged runs."""
+    shared_root = os.environ.get("HUIFA_APPLICATION_ROOT", "").strip()
+    if shared_root:
+        return Path(shared_root).resolve()
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[2]
@@ -33,6 +36,9 @@ def application_dir() -> Path:
 
 def _portable_data_path() -> Path:
     """Return the data directory defined by the current deployment layout."""
+    isolated_root = os.environ.get("HUIFA_DATA_ROOT", "").strip()
+    if isolated_root:
+        return Path(isolated_root).resolve()
     try:
         from app.core.application_updater import velopack_persistent_data_dir
 
@@ -97,6 +103,9 @@ def system_downloads_dir() -> Path:
 
 
 def downloads_dir() -> Path:
+    isolated_root = os.environ.get("HUIFA_DATA_ROOT", "").strip()
+    if isolated_root:
+        return _ensure_writable_directory(Path(isolated_root).resolve() / "downloads")
     app_root = application_dir()
     managed_root = _managed_release_root(app_root)
     if managed_root is not None and not portable_deployment(app_root):
@@ -136,7 +145,7 @@ def portable_path_value(
     """Store app-owned paths relatively while preserving explicit externals.
 
     A directory-portable build can therefore be moved to another drive or PC
-    without leaving stale drive letters in ``settings.ini``.  Paths selected
+    without leaving stale drive letters in ``config.ini``.  Paths selected
     outside the application/data trees remain absolute because they are an
     explicit user choice.
     """

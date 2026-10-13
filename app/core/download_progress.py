@@ -78,6 +78,7 @@ class StageProgressState:
     elapsed_seconds: float = 0.0
     stage_elapsed_seconds: float = 0.0
     transcode_encoder: str = ""
+    stage_indeterminate: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +113,7 @@ def merge_stage_progress(
     )
 
     progress = optional_non_negative_float(payload.get("stage_progress"))
+    indeterminate = bool(payload.get("stage_indeterminate", progress is None if stage_changed else current.stage_indeterminate if progress is None else False))
     if progress is None:
         progress = 0.0 if stage_changed else bounded_percent(current.stage_progress)
     else:
@@ -161,6 +163,7 @@ def merge_stage_progress(
             elapsed_seconds=elapsed,
             stage_elapsed_seconds=stage_elapsed,
             transcode_encoder=transcode_encoder,
+            stage_indeterminate=indeterminate,
         ),
         stage_changed=stage_changed,
         # A stage transition either leaves network transfer or starts a new
@@ -178,6 +181,7 @@ class TransferCounterState:
     visible_progress: float = 0.0
     visible_downloaded_bytes: int = 0
     visible_total_bytes: int = 0
+    stream_key: str = ""
 
 
 def _payload_percent(payload: Mapping[str, Any]) -> float | None:
@@ -195,7 +199,13 @@ def merge_transfer_counters(
     current: TransferCounterState,
     payload: Mapping[str, Any],
 ) -> TransferCounterState:
-    """Merge monotonic transfer counters from a yt-dlp progress callback."""
+    """Keep counters monotonic within a stream, never across video/audio."""
+
+    info = payload.get("info_dict")
+    info = info if isinstance(info, Mapping) else {}
+    stream_key = str(payload.get("filename") or info.get("format_id") or payload.get("stream_kind") or "")
+    if stream_key and current.stream_key and stream_key != current.stream_key:
+        current = TransferCounterState(stream_key=stream_key)
 
     progress = bounded_percent(current.progress)
     downloaded = non_negative_int(current.downloaded_bytes)
@@ -233,6 +243,7 @@ def merge_transfer_counters(
             non_negative_int(current.visible_total_bytes),
             total,
         ),
+        stream_key=stream_key or current.stream_key,
     )
 
 

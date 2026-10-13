@@ -13,7 +13,7 @@ from app.core.download_options import DownloadOptions
 from app.core.download_service import same_storage_volume
 from app.core.download_submission import service_task_arguments
 from app.core.paths import resolve_portable_path
-from app.ui.collection_probe_coordinator import CollectionProbeCoordinator
+from app.presentation.collection_probe_coordinator import CollectionProbeCoordinator
 from app.ui.i18n import format_text as ui_format
 from app.ui.i18n import runtime_text, text as ui_text
 from app.ui.media_presentation import compact_path_display, format_file_size
@@ -46,7 +46,7 @@ class CollectionWorkflowController(QObject):
             on_failed=self._on_failed,
             on_finished=self._on_finished,
             on_start_error=self._on_start_error,
-            on_slot_released=lambda: self.coordinator.start_pending(),
+            on_slot_released=self._start_pending,
             parent=self,
             max_concurrent=2,
         )
@@ -55,10 +55,21 @@ class CollectionWorkflowController(QObject):
     def running(self) -> bool:
         return self.coordinator.running
 
+    def _start_pending(self) -> None:
+        self.coordinator.start_pending()
+
     def request_shutdown(self) -> None:
         self.coordinator.request_shutdown()
         self.selection_view.set_storage_preview_provider(None)
         self.selection_view.model.clear_source()
+
+    def reset_after_database_change(self) -> None:
+        if not self.coordinator.clear_inactive_states():
+            return
+        self.active_request_id = ''
+        self.selection_view.set_storage_preview_provider(None)
+        self.selection_view.model.clear_source()
+        self.page_stack.setCurrentWidget(self.overview_page)
 
     def request_id_for_parent(self, parent_id: str) -> str:
         return next(
@@ -91,7 +102,23 @@ class CollectionWorkflowController(QObject):
         for task in list(self.window.download_service.tasks.values()):
             if not self._task_needs_probe_restore(task, active_parent_ids):
                 continue
-            self._restore_collection_task(task)
+            try:
+                self._restore_collection_task(task)
+            except Exception as exc:
+                message = ui_format(
+                    'Unable to restore collection parsing: {error}',
+                    error=runtime_text(exc),
+                )
+                try:
+                    self.window.download_service.fail_collection_probe(task.id, message)
+                except Exception as state_error:
+                    message = ui_format(
+                        'Unable to restore collection parsing: {error}; unable to save failure state: {state_error}',
+                        error=runtime_text(exc),
+                        state_error=runtime_text(state_error),
+                    )
+                self.status_label.setText(message)
+                continue
             active_parent_ids.add(str(task.id))
 
     def _active_probe_parent_ids(self) -> set[str]:
@@ -192,19 +219,23 @@ class CollectionWorkflowController(QObject):
             context,
             cached_count,
         )
-        if task.status != 'waiting_selection':
-            self.window.download_service.update_collection_probe(
-                task.id,
-                title=task.title,
-                source_key=task.source_key,
-                parsed_count=cached_count,
-                finished=True,
-            )
-        if options.collection_mode == 'all':
-            self._on_finished(request_id, True, cached_count)
-        elif not self.active_request_id:
-            self.show_selection(request_id)
-            self.selection_view.set_finished()
+        try:
+            if task.status != 'waiting_selection':
+                self.window.download_service.update_collection_probe(
+                    task.id,
+                    title=task.title,
+                    source_key=task.source_key,
+                    parsed_count=cached_count,
+                    finished=True,
+                )
+            if options.collection_mode == 'all':
+                self._on_finished(request_id, True, cached_count)
+            elif not self.active_request_id:
+                self.show_selection(request_id)
+                self.selection_view.set_finished()
+        except Exception:
+            self.coordinator.states.pop(request_id, None)
+            raise
 
     @staticmethod
     def _restored_probe_state(
@@ -408,10 +439,6 @@ class CollectionWorkflowController(QObject):
         if source_key and not state.get('source_key_registered'):
             if source_key in visited:
                 self._on_failed(request_id, ui_text('A collection loop was detected and stopped.'))
-                state['confirmed'] = True
-                worker = state.get('worker')
-                if isinstance(worker, CollectionProbeWorker):
-                    worker.cancel()
                 return ''
             visited.add(source_key)
             state['visited_source_keys'] = visited
@@ -440,13 +467,27 @@ class CollectionWorkflowController(QObject):
             return
         state['metadata'] = dict(metadata)
         parent_id = self._ensure_parent(request_id)
-        if parent_id:
-            self.window.download_service.update_collection_probe(
+        if not parent_id:
+            return
+        try:
+            updated = self.window.download_service.update_collection_probe(
                 parent_id,
                 title=str(metadata.get('title') or ''),
                 source_key=str(metadata.get('source_key') or ''),
                 parsed_count=int(state.get('entry_count') or 0),
             )
+        except Exception as exc:
+            self._on_failed(
+                request_id,
+                ui_format(
+                    'Unable to save collection metadata: {error}',
+                    error=runtime_text(exc),
+                ),
+            )
+            return
+        if not updated:
+            self._on_failed(request_id, ui_text('The collection task no longer exists.'))
+            return
         if self.active_request_id == request_id:
             self.selection_view.set_metadata(metadata)
 
@@ -460,15 +501,43 @@ class CollectionWorkflowController(QObject):
         if not parent_id:
             return
         old_count = int(state.get('entry_count') or 0)
-        self.window.db.upsert_collection_probe_entries(parent_id, entries)
-        current_count = self.window.db.collection_probe_entry_count(parent_id)
+        try:
+            current_count = self.window.download_service.store_collection_probe_entries(
+                parent_id,
+                entries,
+            )
+        except Exception as exc:
+            self._on_failed(
+                request_id,
+                ui_format(
+                    'Unable to save collection entries: {error}',
+                    error=runtime_text(exc),
+                ),
+            )
+            return
+        if current_count is None:
+            self._on_failed(request_id, ui_text('The collection task no longer exists.'))
+            return
         state['entry_count'] = current_count
-        self.window.download_service.update_collection_probe(
-            parent_id,
-            title=str((state.get('metadata') or {}).get('title') or ''),
-            source_key=str((state.get('metadata') or {}).get('source_key') or ''),
-            parsed_count=current_count,
-        )
+        try:
+            updated = self.window.download_service.update_collection_probe(
+                parent_id,
+                title=str((state.get('metadata') or {}).get('title') or ''),
+                source_key=str((state.get('metadata') or {}).get('source_key') or ''),
+                parsed_count=current_count,
+            )
+        except Exception as exc:
+            self._on_failed(
+                request_id,
+                ui_format(
+                    'Unable to update collection progress: {error}',
+                    error=runtime_text(exc),
+                ),
+            )
+            return
+        if not updated:
+            self._on_failed(request_id, ui_text('The collection task no longer exists.'))
+            return
         options = DownloadOptions.from_mapping(state['context'].get('options_json'))
         if not self.active_request_id and options.collection_mode == 'select':
             self.show_selection(request_id)
@@ -495,10 +564,10 @@ class CollectionWorkflowController(QObject):
             lambda offset, limit, parent_id=parent_id: self.window.db.list_collection_probe_entries(
                 parent_id, offset=offset, limit=limit
             ),
-            selection_updater=lambda index, selected, parent_id=parent_id: self.window.db.set_collection_probe_entry_selected(
+            selection_updater=lambda index, selected, parent_id=parent_id: self.window.download_service.set_collection_probe_entry_selected(
                 parent_id, index, selected
             ),
-            selection_setter=lambda mode, parent_id=parent_id: self.window.db.set_collection_probe_selection(
+            selection_setter=lambda mode, parent_id=parent_id: self.window.download_service.set_collection_probe_selection(
                 parent_id, mode
             ),
             selected_loader=lambda parent_id=parent_id: self.window.db.list_collection_probe_entries(
@@ -609,11 +678,21 @@ class CollectionWorkflowController(QObject):
         parent_id = str(state.get('parent_id') or '')
         metadata = state.get('metadata') or {}
         single_info = info if isinstance(info, dict) else {}
-        resolved = self.window.download_service.resolve_collection_as_video(
-            parent_id,
-            title=str(single_info.get('title') or metadata.get('title') or ''),
-            source_key=str(metadata.get('source_key') or ''),
-        )
+        try:
+            resolved = self.window.download_service.resolve_collection_as_video(
+                parent_id,
+                title=str(single_info.get('title') or metadata.get('title') or ''),
+                source_key=str(metadata.get('source_key') or ''),
+            )
+        except Exception as exc:
+            self._on_failed(
+                request_id,
+                ui_format(
+                    'Unable to create the parsed single-video task: {error}',
+                    error=runtime_text(exc),
+                ),
+            )
+            return
         if not resolved:
             self._on_failed(
                 request_id,
@@ -624,25 +703,50 @@ class CollectionWorkflowController(QObject):
         if self.active_request_id == request_id:
             self.active_request_id = ''
             self.page_stack.setCurrentWidget(self.overview_page)
+        if not self.coordinator.thread_is_running(state.get('thread')):
+            self.coordinator.states.pop(request_id, None)
 
     @Slot(str, str)
     def _on_failed(self, request_id: str, error: str) -> None:
         state = self.coordinator.result_state(request_id)
         if state is None:
             return
-        parent_id = str(state.get('parent_id') or '')
-        if parent_id and parent_id in self.window.download_service.tasks:
-            self.window.download_service.fail_collection_probe(parent_id, error)
-        else:
-            QMessageBox.warning(
-                self.selection_view,
-                ui_text('Unable to Parse URL'),
-                runtime_text(error),
-            )
+        message = str(error or ui_text('Unable to Parse URL'))
         state['confirmed'] = True
+        worker = state.get('worker')
+        if isinstance(worker, CollectionProbeWorker):
+            try:
+                worker.cancel()
+            except RuntimeError:
+                pass
+        parent_id = str(state.get('parent_id') or '')
+        try:
+            saved = (
+                self.window.download_service.fail_collection_probe(parent_id, message)
+                if parent_id else False
+            )
+        except Exception as exc:
+            self.status_label.setText(
+                ui_format(
+                    'Collection parsing failed: {error}; unable to save failure state: {state_error}',
+                    error=runtime_text(message),
+                    state_error=runtime_text(exc),
+                )
+            )
+        else:
+            if saved:
+                self.status_label.setText(runtime_text(message))
+            else:
+                QMessageBox.warning(
+                    self.selection_view,
+                    ui_text('Unable to Parse URL'),
+                    runtime_text(message),
+                )
         if self.active_request_id == request_id:
             self.active_request_id = ''
             self.page_stack.setCurrentWidget(self.overview_page)
+        if not self.coordinator.thread_is_running(state.get('thread')):
+            self.coordinator.states.pop(request_id, None)
 
     def _start_nested_probe(
         self,
@@ -676,35 +780,78 @@ class CollectionWorkflowController(QObject):
             return
         if not is_collection:
             return
-        parent_id = self._ensure_parent(request_id)
+        try:
+            parent_id = self._ensure_parent(request_id)
+        except Exception as exc:
+            self._on_failed(
+                request_id,
+                ui_format(
+                    'Unable to prepare the collection task: {error}',
+                    error=runtime_text(exc),
+                ),
+            )
+            return
         if not parent_id:
             return
-        persisted_count = max(
-            0,
-            int(self.window.db.collection_probe_entry_count(parent_id) or 0),
-        )
+        try:
+            persisted_count = max(
+                0,
+                int(self.window.db.collection_probe_entry_count(parent_id) or 0),
+            )
+        except Exception as exc:
+            self._on_failed(
+                request_id,
+                ui_format(
+                    'Unable to read collection entries: {error}',
+                    error=runtime_text(exc),
+                ),
+            )
+            return
         state['entry_count'] = persisted_count
-        self.window.download_service.update_collection_probe(
-            parent_id,
-            title=str((state.get('metadata') or {}).get('title') or ''),
-            source_key=str((state.get('metadata') or {}).get('source_key') or ''),
-            parsed_count=persisted_count,
-            finished=True,
-        )
+        try:
+            updated = self.window.download_service.update_collection_probe(
+                parent_id,
+                title=str((state.get('metadata') or {}).get('title') or ''),
+                source_key=str((state.get('metadata') or {}).get('source_key') or ''),
+                parsed_count=persisted_count,
+                finished=True,
+            )
+        except Exception as exc:
+            self._on_failed(
+                request_id,
+                ui_format(
+                    'Unable to save collection completion: {error}',
+                    error=runtime_text(exc),
+                ),
+            )
+            return
+        if not updated:
+            self._on_failed(request_id, ui_text('The collection task no longer exists.'))
+            return
         options = DownloadOptions.from_mapping(state['context'].get('options_json'))
         if options.collection_mode == 'all':
-            nested = self.window.db.list_collection_probe_entries(
-                parent_id,
-                offset=0,
-                limit=2**31 - 1,
-                selected_only=True,
-                entry_kind='collection',
-            )
+            try:
+                nested = self.window.db.list_collection_probe_entries(
+                    parent_id,
+                    offset=0,
+                    limit=2**31 - 1,
+                    selected_only=True,
+                    entry_kind='collection',
+                )
+                self.window.download_service.start_collection_materialization(
+                    parent_id,
+                    options.collection_order,
+                )
+            except Exception as exc:
+                self._on_failed(
+                    request_id,
+                    ui_format(
+                        'Unable to queue collection items: {error}',
+                        error=runtime_text(exc),
+                    ),
+                )
+                return
             state['confirmed'] = True
-            self.window.download_service.start_collection_materialization(
-                parent_id,
-                options.collection_order,
-            )
             for entry in nested:
                 self._start_nested_probe(entry, state, parent_id)
             if self.active_request_id == request_id:
@@ -727,32 +874,44 @@ class CollectionWorkflowController(QObject):
             return
         worker = state.get('worker')
         if isinstance(worker, CollectionProbeWorker):
-            worker.cancel()
-        parent_id = self._ensure_parent(request_id)
-        if not parent_id:
+            try:
+                worker.cancel()
+            except RuntimeError:
+                pass
+        try:
+            parent_id = self._ensure_parent(request_id)
+            if not parent_id:
+                return
+            options = DownloadOptions.from_mapping(state['context'].get('options_json'))
+            if selected is None:
+                nested_entries = self.window.db.list_collection_probe_entries(
+                    parent_id,
+                    offset=0,
+                    limit=2**31 - 1,
+                    selected_only=True,
+                    entry_kind='collection',
+                )
+                self.window.download_service.start_collection_materialization(
+                    parent_id,
+                    options.collection_order,
+                )
+            else:
+                selected_entries = [dict(item) for item in selected if isinstance(item, dict)]
+                nested_entries = [entry for entry in selected_entries if entry.get('entry_kind') == 'collection']
+                ordered = self._ordered_entries(
+                    [entry for entry in selected_entries if entry.get('entry_kind') == 'video'],
+                    options,
+                )
+                self.window.download_service.enqueue_collection_entries(parent_id, ordered)
+        except Exception as exc:
+            self.status_label.setText(
+                ui_format(
+                    'Unable to queue selected collection items: {error}',
+                    error=runtime_text(exc),
+                )
+            )
             return
         state['confirmed'] = True
-        options = DownloadOptions.from_mapping(state['context'].get('options_json'))
-        if selected is None:
-            nested_entries = self.window.db.list_collection_probe_entries(
-                parent_id,
-                offset=0,
-                limit=2**31 - 1,
-                selected_only=True,
-                entry_kind='collection',
-            )
-            self.window.download_service.start_collection_materialization(
-                parent_id,
-                options.collection_order,
-            )
-        else:
-            selected_entries = [dict(item) for item in selected if isinstance(item, dict)]
-            nested_entries = [entry for entry in selected_entries if entry.get('entry_kind') == 'collection']
-            ordered = self._ordered_entries(
-                [entry for entry in selected_entries if entry.get('entry_kind') == 'video'],
-                options,
-            )
-            self.window.download_service.enqueue_collection_entries(parent_id, ordered)
         for entry in nested_entries:
             self._start_nested_probe(entry, state, parent_id)
         self.active_request_id = ''
@@ -767,9 +926,18 @@ class CollectionWorkflowController(QObject):
         state = self.coordinator.states.get(request_id)
         if state:
             parent_id = str(state.get('parent_id') or '')
-            self.coordinator.cancel(request_id)
             if parent_id:
-                self.window.download_service.delete_task(parent_id, False)
+                try:
+                    self.window.download_service.delete_task(parent_id, False)
+                except Exception as exc:
+                    self.status_label.setText(
+                        ui_format(
+                            'Unable to cancel collection parsing: {error}',
+                            error=runtime_text(exc),
+                        )
+                    )
+                    return
+            self.coordinator.cancel(request_id)
         self.active_request_id = ''
         self.page_stack.setCurrentWidget(self.overview_page)
 

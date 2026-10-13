@@ -1,4 +1,4 @@
-# Huifa Media Downloader
+# HuifaMediaDownloader
 
 <p align="center">
   <strong>A Windows downloader, media processor, and multi-platform publishing tool powered by yt-dlp</strong>
@@ -14,11 +14,11 @@
   <a href="https://github.com/jwwsjlm/huifa-media-downloader/issues">Report an issue</a>
 </p>
 
-![Huifa Media Downloader task view](docs/images/download-tasks.png)
+![HuifaMediaDownloader task view](docs/images/download-tasks.png)
 
 ## Overview
 
-Huifa Media Downloader is a desktop application for Windows 10/11 x64. It uses `yt-dlp` to resolve videos, playlists, channels, and other collection URLs, uses FFmpeg for merging and transcoding, and provides cookie-based sign-in, thumbnail processing, subtitles, task management, and multi-platform publishing workflows.
+HuifaMediaDownloader is a desktop application for Windows 10/11 x64. It uses `yt-dlp` to resolve videos, playlists, channels, and other collection URLs, uses FFmpeg for merging and transcoding, and provides cookie-based sign-in, thumbnail processing, subtitles, task management, and multi-platform publishing workflows.
 
 Official releases provide both a portable ZIP and an installer ZIP. Both editions contain the Python runtime and required application components, so end users do not need to install Python, Chrome, FFmpeg, or yt-dlp.
 
@@ -39,9 +39,9 @@ Official releases provide both a portable ZIP and an installer ZIP. Both edition
 ## Download and use
 
 1. Open the [latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest).
-2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract the complete archive, and run the root `Huifa Media Downloader.exe`. Do not copy only the EXE.
+2. For portable use, download `HuifaMediaDownloader-<version>-portable-win-x64.zip`, extract the complete archive, and run the root `HuifaMediaDownloader.exe`. Do not copy only the EXE.
 3. For an installed edition, download `HuifaMediaDownloader-<version>-installer-win-x64.zip`, extract it, and run `HuifaMediaDownloader-Setup.exe`; choose the install folder in the wizard, then uninstall it from Windows Installed apps.
-4. Portable-edition state stays in `data/`, while downloads default to the root `downloads/` folder. Move the complete folder when relocating it. The installed edition downloads to `Huifa Video Downloader/` under the system Downloads folder by default, keeping media outside the application's uninstall scope.
+4. Portable-edition state stays in `data/`, while downloads default to the root `downloads/` folder. Move the complete folder when relocating it. The installed edition downloads to `HuifaMediaDownloader/` under the system Downloads folder by default, keeping media outside the application's uninstall scope.
 
 The portable edition uses a self-updating directory layout. FFmpeg, FFprobe, yt-dlp, Deno, yt-dlp-ejs, and Chromium are shipped in the application's own `current/tools/` directory. If Windows SmartScreen reports an unknown publisher, verify that the file came from this repository's Release page before deciding whether to run it.
 
@@ -50,12 +50,13 @@ The portable edition uses a self-updating directory layout. FFmpeg, FFprobe, yt-
 The application keeps its main runtime data beside the executable instead of requiring the Documents folder:
 
 - `data/app.db`: download, media, and publishing task database.
-- `data/settings.ini`: application settings.
+- `data/config.ini`: application settings.
 - `data/browser/`: app-managed browser profiles and encrypted cookie copies.
 - `data/logs/`: task diagnostics.
 - `data/tools/`: independently updatable local runtime components.
 
 The portable edition's default media folder is the root `downloads/` directory, separate from private runtime state such as the database and cookies. yt-dlp-ejs updates follow the exact companion version declared by the bundled yt-dlp; the official external `yt-dlp.exe` already includes EJS.
+An existing legacy `data/settings.ini` is copied to `data/config.ini` on first launch; the original file is retained as a backup.
 
 Do not publicly upload the complete `data/` directory. It may contain signed-in account state and private task information.
 

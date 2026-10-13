@@ -9,29 +9,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.ui.runtime import ui_text
-
-
-def text(key: str, *, context: str = "") -> str:
-    return ui_text(key, app=QApplication.instance(), context=context)
-
-
-def format_text(key: str, *, context: str = "", **values: object) -> str:
-    """Translate a stable template, then substitute named runtime values."""
-    return text(key, context=context).format(**values)
-
-
-def application_name_text() -> str:
-    """Return the localized product name from the normal language pack."""
-    return ui_text(
-        'Huifa Video Downloader',
-        context="application.name",
-    )
-
-
-def runtime_text(value: object) -> str:
-    """Return service/adaptor output unchanged for display."""
-    return "" if value is None else str(value)
+from app.presentation.i18n import (
+    application_name_text,
+    format_text,
+    runtime_text,
+    text,
+)
+from app.presentation.runtime import ui_text
 
 
 _STANDARD_EDIT_ACTIONS = {

@@ -94,18 +94,20 @@ def find_non_ui_translation_usage() -> list[str]:
     """Keep language-pack lookups out of services, adapters and storage.
 
     ``app/main.py`` is allowed because its translated strings are startup
-    message-box controls. All other translation calls belong under ``app/ui``.
+    message-box controls. QML-facing text belongs under ``app/presentation``;
+    the frozen Widgets compatibility path remains under ``app/ui``.
     """
     findings: list[str] = []
     allowed_main = ROOT / "app" / "main.py"
-    ui_root = ROOT / "app" / "ui"
+    ui_roots = {ROOT / "app" / "ui", ROOT / "app" / "presentation"}
     for source in sorted((ROOT / "app").rglob("*.py")):
-        if source == allowed_main or ui_root in source.parents:
+        if source == allowed_main or any(root in source.parents for root in ui_roots):
             continue
         tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and str(node.module or "") in {
                 "app.ui.i18n", "app.ui.runtime",
+                "app.presentation.i18n", "app.presentation.runtime",
             }:
                 imported = {alias.name for alias in node.names}
                 if imported.intersection({"text", "format_text", "ui_text"}):
@@ -153,6 +155,7 @@ def _direct_strings(node: ast.AST) -> list[str]:
 
 def _ui_sources() -> list[Path]:
     sources = sorted((ROOT / "app" / "ui").rglob("*.py"))
+    sources.extend(sorted((ROOT / "app" / "presentation").rglob("*.py")))
     main_source = ROOT / "app" / "main.py"
     if main_source.is_file():
         sources.append(main_source)

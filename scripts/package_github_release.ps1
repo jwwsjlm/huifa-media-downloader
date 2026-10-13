@@ -113,7 +113,7 @@ $InstallerMatches = @(
     Get-ChildItem -LiteralPath $VelopackRoot -Filter 'HuifaMediaDownloader-Setup.exe' -File -ErrorAction SilentlyContinue
 )
 if ($InstallerMatches.Count -ne 1 -or $InstallerMatches[0].Length -le 0) {
-    throw "Expected exactly one non-empty Inno Setup installer; found $($InstallerMatches.Count)"
+    throw "Expected exactly one non-empty NSIS installer; found $($InstallerMatches.Count)"
 }
 $Installer = $InstallerMatches[0]
 $PortableMatches = @(
@@ -165,7 +165,7 @@ Copy-Item -LiteralPath $ReleaseNotesFull -Destination (Join-Path $InstallerStage
 Copy-Item -LiteralPath $VelopackPortable.FullName -Destination $PortableArchive
 Compress-Archive -Path (Join-Path $InstallerStage '*') -DestinationPath $InstallerArchive -CompressionLevel Optimal
 Assert-ZipEntries $PortableArchive @(
-    'Huifa Media Downloader.exe',
+    'HuifaMediaDownloader.exe',
     'Update.exe',
     'current/HuifaVideoDownloader.exe',
     'current/sq.version',

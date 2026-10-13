@@ -378,20 +378,10 @@ class ShutdownController(QObject):
         self._close_timer.start(0)
 
     def _persist_interrupted_tasks(self) -> None:
-        tasks = []
-        for task_id, task in self.download_service.tasks.items():
-            if (
-                self._database_task_ids is not None
-                and task_id not in self._database_task_ids
-            ):
-                continue
-            if task.status in {"downloading", "暂停中"}:
-                task.status = "paused"
-                tasks.append(task)
-        if not tasks:
-            return
         try:
-            self.download_service.db.update_download_tasks(tasks)
+            self.download_service.persist_interrupted_tasks(
+                self._database_task_ids,
+            )
         except Exception:
             self._record_current_exception(
                 "persist-interrupted-tasks",

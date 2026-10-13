@@ -830,7 +830,7 @@ class SettingsPage(QWidget):
         form.addRow(ui_text('OpenAI API Key'), key_row)
 
         cover_note = QLabel(ui_text(
-            'The API URL is stored in regular settings. The API key is stored only in the system credential vault and is never written to settings.ini, the database, diagnostic bundles or task logs.',
+            'The API URL is stored in regular settings. The API key is stored only in the system credential vault and is never written to config.ini, the database, diagnostic bundles or task logs.',
         ))
         cover_note.setObjectName("mutedText")
         cover_note.setWordWrap(True)
@@ -1400,7 +1400,9 @@ class SettingsPage(QWidget):
         if component == "Deno":
             stored_path = stored["deno_path"]
             self.deno.setText(stored_path)
-            self.window.download_service.deno_path = stored_path
+            self.window.download_service.configure_runtime_settings(
+                deno_path=stored_path,
+            )
         else:
             clear_ffmpeg_encoder_cache()
             if stored.get("ffmpeg_path"):
@@ -1408,7 +1410,9 @@ class SettingsPage(QWidget):
             if stored.get("ffprobe_path"):
                 stored_ffprobe = stored["ffprobe_path"]
                 self.ffprobe.setText(stored_ffprobe)
-                self.window.download_service.ffprobe_path = stored_ffprobe
+                self.window.download_service.configure_runtime_settings(
+                    ffprobe_path=stored_ffprobe,
+                )
         self.window.update_service.set_tool_overrides({
             "ffmpeg": self.ffmpeg.text().strip(),
             "ffprobe": self.ffprobe.text().strip(),

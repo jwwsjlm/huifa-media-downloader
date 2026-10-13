@@ -23,10 +23,7 @@ EXCLUDED_PYSIDE_MODULES = (
     "PySide6.QtPdf",
     "PySide6.QtPdfWidgets",
     "PySide6.QtPrintSupport",
-    "PySide6.QtQml",
-    "PySide6.QtQuick",
     "PySide6.QtQuick3D",
-    "PySide6.QtQuickControls2",
     "PySide6.QtQuickWidgets",
     "PySide6.QtSensors",
     "PySide6.QtSerialBus",
@@ -61,9 +58,7 @@ EXCLUDED_WINDOWS_RUNTIME_MODULES = (
 )
 
 
-_UNUSED_QML_PREFIXES = (
-    "pyside6/qml/",
-)
+_UNUSED_QML_PREFIXES: tuple[str, ...] = ()
 
 _UNUSED_NATIVE_PREFIXES = (
     "qt63d",
@@ -73,8 +68,6 @@ _UNUSED_NATIVE_PREFIXES = (
     "qt6pdf",
     "qt6positioning",
     "qt6printsupport",
-    "qt6qml",
-    "qt6quick",
     "qt6quick3d",
     "qt6sensors",
     "qt6serialbus",
@@ -125,6 +118,9 @@ REQUIRED_QT_ARTIFACTS = frozenset(
         "pyside6/qt6gui.dll",
         "pyside6/qt6network.dll",
         "pyside6/qt6widgets.dll",
+        "pyside6/qt6qml.dll",
+        "pyside6/qt6quick.dll",
+        "pyside6/qt6quickcontrols2.dll",
         "pyside6/plugins/imageformats/qjpeg.dll",
         "pyside6/plugins/platforms/qwindows.dll",
     }
@@ -147,6 +143,15 @@ def is_unused_qt_artifact(destination: object) -> bool:
     filename = path.rsplit("/", 1)[-1]
     if path in _UNUSED_EXACT_PATHS:
         return True
+    # Qt6Core on supported Windows versions resolves the system ICU forwarder
+    # DLLs. Do not bundle an arbitrary ICU copy discovered through the build
+    # machine PATH: third-party ICU builds commonly export only suffixed names
+    # (for example ``ucnv_open_78``), while Qt imports unsuffixed symbols.
+    if "/" not in path and (
+        filename == "icuuc.dll"
+        or (filename.startswith("icudt") and filename.endswith(".dll"))
+    ):
+        return True
     if any(path.startswith(prefix) for prefix in _PRESERVED_PATH_PREFIXES):
         return False
     if any(path.startswith(prefix) for prefix in _UNUSED_PATH_PREFIXES):
@@ -165,7 +170,7 @@ def filter_qt_bundle_entries(entries: Iterable[Entry]) -> list[Entry]:
 
 
 def validate_required_qt_artifacts(*entry_groups: Iterable[Sequence[object]]) -> None:
-    """Abort a release build that is missing a QWidget-critical Qt artifact."""
+    """Abort a release build that is missing a required Qt GUI artifact."""
 
     destinations = {
         normalize_bundle_path(entry[0])

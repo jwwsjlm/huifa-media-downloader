@@ -291,7 +291,6 @@ class GithubMirrorDialog(QDialog):
             "github_route_profiles",
             self.settings_page.github_route_profiles,
         )
-        self.settings_page.window.app_settings.sync()
         usable = [row for row in results if row.get("usable")]
         if usable:
             fastest = min(

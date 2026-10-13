@@ -7,59 +7,9 @@ from PySide6.QtCore import QObject, QTimer
 from PySide6.QtWidgets import QMessageBox
 
 from app.storage.database import Database
+from app.presentation.database_recovery import database_recovery_notice
 from app.ui.i18n import format_text as ui_format
 from app.ui.i18n import runtime_text, text as ui_text
-
-
-def database_recovery_notice(database: Any) -> tuple[str, str, str] | None:
-    report = database.recovery_report
-    if not report.requires_notice:
-        return None
-
-    if report.status == "restored":
-        title = ui_text("Database Restored Automatically")
-        summary = ui_text(
-            "The local database was damaged and has been restored from the most recent healthy backup.",
-        )
-        consequence = ui_text(
-            "A small number of task states created after the last backup may need to be checked again.",
-        )
-        location = report.quarantine_dir or str(database.path.parent / "recovery")
-        detail = ui_format(
-            "{summary}\n\n{consequence}\n\nThe original files were quarantined at:\n{location}",
-            summary=summary,
-            consequence=consequence,
-            location=location,
-        )
-    elif report.status == "schema_reset":
-        title = ui_text("Database Schema Updated")
-        summary = ui_text(
-            "The database schema was not the current development version and has been recreated with the latest schema.",
-        )
-        consequence = ui_text(
-            "Old development data was removed; no legacy migration was performed.",
-        )
-        detail = ui_format(
-            "{summary}\n\n{consequence}",
-            summary=summary,
-            consequence=consequence,
-        )
-    else:
-        title = ui_text("Database Rebuilt Safely")
-        summary = ui_text(
-            "The local database was damaged and no usable backup was found, so a new empty database was created.",
-        )
-        consequence = ui_text(
-            "The original database was not deleted and can be provided to support for further analysis.",
-        )
-        location = report.quarantine_dir or str(database.path.parent / "recovery")
-        detail = ui_format(
-            "{summary}\n\n{consequence}\n\nThe original files were quarantined at:\n{location}",
-            summary=summary,
-            consequence=consequence,
-            location=location,
-        )
-    return title, summary, detail
 
 
 class DatabaseLifecycleController(QObject):
@@ -81,6 +31,7 @@ class DatabaseLifecycleController(QObject):
         )
         self.show_status = window.statusBar().showMessage
         self._view_reset_pending = False
+        self._replacement_pending: Database | None = None
         self._persistence_safe = True
         self._watch = QTimer(self)
         self._watch.setInterval(self.WATCH_INTERVAL_MS)
@@ -93,7 +44,8 @@ class DatabaseLifecycleController(QObject):
         return self.window.db
 
     def set_database(self, database: Any) -> None:
-        self.window.db = database
+        self.window.runtime.replace_database(database)
+        self.window.db = self.window.runtime.db
 
     @property
     def watching(self) -> bool:
@@ -114,11 +66,19 @@ class DatabaseLifecycleController(QObject):
     def stop(self) -> None:
         self._watch.stop()
         self._notice.stop()
+        replacement = self._replacement_pending
+        self._replacement_pending = None
+        if replacement is not None:
+            try:
+                replacement.close()
+            except Exception:
+                pass
 
     def _background_database_users_active(self) -> bool:
         return bool(
             self.download_service.active_thread_count
             or self.publish_service.active_thread_count
+            or getattr(getattr(self.window, "collection_workflow", None), "running", False)
         )
 
     def show_recovery_notice(self) -> None:
@@ -139,6 +99,10 @@ class DatabaseLifecycleController(QObject):
 
         current = self.database()
         database_path = Path(current.path)
+        if self._replacement_pending is not None:
+            if not self._background_database_users_active():
+                self._continue_database_replacement(current)
+            return
         if database_path.exists():
             return
 
@@ -155,10 +119,24 @@ class DatabaseLifecycleController(QObject):
         except Exception as exc:
             self._show_reset_error(exc)
             return
+        self._replacement_pending = replacement
+        self._continue_database_replacement(current)
 
+    def _continue_database_replacement(self, current: Any) -> None:
+        replacement = self._replacement_pending
+        if replacement is None:
+            return
+        try:
+            # The missing database makes every cached task stale. Clear it
+            # before redirecting the service to the replacement so a queued
+            # lifecycle callback cannot recreate old rows in the new file.
+            self.download_service.reset_task_cache()
+            self.publish_service.reset_database_state()
+        except Exception as exc:
+            self._show_reset_error(exc)
+            return
         self.set_database(replacement)
-        self.download_service.db = replacement
-        self.publish_service.db = replacement
+        self._replacement_pending = None
         self._view_reset_pending = True
         try:
             current.close()
@@ -166,15 +144,19 @@ class DatabaseLifecycleController(QObject):
             # The replacement is already authoritative. Report the close
             # failure, but continue clearing stale in-memory task state.
             self._show_reset_error(exc)
-        self._refresh_after_reset()
+        self._refresh_after_reset(task_cache_cleared=True)
 
-    def _refresh_after_reset(self) -> None:
+    def _refresh_after_reset(self, *, task_cache_cleared: bool = False) -> None:
         errors: list[Exception] = []
-        task_cache_cleared = False
         dashboard_cleared = False
+        if not task_cache_cleared:
+            try:
+                self.download_service.reset_task_cache()
+                task_cache_cleared = True
+            except Exception as exc:
+                errors.append(exc)
         try:
-            self.download_service.reset_task_cache()
-            task_cache_cleared = True
+            self.dashboard.collection_workflow.reset_after_database_change()
         except Exception as exc:
             errors.append(exc)
         try:

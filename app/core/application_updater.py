@@ -15,7 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from app.core.atomic_json import write_json_atomic
-from app.core.version import APP_NAME_EN, APP_VERSION
+from app.core.version import APP_PERSISTENT_DATA_DIR_NAME, APP_VERSION
 from app.core.update_receipt import record_update_install_result
 
 
@@ -267,10 +267,17 @@ def velopack_persistent_data_dir(executable_dir: str | Path | None = None) -> Pa
     if (root / ".portable").is_file():
         return root / "data"
     local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    return Path(local_app_data) / APP_NAME_EN if local_app_data else root / "data"
+    return (
+        Path(local_app_data) / APP_PERSISTENT_DATA_DIR_NAME
+        if local_app_data
+        else root / "data"
+    )
 
 
 def _velopack_application_update_state_dir() -> Path | None:
+    isolated_root = os.environ.get("HUIFA_DATA_ROOT", "").strip()
+    if isolated_root:
+        return Path(isolated_root).resolve() / "updates" / "application"
     persistent = velopack_persistent_data_dir()
     return persistent / "updates" / "application" if persistent is not None else None
 

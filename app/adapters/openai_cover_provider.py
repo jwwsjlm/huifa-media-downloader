@@ -92,7 +92,7 @@ class OpenAICoverGenerationProvider:
     """Minimal GPT Image edit adapter for official or compatible APIs.
 
     Credentials are injected at construction time and never copied into the
-    serializable generation request, settings.ini, task database or logs.
+    serializable generation request, config.ini, task database or logs.
     """
 
     provider_id = "openai-gpt-image"

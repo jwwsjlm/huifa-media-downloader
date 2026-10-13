@@ -32,7 +32,8 @@ build/*
 !build/01_velopack_hook.py
 !build/HuifaVideoDownloader.lean.spec
 !build/HuifaVideoDownloader.velopack.spec
-!build/HuifaMediaDownloader.iss
+!build/HuifaPythonBackend.spec
+!build/HuifaMediaDownloader.nsi
 
 # Download archives are kept outside the repository. App-local runtime
 # payloads are reproducible release inputs and do not belong in normal Git.
@@ -43,9 +44,23 @@ build/*
 /tools/yt-dlp/
 /tools/yt-dlp-ejs/
 /tools/node/
+/tools/nsis/
+/tools/nsis-download/
+/desktop/node_modules/
+/desktop/dist/
 /tools/ffmpeg/**/*.exe
 /tools/ffmpeg/**/*.dll
 
 # Legacy binaries at tools/ffmpeg root.
 /tools/ffmpeg/*.exe
 /tools/ffmpeg/*.dll
+
+# Local acceptance artifacts and generated Rust/frontend output.
+/output/
+/deliveries/
+/.audit-*.png
+/*-checkpoint.md
+/target/
+/frontend/node_modules/
+/frontend/dist/
+/src-tauri/target/

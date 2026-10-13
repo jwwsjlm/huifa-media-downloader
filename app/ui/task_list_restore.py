@@ -13,52 +13,6 @@ from app.ui.task_list import (
 )
 
 
-def enrich_completed_task_metadata(
-    tasks: Sequence[DownloadTask],
-    database: Any,
-) -> bool:
-    """Restore catalog-only card metadata with one bounded database lookup."""
-
-    completed = [task for task in tasks if task.status == "completed"]
-    if not completed or database is None:
-        return False
-
-    try:
-        urls = list(dict.fromkeys(
-            str(task.url or "")
-            for task in completed
-            if str(task.url or "")
-        ))
-        media_items = list(database.latest_media_by_source_urls(urls).values())
-    except Exception:
-        # Optional card metadata must not prevent durable history loading.
-        return False
-
-    by_path = {
-        str(media.video_path): media
-        for media in media_items
-        if str(media.video_path or "")
-    }
-    by_url = {
-        str(media.source_url): media
-        for media in media_items
-        if str(media.source_url or "")
-    }
-    enriched = False
-    for task in completed:
-        media = by_path.get(str(task.media_path or "")) or by_url.get(
-            str(task.url or "")
-        )
-        if media is None:
-            continue
-        task.uploader = media.uploader or ""
-        task.downloaded_at = media.downloaded_at or ""
-        task.media_path = task.media_path or media.video_path
-        task.thumbnail_path = task.thumbnail_path or media.thumbnail_path
-        enriched = True
-    return enriched
-
-
 class TaskListRestoreController:
     """Page restored task history without materializing every card widget."""
 
@@ -78,9 +32,6 @@ class TaskListRestoreController:
         self.load_more_button = page.load_more_button
         self.page_size = max(1, int(page_size))
         self.batch_size = max(1, int(batch_size))
-
-    def database(self) -> Any:
-        return self.page.window.db
 
     def sort_mode(self) -> str:
         return str(self.page.sort_box.currentData() or "newest")
@@ -103,7 +54,6 @@ class TaskListRestoreController:
         self.update_load_more_button()
 
     def begin(self, tasks: Sequence[DownloadTask]) -> None:
-        enrich_completed_task_metadata(tasks, self.database())
         ordered = ordered_top_level_tasks(tasks, self.sort_mode())
         self.render_timer.stop()
         self.clear_rows()

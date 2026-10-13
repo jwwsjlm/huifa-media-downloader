@@ -7,7 +7,7 @@
     "Huifa Video Downloader contributors"
   ],
   "translations": {
-    "application.name::Huifa Video Downloader": "Huifa Video Downloader",
+    "application.name::Huifa Video Downloader": "HuifaMediaDownloader",
     "application.update::Up to Date": "Up to Date",
     "completed.filter::All": "All",
     "completed.filter::All Targets Complete": "All Targets Complete",

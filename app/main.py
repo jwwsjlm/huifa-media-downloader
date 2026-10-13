@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from PySide6 import __version__ as PYSIDE_VERSION
-from PySide6.QtCore import QTimer, qVersion
+from PySide6.QtCore import QCoreApplication, QEvent, QTimer, qVersion
 from PySide6.QtGui import QIcon
+from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication
 from PySide6.QtWidgets import QMessageBox
 
@@ -20,7 +21,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.ui.main_window import MainWindow
 from app.core.download_service import yt_dlp as download_ytdlp
 from app.core.app_settings import AppSettings
 from app.core.atomic_json import write_json_atomic
@@ -33,15 +33,17 @@ from app.core.paths import (
 )
 from app.core.single_instance import SingleInstance
 from app.core.update_service import installed_component_details
-from app.ui.runtime import configure_font, configure_high_dpi, ui_text
-from app.ui.i18n import application_name_text, runtime_text
+from app.presentation.application_runtime import ApplicationRuntime
+from app.presentation.qml_shell import QmlShell
+from app.presentation.runtime import configure_font, configure_high_dpi, ui_text
+from app.presentation.i18n import application_name_text, runtime_text
 
 
 PACKAGED_SMOKE_OUTPUT_ENV = "HUIFA_PACKAGED_SMOKE_OUTPUT"
 PACKAGED_UPDATE_MODES = frozenset({"velopack"})
 
 
-def _build_packaged_smoke_report(app: QApplication, window: MainWindow) -> dict[str, Any]:
+def _build_packaged_smoke_report(app: QApplication, shell: QmlShell) -> dict[str, Any]:
     """Describe the exact runtime loaded by a freshly built executable.
 
     The build pipeline uses this report to catch packaging regressions that
@@ -49,26 +51,27 @@ def _build_packaged_smoke_report(app: QApplication, window: MainWindow) -> dict[
     packaged build accidentally falling back to the non-updatable source mode.
     """
     yt_version, yt_source, yt_path = installed_component_details("yt-dlp")
+    runtime = shell.runtime
     ffmpeg_version, ffmpeg_source, ffmpeg_path = installed_component_details(
-        "FFmpeg", window.app_settings.get("ffmpeg_path")
+        "FFmpeg", runtime.app_settings.get("ffmpeg_path")
     )
-    configured_ffprobe = window.app_settings.get("ffprobe_path")
+    configured_ffprobe = runtime.app_settings.get("ffprobe_path")
     ffprobe_version, ffprobe_source, ffprobe_path = (
         installed_component_details(
             "FFprobe",
-            window.app_settings.get("ffmpeg_path"),
+            runtime.app_settings.get("ffmpeg_path"),
             configured_ffprobe,
         )
         if configured_ffprobe.strip()
-        else installed_component_details("FFprobe", window.app_settings.get("ffmpeg_path"))
+        else installed_component_details("FFprobe", runtime.app_settings.get("ffmpeg_path"))
     )
     executable = Path(sys.executable).resolve()
     frozen = bool(getattr(sys, "frozen", False))
     yt_dlp_core_ready = bool(
         download_ytdlp is not None and callable(getattr(download_ytdlp, "YoutubeDL", None))
     )
-    update_mode = str(getattr(window, "application_update_mode", "") or "")
-    secure_store_backend = str(getattr(window.secure_store, "backend_name", "") or "")
+    update_mode = str(runtime.application_update_mode or "")
+    secure_store_backend = str(getattr(runtime.secure_store, "backend_name", "") or "")
     application_version = app.applicationVersion()
     organization_name = app.organizationName()
     ok = bool(
@@ -79,6 +82,7 @@ def _build_packaged_smoke_report(app: QApplication, window: MainWindow) -> dict[
         and organization_name == APP_PUBLISHER
         and secure_store_backend == "keyring.backends.Windows.WinVaultKeyring"
         and yt_dlp_core_ready
+        and shell.root is not None
         and yt_version not in {"", "未安装", "未检测"}
         and ffmpeg_version not in {"", "未安装", "未检测", "不可用"}
         and ffprobe_version not in {"", "未安装", "未检测", "不可用"}
@@ -95,6 +99,7 @@ def _build_packaged_smoke_report(app: QApplication, window: MainWindow) -> dict[
         "pyside6_version": PYSIDE_VERSION,
         "qt_version": qVersion(),
         "qt_platform": app.platformName(),
+        "qml_root_loaded": shell.root is not None,
         "secure_store_backend": secure_store_backend,
         "yt_dlp": {
             "version": yt_version,
@@ -115,12 +120,19 @@ def _build_packaged_smoke_report(app: QApplication, window: MainWindow) -> dict[
     }
 
 
-def _run_packaged_smoke(app: QApplication, output_path: Path) -> int:
-    """Create the real main window, record runtime health, then close cleanly."""
-    window: MainWindow | None = None
+def _run_packaged_smoke(
+    app: QApplication,
+    output_path: Path,
+    runtime_data_dir: Path,
+) -> int:
+    """Load the real QML shell, record runtime health, then exit promptly."""
+    shell: QmlShell | None = None
+    root: Any | None = None
     try:
-        window = MainWindow()
-        report = _build_packaged_smoke_report(app, window)
+        runtime = ApplicationRuntime(runtime_data_dir, app)
+        shell = QmlShell(runtime, app)
+        root = shell.load()
+        report = _build_packaged_smoke_report(app, shell)
         write_json_atomic(output_path, report)
     except Exception as exc:
         try:
@@ -141,25 +153,44 @@ def _run_packaged_smoke(app: QApplication, output_path: Path) -> int:
 
     result_code = 0 if report["ok"] else 2
 
-    # Showing the window on Qt's offscreen platform ensures the same polish,
-    # layout and close lifecycle used by a real launch are exercised. The
-    # normal cooperative shutdown closes the database and all services.
-    window.show()
-    QTimer.singleShot(0, window.close)
+    # The package probe must not race ordinary startup restoration with the
+    # asynchronous user-facing shutdown path. Loading the real QML root above
+    # is the coverage needed here; exit the isolated process directly.
+    QTimer.singleShot(0, lambda: app.exit(result_code))
     timeout = QTimer(app)
     timeout.setSingleShot(True)
     timeout.timeout.connect(lambda: app.exit(3))
     timeout.start(20_000)
     event_result = app.exec()
     timeout.stop()
-    return result_code or int(event_result)
+    return int(event_result)
 
 
 def main() -> int:
     configure_high_dpi()
+    # Keep every QML control on one cross-platform dark control style instead
+    # of falling back to the Windows-native white widgets.
+    QQuickStyle.setStyle("Material")
     app = QApplication(sys.argv)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName(APP_PUBLISHER)
+    try:
+        runtime_data_dir = initialize_data_layout()
+    except PortableDataDirectoryError as exc:
+        QMessageBox.critical(
+            None,
+            ui_text('Application Folder Is Not Writable'),
+            ui_text(
+                'The application stores settings, cookies, the database, and updates in its local folder.\n\n',
+            )
+            + ui_text('Cannot write to: ')
+            + f"{exc.path}"
+            + ui_text(
+                '\n\nExit, move the complete application folder to a writable location, and start it again.',
+            )
+        )
+        return 1
+
     configure_font(app, AppSettings().get("ui_language"))
     app.setApplicationName(application_name_text())
     app.setApplicationDisplayName(application_name_text())
@@ -206,29 +237,12 @@ def main() -> int:
 
     sys.excepthook = handle_exception
 
-    try:
-        initialize_data_layout()
-    except PortableDataDirectoryError as exc:
-        QMessageBox.critical(
-            None,
-            ui_text('Application Folder Is Not Writable'),
-            ui_text(
-                'The application stores settings, cookies, the database, and updates in its local folder.\n\n',
-            )
-            + ui_text('Cannot write to: ')
-            + f"{exc.path}"
-            + ui_text(
-                '\n\nExit, move the complete application folder to a writable location, and start it again.',
-            )
-        )
-        return 1
-
     smoke_output = os.environ.get(PACKAGED_SMOKE_OUTPUT_ENV, "").strip()
     if smoke_output:
         # Build verification must not contend with or activate an already
         # running user instance. It runs from an isolated temporary directory
-        # and exits immediately after the real MainWindow has initialized.
-        return _run_packaged_smoke(app, Path(smoke_output))
+        # and exits immediately after the real QML shell has initialized.
+        return _run_packaged_smoke(app, Path(smoke_output), runtime_data_dir)
 
     instance_guard = SingleInstance(parent=app)
     try:
@@ -246,20 +260,35 @@ def main() -> int:
         # Exit immediately so a second modal window/process is not left behind.
         return 0
 
-    window = MainWindow()
+    runtime = ApplicationRuntime(runtime_data_dir, app)
+    shell = QmlShell(runtime, app)
+    root = shell.load()
+    shell.restore_startup_state()
 
     def activate_window() -> None:
-        if window.isMinimized():
-            window.showNormal()
-        else:
-            window.show()
-        window.raise_()
-        window.activateWindow()
+        try:
+            if root.isMinimized():
+                root.showNormal()
+            else:
+                root.show()
+            root.raise_()
+            root.requestActivate()
+        except RuntimeError:
+            pass
 
     instance_guard.activation_requested.connect(activate_window)
     app.aboutToQuit.connect(instance_guard.close)
-    window.show()
-    return app.exec()
+    exit_code = app.exec()
+    if not shell.bridge.shutdownReady:
+        # Some native close paths tear down the QML window before its closing
+        # handler runs. Finish the same cooperative shutdown synchronously
+        # instead of leaving Python alive without a GUI event loop.
+        shell.bridge.finish_shutdown_blocking()
+    instance_guard.close()
+    shell.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+    return int(exit_code)
 
 
 if __name__ == "__main__":

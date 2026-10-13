@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Encrypted cookie storage and format conversion for the embedded browser.
 
-Cookie values must never enter settings.ini, SQLite, logs, or diagnostic
+Cookie values must never enter config.ini, SQLite, logs, or diagnostic
 bundles.  The application keeps one Windows-DPAPI-encrypted master copy and
 materialises short-lived compatibility files only when yt-dlp or SAU needs
 one.

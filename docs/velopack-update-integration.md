@@ -15,7 +15,7 @@
 - `UpdateManager` 负责检查、下载进度、待重启更新和退出后安装。
 - `vpk pack --releaseNotes` 把 Markdown 版本说明写入更新包；应用同时按目标 tag 读取
   GitHub Release 正文，API 不可用时回退包内说明。
-- `vpk pack --msi --instLocation Either` 生成内部 MSI、可自更新便携包、完整包和 JSON feed；Inno Setup 外层向导先选择目录，再静默执行 MSI。MSI 写入 Windows 标准卸载注册表项。
+- `vpk pack --msi --instLocation Either` 生成内部 MSI、可自更新便携包、完整包和 JSON feed；NSIS 外层向导先选择目录，再以官方支持的 `VELOPACK_INSTALLDIR` 属性静默执行 MSI。MSI 写入 Windows 标准卸载注册表项。
 - Velopack 使用 PyInstaller onedir，更新单位是完整应用目录。
 - Windows 更新会替换 `current/`，因此数据库、设置、Cookie、日志和可独立更新工具必须位于
   根目录 `data/` 等持久目录。
@@ -46,10 +46,10 @@
   - 在主程序启动前运行 Velopack 钩子；
   - 不在未确认时自动安装更新。
 - `scripts/build_velopack_release.ps1`
-  - 生成安装器、便携包、完整包和 feed；
+  - 使用 NSIS 3.12 编译 `build/HuifaMediaDownloader.nsi`，生成安装器、便携包、完整包和 feed；
   - 校验版本、工具链、包结构、大小和 SHA-256；
-  - 在隔离目录真实启动便携包，并执行一次本地更新 apply；
-  - 验证 `current/tools/` 随更新恢复且根目录 `data/` 保留。
+  - 仅在显式传入 `-RunSmokeChecks` 后，在隔离目录启动便携包并执行本地更新 apply，
+    验证 `current/tools/` 随更新恢复且根目录 `data/` 保留。
 - `scripts/package_github_release.ps1`
   - 输出面向用户的便携版 ZIP、安装包 ZIP、版本说明、feed、完整包和校验清单；
   - 不再发布独立单 EXE 资产。

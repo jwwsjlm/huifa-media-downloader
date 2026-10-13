@@ -10,11 +10,11 @@ import time
 from copy import deepcopy
 from contextlib import contextmanager
 from functools import partial
-from math import isfinite
+from math import exp, isfinite
 from uuid import uuid4
 from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,6 +61,8 @@ from app.core.local_components import activate_local_ejs
 from app.core.external_ytdlp import (
     ExternalYtdlpError,
     cached_external_ytdlp_version,
+    install_native_checkpointing,
+    prepare_native_move_checkpoint,
     run_external_ytdlp,
 )
 from app.core.paths import application_dir, resolve_portable_path, tool_runtime_roots
@@ -169,6 +171,7 @@ RESTORE_INITIAL_TERMINAL_CHILDREN = 200
 DOWNLOAD_TERMINAL_STATUSES = frozenset({
     "completed",
     "failed",
+    "processing_failed",
     "canceled",
     "deleted",
     "partial_failed",
@@ -199,6 +202,63 @@ ACTIVE_DUPLICATE_STATUSES = frozenset({
 })
 WORKER_PROGRESS_EMIT_INTERVAL_SECONDS = 0.10
 TRANSCODE_PROGRESS_EMIT_INTERVAL_SECONDS = 0.15
+TRANSFER_RATE_SAMPLE_COUNT = 30
+ETA_SMOOTHING_SECONDS = 4.0
+
+
+class _WorkerCapacityBudget:
+    """A cancellable FIFO permit shared by network and processing runtimes."""
+
+    def __init__(self, capacity: int = 1) -> None:
+        self._condition = threading.Condition()
+        self._capacity = max(1, int(capacity))
+        self._owners: dict[object, int] = {}
+        self._waiting: deque[object] = deque()
+
+    @property
+    def active_count(self) -> int:
+        with self._condition:
+            return len(self._owners)
+
+    def holds(self, owner: object) -> bool:
+        with self._condition:
+            return owner in self._owners
+
+    def configure(self, capacity: int) -> None:
+        with self._condition:
+            self._capacity = max(1, int(capacity))
+            self._condition.notify_all()
+
+    def acquire(self, owner: object, cancel: threading.Event) -> None:
+        with self._condition:
+            if cancel.is_set():
+                raise InterruptedError("用户取消处理")
+            if owner in self._owners:
+                self._owners[owner] += 1
+                return
+            self._waiting.append(owner)
+            try:
+                while True:
+                    if cancel.is_set():
+                        raise InterruptedError("用户取消处理")
+                    if self._waiting[0] is owner and len(self._owners) < self._capacity:
+                        self._waiting.popleft()
+                        self._owners[owner] = 1
+                        return
+                    self._condition.wait(0.1)
+            finally:
+                if owner in self._waiting:
+                    self._waiting.remove(owner)
+                self._condition.notify_all()
+
+    def release(self, owner: object, *, all_depths: bool = False) -> None:
+        with self._condition:
+            depth = self._owners.get(owner, 0)
+            if all_depths or depth <= 1:
+                self._owners.pop(owner, None)
+            else:
+                self._owners[owner] = depth - 1
+            self._condition.notify_all()
 
 
 class _DownloadSetupError(RuntimeError):
@@ -387,6 +447,8 @@ class DownloadTask:
     downloaded_bytes: int = 0
     total_bytes: int = 0
     eta: str = ""
+    eta_seconds: float = field(default=0.0, repr=False)
+    eta_updated_at: float = field(default=0.0, repr=False)
     size: str = ""
     error: str = ""
     media_path: str = ""
@@ -400,6 +462,8 @@ class DownloadTask:
     stage: str = "queued"
     stage_text: str = "排队中"
     stage_progress: float = 0.0
+    stage_indeterminate: bool = True
+    failed_step: str = ""
     retry_count: int = 0
     retry_total: int = 2
     reconnect_message: str = ""
@@ -414,11 +478,10 @@ class DownloadTask:
     # configured encoder so an automatic fallback does not become a strict
     # setting on retry.
     current_transcode_encoder: str = ""
-    # A failed optional post-download conversion must not turn a verified
-    # download into a failed task. Keep the warning separate from ``error`` so
-    # status aggregation and retry logic still treat the task as completed.
+    # Cleanup warnings belong to an already committed result. Requested
+    # processing failures use their durable checkpoint and failed step.
     completion_warning: str = ""
-    # Monotonic in-memory presentation values. yt-dlp can briefly emit
+    # Monotonic within each stream. yt-dlp can briefly emit
     # transitional callbacks with zero/unknown byte counters when switching
     # streams or entering post-processing. Keep them on the task so a UI
     # card rebuild cannot make details jump back to 0 B / unknown.
@@ -430,6 +493,7 @@ class DownloadTask:
     visible_size: str = ""
     visible_speed: str = ""
     visible_eta: str = ""
+    transfer_stream_key: str = field(default="", repr=False)
     # Completion metadata is kept in memory for the task card; the canonical
     # copy remains in ``media_items`` and no task-table columns are added.
     uploader: str = ""
@@ -446,7 +510,7 @@ class DownloadTask:
             self.options_json = DownloadOptions.from_mapping(
                 raw_options
             ).to_sparse_dict()
-            for internal_key in ("_collection", "_storage_preview", "_collection_materialization"):
+            for internal_key in ("_collection", "_storage_preview", "_collection_materialization", "_processing_plan", "_processing"):
                 if isinstance(raw_options.get(internal_key), Mapping):
                     self.options_json[internal_key] = dict(raw_options[internal_key])
             if raw_options.get("_local_history") is True:
@@ -609,6 +673,13 @@ class _OptionalTranscodePlan:
     target_label: str = ""
     device_label: str = ""
     action_text: str = ""
+
+
+@dataclass(slots=True)
+class _ProcessingHandoff:
+    checkpoint: dict[str, Any]
+    acknowledged: threading.Event = field(default_factory=threading.Event)
+    error: Exception | None = None
 
 
 def validate_filename_template(value: str) -> str:
@@ -856,6 +927,8 @@ class DownloadWorker(QObject):
     finished = Signal()
     formats_ready = Signal(str, object)
     playlist_info = Signal(str, object)
+    processing_checkpoint_ready = Signal(str, object)
+    processing_capacity_changed = Signal(str, bool)
 
     def __init__(self, task_id: str, url: str, output_dir: str, db: Database, proxy: str = "", cookie_file: str = "",
                  quality: str = "best", filename_template: str = "%(title)s [%(id)s].%(ext)s",
@@ -870,7 +943,11 @@ class DownloadWorker(QObject):
                  transcode_device: str = "auto", subtitle_language: str = "none",
                  transcode_encoder: str = "", cover_convert_jpeg: bool = False,
                  cover_jpeg_quality: int = 90, options_json: Mapping[str, Any] | None = None,
-                 log_service: DownloadLogService | None = None):
+                 log_service: DownloadLogService | None = None,
+                 defer_processing: bool = False,
+                 processing_budget: _WorkerCapacityBudget | None = None,
+                 network_budget: _WorkerCapacityBudget | None = None,
+                 native_task_title: str = "", native_source_key: str = ""):
         super().__init__()
         self.task_id = task_id
         self.url = url
@@ -902,9 +979,28 @@ class DownloadWorker(QObject):
             self.transcode_codec = transcode_encoder_codec(self.transcode_encoder)
             self.transcode_device = transcode_encoder_device(self.transcode_encoder)
         self.subtitle_language = normalize_subtitle_language(subtitle_language)
-        self.cover_convert_jpeg = bool(cover_convert_jpeg)
-        self.cover_jpeg_quality = max(50, min(int(cover_jpeg_quality or 90), 100))
+        raw_options = dict(options_json or {})
+        processing_plan = raw_options.get("_processing_plan", {})
+        processing_plan = processing_plan if isinstance(processing_plan, Mapping) else {}
+        self.cover_convert_jpeg = bool(processing_plan.get("cover_convert_jpeg", cover_convert_jpeg))
+        self.cover_jpeg_quality = max(50, min(non_negative_int(processing_plan.get("cover_jpeg_quality", cover_jpeg_quality), 90), 100))
+        self._processing_checkpoint = deepcopy(raw_options.get("_processing")) if isinstance(raw_options.get("_processing"), Mapping) else None
+        self._defer_processing = bool(defer_processing)
+        self._processing_handoff_started = False
+        self._processing_only = self._processing_checkpoint is not None
+        self._processing_budget = processing_budget
+        self._network_budget = network_budget
+        self._processing_capacity_exempt = self._processing_only
+        self._native_task_title = str(native_task_title or "")
+        self._native_source_key = str(native_source_key or "")
+        self._replaying_native = False
+        if self._processing_only and self._processing_checkpoint.get("kind") == "manual":
+            self.transcode_encoder = normalize_transcode_encoder(self._processing_checkpoint.get("encoder"))
+            self.transcode_codec = transcode_encoder_codec(self.transcode_encoder)
+            self.transcode_device = transcode_encoder_device(self.transcode_encoder)
         self.download_options = DownloadOptions.from_mapping(options_json)
+        if self._processing_only and self._processing_checkpoint.get("kind") == "manual":
+            self.download_options.prepend_cover_enabled = False
         self.processing_temp_dir = (
             str(resolve_portable_path(self.download_options.processing_temp_dir))
             if self.download_options.processing_temp_dir else ""
@@ -935,6 +1031,7 @@ class DownloadWorker(QObject):
         self._stage = "queued"
         self._stage_text = "排队中"
         self._stage_progress = 0.0
+        self._stage_indeterminate = True
         self._retry_count = 0
         self._retry_total = 2
         self._current_info: dict[str, Any] = {}
@@ -954,6 +1051,7 @@ class DownloadWorker(QObject):
         self.ytdlp_core_mode = normalize_ytdlp_core_mode(ytdlp_core_mode)
         self._pending_transcodes: list[PreparedTranscode] = []
         self._last_worker_progress_emit_at = 0.0
+        self._last_emitted_stage = ""
         self._last_transcode_progress_emit_at = 0.0
 
     def _log(self, level: str, category: str, message: str, **details: Any) -> None:
@@ -962,6 +1060,8 @@ class DownloadWorker(QObject):
     def _emit_worker_progress(self, payload: dict[str, Any], *, force: bool = False) -> bool:
         """Bound queued worker traffic before it reaches the GUI event loop."""
         now = time.monotonic()
+        stage = str(payload.get("stage") or "")
+        force = force or bool(stage and stage != self._last_emitted_stage)
         if (
             not force
             and self._last_worker_progress_emit_at
@@ -969,6 +1069,8 @@ class DownloadWorker(QObject):
         ):
             return False
         self._last_worker_progress_emit_at = now
+        if stage:
+            self._last_emitted_stage = stage
         self.progress.emit(self.task_id, payload)
         return True
 
@@ -991,6 +1093,7 @@ class DownloadWorker(QObject):
         stage_changed = stage_code_changed or text != self._stage_text
         changed = stage_changed or next_progress != self._stage_progress or details
         self._stage, self._stage_text, self._stage_progress = stage, text, next_progress
+        self._stage_indeterminate = progress is None and (stage_code_changed or self._stage_indeterminate)
         if not changed and not force:
             return
         if stage_code_changed:
@@ -999,6 +1102,7 @@ class DownloadWorker(QObject):
             "stage": stage,
             "stage_text": text,
             "stage_progress": next_progress,
+            "stage_indeterminate": self._stage_indeterminate,
             "retry_count": self._retry_count,
             "retry_total": self._retry_total,
             "elapsed_seconds": max(0.0, now - self._started_at),
@@ -1027,7 +1131,7 @@ class DownloadWorker(QObject):
             "merging formats into" in lower
             or ("merging" in lower and "format" in lower)
         ):
-            return _YtdlpStageEvent("merging", "正在合并视频和音频", 99)
+            return _YtdlpStageEvent("merging", "正在合并视频和音频")
         if self._media_download_started and any(
             token in lower
             for token in (
@@ -1036,7 +1140,7 @@ class DownloadWorker(QObject):
                 "fixing thumbnail",
             )
         ):
-            return _YtdlpStageEvent("thumbnail", "正在下载封面", 99)
+            return _YtdlpStageEvent("thumbnail", "正在下载封面")
         if self._media_download_started and any(
             token in lower
             for token in (
@@ -1046,12 +1150,12 @@ class DownloadWorker(QObject):
                 "adding metadata",
             )
         ):
-            return _YtdlpStageEvent("metadata", "正在写入元数据", 99)
+            return _YtdlpStageEvent("metadata", "正在写入元数据")
         if self._media_download_started and any(
             token in lower
             for token in ("deleting original file", "fixing malformed")
         ):
-            return _YtdlpStageEvent("verifying", "正在校验媒体文件", 99)
+            return _YtdlpStageEvent("verifying", "正在校验媒体文件")
         if any(
             token in lower
             for token in (
@@ -1106,7 +1210,66 @@ class DownloadWorker(QObject):
         self._log(effective_level, effective_category, normalized)
         self._apply_ytdlp_stage_event(self._ytdlp_stage_event(normalized))
 
-    def _handle_postprocessor(self, data: dict[str, Any]) -> None:
+    def _notify_processing_capacity(self, processing: bool) -> None:
+        if self._processing_only or processing == self._processing_capacity_exempt:
+            return
+        self._processing_capacity_exempt = processing
+        self.processing_capacity_changed.emit(self.task_id, processing)
+
+    def _enter_network_budget(self) -> None:
+        budget = self._network_budget
+        if budget is not None and not budget.holds(self):
+            budget.acquire(self, self._cancel)
+        self._notify_processing_capacity(False)
+
+    def _enter_processing_budget(self) -> None:
+        if self._network_budget is not None:
+            self._network_budget.release(self, all_depths=True)
+        self._notify_processing_capacity(True)
+        budget = self._processing_budget
+        if budget is None:
+            return
+        if not budget.holds(self):
+            self._set_stage("waiting_processing", "等待处理已下载的媒体", force=True)
+        budget.acquire(self, self._cancel)
+
+    def _release_processing_budget(self, *, all_depths: bool = False) -> None:
+        if self._processing_budget is not None:
+            self._processing_budget.release(self, all_depths=all_depths)
+
+    def _release_worker_budgets(self) -> None:
+        self._release_processing_budget(all_depths=True)
+        if self._network_budget is not None:
+            self._network_budget.release(self, all_depths=True)
+
+    def _external_budget_event(self, data: dict[str, Any]) -> None:
+        action = data.get("action")
+        if action == "network":
+            self._enter_network_budget()
+        elif action == "started":
+            self._handle_postprocessor({**data, "status": "started"})
+        elif action == "finished":
+            self._release_processing_budget()
+        elif action == "checkpoint":
+            self._save_native_processing_checkpoint(data.get("checkpoint"))
+        else:
+            raise ExternalYtdlpError("外置 yt-dlp 处理通道返回了无效请求")
+
+    def _install_builtin_network_gate(self, ydl: Any) -> None:
+        if self._network_budget is None:
+            return
+        from yt_dlp.postprocessor.common import PostProcessor
+
+        enter_network = self._enter_network_budget
+
+        class HuifaNetworkPermitPP(PostProcessor):
+            def run(self, info: dict[str, Any]):
+                enter_network()
+                return [], info
+
+        ydl.add_post_processor(HuifaNetworkPermitPP(ydl), when="before_dl")
+
+    def _handle_postprocessor(self, data: dict[str, Any], *, manage_budget: bool = True) -> None:
         """Translate yt-dlp post-processing callbacks into stable UI stages.
 
         Logger wording varies between yt-dlp versions and extractors.  The
@@ -1116,6 +1279,15 @@ class DownloadWorker(QObject):
         """
         key = str(data.get("postprocessor") or data.get("postprocessor_key") or "").lower()
         status = str(data.get("status") or "").lower()
+        if key in {"huifanetworkpermit", "huifabudget"}:
+            return
+        # yt-dlp invokes the started hook synchronously before the PP body.
+        # Holding this permit here gates FFmpeg itself, including merger,
+        # remuxer, audio extraction, subtitle/embed and chapter removal work.
+        if manage_budget and status == "started":
+            self._enter_processing_budget()
+        elif manage_budget and status == "finished":
+            self._release_processing_budget()
         if "merger" in key or "merge" in key:
             stage, text = "merging", "正在合并视频和音频"
         elif "thumbnail" in key or "embedthumbnail" in key:
@@ -1125,7 +1297,7 @@ class DownloadWorker(QObject):
         elif any(token in key for token in ("fixup", "movefiles", "ffmpeg", "extractaudio")):
             stage, text = "verifying", "正在校验和整理媒体文件"
         else:
-            return
+            stage, text = "verifying", "正在处理媒体文件"
         if not self._media_download_started:
             return
         if status == "started":
@@ -1134,7 +1306,7 @@ class DownloadWorker(QObject):
             # full target disk cannot turn a valid download into a corrupt
             # merge output.
             self._check_disk_low_watermark(force=True)
-        progress = 100 if status == "finished" else 99
+        progress = 100 if status == "finished" else None
         self._set_stage(stage, text, progress)
         if status == "started":
             self._log("info", "后处理", text, postprocessor=key)
@@ -1149,14 +1321,19 @@ class DownloadWorker(QObject):
                     self._set_stage(resume_stage, f"网络已恢复，继续{stage}", force=True)
                 return result
             except Exception as exc:
+                # A failed PP does not emit a finished hook. Its body has
+                # already unwound (or the external process has been stopped),
+                # so retrying must not retain the shared processing permit.
+                self._release_processing_budget(all_depths=True)
                 category = DownloadLogService.classify_error(str(exc))
-                if category != "网络/代理" or attempt >= 2 or self._cancel.is_set():
+                if self._processing_handoff_started or category != "网络/代理" or attempt >= 2 or self._cancel.is_set():
                     raise
                 # A whole-extraction retry may revisit yt-dlp's match_filter.
                 # Release only this worker's incomplete entry before retrying
                 # so an unknown-size exclusive reservation cannot wait on
                 # itself and known-size tasks cannot be counted twice.
                 self._release_capacity_before_network_retry()
+                self._enter_network_budget()
                 delay = 2 ** attempt
                 self._retry_count = attempt + 1
                 self._log("warning", "网络/代理", f"{stage}失败，将在 {delay} 秒后重试", attempt=self._retry_count, error=str(exc))
@@ -1592,7 +1769,11 @@ class DownloadWorker(QObject):
     ) -> None:
         for published in reversed(published_transcodes):
             try:
-                published.rollback()
+                recovery = published.rollback()
+                if self._processing_only and recovery is not None:
+                    prepared = next((item for item in self._pending_transcodes if item.source_path == published.source_path and item.target_path == published.final_path), None)
+                    if prepared is not None and not prepared.temporary_path.exists():
+                        recovery.replace(prepared.temporary_path)
             except BaseException as cleanup_error:
                 self._log(
                     "error",
@@ -1603,6 +1784,8 @@ class DownloadWorker(QObject):
                     error_type=type(cleanup_error).__name__,
                 )
         for prepared in uncommitted_transcodes:
+            if self._processing_only:
+                continue
             try:
                 prepared.discard()
             except BaseException as cleanup_error:
@@ -1686,6 +1869,17 @@ class DownloadWorker(QObject):
 
         completion_task = self._completed_download_task(media_items)
         published_transcodes: list[PublishedTranscode] = []
+        if self._processing_only:
+            publications = [{
+                "source_path": str(prepared.source_path),
+                "target_path": str(prepared.target_path),
+                "temporary_path": str(prepared.temporary_path),
+                "backup_path": str(prepared.source_path.with_name(
+                    f".{prepared.source_path.name}.pre-transcode-{os.getpid()}-{threading.get_ident()}.bak"
+                )) if prepared.source_path == prepared.target_path else "",
+            } for prepared in prepared_transcodes]
+            self._set_stage("publishing", "正在保存处理结果", force=True)
+            self._save_processing_checkpoint({**self._processing_checkpoint, "state": "publishing", "publications": publications})
         try:
             self._publish_prepared_transcodes(
                 prepared_transcodes,
@@ -1697,7 +1891,17 @@ class DownloadWorker(QObject):
                 self.download_options,
                 subtitle_language=self.subtitle_language,
             )
-            self.db.complete_download_task_batch(completion_task, media_items, task_files)
+            if self._processing_only and self._processing_checkpoint.get("kind") == "manual":
+                self.db.replace_completed_media_path(
+                    self.task_id,
+                    str(self._processing_checkpoint["entries"][0]["filepath"]),
+                    media_items[-1].video_path,
+                    transcode_codec=self.transcode_codec,
+                    transcode_device=self.transcode_device,
+                    transcode_encoder=self.transcode_encoder,
+                )
+            else:
+                self.db.complete_download_task_batch(completion_task, media_items, task_files)
         except BaseException:
             self._rollback_completed_media_publication(
                 published_transcodes,
@@ -1758,20 +1962,20 @@ class DownloadWorker(QObject):
                 estimate = transcode_capacity_estimate(video_path)
                 temp_capacity_target = transcode_temp_dir or Path(video_path)
                 temporary_key = f"transcode\x1f{normalized_video_path}\x1ftemp"
-                lease.acquire(
+                self._acquire_transcode_capacity(
+                    lease,
                     temporary_key,
                     temp_capacity_target,
                     estimate,
-                    cancel_event=self._cancel,
                 )
                 reservation_keys.append(temporary_key)
                 if not same_storage_volume(temp_capacity_target, video_path):
                     final_key = f"transcode\x1f{normalized_video_path}\x1ffinal"
-                    lease.acquire(
+                    self._acquire_transcode_capacity(
+                        lease,
                         final_key,
                         video_path,
                         estimate,
-                        cancel_event=self._cancel,
                     )
                     reservation_keys.append(final_key)
             yield transcode_temp_dir
@@ -1789,6 +1993,30 @@ class DownloadWorker(QObject):
                         error=str(exc),
                         remaining=lease.active_count,
                     )
+
+    def _acquire_transcode_capacity(
+        self,
+        lease: DiskReservationLease,
+        key: str,
+        target: str | Path,
+        estimate: CapacityEstimate,
+    ) -> None:
+        yielded_processing = False
+
+        def wait(snapshot: DiskCapacitySnapshot, required: int) -> None:
+            nonlocal yielded_processing
+            budget = self._processing_budget
+            if budget is not None and budget.holds(self):
+                # An unknown-size download can own this disk while waiting
+                # for its native PP permit. Let that PP finish and release
+                # the lease before reacquiring processing for the transcode.
+                self._release_processing_budget(all_depths=True)
+                yielded_processing = True
+            self._report_capacity_waiting(snapshot, required)
+
+        lease.acquire(key, target, estimate, cancel_event=self._cancel, on_wait=wait)
+        if yielded_processing:
+            self._enter_processing_budget()
 
     def _build_validated_transcode(
         self,
@@ -1848,7 +2076,6 @@ class DownloadWorker(QObject):
         self._set_stage(
             "waiting_disk",
             "正在为格式转换预留磁盘空间",
-            0,
             force=True,
         )
         return prepare_transcode_media(
@@ -1885,7 +2112,6 @@ class DownloadWorker(QObject):
         self._set_stage(
             "verifying",
             "正在校验转换临时成品",
-            0,
             force=True,
         )
         validation = validate_media_file(
@@ -1904,6 +2130,8 @@ class DownloadWorker(QObject):
         return validation
 
     def _discard_failed_transcode(self, prepared: PreparedTranscode) -> None:
+        if self._processing_only:
+            return
         try:
             prepared.discard()
         except BaseException as cleanup_error:
@@ -1927,6 +2155,8 @@ class DownloadWorker(QObject):
             and self.download_options.content_mode != "audio"
         )
         if prepend_cover and thumbnail is None:
+            if self._processing_only:
+                raise RuntimeError("开头封面处理失败：未找到可用封面，原始文件已保留")
             warning = "未获取到可用封面，已跳过视频开头封面插帧"
             completion_warnings.append(warning)
             self._log("warning", "封面", warning, input_path=video_path)
@@ -2056,6 +2286,13 @@ class DownloadWorker(QObject):
     ) -> tuple[str, Path, MediaValidationResult | None, PreparedTranscode | None]:
         """Prepare and validate an optional transcode without publishing it."""
 
+        if self._processing_only and self._processing_checkpoint.get("kind") == "manual":
+            info = probe_video_stream(video_path, ffprobe_path)
+            if info.codec == self.transcode_codec:
+                self._processing_checkpoint["skipped_reason"] = "already_target"
+                self._processing_checkpoint["source_codec"] = info.codec
+                return video_path, Path(video_path), None, None
+
         plan = self._optional_transcode_plan(
             video_path,
             thumbnail,
@@ -2079,6 +2316,8 @@ class DownloadWorker(QObject):
         except Exception as exc:
             if self._optional_transcode_was_cancelled(exc):
                 raise InterruptedError("用户取消格式转换") from exc
+            if self._processing_only:
+                raise
             return self._handle_optional_transcode_failure(
                 plan,
                 exc,
@@ -2145,7 +2384,7 @@ class DownloadWorker(QObject):
         base: Path,
         video_path: Path,
     ) -> Path | None:
-        self._set_stage("thumbnail", "正在整理封面", 99)
+        self._set_stage("thumbnail", "正在整理封面")
         thumbnail = self._thumbnails.finalize(base, video_path)
         if thumbnail is not None:
             # The early id-based preview may have been renamed to the final
@@ -2154,7 +2393,7 @@ class DownloadWorker(QObject):
             self._set_stage(
                 "thumbnail",
                 "封面整理完成",
-                99,
+                100,
                 force=True,
                 thumbnail_path=str(thumbnail),
             )
@@ -2198,7 +2437,7 @@ class DownloadWorker(QObject):
         transcode_validation: MediaValidationResult | None,
         ffprobe_path: str,
     ) -> MediaValidationResult:
-        self._set_stage("verifying", "正在校验媒体文件", 99)
+        self._set_stage("verifying", "正在校验媒体文件")
         validation = transcode_validation or validate_media_file(
             verification_path,
             ffprobe_path,
@@ -2229,7 +2468,7 @@ class DownloadWorker(QObject):
         thumbnail: Path | None,
         info_json: Path | None,
     ) -> MediaItem:
-        self._set_stage("metadata", "正在写入元数据", 99)
+        self._set_stage("metadata", "正在写入元数据")
         return MediaItem(
             source_url=entry.get("webpage_url") or self.url,
             title=entry.get("title") or "",
@@ -2256,7 +2495,12 @@ class DownloadWorker(QObject):
         """Validate one downloaded entry and build its uncommitted catalog row."""
 
         paths = self._completed_entry_paths(entry, prepare_filename)
-        thumbnail = self._prepare_entry_thumbnail(paths.base, paths.video)
+        manual = self._processing_only and self._processing_checkpoint.get("kind") == "manual"
+        thumbnail = Path(self._processing_checkpoint["thumbnail_path"]) if manual and self._processing_checkpoint.get("thumbnail_path") else None
+        if not manual:
+            thumbnail = self._prepare_entry_thumbnail(paths.base, paths.video)
+            if self._processing_only and self.cover_convert_jpeg and thumbnail is not None and thumbnail.suffix.casefold() not in {".jpg", ".jpeg"}:
+                raise RuntimeError("JPEG 封面转换失败，原始封面和媒体文件已保留")
 
         if allow_optional_transcode:
             (
@@ -2298,7 +2542,8 @@ class DownloadWorker(QObject):
             # is still cleaned by the worker's finalizer.
             self._pending_transcodes.append(prepared_transcode)
 
-        thumbnail = self._discard_unwanted_thumbnail(thumbnail)
+        if not manual:
+            thumbnail = self._discard_unwanted_thumbnail(thumbnail)
         self._validate_completed_entry(
             entry,
             paths.requested,
@@ -2328,9 +2573,40 @@ class DownloadWorker(QObject):
         if not entries:
             raise RuntimeError("下载没有生成任何可用媒体条目，请重新解析链接后重试。")
 
+        if self._defer_processing and not self._processing_only:
+            self._processing_handoff_started = True
+            snapshots = []
+            for entry in entries:
+                paths = self._completed_entry_paths(entry, prepare_filename)
+                snapshot = {
+                    key: deepcopy(entry.get(key))
+                    for key in ("id", "title", "description", "uploader", "webpage_url", "duration", "vcodec", "acodec")
+                    if isinstance(entry.get(key), (str, int, float, bool, type(None)))
+                }
+                snapshot["tags"] = [str(tag) for tag in (entry.get("tags") or [])]
+                snapshot["filepath"] = str(paths.video)
+                snapshot["requested_downloads"] = [
+                    {key: str(requested.get(key) or "") for key in ("filepath", "vcodec", "acodec")}
+                    for requested in paths.requested
+                ]
+                snapshots.append(snapshot)
+            self._save_processing_checkpoint({
+                "version": 1,
+                "kind": "download",
+                "state": "waiting",
+                "entries": snapshots,
+                "prepared_entries": [],
+                "workspace": str(self._processing_workspace or ""),
+                "source_ip": self._source_ip_for_media(),
+                "preview_thumbnail": str(self._thumbnails.path or ""),
+                "ffmpeg_path": ffmpeg_runtime_path(self.ffmpeg_path),
+                "ffprobe_path": ffprobe_runtime_path(self.ffmpeg_path, self.ffprobe_path),
+            })
+            return
+
         ffprobe_path = ffprobe_runtime_path(self.ffmpeg_path, self.ffprobe_path)
         media_items: list[MediaItem] = []
-        completion_warnings: list[str] = []
+        completion_warnings: list[str] = list((self._processing_checkpoint or {}).get("completion_warnings") or [])
         prepared_transcodes: list[PreparedTranscode] = []
         # yt-dlp has finished all network/merge work at this point. Release its
         # reservations before taking a dedicated temporary-output reservation.
@@ -2339,6 +2615,8 @@ class DownloadWorker(QObject):
             try:
                 self._disk_lease.release_all()
             except Exception as exc:
+                if self._processing_only:
+                    raise
                 # The media download itself is already complete.  Preserve it
                 # and avoid waiting on this worker's retained reservation in a
                 # new optional transcode; finalizers will retry the cleanup.
@@ -2349,15 +2627,26 @@ class DownloadWorker(QObject):
                     error=str(exc),
                     remaining=self._disk_lease.active_count,
                 )
-        for entry in entries:
-            item, prepared_transcode = self._prepare_completed_entry(
-                entry,
-                prepare_filename,
-                ffprobe_path,
-                completion_warnings,
-                release_capacity=release_capacity,
-                allow_optional_transcode=allow_optional_transcode,
-            )
+        saved_entries = list((self._processing_checkpoint or {}).get("prepared_entries") or [])
+        for index, entry in enumerate(entries):
+            if index < len(saved_entries):
+                item, prepared_transcode = self._restore_prepared_processing_entry(saved_entries[index], entry, ffprobe_path)
+            else:
+                item, prepared_transcode = self._prepare_completed_entry(
+                    entry,
+                    prepare_filename,
+                    ffprobe_path,
+                    completion_warnings,
+                    release_capacity=release_capacity,
+                    allow_optional_transcode=allow_optional_transcode,
+                )
+                if self._processing_only:
+                    saved_entries.append(self._prepared_processing_entry(item, prepared_transcode))
+                    self._save_processing_checkpoint({
+                        **self._processing_checkpoint,
+                        "prepared_entries": saved_entries,
+                        "completion_warnings": completion_warnings,
+                    })
             media_items.append(item)
             if prepared_transcode is not None:
                 prepared_transcodes.append(prepared_transcode)
@@ -2367,6 +2656,329 @@ class DownloadWorker(QObject):
             prepared_transcodes,
             completion_warnings,
         )
+
+    def _save_processing_checkpoint(self, checkpoint: Mapping[str, Any]) -> None:
+        handoff = _ProcessingHandoff(deepcopy(dict(checkpoint)))
+        self._processing_checkpoint = handoff.checkpoint
+        self.processing_checkpoint_ready.emit(self.task_id, handoff)
+        while not handoff.acknowledged.wait(0.1):
+            self._raise_if_progress_canceled()
+        if handoff.error is not None:
+            raise handoff.error
+        self._raise_if_progress_canceled()
+
+    def _save_native_processing_checkpoint(self, snapshot: Any) -> None:
+        if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get("info"), Mapping) or not isinstance(snapshot.get("processors"), list):
+            raise ValueError("原生媒体处理检查点不可用")
+        info = deepcopy(dict(snapshot["info"]))
+        previous = self._processing_checkpoint or {}
+        origin = (previous.get("native") or {}).get("origin_info") if previous.get("kind") == "native" else None
+        self._processing_handoff_started = True
+        self._save_processing_checkpoint({
+            "version": 1, "kind": "native", "state": "native_running",
+            "entries": [info], "prepared_entries": [],
+            "native": {**deepcopy(dict(snapshot)), "origin_info": deepcopy(origin or info)},
+            "workspace": str(self._processing_workspace or ""),
+            "source_ip": self._source_ip_for_media(),
+            "preview_thumbnail": str(self._thumbnails.path or ""),
+            "ffmpeg_path": ffmpeg_runtime_path(self.ffmpeg_path),
+            "ffprobe_path": ffprobe_runtime_path(self.ffmpeg_path, self.ffprobe_path),
+        })
+
+    def _validate_native_processing_paths(self, native: Mapping[str, Any], ydl: Any) -> list[Path]:
+        info, origin = native.get("info"), native.get("origin_info")
+        if not isinstance(info, Mapping) or not isinstance(origin, Mapping):
+            raise ValueError("原生媒体处理检查点缺少来源信息")
+        if self._native_source_key and normalize_source_key(media_source_key(origin)) != normalize_source_key(self._native_source_key):
+            raise ValueError("原生处理检查点来源与当前任务不匹配")
+        if self._native_task_title and normalize_media_title(origin.get("title")) != normalize_media_title(self._native_task_title):
+            raise ValueError("原生处理检查点标题与当前任务不匹配")
+        if str(info.get("id") or "") != str(origin.get("id") or "") or normalize_media_title(info.get("title")) != normalize_media_title(origin.get("title")):
+            raise ValueError("原生处理检查点媒体身份已改变")
+        expected = self._checked_processing_path(ydl.prepare_filename(dict(origin)))
+        final_parent = expected.parent.resolve()
+        parents = {final_parent}
+        if self._processing_workspace is not None:
+            relative_parent = final_parent.relative_to(Path(self.output_dir).resolve())
+            parents.add((self._processing_workspace / relative_parent).resolve())
+        base = re.escape(expected.stem)
+        media_extensions = r"mp4|mkv|webm|mov|m4a|mp3|aac|opus|ogg|oga|wav|flac|alac|aiff|avi|m4v|ts|mpeg|mpg|wmv"
+        allowed_names = [rf"{base}\.(?:{media_extensions}|jpg|jpeg|png|webp|gif|avif|info\.json|description|live_chat\.json)"]
+        for record in origin.get("requested_formats") or []:
+            if isinstance(record, Mapping) and record.get("format_id"):
+                allowed_names.append(rf"{base}\.f{re.escape(str(record['format_id']))}\.(?:{media_extensions})")
+        for language in (info.get("requested_subtitles") or {}):
+            allowed_names.append(rf"{base}\.{re.escape(str(language))}\.(?:srt|vtt|ass|ssa|ttml|srv[123]|json[123])")
+        if any(isinstance(spec, Mapping) and spec.get("key") == "ModifyChapters" for spec in native.get("processors") or []):
+            allowed_names.append(rf"{base}\.uncut\.(?:{media_extensions})")
+        name_pattern = re.compile("(?:" + "|".join(allowed_names) + ")", re.IGNORECASE)
+        paths: list[Path] = []
+
+        def check(value: Any) -> None:
+            if not value:
+                return
+            path = self._checked_processing_path(value)
+            if path.parent.resolve() not in parents or name_pattern.fullmatch(path.name) is None:
+                raise ValueError("原生处理检查点文件不属于当前任务的媒体名称")
+            if any(_is_reparse_point(parent) for parent in (path, *path.parents) if parent != parent.parent):
+                raise ValueError("原生处理检查点文件包含符号链接")
+            paths.append(path)
+
+        for key in ("filepath", "_filename", "filename", "infojson_filename"):
+            check(info.get(key))
+        for value in info.get("__files_to_merge") or []:
+            check(value)
+        for key in ("requested_formats", "requested_downloads", "thumbnails"):
+            for record in info.get(key) or []:
+                if isinstance(record, Mapping):
+                    check(record.get("filepath"))
+                    check(record.get("filename"))
+        for record in (info.get("requested_subtitles") or {}).values():
+            if isinstance(record, Mapping):
+                check(record.get("filepath"))
+        for source, target in (info.get("__files_to_move") or {}).items():
+            check(source)
+            if target:
+                check(target)
+                if Path(source).name != Path(target).name:
+                    raise ValueError("原生处理检查点发布目标与源文件名称不匹配")
+        finaldir = info.get("__finaldir")
+        if finaldir and Path(str(finaldir)).resolve() != final_parent:
+            raise ValueError("原生处理检查点成品目录与当前任务不匹配")
+        return list(dict.fromkeys(paths))
+
+    def _run_saved_native_processing(self, checkpoint: Mapping[str, Any]) -> None:
+        if yt_dlp is None:
+            raise RuntimeError("离线媒体处理需要可用的内置 yt-dlp 模块")
+        native = checkpoint.get("native")
+        if not isinstance(native, Mapping) or not isinstance(native.get("processors"), list):
+            raise ValueError("原生媒体处理检查点缺少处理计划")
+        processors = deepcopy(native["processors"])
+        allowed = {
+            "FFmpegMerger", "FFmpegVideoRemuxer", "FFmpegVideoConvertor", "FFmpegExtractAudio",
+            "FFmpegMetadata", "FFmpegEmbedSubtitle", "FFmpegSubtitlesConvertor", "FFmpegThumbnailsConvertor",
+            "FFmpegSplitChapters", "EmbedThumbnail", "ModifyChapters", "MoveFilesAfterDownload",
+            "FFmpegFixupStretched", "FFmpegFixupM4a", "FFmpegFixupM3u8", "FFmpegFixupTimestamp",
+            "FFmpegFixupDuration", "FFmpegFixupDuplicateMoov",
+        }
+        if len(processors) > 32 or any(not isinstance(spec, Mapping) or spec.get("key") not in allowed for spec in processors):
+            raise ValueError("原生媒体处理检查点包含不支持的处理步骤")
+        options = self._build_ytdlp_options()
+        saved_options = native.get("options")
+        if isinstance(saved_options, Mapping):
+            local_keys = {"keepvideo", "overwrites", "postoverwrites", "writeinfojson", "writethumbnail", "writesubtitles", "clean_infojson", "compat_opts"}
+            options.update({key: value for key, value in saved_options.items() if key in local_keys})
+        options.pop("postprocessors", None)
+        options["skip_download"] = True
+        self._replaying_native = True
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                paths = self._validate_native_processing_paths(native, ydl)
+                existing = [path for path in paths if path.is_file()]
+                if not existing:
+                    raise ValueError("原生处理检查点没有保留可用的本地媒体")
+                if self._disk_lease is not None:
+                    total = sum(path.stat().st_size for path in existing)
+                    margin = max(256 * 1024 * 1024, total // 4)
+                    estimate = CapacityEstimate(True, 0, total + margin, total * 2 + margin, margin, 1, 1, ("native-processing-inputs",))
+                    self._acquire_transcode_capacity(self._disk_lease, "native-processing", self._processing_workspace or self.output_dir, estimate)
+                info = deepcopy(dict(native["info"]))
+                from yt_dlp.postprocessor import get_postprocessor
+
+                for index, specification in enumerate(processors):
+                    self._raise_if_progress_canceled()
+                    arguments = dict(specification)
+                    key = arguments.pop("key")
+                    if key == "MoveFilesAfterDownload":
+                        prepare_native_move_checkpoint(info)
+                        self._save_native_processing_checkpoint({
+                            **native, "info": info, "processors": processors[index:],
+                        })
+                    processor = get_postprocessor(key)(ydl, **arguments)
+                    original_delete = ydl._delete_downloaded_files
+                    pending_deletes: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+                    def defer_delete(*files: Any, **details: Any) -> None:
+                        pending_deletes.append((files, details))
+                        for filename in files:
+                            info.get("__files_to_move", {}).pop(filename, None)
+
+                    ydl._delete_downloaded_files = defer_delete
+                    try:
+                        info = ydl.run_pp(processor, info)
+                    finally:
+                        ydl._delete_downloaded_files = original_delete
+                    self._save_native_processing_checkpoint({
+                        **native, "info": info, "processors": processors[index + 1:],
+                    })
+                    for files, details in pending_deletes:
+                        original_delete(*files, **details)
+                # Continue through the established validation/publication path
+                # without constructing a downloader or extracting the URL.
+                local_checkpoint = {
+                    **self._processing_checkpoint, "kind": "download", "state": "running",
+                    "entries": [info], "prepared_entries": [],
+                }
+                local_checkpoint.pop("native", None)
+                self._save_processing_checkpoint(local_checkpoint)
+                self._complete_download_info(info, lambda entry: str(entry["filepath"]))
+        finally:
+            self._replaying_native = False
+
+    @staticmethod
+    def _prepared_processing_entry(item: MediaItem, prepared: PreparedTranscode | None) -> dict[str, Any]:
+        return {
+            "media": asdict(item),
+            "transcode": None if prepared is None else {
+                "source_path": str(prepared.source_path),
+                "target_path": str(prepared.target_path),
+                "temporary_path": str(prepared.temporary_path),
+                "encoder": prepared.encoder,
+                "preserve_source": prepared.preserve_source,
+            },
+        }
+
+    def _checked_processing_path(self, value: Any) -> Path:
+        path = Path(str(value or ""))
+        if not str(value or "").strip() or not path.is_absolute():
+            raise ValueError("处理检查点包含无效文件路径")
+        resolved = path.resolve()
+        roots = [Path(self.output_dir).resolve()]
+        if self._processing_workspace is not None:
+            roots.append(self._processing_workspace.resolve())
+        if not any(resolved.is_relative_to(root) for root in roots):
+            raise ValueError("处理检查点文件超出任务目录")
+        return path
+
+    def _restore_prepared_processing_entry(self, record: Mapping[str, Any], entry: Mapping[str, Any], ffprobe_path: str) -> tuple[MediaItem, PreparedTranscode | None]:
+        self._validate_prepared_processing_identity(record, entry)
+        item = MediaItem(**record["media"])
+        self._checked_processing_path(item.video_path)
+        raw = record.get("transcode")
+        prepared = None
+        verification_path = Path(item.video_path)
+        if isinstance(raw, Mapping):
+            prepared = PreparedTranscode(
+                source_path=self._checked_processing_path(raw.get("source_path")),
+                target_path=self._checked_processing_path(raw.get("target_path")),
+                temporary_path=self._checked_processing_path(raw.get("temporary_path")),
+                encoder=normalize_transcode_encoder(raw.get("encoder")),
+                preserve_source=bool(raw.get("preserve_source")),
+            )
+            verification_path = prepared.temporary_path
+            self._pending_transcodes.append(prepared)
+        validation = self._validate_prepared_transcode(
+            prepared, probe_video_stream(prepared.source_path, ffprobe_path), ffprobe_path,
+        ) if prepared is not None else None
+        self._validate_completed_entry(
+            entry,
+            tuple(item for item in (entry.get("requested_downloads") or []) if isinstance(item, Mapping)),
+            item.video_path, verification_path, validation, ffprobe_path,
+        )
+        return item, prepared
+
+    def _validate_prepared_processing_identity(self, record: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
+        if not isinstance(record, Mapping) or not isinstance(record.get("media"), Mapping):
+            raise ValueError("处理检查点缺少已校验媒体信息")
+        source = self._checked_processing_path(entry.get("filepath")).resolve()
+        media = self._checked_processing_path(record["media"].get("video_path")).resolve()
+        raw = record.get("transcode")
+        if raw is None:
+            if media != source:
+                raise ValueError("处理检查点媒体不属于当前下载条目")
+            return
+        if not isinstance(raw, Mapping):
+            raise ValueError("处理检查点转换信息无效")
+        prepared_source = self._checked_processing_path(raw.get("source_path")).resolve()
+        target = self._checked_processing_path(raw.get("target_path")).resolve()
+        temporary = self._checked_processing_path(raw.get("temporary_path")).resolve()
+        requested = self.download_options.container
+        container = requested if requested in {"mp4", "mkv"} else "mkv" if source.suffix.casefold() == ".mkv" else "mp4"
+        expected_target = source if source.suffix.casefold() == "." + container else source.with_suffix("." + container)
+        if prepared_source != source or target != expected_target or media != target:
+            raise ValueError("处理检查点转换路径与当前下载条目不匹配")
+        if temporary in {source, target} or not re.fullmatch(rf"\.{re.escape(target.stem)}\.transcoding-\d+-\d+\.part{re.escape(target.suffix)}", temporary.name):
+            raise ValueError("处理检查点临时文件不属于当前转换结果")
+        allowed_temporary_roots = {target.parent}
+        if self._processing_workspace is not None:
+            allowed_temporary_roots.update({self._processing_workspace.resolve(), (self._processing_workspace / "transcode").resolve()})
+        if temporary.parent not in allowed_temporary_roots:
+            raise ValueError("处理检查点临时文件位置与任务不匹配")
+
+    def _recover_processing_publications(self, checkpoint: Mapping[str, Any]) -> None:
+        entries = checkpoint.get("entries") or []
+        records = checkpoint.get("prepared_entries") or []
+        if not isinstance(entries, list) or not isinstance(records, list) or len(records) > len(entries):
+            raise ValueError("文件发布检查点条目数量无效")
+        for record, entry in zip(records, entries):
+            self._validate_prepared_processing_identity(record, entry)
+        prepared_records = [record.get("transcode") for record in checkpoint.get("prepared_entries") or [] if isinstance(record, Mapping)]
+        publications = checkpoint.get("publications") or []
+        if not isinstance(publications, list) or len(publications) > len(prepared_records):
+            raise ValueError("文件发布检查点记录数量无效")
+        validated = []
+        for raw in publications:
+            if not isinstance(raw, Mapping) or not any(
+                isinstance(prepared, Mapping) and all(raw.get(key) == prepared.get(key) for key in ("source_path", "target_path", "temporary_path"))
+                for prepared in prepared_records
+            ):
+                raise ValueError("文件发布检查点与已校验的处理结果不匹配")
+            source = self._checked_processing_path(raw["source_path"])
+            target = self._checked_processing_path(raw["target_path"])
+            temporary = self._checked_processing_path(raw["temporary_path"])
+            if temporary in {source, target} or ".transcoding-" not in temporary.name or ".part" not in temporary.name:
+                raise ValueError("文件发布检查点包含无效临时文件")
+            backup_value = raw.get("backup_path")
+            backup = self._checked_processing_path(backup_value) if backup_value else None
+            if backup is not None and (
+                target != source
+                or
+                backup.parent != source.parent
+                or not re.fullmatch(rf"\.{re.escape(source.name)}\.pre-transcode-\d+-\d+\.bak", backup.name)
+            ):
+                raise ValueError("处理检查点包含无效备份路径")
+            validated.append((source, target, temporary, backup))
+        if len({target for _, target, _, _ in validated}) != len(validated):
+            raise ValueError("文件发布检查点包含重复输出文件")
+        for source, target, temporary, backup in validated:
+            if backup is not None and backup.is_file():
+                if target.is_file() and not temporary.exists():
+                    target.replace(temporary)
+                backup.replace(source)
+            elif target != source and target.is_file() and not temporary.exists():
+                target.replace(temporary)
+
+    def _run_saved_processing(self) -> None:
+        checkpoint = self._processing_checkpoint or {}
+        if checkpoint.get("version") != 1 or checkpoint.get("kind") not in {"download", "manual", "native"}:
+            raise ValueError("处理检查点版本或类型无效")
+        self._processing_workspace = processing_temp_workspace_path(self.processing_temp_dir, self.task_id, "download")
+        if str(self._processing_workspace or "") != str(checkpoint.get("workspace") or ""):
+            raise ValueError("处理检查点临时目录与任务不匹配")
+        if self._processing_workspace is not None and any(_is_reparse_point(path) for path in (self._processing_workspace, self._processing_workspace.parent, self._processing_workspace.parent.parent)):
+            raise ValueError("处理检查点临时目录包含符号链接")
+        entries = checkpoint.get("entries")
+        if not isinstance(entries, list) or not entries or not all(isinstance(entry, Mapping) for entry in entries):
+            raise ValueError("处理检查点缺少媒体条目")
+        prepared_entries = checkpoint.get("prepared_entries") or []
+        if not isinstance(prepared_entries, list) or len(prepared_entries) > len(entries):
+            raise ValueError("处理检查点条目数量无效")
+        for entry in entries:
+            self._checked_processing_path(entry.get("filepath"))
+        self._source_ip = str(checkpoint.get("source_ip") or "")
+        self._source_ip_checked = True
+        preview = str(checkpoint.get("preview_thumbnail") or "")
+        if preview:
+            self._thumbnails.path = str(self._checked_processing_path(preview))
+            self._thumbnails.attempted = True
+        self.ffmpeg_path = str(checkpoint.get("ffmpeg_path") or self.ffmpeg_path)
+        self.ffprobe_path = str(checkpoint.get("ffprobe_path") or self.ffprobe_path)
+        if checkpoint.get("kind") == "native":
+            self._run_saved_native_processing(checkpoint)
+            return
+        self._recover_processing_publications(checkpoint)
+        self._set_stage("verifying", "正在处理已下载的媒体", force=True)
+        self._complete_download_info({"_type": "playlist", "entries": entries}, lambda entry: str(entry["filepath"]))
 
     @staticmethod
     def _adaptive_probe_options(
@@ -2615,8 +3227,9 @@ class DownloadWorker(QObject):
                 log_line=self._external_log_line,
                 progress_hook=lambda payload: progress_hook(self._external_progress_payload(payload)),
                 postprocess_hook=lambda payload: self._handle_postprocessor(
-                    self._external_progress_payload(payload)
+                    self._external_progress_payload(payload), manage_budget=False
                 ),
+                processing_gate=self._external_budget_event,
             ),
             "视频下载",
         )
@@ -2822,7 +3435,7 @@ class DownloadWorker(QObject):
         self._set_stage(
             stage,
             stage_text,
-            stream_progress if stage != "downloading" or status == "finished" else None,
+            stream_progress if total or status == "finished" else None,
             publish=False,
         )
         stream_kind = self._progress_stream_kind(stage)
@@ -2851,6 +3464,7 @@ class DownloadWorker(QObject):
             "stage": self._stage,
             "stage_text": self._stage_text,
             "stage_progress": self._stage_progress,
+            "stage_indeterminate": self._stage_indeterminate,
             "retry_count": self._retry_count,
             "retry_total": self._retry_total,
             "elapsed_seconds": max(0.0, now - self._started_at),
@@ -3161,6 +3775,9 @@ class DownloadWorker(QObject):
                 category="格式/工具",
             )
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            self._install_builtin_network_gate(ydl)
+            if self._defer_processing:
+                install_native_checkpointing(ydl, self._save_native_processing_checkpoint)
             if self._disk_lease is not None:
                 ydl.params["match_filter"] = (
                     lambda info, *, incomplete=False: self._capacity_match_filter(
@@ -3225,6 +3842,14 @@ class DownloadWorker(QObject):
         category, log_message, details = self._run_failure_details(exc)
         self._log("error", category, log_message, **details)
         message = self._run_exception_message(exc)
+        if self._processing_only or self._processing_handoff_started:
+            failed_step = self._stage
+            self._set_stage(
+                "processing_failed", f"PROCESSING FAILED · {failed_step}: {message[:120]}",
+                force=True, error=message, failed_step=failed_step,
+            )
+            self.failed.emit(self.task_id, message)
+            return
         self._set_stage(
             "failed",
             f"下载失败：{message[:120]}",
@@ -3243,6 +3868,8 @@ class DownloadWorker(QObject):
             pass
 
     def _discard_pending_transcodes_after_run(self) -> None:
+        if self._processing_only and not self._download_completed:
+            return
         pending = tuple(self._pending_transcodes)
         self._pending_transcodes.clear()
         for prepared in pending:
@@ -3301,6 +3928,8 @@ class DownloadWorker(QObject):
                 pass
 
     def _should_cleanup_processing_workspace(self) -> bool:
+        if (self._processing_only or self._processing_handoff_started) and not self._download_completed:
+            return False
         return (
             self._download_completed
             or not self._cancel.is_set()
@@ -3364,18 +3993,25 @@ class DownloadWorker(QObject):
     def run(self) -> None:
         cookies: MaterializedCookieSource | None = None
         try:
-            self._start_run()
-            external_executable = self._resolve_download_core()
-            self._prepare_run_environment()
-            ydl_options = self._build_ytdlp_options()
-            cookies = self._configure_cookie_options(ydl_options)
-            self._run_download_flow(external_executable, ydl_options)
+            if self._processing_only:
+                self._started_at = self._stage_started_at = time.monotonic()
+                self._enter_processing_budget()
+                self._run_saved_processing()
+            else:
+                self._enter_network_budget()
+                self._start_run()
+                external_executable = self._resolve_download_core()
+                self._prepare_run_environment()
+                ydl_options = self._build_ytdlp_options()
+                cookies = self._configure_cookie_options(ydl_options)
+                self._run_download_flow(external_executable, ydl_options)
         except Exception as exc:
             self._handle_run_exception(exc)
         finally:
             try:
                 self._cleanup_run(cookies)
             finally:
+                self._release_worker_budgets()
                 self.finished.emit()
 
 @dataclass(frozen=True, slots=True)
@@ -3479,6 +4115,10 @@ class DownloadService(QObject):
         self._collection_child_state: dict[str, _CollectionChildContribution] = {}
         self._collection_aggregates: dict[str, _CollectionAggregate] = {}
         self.queue = DownloadTaskQueue()
+        self._processing_queue = DownloadTaskQueue()
+        self._processing_task_ids: set[str] = set()
+        self._ytdlp_processing_task_ids: set[str] = set()
+        self._processing_budget = _WorkerCapacityBudget(1)
         (
             self.max_concurrent,
             self.fragment_concurrent,
@@ -3488,6 +4128,7 @@ class DownloadService(QObject):
             fragment_concurrent,
             request_delay,
         )
+        self._network_budget = _WorkerCapacityBudget(self.max_concurrent)
         self.ytdlp_core_mode = normalize_ytdlp_core_mode(ytdlp_core_mode)
         self.deno_path = str(deno_path or "").strip()
         self.ffprobe_path = str(ffprobe_path or "").strip()
@@ -3553,13 +4194,42 @@ class DownloadService(QObject):
             request_delay,
         )
         self.max_concurrent, self.fragment_concurrent, self.request_delay = values
+        self._network_budget.configure(self.max_concurrent)
         self._start_next()
         return values
 
+    def configure_runtime_settings(
+        self,
+        *,
+        ytdlp_core_mode: str | None = None,
+        deno_path: str | None = None,
+        ffprobe_path: str | None = None,
+        ytdlp_ejs_source: str | None = None,
+        cover_convert_jpeg: bool | None = None,
+        cover_jpeg_quality: int | None = None,
+    ) -> None:
+        """Apply normalized core settings without exposing mutable service fields."""
+
+        if ytdlp_core_mode is not None:
+            self.ytdlp_core_mode = normalize_ytdlp_core_mode(ytdlp_core_mode)
+        if deno_path is not None:
+            self.deno_path = str(deno_path or "").strip()
+        if ffprobe_path is not None:
+            self.ffprobe_path = str(ffprobe_path or "").strip()
+        if ytdlp_ejs_source is not None:
+            self.ytdlp_ejs_source = normalize_ytdlp_ejs_source(ytdlp_ejs_source)
+        if cover_convert_jpeg is not None:
+            self.cover_convert_jpeg = bool(cover_convert_jpeg)
+        if cover_jpeg_quality is not None:
+            self.cover_jpeg_quality = max(50, min(int(cover_jpeg_quality or 90), 100))
+
     @property
     def active_thread_count(self) -> int:
+        # A stopped worker still owns its queued outcome and cleanup callbacks.
+        # Treat the retained runtime as active until those references leave the
+        # service, so an external database replacement cannot race late writes.
         threads = set(self.threads.values()) | set(self.conversion_threads.values())
-        return sum(1 for thread in threads if thread.isRunning())
+        return len(threads)
 
     def total_speed_bps(self) -> float:
         """Return the incrementally maintained aggregate download speed."""
@@ -3669,11 +4339,38 @@ class DownloadService(QObject):
         self._deferred_thread_finishes.clear()
         self.tasks.clear()
         self.queue.clear()
+        self._processing_queue.clear()
+        self._processing_task_ids.clear()
+        self._ytdlp_processing_task_ids.clear()
         self._task_index.clear()
         self._collection_child_state.clear()
         self._collection_aggregates.clear()
         self._last_progress_emit.clear()
         self._resolved_identity_state.clear()
+
+    def persist_interrupted_tasks(
+        self,
+        task_ids: Iterable[str] | None = None,
+    ) -> int:
+        """Durably leave interrupted downloads paused during cooperative shutdown."""
+
+        allowed = (
+            {str(task_id) for task_id in task_ids}
+            if task_ids is not None
+            else None
+        )
+        tasks = [
+            task
+            for task_id, task in self.tasks.items()
+            if (allowed is None or task_id in allowed)
+            and task.status in {"downloading", "暂停中"}
+        ]
+        if not tasks:
+            return 0
+        with self._durable_task_mutations(tasks):
+            for task in tasks:
+                task.status = "paused"
+        return len(tasks)
 
     def task_statistics(self, *, top_level_only: bool = False) -> dict[str, int]:
         """Return cached task totals without walking every task object."""
@@ -3766,6 +4463,7 @@ class DownloadService(QObject):
             task.speed = ""
             task.eta = ""
         if task.status == "completed":
+            task.stage_indeterminate = False
             task.stage, task.stage_text, task.stage_progress = (
                 "completed",
                 "下载完成",
@@ -3773,6 +4471,15 @@ class DownloadService(QObject):
             )
         elif task.status == "failed":
             task.stage, task.stage_text = "failed", "下载失败"
+        elif task.status == "processing_failed":
+            checkpoint = task.options_json.get("_processing", {})
+            task.failed_step = str(checkpoint.get("failed_step") or "processing")
+            task.stage = "processing_failed"
+            task.stage_text = f"PROCESSING FAILED · {task.failed_step}: {task.error[:120]}"
+        elif task.status == "processing":
+            task.stage, task.stage_text = "waiting_processing", "等待处理已下载的媒体"
+            task.stage_progress = 0.0
+            task.stage_indeterminate = True
         elif task.status == "paused":
             task.stage, task.stage_text = "paused", "已暂停"
         elif task.status == "canceled":
@@ -3947,6 +4654,8 @@ class DownloadService(QObject):
                 )
         if task.status == "queued" and task.task_kind == "video":
             self.queue.append_unique(task.id)
+        elif task.status == "processing" and task.task_kind == "video":
+            self._processing_queue.append_unique(task.id)
 
     def _restore_task_row(self, row: Any) -> DownloadTask:
         reader = _TaskRowReader(row)
@@ -4269,6 +4978,18 @@ class DownloadService(QObject):
         prepend_cover_enabled: bool | None = None,
         prepend_cover_frames: int | None = None,
     ) -> DownloadTask:
+        options = self._snapshot_new_task_options(
+            options_json,
+            organize_task_folder=organize_task_folder,
+            prepend_cover_enabled=prepend_cover_enabled,
+            prepend_cover_frames=prepend_cover_frames,
+        )
+        options.pop("_processing", None)
+        options["_processing_plan"] = {
+            "cover_convert_jpeg": bool(getattr(self, "cover_convert_jpeg", False)),
+            "cover_jpeg_quality": non_negative_int(getattr(self, "cover_jpeg_quality", 90), 90),
+            "ffprobe_path": str(getattr(self, "ffprobe_path", "") or ""),
+        }
         return DownloadTask(
             id=self._new_task_id(),
             url=str(url or "").strip(),
@@ -4279,12 +5000,7 @@ class DownloadService(QObject):
             root_task_id=root_task_id,
             source_key=source_key,
             collection_index=collection_index,
-            options_json=self._snapshot_new_task_options(
-                options_json,
-                organize_task_folder=organize_task_folder,
-                prepend_cover_enabled=prepend_cover_enabled,
-                prepend_cover_frames=prepend_cover_frames,
-            ),
+            options_json=options,
             cookie_file=str(cookie_file or "").strip(),
             cookie_source=str(cookie_source or "none").strip(),
             cookie_browser=str(cookie_browser or "chrome").strip(),
@@ -4616,23 +5332,142 @@ class DownloadService(QObject):
         source_key: str = "",
         parsed_count: int | None = None,
         finished: bool = False,
-    ) -> None:
+        clear_error: bool = False,
+    ) -> bool:
         parent = self.tasks.get(parent_id)
         if not parent or parent.task_kind != "collection":
-            return
-        if title:
-            parent.title = title
-        if source_key:
-            parent.source_key = normalize_source_key(source_key)
-        metadata = parent.options_json.setdefault("_collection", {})
-        if parsed_count is not None:
-            metadata["parsed"] = max(0, int(parsed_count))
-        metadata["probe_finished"] = bool(finished)
-        parent.status = "waiting_selection" if finished else "parsing_collection"
-        parent.stage = parent.status
-        parent.stage_text = "等待选择下载项目" if finished else "正在解析合集"
-        self._persist(parent)
+            return False
+        with self._durable_task_mutation(parent):
+            if title:
+                parent.title = title
+            if source_key:
+                parent.source_key = normalize_source_key(source_key)
+            metadata = parent.options_json.setdefault("_collection", {})
+            if parsed_count is not None:
+                metadata["parsed"] = max(0, int(parsed_count))
+            metadata["probe_finished"] = bool(finished)
+            if clear_error:
+                parent.error = ""
+            parent.status = "waiting_selection" if finished else "parsing_collection"
+            parent.stage = parent.status
+            parent.stage_text = "等待选择下载项目" if finished else "正在解析合集"
         self.task_updated.emit(parent)
+        return True
+
+    def restart_collection_probe(self, parent_id: str) -> bool:
+        """Return one failed, childless collection to parsing state."""
+
+        parent = self.tasks.get(str(parent_id or ""))
+        if (
+            parent is None
+            or parent.task_kind != "collection"
+            or parent.status != "failed"
+            or self.collection_children(parent.id)
+        ):
+            return False
+        try:
+            parsed_count = int(self.db.collection_probe_entry_count(parent.id))
+        except (OSError, TypeError, ValueError):
+            parsed_count = 0
+        return self.update_collection_probe(
+            parent.id,
+            title=parent.title,
+            source_key=parent.source_key,
+            parsed_count=max(0, parsed_count),
+            finished=False,
+            clear_error=True,
+        )
+
+    def set_task_authentication(
+        self,
+        task_id: str,
+        authentication: CookieSource,
+    ) -> bool:
+        """Persist the current Cookie source for one task or collection tree."""
+
+        root = self.tasks.get(str(task_id or ""))
+        if root is None:
+            return False
+        tasks = (
+            self._collection_tree_tasks(root.id)
+            if root.task_kind == "collection"
+            else [root]
+        )
+        source = authentication.normalized()
+        changed = [
+            task
+            for task in tasks
+            if (
+                task.cookie_source,
+                task.cookie_file,
+                task.cookie_browser,
+                task.cookie_profile,
+                task.cookie_keyring,
+                task.cookie_container,
+            ) != (
+                source.source,
+                source.file,
+                source.browser,
+                source.profile,
+                source.keyring,
+                source.container,
+            )
+        ]
+        if not changed:
+            return True
+        with self._durable_task_mutations(changed):
+            for task in changed:
+                task.cookie_source = source.source
+                task.cookie_file = source.file
+                task.cookie_browser = source.browser
+                task.cookie_profile = source.profile
+                task.cookie_keyring = source.keyring
+                task.cookie_container = source.container
+        for task in changed:
+            self.task_updated.emit(task)
+        return True
+
+    def store_collection_probe_entries(
+        self,
+        parent_id: str,
+        entries: Iterable[Mapping[str, object]],
+    ) -> int | None:
+        """Persist probe entries only while their collection parent still exists."""
+
+        parent = self.tasks.get(str(parent_id or ""))
+        if parent is None or parent.task_kind != "collection":
+            return None
+        payload = [dict(entry) for entry in entries]
+        if payload:
+            self.db.upsert_collection_probe_entries(parent.id, payload)
+        return self.db.collection_probe_entry_count(parent.id)
+
+    def set_collection_probe_entry_selected(
+        self,
+        parent_id: str,
+        collection_index: int,
+        selected: bool,
+    ) -> bool:
+        """Persist one collection selection through the task-service seam."""
+
+        parent = self.tasks.get(str(parent_id or ""))
+        if parent is None or parent.task_kind != "collection":
+            return False
+        self.db.set_collection_probe_entry_selected(
+            parent.id,
+            int(collection_index or 0),
+            bool(selected),
+        )
+        return True
+
+    def set_collection_probe_selection(self, parent_id: str, mode: str) -> bool:
+        """Persist a bulk collection selection through the task-service seam."""
+
+        parent = self.tasks.get(str(parent_id or ""))
+        if parent is None or parent.task_kind != "collection":
+            return False
+        self.db.set_collection_probe_selection(parent.id, str(mode or ""))
+        return True
 
     def fail_collection_probe(self, parent_id: str, error: str) -> bool:
         """Persist a collection-probe failure through the service boundary."""
@@ -4641,12 +5476,12 @@ class DownloadService(QObject):
         if not parent or parent.task_kind != "collection":
             return False
         message = str(error or "合集解析失败")
-        parent.status = "failed"
-        parent.error = message
-        parent.stage = "failed"
-        parent.stage_text = message
-        parent.stage_progress = 0.0
-        self._persist(parent)
+        with self._durable_task_mutation(parent):
+            parent.status = "failed"
+            parent.error = message
+            parent.stage = "failed"
+            parent.stage_text = message
+            parent.stage_progress = 0.0
         self.task_updated.emit(parent)
         if parent.parent_task_id:
             self._refresh_collection(parent.parent_task_id)
@@ -4686,19 +5521,19 @@ class DownloadService(QObject):
             # already queued/running canonical task remains untouched.
             self.discard_task(task.id)
             return True
-        task.task_kind = "video"
-        task.playlist_mode = "single"
-        task.download_album = False
-        task.title = resolved_title
-        if source_key:
-            task.source_key = normalize_source_key(source_key)
-        task.status = "queued"
-        task.stage = "queued"
-        task.stage_text = "解析完成，等待下载"
-        task.stage_progress = 0.0
-        task.progress = 0.0
-        task.error = ""
-        self._persist(task)
+        with self._durable_task_mutation(task):
+            task.task_kind = "video"
+            task.playlist_mode = "single"
+            task.download_album = False
+            task.title = resolved_title
+            if source_key:
+                task.source_key = normalize_source_key(source_key)
+            task.status = "queued"
+            task.stage = "queued"
+            task.stage_text = "解析完成，等待下载"
+            task.stage_progress = 0.0
+            task.progress = 0.0
+            task.error = ""
         self.queue.append_unique(task.id)
         self._best_effort_service_log(
             task.id,
@@ -4747,7 +5582,10 @@ class DownloadService(QObject):
             # Content confirmation is a single-video interaction. A collection
             # must not open one blocking dialog for every selected child.
             options.content_mode = "video"
-        return options.to_sparse_dict()
+        child_options = options.to_sparse_dict()
+        if isinstance(parent.options_json.get("_processing_plan"), Mapping):
+            child_options["_processing_plan"] = deepcopy(parent.options_json["_processing_plan"])
+        return child_options
 
     @staticmethod
     def _collection_entry_spec(
@@ -4936,17 +5774,17 @@ class DownloadService(QObject):
         if seed <= 0:
             seed = int(uuid4().hex[:8], 16) | 1
         total = self.db.count_selected_collection_probe_entries(parent_id, "video")
-        parent.options_json["_collection_materialization"] = {
-            "active": True,
-            "offset": 0,
-            "total": total,
-            "order": normalized_order,
-            "seed": seed,
-        }
-        parent.status = "queued" if total else "canceled"
-        parent.stage = parent.status
-        parent.stage_text = "正在创建合集子任务" if total else "未选择下载项目"
-        self._persist(parent)
+        with self._durable_task_mutation(parent):
+            parent.options_json["_collection_materialization"] = {
+                "active": bool(total),
+                "offset": 0,
+                "total": total,
+                "order": normalized_order,
+                "seed": seed,
+            }
+            parent.status = "queued" if total else "canceled"
+            parent.stage = parent.status
+            parent.stage_text = "正在创建合集子任务" if total else "未选择下载项目"
         self.task_updated.emit(parent)
         if total and parent_id not in self._materialization_parents:
             self._materialization_parents.append(parent_id)
@@ -4969,27 +5807,44 @@ class DownloadService(QObject):
         offset = max(0, int(state.get("offset") or 0))
         order = str(state.get("order") or "original")
         sort_column = "random" if order == "random" else "collection_index"
-        entries = self.db.list_collection_probe_entries(
-            parent_id,
-            offset=offset,
-            limit=200,
-            selected_only=True,
-            entry_kind="video",
-            sort_column=sort_column,
-            sort_descending=order == "reverse",
-            random_seed=int(state.get("seed") or 1),
-        )
-        if entries:
-            self.enqueue_collection_entries(parent_id, entries)
-            state["offset"] = offset + len(entries)
-        total = max(0, int(state.get("total") or 0))
-        finished = not entries or int(state.get("offset") or 0) >= total
+        try:
+            entries = self.db.list_collection_probe_entries(
+                parent_id,
+                offset=offset,
+                limit=200,
+                selected_only=True,
+                entry_kind="video",
+                sort_column=sort_column,
+                sort_descending=order == "reverse",
+                random_seed=int(state.get("seed") or 1),
+            )
+            if entries:
+                self.enqueue_collection_entries(parent_id, entries)
+            total = max(0, int(state.get("total") or 0))
+            next_offset = offset + len(entries)
+            finished = not entries or next_offset >= total
+            with self._durable_task_mutation(parent):
+                state["offset"] = next_offset
+                if finished:
+                    state["active"] = False
+        except Exception as exc:
+            # The durable mutation restores the in-memory state on a failed
+            # SQLite write. Requeue this parent so a transient lock does not
+            # silently strand selected collection entries.
+            self._best_effort_service_log(
+                parent_id,
+                "warning",
+                "数据库/合集",
+                "创建合集子任务失败，将自动重试",
+                error=str(exc),
+            )
+            if not self._shutting_down:
+                self._materialization_parents.appendleft(parent_id)
+                QTimer.singleShot(1000, self._schedule_next_materialization)
+            return
         if finished:
-            state["active"] = False
-            self._persist(parent)
             self._refresh_collection(parent_id)
         else:
-            self._persist(parent)
             self._materialization_parents.append(parent_id)
         self._schedule_next_materialization()
 
@@ -5019,7 +5874,9 @@ class DownloadService(QObject):
         parent.status = summary.status
         parent.stage = summary.status
         parent.stage_text = summary.stage_text
-        parent.progress = summary.progress
+        parent.progress = summary.progress if summary.terminal else min(99.0, summary.progress)
+        parent.stage_indeterminate = summary.status not in {"downloading", "completed"}
+        parent.stage_progress = 0.0 if parent.stage_indeterminate else parent.progress
         parent.speed_bps = summary.speed_bps
         parent.speed = format_speed(summary.speed_bps)
         parent.downloaded_bytes = summary.downloaded_bytes
@@ -5041,7 +5898,10 @@ class DownloadService(QObject):
         snapshot = self._snapshot_task_state(parent)
         self._apply_collection_summary(parent, summary)
         try:
-            self._persist_progress(parent, force=summary.terminal)
+            if not self._persist_progress(parent, force=summary.terminal):
+                self._restore_task_state(parent, snapshot)
+                self._schedule_collection_refresh(parent_id)
+                return
         except Exception as exc:
             # Collection state is derived from its children and can be retried.
             # Do not leave the card ahead of SQLite or let a timer callback
@@ -5105,18 +5965,29 @@ class DownloadService(QObject):
 
     @staticmethod
     def _mark_task_resumed(task: DownloadTask) -> None:
-        task.status = "queued"
-        task.stage = "queued"
-        task.stage_text = "等待重新开始"
+        processing = isinstance(task.options_json.get("_processing"), Mapping)
+        task.status = "processing" if processing else "queued"
+        task.stage = "waiting_processing" if processing else "queued"
+        task.stage_text = "等待处理已下载的媒体" if processing else "等待重新开始"
+        task.stage_indeterminate = True
+        task.failed_step = ""
+        if processing:
+            task.options_json["_processing"].update(state="waiting", failed_step="", error="")
         task.error = ""
         task.pause_requested = False
         task.cancel_requested = False
         task.speed_samples = ()
         task.speed_bps = 0.0
         task.speed = ""
+        task.eta = ""
+        task.visible_eta = ""
 
     @staticmethod
     def _reset_task_for_retry(task: DownloadTask) -> None:
+        if isinstance(task.options_json.get("_processing"), Mapping):
+            DownloadService._mark_task_resumed(task)
+            task.stage_progress = 0.0
+            return
         task.status = "queued"
         task.error = ""
         task.progress = 0.0
@@ -5136,6 +6007,7 @@ class DownloadService(QObject):
         task.speed_samples = ()
         task.speed_bps = 0.0
         task.speed = ""
+        task.eta = ""
 
     def _refresh_collection_tree(self, tree_tasks: Iterable[DownloadTask]) -> None:
         """Refresh nested collection summaries from deepest to root."""
@@ -5184,10 +6056,10 @@ class DownloadService(QObject):
 
         if action == "pause":
             worker = self.workers.get(child.id)
-            if worker is not None and child.status in {"downloading", "waiting_selection"}:
+            if worker is not None and child.status in {"downloading", "processing", "waiting_selection"}:
                 plan.transitions.append(("pause_active", child))
                 plan.worker_cancels.append((child, worker, "pause"))
-            elif child.status == "queued":
+            elif child.status in {"queued", "processing"}:
                 plan.transitions.append(("pause_queued", child))
             return
 
@@ -5198,7 +6070,7 @@ class DownloadService(QObject):
 
         if action == "cancel":
             if child.status in {
-                "completed", "failed", "partial_failed", "canceled", "deleted",
+                "completed", "failed", "processing_failed", "partial_failed", "canceled", "deleted",
             }:
                 return
             if child.status == "paused":
@@ -5225,7 +6097,7 @@ class DownloadService(QObject):
                 plan.transitions.append(("cancel_orphan", child))
             return
 
-        if child.status not in {"failed", "canceled"}:
+        if child.status not in {"failed", "processing_failed", "canceled"}:
             return
         if (
             child.id in self.workers
@@ -5260,10 +6132,12 @@ class DownloadService(QObject):
         ))
         if remove_from_queue:
             self.queue.remove_all(remove_from_queue)
+            self._processing_queue.remove_all(remove_from_queue)
 
         resume_ids = plan.transition_ids("resume")
         for child_id in reversed(resume_ids):
-            self.queue.appendleft_unique(child_id)
+            target_queue = self._processing_queue if self.tasks[child_id].status == "processing" else self.queue
+            target_queue.appendleft_unique(child_id)
 
         retry_ids = plan.transition_ids("retry")
         self._pending_runtime_retries.difference_update(
@@ -5271,7 +6145,8 @@ class DownloadService(QObject):
         )
         for child_id in retry_ids:
             self._pending_runtime_retries.discard(child_id)
-            self.queue.append_unique(child_id)
+            target_queue = self._processing_queue if self.tasks[child_id].status == "processing" else self.queue
+            target_queue.append_unique(child_id)
         for child in plan.pending_retries:
             self._pending_runtime_retries.add(child.id)
         return bool(resume_ids or retry_ids)
@@ -5475,7 +6350,7 @@ class DownloadService(QObject):
             if task.parent_task_id:
                 self._refresh_collection(task.parent_task_id)
             return
-        if task.status == "queued":
+        if task.status == "queued" or (task.status == "processing" and task_id not in self.workers and task_id not in self.conversion_workers):
             # The row action is labelled "取消".  A queued task has no
             # worker to interrupt, so mark it as canceled rather than
             # silently turning it into a paused task.  This keeps the UI
@@ -5483,6 +6358,7 @@ class DownloadService(QObject):
             with self._durable_task_mutation(task):
                 self._mark_task_canceled(task)
             self.queue.remove_all((task_id,))
+            self._processing_queue.remove_all((task_id,))
             self.task_updated.emit(task)
             self._best_effort_service_log(
                 task_id,
@@ -5523,7 +6399,7 @@ class DownloadService(QObject):
         if self._cascade_collection(task_id, "pause"):
             return
         worker = self.workers.get(task_id)
-        if worker and task.status in {"downloading", "waiting_selection"}:
+        if worker and task.status in {"downloading", "processing", "waiting_selection"}:
             with self._durable_task_mutation(task):
                 self._mark_task_pausing(task)
             self.task_updated.emit(task)
@@ -5534,12 +6410,13 @@ class DownloadService(QObject):
                 "用户操作",
                 "已请求暂停任务",
             )
-        elif task.status == "queued":
+        elif task.status in {"queued", "processing"}:
             # A queued task has no worker yet; pausing it means removing it
             # from the queue and retaining the task record for later resume.
             with self._durable_task_mutation(task):
                 self._mark_task_paused(task)
             self.queue.remove_all((task_id,))
+            self._processing_queue.remove_all((task_id,))
             self.task_updated.emit(task)
 
     def resume(self, task_id: str) -> None:
@@ -5551,7 +6428,8 @@ class DownloadService(QObject):
             return
         with self._durable_task_mutation(task):
             self._mark_task_resumed(task)
-        self.queue.appendleft_unique(task.id)
+        target_queue = self._processing_queue if task.status == "processing" else self.queue
+        target_queue.appendleft_unique(task.id)
         self.task_updated.emit(task)
         self._best_effort_service_log(
             task_id,
@@ -5569,7 +6447,7 @@ class DownloadService(QObject):
         if task and task.status == "deleted":
             self.redownload(task_id)
             return
-        if not task or task.status not in {"failed", "canceled"}:
+        if not task or task.status not in {"failed", "processing_failed", "canceled"}:
             return
         if (
             task_id in self.workers
@@ -5594,7 +6472,8 @@ class DownloadService(QObject):
         with self._durable_task_mutation(task):
             self._reset_task_for_retry(task)
         self._pending_runtime_retries.discard(task_id)
-        self.queue.append_unique(task_id)
+        target_queue = self._processing_queue if task.status == "processing" else self.queue
+        target_queue.append_unique(task_id)
         self.task_updated.emit(task)
         self._best_effort_service_log(
             task_id,
@@ -5611,7 +6490,7 @@ class DownloadService(QObject):
             self._pending_runtime_retries.discard(task_id)
             return False
         task = self.tasks.get(task_id)
-        if task is None or task.status not in {"failed", "canceled"}:
+        if task is None or task.status not in {"failed", "processing_failed", "canceled"}:
             self._pending_runtime_retries.discard(task_id)
             return False
         try:
@@ -5641,7 +6520,7 @@ class DownloadService(QObject):
             self._start_next()
         elif task.status == "paused":
             self.resume(task_id)
-        elif task.status in {"failed", "partial_failed", "canceled"}:
+        elif task.status in {"failed", "processing_failed", "partial_failed", "canceled"}:
             self.retry(task_id)
         elif task.status in {"completed", "deleted"}:
             self.redownload(task_id)
@@ -5876,24 +6755,27 @@ class DownloadService(QObject):
         if request.encoder == "original":
             self.conversion_finished.emit(task_id, "keep_original", True)
             return True
-
-        try:
-            runtime = self._prepare_completed_conversion_runtime(
-                request.task,
-                request.encoder,
-                request.ffmpeg_path,
-                request.ffprobe_path,
-            )
-        except Exception as exc:
-            self._report_completed_conversion_start_failure(request.task, exc)
-            return False
-
-        self._activate_completed_conversion_runtime(request, runtime)
-        try:
-            runtime.thread.start()
-        except Exception as exc:
-            self._rollback_completed_conversion_start(request.task, runtime, exc)
-            return False
+        task = request.task
+        options = DownloadOptions.from_mapping(task.options_json)
+        checkpoint = {
+            "version": 1,
+            "kind": "manual",
+            "state": "waiting",
+            "encoder": request.encoder,
+            "entries": [{"filepath": str(Path(task.media_path).resolve()), "webpage_url": task.url, "title": task.title, "uploader": task.uploader}],
+            "prepared_entries": [],
+            "thumbnail_path": task.thumbnail_path,
+            "workspace": str(processing_temp_workspace_path(options.processing_temp_dir, task.id, "download") or ""),
+            "ffmpeg_path": request.ffmpeg_path,
+            "ffprobe_path": request.ffprobe_path,
+        }
+        with self._durable_task_mutation(task):
+            task.options_json["_processing"] = checkpoint
+            self._mark_task_resumed(task)
+        self._processing_queue.append_unique(task.id)
+        self.task_updated.emit(task)
+        self._refresh_parent_collection(task)
+        self._start_next()
         return True
 
     def _restore_completed_after_conversion(self, task: DownloadTask, text: str = "下载完成") -> None:
@@ -6300,10 +7182,23 @@ class DownloadService(QObject):
             # Deleting an active task also implies cancelling it.  Keep the
             # requested file policy and remove everything after the worker
             # unwinds, so the user does not need to pause first.
-            with self._durable_task_mutation(task):
-                task.pause_requested = False
-                task.cancel_requested = True
-                task.status = "canceling"
+            try:
+                with self._durable_task_mutation(task):
+                    self._mark_task_canceling(task)
+            except LookupError as exc:
+                # An externally removed row remains authoritative.  The live
+                # worker still has to unwind through the normal delete path,
+                # but it must not block that cleanup by trying to update a row
+                # which no longer exists.
+                self._mark_task_canceling(task)
+                self._sync_task_indexes(task)
+                self._best_effort_service_log(
+                    task_id,
+                    "warning",
+                    "数据库/删除",
+                    "任务记录已不存在，已请求停止运行任务并等待清理",
+                    error=str(exc),
+                )
             self._pending_deletes[task_id] = bool(delete_files)
             self.task_updated.emit(task)
             self.workers[task_id].cancel("delete")
@@ -6388,6 +7283,7 @@ class DownloadService(QObject):
         if task is None:
             return None
         self.queue.remove_all((task_id,))
+        self._processing_queue.remove_all((task_id,))
         self._pending_runtime_retries.discard(task_id)
         self._discard_tasks.discard(task_id)
         self._pending_deletes.pop(task_id, None)
@@ -6469,6 +7365,7 @@ class DownloadService(QObject):
 
         tree_ids = {task.id for task in tree_tasks}
         self.queue.remove_all(tree_ids)
+        self._processing_queue.remove_all(tree_ids)
         self._pending_collection_deletes[root_id] = pending
         for child in active_children:
             self._collection_delete_root_by_child[child.id] = root_id
@@ -6568,7 +7465,8 @@ class DownloadService(QObject):
             plan = prepared_cleanup_plans.get(task.id)
             if plan is not None:
                 self._delete_planned_task_files(task, *plan)
-            self._cleanup_task_processing_workspaces(task)
+            if delete_files or not task.options_json.get("_processing"):
+                self._cleanup_task_processing_workspaces(task)
             self.task_deleted.emit(task.id)
         if outer_parent_id:
             self._schedule_collection_refresh(outer_parent_id)
@@ -6597,7 +7495,8 @@ class DownloadService(QObject):
         self._forget_task_runtime_state(task_id)
         if delete_files:
             self._delete_planned_task_files(task, cleanup_files, output_root)
-        self._cleanup_task_processing_workspaces(task)
+        if delete_files or not task.options_json.get("_processing"):
+            self._cleanup_task_processing_workspaces(task)
         self.task_deleted.emit(task_id)
         if task.parent_task_id:
             self._schedule_collection_refresh(task.parent_task_id)
@@ -6634,6 +7533,7 @@ class DownloadService(QObject):
         with self._durable_task_mutation(task):
             task.format_selector = selector
             if content_mode or audio_format:
+                processing_plan = task.options_json.get("_processing_plan")
                 selected_options = DownloadOptions.from_mapping(task.options_json).to_dict()
                 if content_mode:
                     selected_options["content_mode"] = content_mode
@@ -6642,6 +7542,8 @@ class DownloadService(QObject):
                 task.options_json = DownloadOptions.from_mapping(
                     selected_options
                 ).to_sparse_dict()
+                if isinstance(processing_plan, Mapping):
+                    task.options_json["_processing_plan"] = deepcopy(dict(processing_plan))
             task.error = ""
             task.pause_requested = False
             task.cancel_requested = False
@@ -6756,7 +7658,7 @@ class DownloadService(QObject):
             disk_lease=disk_lease,
             ytdlp_core_mode=self.ytdlp_core_mode,
             deno_path=self.deno_path,
-            ffprobe_path=self.ffprobe_path,
+            ffprobe_path=str(task.options_json.get("_processing_plan", {}).get("ffprobe_path", self.ffprobe_path)),
             ytdlp_ejs_source=self.ytdlp_ejs_source,
             transcode_codec=task.transcode_codec,
             transcode_device=task.transcode_device,
@@ -6766,6 +7668,11 @@ class DownloadService(QObject):
             cover_jpeg_quality=self.cover_jpeg_quality,
             options_json=task.options_json,
             log_service=self.logs,
+            defer_processing=True,
+            processing_budget=self._processing_budget,
+            network_budget=self._network_budget,
+            native_task_title=task.title,
+            native_source_key=task.source_key,
         )
         thread = QThread()
         try:
@@ -6791,6 +7698,8 @@ class DownloadService(QObject):
         worker.playlist_info.connect(self._on_playlist_info, Qt.QueuedConnection)
         worker.completed.connect(self._on_media_completed, Qt.QueuedConnection)
         worker.failed.connect(self._on_failed, Qt.QueuedConnection)
+        worker.processing_checkpoint_ready.connect(self._on_processing_checkpoint, Qt.QueuedConnection)
+        worker.processing_capacity_changed.connect(self._on_processing_capacity_changed, Qt.QueuedConnection)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._thread_finished_from_signal, Qt.QueuedConnection)
@@ -6803,6 +7712,8 @@ class DownloadService(QObject):
         self.threads[task_id] = runtime.thread
         self.workers[task_id] = runtime.worker
         self._disk_leases[task_id] = runtime.disk_lease
+        if runtime.worker._processing_only:
+            self._processing_task_ids.add(task_id)
         if self.active_task_id is None:
             self.active_task_id = task_id
             self.thread = runtime.thread
@@ -6889,7 +7800,15 @@ class DownloadService(QObject):
     def _start_next(self) -> None:
         if self._shutting_down:
             return
-        while len(self.workers) < self.max_concurrent:
+        self._start_next_processing()
+        exempt = self._processing_task_ids | self._ytdlp_processing_task_ids
+        # A yt-dlp runtime can wait for processing while another task fills its
+        # network slot. Bound those retained runtimes even for huge playlists.
+        runtime_limit = self.max_concurrent * 2 + 1
+        while (
+            len(self.workers) - len(exempt) < self.max_concurrent
+            and len(self.workers) - len(self._processing_task_ids) < runtime_limit
+        ):
             task = self._take_next_queued_task()
             if task is None:
                 return
@@ -6905,6 +7824,69 @@ class DownloadService(QObject):
                 runtime.thread.start()
             except Exception as exc:
                 self._finalize_download_start_failure(task, exc, runtime)
+
+    @Slot(str, bool)
+    def _on_processing_capacity_changed(self, task_id: str, processing: bool) -> None:
+        if not self._accept_download_worker_signal(task_id):
+            return
+        if processing:
+            self._ytdlp_processing_task_ids.add(task_id)
+        else:
+            self._ytdlp_processing_task_ids.discard(task_id)
+        self._start_next()
+
+    @Slot(str, object)
+    def _on_processing_checkpoint(self, task_id: str, handoff: _ProcessingHandoff) -> None:
+        try:
+            if not self._accept_download_worker_signal(task_id):
+                raise RuntimeError("处理检查点来自已失效的工作线程")
+            task = self.tasks.get(task_id)
+            if task is None or task_id in self._pending_deletes:
+                raise InterruptedError("任务已删除或正在停止")
+            with self._durable_task_mutation(task):
+                task.options_json["_processing"] = deepcopy(handoff.checkpoint)
+                if not task.pause_requested and not task.cancel_requested:
+                    task.status = "processing"
+                    if handoff.checkpoint.get("state") == "waiting":
+                        task.stage = "waiting_processing"
+                        task.stage_text = "等待处理已下载的媒体"
+                        task.stage_progress = 0.0
+                        task.stage_indeterminate = True
+                task.speed_bps = 0.0
+                task.speed = task.eta = ""
+                task.speed_samples = ()
+            self.task_updated.emit(task)
+            self._refresh_parent_collection(task)
+        except Exception as exc:
+            handoff.error = exc
+        finally:
+            handoff.acknowledged.set()
+
+    def _start_next_processing(self) -> None:
+        if self._shutting_down or self._processing_task_ids or self.conversion_workers:
+            return
+        task = self._processing_queue.take_next(
+            self.tasks.get,
+            lambda candidate: candidate.status == "processing" and candidate.id not in self.workers,
+        )
+        if task is None:
+            return
+        runtime: _DownloadRuntime | None = None
+        try:
+            with self._durable_task_mutation(task):
+                checkpoint = task.options_json.get("_processing")
+                if not isinstance(checkpoint, dict) or checkpoint.get("version") != 1:
+                    raise ValueError("已下载媒体的处理检查点不可用")
+                checkpoint["state"] = "running"
+                task.stage = "verifying"
+                task.stage_text = "正在处理已下载的媒体"
+                task.stage_indeterminate = True
+            runtime = self._create_download_runtime(task)
+            self._register_download_runtime(task.id, runtime)
+            runtime.thread.start()
+        except Exception as exc:
+            self._finalize_download_start_failure(task, exc, runtime)
+            QTimer.singleShot(0, self._start_next_processing)
 
     @Slot(str, object)
     def _on_formats_ready(self, task_id: str, payload: dict) -> None:
@@ -6977,12 +7959,22 @@ class DownloadService(QObject):
                 if task.completion_warning else "下载完成"
             )
             task.stage_progress = 100.0
+            task.stage_indeterminate = False
             task.reconnect_message = ""
             task.speed_bps = 0.0
             task.speed = ""
             task.eta = ""
             task.speed_samples = ()
             self._sync_task_indexes(task)
+        if task:
+            checkpoint = task.options_json.get("_processing", {})
+            if checkpoint.get("kind") == "manual":
+                encoder = normalize_transcode_encoder(checkpoint.get("encoder"))
+                task.transcode_encoder = encoder
+                task.transcode_codec = transcode_encoder_codec(encoder)
+                task.transcode_device = transcode_encoder_device(encoder)
+                skipped = str(checkpoint.get("skipped_reason") or "")
+                self.conversion_finished.emit(task_id, f"{skipped}:{checkpoint.get('source_codec', '')}" if skipped else encoder, bool(skipped))
         self.task_media_completed.emit(task_id, media)
         if task and task.parent_task_id:
             self._refresh_collection(task.parent_task_id)
@@ -7052,6 +8044,7 @@ class DownloadService(QObject):
                 elapsed_seconds=self._progress_float(task.elapsed_seconds),
                 stage_elapsed_seconds=self._progress_float(task.stage_elapsed_seconds),
                 transcode_encoder=str(task.current_transcode_encoder or ""),
+                stage_indeterminate=task.stage_indeterminate,
             ),
             data,
         )
@@ -7059,12 +8052,15 @@ class DownloadService(QObject):
         task.stage = state.stage
         task.stage_text = state.stage_text
         task.stage_progress = state.stage_progress
+        task.stage_indeterminate = state.stage_indeterminate
         task.retry_count = state.retry_count
         task.retry_total = state.retry_total
         task.reconnect_message = state.reconnect_message
         task.elapsed_seconds = state.elapsed_seconds
         task.stage_elapsed_seconds = state.stage_elapsed_seconds
         task.current_transcode_encoder = state.transcode_encoder
+        if "failed_step" in data:
+            task.failed_step = str(data.get("failed_step") or "")
         if "completion_warning" in data:
             task.completion_warning = str(data.get("completion_warning") or "")
 
@@ -7086,6 +8082,7 @@ class DownloadService(QObject):
                 visible_progress=task.visible_progress,
                 visible_downloaded_bytes=task.visible_downloaded_bytes,
                 visible_total_bytes=task.visible_total_bytes,
+                stream_key=task.transfer_stream_key,
             ),
             data,
         )
@@ -7095,6 +8092,10 @@ class DownloadService(QObject):
         task.visible_progress = counters.visible_progress
         task.visible_downloaded_bytes = counters.visible_downloaded_bytes
         task.visible_total_bytes = counters.visible_total_bytes
+        task.transfer_stream_key = counters.stream_key
+        if task.status != "completed":
+            task.progress = min(99.0, task.progress)
+            task.visible_progress = min(99.0, task.visible_progress)
 
     def _apply_selected_transfer_quality(
         self,
@@ -7118,7 +8119,9 @@ class DownloadService(QObject):
                 and sample > 0.0
             ]
             valid_samples.append(raw_speed)
-            task.speed_samples = tuple(valid_samples[-6:])
+            # Worker callbacks are emitted every 100 ms; a three-second window
+            # filters ordinary network bursts before they reach the ETA.
+            task.speed_samples = tuple(valid_samples[-TRANSFER_RATE_SAMPLE_COUNT:])
             task.speed_bps = sum(task.speed_samples) / len(task.speed_samples)
         else:
             task.speed_bps = self._progress_float(task.speed_bps)
@@ -7131,14 +8134,26 @@ class DownloadService(QObject):
             self._progress_int(task.total_bytes)
             - self._progress_int(task.downloaded_bytes),
         )
-        eta_text = (
-            format_eta(remaining / task.speed_bps)
-            if task.speed_bps > 0 and remaining > 0
-            else data.get("_eta_str") or ""
-        )
-        if eta_text:
-            task.eta = str(eta_text)
-            task.visible_eta = str(eta_text)
+        eta_text = ""
+        if task.speed_bps > 0 and remaining > 0:
+            raw_eta = remaining / task.speed_bps
+            now = time.monotonic()
+            previous_eta = self._progress_float(task.eta_seconds)
+            elapsed = max(0.0, now - self._progress_float(task.eta_updated_at))
+            if task.eta and previous_eta > 0.0:
+                projected_eta = max(0.0, previous_eta - elapsed)
+                correction = 1.0 - exp(-elapsed / ETA_SMOOTHING_SECONDS)
+                eta_seconds = projected_eta + (raw_eta - projected_eta) * correction
+            else:
+                eta_seconds = raw_eta
+            task.eta_seconds = eta_seconds
+            task.eta_updated_at = now
+            eta_text = format_eta(eta_seconds)
+        else:
+            task.eta_seconds = 0.0
+            task.eta_updated_at = 0.0
+        task.eta = str(eta_text)
+        task.visible_eta = str(eta_text)
 
     @staticmethod
     def _apply_transfer_size(task: DownloadTask, data: Mapping[str, Any]) -> None:
@@ -7186,8 +8201,17 @@ class DownloadService(QObject):
             return
         force_persist = self._apply_storage_preview(task, data)
         stage_changed = self._apply_stage_progress(task, data)
+        if task.status not in DOWNLOAD_TERMINAL_STATUSES and not task.pause_requested and not task.cancel_requested:
+            if task.stage in {"merging", "thumbnail", "metadata", "verifying", "transcoding", "publishing", "waiting_processing"}:
+                task.status = "processing"
+            elif task.stage.startswith("downloading"):
+                task.status = "downloading"
         self._apply_transfer_counters(task, data)
-        self._apply_transfer_details(task, data, info)
+        local_processing = task_id in self._processing_task_ids
+        if local_processing:
+            self._apply_transfer_paths(task, data)
+        else:
+            self._apply_transfer_details(task, data, info)
         now = time.monotonic()
         transfer_finished = data.get("status") == "finished"
         # ``task.progress`` remains at 100 while FFmpeg merges/transcodes.
@@ -7195,7 +8219,12 @@ class DownloadService(QObject):
         # callback can stall the GUI badly when another task is downloading.
         # Only a real transfer-finished event or durable option change needs
         # an immediate write; ordinary stage progress uses the 900 ms batch.
-        self._persist_progress(task, force=force_persist or transfer_finished)
+        if local_processing:
+            # Checkpoints own durable processing writes. A progress timer must
+            # never overwrite the worker's atomic completed/catalog commit.
+            self._sync_task_indexes(task)
+        else:
+            self._persist_progress(task, force=force_persist or transfer_finished)
         last_emit = self._last_progress_emit.get(task_id, 0.0)
         # Stage transitions must never be swallowed by progress throttling: a
         # transition can be followed by a long blocking disk wait or local
@@ -7217,6 +8246,10 @@ class DownloadService(QObject):
         task = self.tasks.get(task_id)
         if task is None:
             return
+        if task_id in self._pending_deletes:
+            # The delete command owns the terminal cleanup.  A cancellation
+            # callback must not rewrite the row before its worker unwinds.
+            return
         already_finalized = (
             task_id not in self.workers
             and task_id not in self.threads
@@ -7224,15 +8257,27 @@ class DownloadService(QObject):
             and task.status in DOWNLOAD_TERMINAL_STATUSES
         )
         task.error = error
-        task.status = "failed"
-        task.stage = "failed"
-        task.stage_text = f"下载失败：{error[:120]}"
+        worker = self.workers.get(task_id)
+        processing_failed = bool(task.options_json.get("_processing")) or bool(getattr(worker, "_processing_handoff_started", False))
+        if processing_failed:
+            if not task.options_json.get("_processing") and isinstance(getattr(worker, "_processing_checkpoint", None), Mapping):
+                task.options_json["_processing"] = deepcopy(worker._processing_checkpoint)
+            task.failed_step = task.failed_step or task.stage
+            checkpoint = task.options_json.get("_processing", {})
+            checkpoint.update(state="failed", failed_step=task.failed_step, error=error)
+            task.status = task.stage = "processing_failed"
+            task.stage_text = f"PROCESSING FAILED · {task.failed_step}: {error[:120]}"
+        else:
+            task.status = task.stage = "failed"
+            task.stage_text = f"下载失败：{error[:120]}"
         task.speed_bps = 0.0
         task.speed = ""
         task.eta = ""
         task.speed_samples = ()
         self._persist(task)
         self.task_updated.emit(task)
+        if processing_failed and task.options_json.get("_processing", {}).get("kind") == "manual":
+            self.conversion_failed.emit(task_id, error)
         category = DownloadLogService.classify_error(error)
         self._best_effort_service_log(
             task_id,
@@ -7305,6 +8350,8 @@ class DownloadService(QObject):
 
         self.threads.pop(task_id, None)
         self.workers.pop(task_id, None)
+        self._processing_task_ids.discard(task_id)
+        self._ytdlp_processing_task_ids.discard(task_id)
         self._last_progress_emit.pop(task_id, None)
         self._progress_persistence.forget(task_id)
         if self.active_task_id != task_id:
@@ -7419,6 +8466,17 @@ class DownloadService(QObject):
 
     @staticmethod
     def _apply_finished_download_state(task: DownloadTask) -> None:
+        if task.options_json.get("_processing") and task.status != "completed" and not task.pause_requested and not task.cancel_requested and task.status not in {"paused", "canceled"}:
+            task.failed_step = task.failed_step or task.stage
+            task.status = task.stage = "processing_failed"
+            task.error = task.error or "处理线程异常结束，未收到完成或失败结果"
+            task.stage_text = f"PROCESSING FAILED · {task.failed_step}: {task.error[:120]}"
+            task.options_json["_processing"].update(state="failed", failed_step=task.failed_step, error=task.error)
+        if task.status == "processing_failed":
+            task.speed_bps = 0.0
+            task.speed = task.eta = ""
+            task.speed_samples = ()
+            return
         state = finished_download_state(
             status=task.status,
             error=task.error,
@@ -7507,8 +8565,15 @@ class DownloadService(QObject):
         self._release_finished_download_capacity(task_id)
         if self._handle_finished_download_removal(task_id, task):
             return
+        if task is not None and task.status == "processing" and task_id not in self._processing_task_ids and task.options_json.get("_processing") and not task.pause_requested and not task.cancel_requested:
+            self._detach_download_runtime(task_id)
+            self._processing_queue.append_unique(task_id)
+            self._start_next()
+            return
         try:
             if task is not None:
+                if task.status == "completed":
+                    task.options_json.pop("_processing", None)
                 self._apply_finished_download_state(task)
                 self._publish_finished_download_state(task)
         finally:

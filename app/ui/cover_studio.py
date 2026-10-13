@@ -36,7 +36,7 @@ from app.core.qt_lifecycle import delete_unstarted_worker
 from app.storage.models import MediaItem
 from app.ui.i18n import format_text as ui_format
 from app.ui.i18n import runtime_text, text as ui_text
-from app.ui.cover_export_paths import (
+from app.core.cover_paths import (
     default_cover_export_path,
     normalized_jpeg_target,
 )

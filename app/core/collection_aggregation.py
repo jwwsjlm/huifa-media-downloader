@@ -137,7 +137,8 @@ def collection_status_counts(aggregate: CollectionAggregate) -> dict[str, int]:
     partial_failed = non_negative_int(counts.get("partial_failed"))
     missing = non_negative_int(counts.get("deleted"))
     failed = (
-        non_negative_int(counts.get("failed")) + partial_failed + missing
+        non_negative_int(counts.get("failed"))
+        + non_negative_int(counts.get("processing_failed")) + partial_failed + missing
     )
     canceled = non_negative_int(counts.get("canceled"))
     paused = non_negative_int(counts.get("paused")) + non_negative_int(
@@ -154,6 +155,7 @@ def collection_status_counts(aggregate: CollectionAggregate) -> dict[str, int]:
         "canceled": canceled,
         "paused": paused,
         "active": active,
+        "processing": non_negative_int(counts.get("processing")),
         "queued": queued,
     }
 
@@ -176,6 +178,8 @@ def collection_parent_status(
             return "canceled", "已取消", True
         return "failed", "下载失败", True
     if non_negative_int(counts.get("active")):
+        if non_negative_int(counts.get("processing")) == non_negative_int(counts.get("active")):
+            return "processing", "正在处理子任务", False
         return "downloading", "正在下载子任务", False
     if (
         non_negative_int(counts.get("paused"))

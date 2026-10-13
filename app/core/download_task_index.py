@@ -140,19 +140,30 @@ class DownloadTaskIndex:
         def count(*statuses: str) -> int:
             return sum(non_negative_int(counts.get(status)) for status in statuses)
 
-        failed = count("failed", "partial_failed", "canceled")
+        failed = count("failed", "partial_failed", "processing_failed", "canceled")
         resumable_paused = count("paused")
         paused = resumable_paused + count("暂停中")
         completed = count("completed")
+        in_progress = count(
+            "queued",
+            "downloading",
+            "processing",
+            "waiting_processing",
+            "waiting_selection",
+            "parsing_collection",
+            "canceling",
+            "暂停中",
+        )
         return {
             "total": sum(non_negative_int(value) for value in counts.values()),
-            "active": count("downloading", "parsing_collection", "canceling"),
+            "active": count("downloading", "processing", "parsing_collection", "canceling", "暂停中"),
+            "in_progress": in_progress,
             "queued": count("queued"),
             "paused": paused,
             "processing": count("processing"),
             "completed": completed,
             "failed": failed,
-            "pausable": count("downloading", "queued"),
+            "pausable": count("downloading", "queued", "processing", "waiting_processing"),
             "resumable": resumable_paused + failed,
             "cleanable": completed,
         }

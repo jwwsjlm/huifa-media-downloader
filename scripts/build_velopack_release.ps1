@@ -1,6 +1,6 @@
 [CmdletBinding()]
 # Managed Windows release pipeline used by the GitHub tag workflow. This
-# command produces a traditional setup wizard backed by an MSI, the portable
+# command produces an NSIS setup wizard backed by an MSI, the portable
 # package, feeds, and update packages.
 param(
     [Parameter(Mandatory = $true)]
@@ -18,7 +18,13 @@ param(
     [ValidatePattern('^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$')]
     [string]$PreviousReleaseRepo = '',
 
-    [switch]$ValidateEnvironmentOnly
+    [switch]$ValidateEnvironmentOnly,
+
+    [switch]$RunSmokeChecks,
+
+    [switch]$Electron,
+
+    [switch]$SkipPythonBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +36,7 @@ $PyInstaller = Join-Path $Root '.venv\Scripts\pyinstaller.exe'
 $Spec = Join-Path $Root 'build\HuifaVideoDownloader.velopack.spec'
 $ToolManifest = Join-Path $Root '.config\dotnet-tools.json'
 $ApplicationIcon = Join-Path $Root 'assets\huifa.ico'
-$InnoScript = Join-Path $Root 'build\HuifaMediaDownloader.iss'
+$NsisScript = Join-Path $Root 'build\HuifaMediaDownloader.nsi'
 $StageRoot = Join-Path $Root 'build\velopack-dist'
 $StageApp = Join-Path $StageRoot 'HuifaVideoDownloader'
 $WorkRoot = Join-Path $Root 'build\pyinstaller-velopack'
@@ -38,6 +44,9 @@ $ReleaseRoot = Join-Path $Root 'releases-velopack'
 $ReleaseToolsRoot = Join-Path $Root 'tools'
 $ReleaseNotesFull = ''
 $ExpectedVelopackVersion = '1.2.0'
+if ($Electron) {
+    $Spec = Join-Path $Root 'build\HuifaPythonBackend.spec'
+}
 
 function Resolve-DotnetSdkExecutable {
     # A 32-bit dotnet host is commonly placed before the 64-bit SDK host in
@@ -128,17 +137,19 @@ function Get-SingleNonEmptyReleaseFile {
     return $Matches[0]
 }
 
-function Resolve-InnoSetupCompiler {
+function Resolve-NsisCompiler {
     $Candidates = [System.Collections.Generic.List[string]]::new()
+    $Candidates.Add((Join-Path $Root 'tools\nsis\makensis.exe'))
+    $Candidates.Add((Join-Path $Root 'tools\nsis-download\nsis-3.13\makensis.exe'))
     foreach ($InstallRoot in @(
         [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'),
         $env:ProgramFiles
     )) {
         if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
-            $Candidates.Add((Join-Path $InstallRoot 'Inno Setup 6\ISCC.exe'))
+            $Candidates.Add((Join-Path $InstallRoot 'NSIS\makensis.exe'))
         }
     }
-    $PathCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    $PathCommand = Get-Command makensis.exe -ErrorAction SilentlyContinue
     if ($PathCommand -and $PathCommand.Source) {
         $Candidates.Add($PathCommand.Source)
     }
@@ -160,26 +171,30 @@ function Resolve-InnoSetupCompiler {
             return $CandidateFull
         }
     }
-    throw 'Inno Setup 6 is required to build the installer. Install it with: choco install innosetup --version=6.7.1 --yes'
+    throw 'NSIS 3.12 is required to build the installer. Install it with: choco install nsis --version=3.12.0 --yes'
 }
 
-function Build-InnoSetupInstaller {
+function Build-NsisInstaller {
     param(
         [Parameter(Mandatory = $true)][System.IO.FileInfo]$Msi
     )
 
     $InstallerPath = Join-Path $ReleaseRoot 'HuifaMediaDownloader-Setup.exe'
-    & $InnoCompiler @(
+    $FileVersion = ($Version -split '[-+]', 2)[0] + '.0'
+    & $NsisCompiler @(
+        '/INPUTCHARSET', 'UTF8',
         "/DAppVersion=$Version",
+        "/DAppFileVersion=$FileVersion",
         "/DSourceMsi=$($Msi.FullName)",
         "/DOutputDir=$ReleaseRoot",
-        $InnoScript
-    )
+        "/DAppIcon=$ApplicationIcon",
+        $NsisScript
+    ) | Out-Host
     if ($LASTEXITCODE -ne 0) {
-        throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
+        throw "NSIS compilation failed with exit code $LASTEXITCODE"
     }
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf) -or (Get-Item -LiteralPath $InstallerPath).Length -le 0) {
-        throw "Inno Setup did not create a non-empty installer: $InstallerPath"
+        throw "NSIS did not create a non-empty installer: $InstallerPath"
     }
     return Get-Item -LiteralPath $InstallerPath
 }
@@ -287,7 +302,7 @@ function Stage-PortableRuntimeTools {
     }
 }
 
-foreach ($RequiredFile in @($Python, $PyInstaller, $Spec, $ToolManifest, $ApplicationIcon, $InnoScript)) {
+foreach ($RequiredFile in @($Python, $PyInstaller, $Spec, $ToolManifest, $ApplicationIcon, $NsisScript)) {
     if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
         throw "Required build file is missing: $RequiredFile"
     }
@@ -325,23 +340,18 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($ExpectedPublisher)) {
 $DotnetResolution = Resolve-DotnetSdkExecutable
 $DotnetExe = $DotnetResolution.Path
 $InstalledSdks = @($DotnetResolution.Sdks)
-$InnoCompiler = Resolve-InnoSetupCompiler
+$NsisCompiler = Resolve-NsisCompiler
 Write-Host "Using .NET SDK host: $DotnetExe"
 Write-Host "Installed SDKs: $($InstalledSdks -join ', ')"
-Write-Host "Using Inno Setup compiler: $InnoCompiler"
+Write-Host "Using NSIS compiler: $NsisCompiler"
 
 if ($ValidateEnvironmentOnly) {
     Write-Host "Velopack build environment is ready for version $Version on channel $Channel."
     return
 }
 
-& $Python -m compileall app
-if ($LASTEXITCODE -ne 0) {
-    throw "Python compile check failed with exit code $LASTEXITCODE"
-}
-
 # Velopack requires a PyInstaller onedir staging area.
-foreach ($Target in @($StageRoot, $WorkRoot, $ReleaseRoot)) {
+foreach ($Target in $(if ($SkipPythonBuild) { @($ReleaseRoot) } else { @($StageRoot, $WorkRoot, $ReleaseRoot) })) {
     $TargetFull = [System.IO.Path]::GetFullPath($Target).TrimEnd('\')
     if (-not $TargetFull.StartsWith($Root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to clean path outside the project: $TargetFull"
@@ -353,9 +363,30 @@ foreach ($Target in @($StageRoot, $WorkRoot, $ReleaseRoot)) {
 New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $ReleaseRoot -Force | Out-Null
 
-& $PyInstaller --noconfirm --clean --distpath $StageRoot --workpath $WorkRoot $Spec
-if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller onedir build failed with exit code $LASTEXITCODE"
+if ($SkipPythonBuild) {
+    $ExistingPythonExecutable = Join-Path $StageRoot $(if ($Electron) { 'HuifaPythonBackend\HuifaPythonBackend.exe' } else { 'HuifaVideoDownloader\HuifaVideoDownloader.exe' })
+    if (-not (Test-Path -LiteralPath $ExistingPythonExecutable -PathType Leaf)) { throw "No existing Python staging build to reuse: $ExistingPythonExecutable" }
+    Write-Host 'Reusing existing Python staging build; source changes require a full rebuild.'
+} else {
+    & $PyInstaller --noconfirm --clean --distpath $StageRoot --workpath $WorkRoot $Spec
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller onedir build failed with exit code $LASTEXITCODE"
+    }
+}
+if ($Electron) {
+    Push-Location (Join-Path $Root 'desktop')
+    try {
+        & npm ci
+        if ($LASTEXITCODE -ne 0) { throw 'Electron dependency restore failed.' }
+        & npm run build
+        if ($LASTEXITCODE -ne 0) { throw 'Electron TypeScript build failed.' }
+        & node scripts\stage.cjs $StageApp
+        if ($LASTEXITCODE -ne 0) { throw 'Electron staging failed.' }
+    }
+    finally { Pop-Location }
+    $BackendStage = Join-Path $StageRoot 'HuifaPythonBackend'
+    Copy-Item -LiteralPath (Join-Path $BackendStage 'HuifaPythonBackend.exe') -Destination $StageApp
+    Copy-Item -LiteralPath (Join-Path $BackendStage '_internal') -Destination $StageApp -Recurse
 }
 $MainExecutable = Join-Path $StageApp 'HuifaVideoDownloader.exe'
 if (-not (Test-Path -LiteralPath $MainExecutable -PathType Leaf)) {
@@ -413,7 +444,7 @@ try {
         '--packVersion', $Version,
         '--packDir', $StageApp,
         '--mainExe', 'HuifaVideoDownloader.exe',
-        '--packTitle', 'Huifa Media Downloader',
+        '--packTitle', 'HuifaMediaDownloader',
         '--packAuthors', 'Huifa',
         '--icon', $ApplicationIcon,
         '--outputDir', $ReleaseRoot,
@@ -425,7 +456,7 @@ try {
         $PackArgs += @('--releaseNotes', $ReleaseNotesFull)
     }
     # Velopack's MSI supplies the installed application and update registration.
-    # The user-facing Inno Setup wizard wraps it so the install folder is always
+    # The user-facing NSIS wizard wraps it so the install folder is always
     # selected before Windows Installer runs.
     $PackArgs += @('--msi', '--instLocation', 'Either')
     & $DotnetExe @PackArgs
@@ -441,7 +472,7 @@ $Portable = Get-SingleNonEmptyReleaseFile -Pattern 'Huifa.VideoDownloader*-Porta
 $ReleaseFeed = Get-SingleNonEmptyReleaseFile -Pattern "releases.$Channel.json" -Label 'release feed'
 $AssetsFeed = Get-SingleNonEmptyReleaseFile -Pattern "assets.$Channel.json" -Label 'assets feed'
 $Msi = Get-SingleNonEmptyReleaseFile -Pattern "Huifa.VideoDownloader-$Channel.msi" -Label 'MSI installer'
-$Installer = Build-InnoSetupInstaller -Msi $Msi
+$Installer = Build-NsisInstaller -Msi $Msi
 
 try {
     $ReleaseIndex = (Get-Content -LiteralPath $ReleaseFeed.FullName -Raw) | ConvertFrom-Json
@@ -488,17 +519,33 @@ if ($ExpectedHash) {
 Assert-ValidZipArchive -File $FullPackage
 Assert-ValidZipArchive -File $Portable -RequiredFileName 'HuifaVideoDownloader.exe'
 
+Write-Host "Velopack release directory: $ReleaseRoot"
+Write-Host "Installer: $($Installer.Name) ($($Installer.Length) bytes)"
+Write-Host "Portable: $($Portable.Name) ($($Portable.Length) bytes)"
+Write-Host "Full package: $($FullPackage.Name) ($($FullPackage.Length) bytes)"
+Write-Host "MSI: $($Msi.Name) ($($Msi.Length) bytes)"
+Write-Host 'Created NSIS wizard, self-updating portable package, full update package and release feeds.'
+Write-Host 'Nothing was uploaded to GitHub.'
+if (-not $RunSmokeChecks) {
+    Write-Host 'Smoke checks were not requested; no application will be launched.'
+    return
+}
+
 # Exercise the exact directory-style portable artifact that users download.
-# Running from current/ proves Velopack management is detected and that the
-# external tools copied beside the application are preferred over PyInstaller
-# extraction fallbacks.
+# Starting through the root launcher proves Velopack management is initialized
+# before the packaged QML runtime reads its external-tool fallbacks.
 $PortableSmokeRoot = Join-Path $Root ('build\velopack-portable-smoke-' + [guid]::NewGuid().ToString('N'))
 $PortableSmokeReport = Join-Path $PortableSmokeRoot 'portable-smoke.json'
 try {
     Expand-Archive -LiteralPath $Portable.FullName -DestinationPath $PortableSmokeRoot -Force
+    $PortableSmokeData = Join-Path $PortableSmokeRoot 'data'
+    New-Item -ItemType Directory -Path $PortableSmokeData -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $PortableSmokeData 'config.ini') -Value "[General]`nauto_check_updates=false`ndesktop_notifications=false" -Encoding UTF8
     $PortableCurrent = Join-Path $PortableSmokeRoot 'current'
+    $PortableLauncher = Join-Path $PortableSmokeRoot 'HuifaMediaDownloader.exe'
     $PortableExecutable = Join-Path $PortableCurrent 'HuifaVideoDownloader.exe'
     foreach ($RequiredPortablePath in @(
+        $PortableLauncher,
         (Join-Path $PortableSmokeRoot 'Update.exe'),
         (Join-Path $PortableSmokeRoot '.portable'),
         (Join-Path $PortableCurrent 'sq.version'),
@@ -513,6 +560,9 @@ try {
             throw "Portable package is missing required file: $RequiredPortablePath"
         }
     }
+    if ($Electron -and -not (Test-Path -LiteralPath (Join-Path $PortableCurrent 'HuifaPythonBackend.exe') -PathType Leaf)) {
+        throw 'Electron portable package is missing its Python backend.'
+    }
     $PortableEjsWheels = @(
         Get-ChildItem -LiteralPath (Join-Path $PortableCurrent 'tools\yt-dlp-ejs') -File -Filter 'yt_dlp_ejs-*.whl' -ErrorAction SilentlyContinue
     )
@@ -521,28 +571,44 @@ try {
     }
 
     $SmokeStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $SmokeStartInfo.FileName = $PortableExecutable
-    $SmokeStartInfo.WorkingDirectory = $PortableCurrent
+    # The root launcher establishes Velopack's managed-process context before
+    # starting current\HuifaVideoDownloader.exe. Running current directly can
+    # block in Velopack startup even though the user-facing portable package is valid.
+    $SmokeStartInfo.FileName = $PortableLauncher
+    $SmokeStartInfo.WorkingDirectory = $PortableSmokeRoot
     $SmokeStartInfo.UseShellExecute = $false
     $SmokeStartInfo.CreateNoWindow = $true
     $SmokeStartInfo.EnvironmentVariables['QT_QPA_PLATFORM'] = 'offscreen'
     $SmokeStartInfo.EnvironmentVariables['HUIFA_PACKAGED_SMOKE_OUTPUT'] = $PortableSmokeReport
+    $SmokeStartInfo.EnvironmentVariables['HUIFA_DATA_ROOT'] = $PortableSmokeData
     $SmokeProcess = [System.Diagnostics.Process]::Start($SmokeStartInfo)
-    if ($null -eq $SmokeProcess -or -not $SmokeProcess.WaitForExit(90000)) {
+    if ($null -eq $SmokeProcess -or -not $SmokeProcess.WaitForExit(10000)) {
         if ($null -ne $SmokeProcess) {
             try { $SmokeProcess.Kill($true) } catch { Stop-Process -Id $SmokeProcess.Id -Force -ErrorAction SilentlyContinue }
         }
-        throw 'Velopack portable smoke test timed out after 90 seconds.'
+        throw 'Velopack portable launcher did not exit after 10 seconds.'
     }
-    if ($SmokeProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $PortableSmokeReport -PathType Leaf)) {
+    if ($SmokeProcess.ExitCode -ne 0) {
         throw "Velopack portable smoke test failed with exit code $($SmokeProcess.ExitCode)."
+    }
+    $SmokeDeadline = [DateTime]::UtcNow.AddSeconds(90)
+    while (
+        -not (Test-Path -LiteralPath $PortableSmokeReport -PathType Leaf) -and
+        [DateTime]::UtcNow -lt $SmokeDeadline
+    ) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not (Test-Path -LiteralPath $PortableSmokeReport -PathType Leaf)) {
+        throw 'Velopack portable smoke test timed out after 90 seconds.'
     }
     $SmokeResult = Get-Content -LiteralPath $PortableSmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json
     if (
         -not $SmokeResult.ok -or
+        ($Electron -and (-not $SmokeResult.renderer_loaded -or $SmokeResult.node_exposed -or -not $SmokeResult.backend_connected)) -or
         $SmokeResult.application_update_mode -ne 'velopack' -or
         $SmokeResult.application_version -ne $Version -or
         $SmokeResult.organization_name -ne $ExpectedPublisher -or
+        $SmokeResult.secure_store_backend -ne 'keyring.backends.Windows.WinVaultKeyring' -or
         -not $SmokeResult.yt_dlp.core_ready -or
         [string]::IsNullOrWhiteSpace([string]$SmokeResult.ffmpeg.version) -or
         [string]::IsNullOrWhiteSpace([string]$SmokeResult.ffprobe.version) -or
@@ -605,17 +671,19 @@ try {
     if (-not (Test-Path -LiteralPath $PersistentMarker -PathType Leaf)) {
         throw 'Velopack update removed portable user data outside current/.'
     }
+    $AcceptanceRoot = Join-Path $Root 'output\electron-acceptance'
+    New-Item -ItemType Directory -Path $AcceptanceRoot -Force | Out-Null
+    Copy-Item -LiteralPath $PortableSmokeReport -Destination (Join-Path $AcceptanceRoot 'portable-startup-health.json') -Force
+    $UpdateEvidence = [ordered]@{ version = $Version; portable = $Portable.FullName; portable_sha256 = (Get-FileHash -LiteralPath $Portable.FullName -Algorithm SHA256).Hash; full_package = $FullPackage.FullName; full_package_sha256 = (Get-FileHash -LiteralPath $FullPackage.FullName -Algorithm SHA256).Hash; update_exit_code = $UpdateProcess.ExitCode; persistent_marker_preserved = (Test-Path -LiteralPath $PersistentMarker -PathType Leaf); deno_sha256_before = $ExpectedDenoHash; deno_sha256_after = $ActualDenoHash }
+    $UpdateEvidence | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $AcceptanceRoot 'portable-apply-evidence.json') -Encoding UTF8
 }
 finally {
-    if (Test-Path -LiteralPath $PortableSmokeRoot) {
-        Remove-Item -LiteralPath $PortableSmokeRoot -Recurse -Force
+    $SmokeRootFull = [System.IO.Path]::GetFullPath($PortableSmokeRoot).TrimEnd('\')
+    if (-not $SmokeRootFull.StartsWith($Root + '\build\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to clean path outside the build directory: $SmokeRootFull"
+    }
+    if (Test-Path -LiteralPath $SmokeRootFull) {
+        Remove-Item -LiteralPath $SmokeRootFull -Recurse -Force
     }
 }
-
-Write-Host "Velopack release directory: $ReleaseRoot"
-Write-Host "Installer: $($Installer.Name) ($($Installer.Length) bytes)"
-Write-Host "Portable: $($Portable.Name) ($($Portable.Length) bytes)"
-Write-Host "Full package: $($FullPackage.Name) ($($FullPackage.Length) bytes)"
-Write-Host "MSI: $($Msi.Name) ($($Msi.Length) bytes)"
-Write-Host 'Created installer wizard, self-updating portable package, full update package and release feeds.'
-Write-Host 'Nothing was uploaded to GitHub.'
+Write-Host 'Requested portable startup and update smoke checks passed.'

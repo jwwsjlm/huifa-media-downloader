@@ -14,6 +14,7 @@ from app.storage.database_recovery import (
     DatabaseRecoveryReport,
     create_rotating_database_backup,
     database_backup_due,
+    quarantine_database_file,
     recover_database_file,
 )
 from app.storage.models import MediaItem, PublishTask
@@ -237,10 +238,11 @@ class Database:
             if self._has_user_schema() and not self._schema_matches_current():
                 self.conn.close()
                 self.conn = None
-                self._remove_database_files()
+                quarantine = quarantine_database_file(self.path)
                 self.recovery_report = DatabaseRecoveryReport(
                     status="schema_reset",
                     detail="数据库结构不是当前开发版本，已按最新结构重新创建",
+                    quarantine_dir=str(quarantine),
                 )
                 self.conn = self._open_connection()
 
@@ -294,10 +296,6 @@ class Database:
             if tuple(str(row[1]) for row in rows) != expected_columns:
                 return False
         return True
-
-    def _remove_database_files(self) -> None:
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            self.path.with_name(self.path.name + suffix).unlink(missing_ok=True)
 
     def _initialize_schema(self) -> None:
         assert self.conn is not None

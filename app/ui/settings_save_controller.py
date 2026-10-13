@@ -441,10 +441,12 @@ class SettingsSaveController:
 
         def apply_tool_settings() -> None:
             settings = self.app_settings
-            self.download_service.ytdlp_core_mode = core_mode
-            self.download_service.deno_path = settings.get("deno_path")
-            self.download_service.ffprobe_path = settings.get("ffprobe_path")
-            self.download_service.ytdlp_ejs_source = ejs_source
+            self.download_service.configure_runtime_settings(
+                ytdlp_core_mode=core_mode,
+                deno_path=settings.get("deno_path"),
+                ffprobe_path=settings.get("ffprobe_path"),
+                ytdlp_ejs_source=ejs_source,
+            )
             self.update_service.set_tool_overrides({
                 "ffmpeg": settings.get("ffmpeg_path"),
                 "ffprobe": settings.get("ffprobe_path"),
@@ -492,8 +494,10 @@ class SettingsSaveController:
         cover_quality = page.cover_quality.value()
 
         def apply_cover_settings() -> None:
-            self.download_service.cover_convert_jpeg = cover_convert_jpeg
-            self.download_service.cover_jpeg_quality = cover_quality
+            self.download_service.configure_runtime_settings(
+                cover_convert_jpeg=cover_convert_jpeg,
+                cover_jpeg_quality=cover_quality,
+            )
             page.openai_key.clear()
             if self.secure_store.get("openai_api_key"):
                 page.openai_key.setPlaceholderText(

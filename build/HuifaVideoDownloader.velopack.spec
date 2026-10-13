@@ -40,6 +40,7 @@ windows_version_info = build_windows_version_info(
 datas = []
 datas.append((str(PROJECT_ROOT / "assets" / "huifa.ico"), "assets"))
 datas.append((str(PROJECT_ROOT / "languages"), "languages"))
+datas.append((str(PROJECT_ROOT / "app" / "qml"), "app/qml"))
 vendor_sau = PROJECT_ROOT / "third_party" / "social_auto_upload"
 if not (vendor_sau / "sau_cli.py").is_file():
     raise FileNotFoundError("Missing vendored social-auto-upload source")
@@ -63,6 +64,9 @@ hiddenimports = [
     "app.core.tool_installer",
     "app.core.update_service",
     "app.core.version",
+    "PySide6.QtQml",
+    "PySide6.QtQuick",
+    "PySide6.QtQuickControls2",
     "yt_dlp",
     "yt_dlp.version",
     "velopack",

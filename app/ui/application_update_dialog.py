@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
     QDialog,
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from app.core.application_update_service import ApplicationUpdateService
 from app.core.application_updater import ApplicationUpdate
+from app.core.download_progress import format_speed
 from app.core.version import APP_VERSION
 from app.ui.i18n import format_text as ui_format, runtime_text, text as ui_text
 from app.ui.media_presentation import format_file_size
@@ -34,6 +37,7 @@ class ApplicationUpdateDialog(QDialog):
         self._signals_connected = False
         self._resuming_download = False
         self._download_resumable = False
+        self._progress_sample: tuple[int, float] | None = None
         self.setWindowTitle(
             ui_text('Update downloaded; restart to install')
             if update.downloaded
@@ -120,6 +124,7 @@ class ApplicationUpdateDialog(QDialog):
         if self._closed:
             return
         self._resuming_download = self._download_resumable
+        self._progress_sample = None
         self.download_button.setEnabled(False)
         try:
             started = self.service.download(self.update)
@@ -138,9 +143,10 @@ class ApplicationUpdateDialog(QDialog):
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.status.setText(
-            ui_text('Resuming and verifying the saved download…')
+            (ui_text('Resuming and verifying the saved download…')
             if self._resuming_download
-            else ui_text('Downloading and verifying the update…')
+            else ui_text('Downloading and verifying the update…'))
+            + f" · {ui_text('Speed')}: --"
         )
 
     def defer_or_pause(self) -> None:
@@ -157,7 +163,27 @@ class ApplicationUpdateDialog(QDialog):
         normalized_progress = max(0, min(100, int(progress)))
         self.progress.setValue(normalized_progress)
         action = ui_text('Resuming and verifying') if self._resuming_download else ui_text('Downloading and verifying the update')
-        self.status.setText(f"{action}: {normalized_progress}%")
+        self.status.setText(
+            f"{action}: {normalized_progress}% · {ui_text('Speed')}: "
+            f"{self._download_speed(normalized_progress)}"
+        )
+
+    def _download_speed(self, progress: int) -> str:
+        if progress <= 0:
+            # A resumed Velopack transfer can report its saved percentage
+            # immediately after the synthetic initial 0%; wait for two real
+            # transfer samples so that jump is not shown as a false high speed.
+            self._progress_sample = None
+            return "--"
+        now = time.monotonic()
+        previous = self._progress_sample
+        self._progress_sample = (progress, now)
+        if previous is None or progress <= previous[0] or self.update.size_bytes <= 0:
+            return "--"
+        elapsed = now - previous[1]
+        if elapsed <= 0:
+            return "--"
+        return format_speed(self.update.size_bytes * (progress - previous[0]) / 100 / elapsed) or "--"
 
     @Slot(object)
     def on_downloaded(self, update: ApplicationUpdate) -> None:

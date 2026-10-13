@@ -13,7 +13,7 @@ from app.core.cover_service import (
     CoverServiceError,
 )
 from app.storage.models import MediaItem
-from app.ui.cover_export_paths import (
+from app.core.cover_paths import (
     default_cover_export_path,
     normalized_jpeg_target,
 )

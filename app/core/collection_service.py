@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -41,10 +42,16 @@ except ImportError:  # pragma: no cover
 COLLECTION_TYPES = frozenset({"playlist", "multi_video"})
 UNAVAILABLE_VALUES = frozenset({"private", "premium_only", "subscriber_only", "needs_auth", "deleted"})
 _MAX_ESTIMATED_BYTES = (1 << 63) - 1
+_YOUTUBE_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
 
 
 def collection_source_key(info: Mapping[str, Any]) -> str:
-    extractor = str(info.get("extractor_key") or info.get("extractor") or "generic").strip().casefold()
+    extractor = str(
+        info.get("extractor_key")
+        or info.get("extractor")
+        or info.get("ie_key")
+        or "generic"
+    ).strip().casefold()
     identifier = str(info.get("id") or info.get("display_id") or info.get("url") or "").strip()
     return f"{extractor}:{identifier}" if identifier else ""
 
@@ -54,6 +61,31 @@ def collection_entry_url(info: Mapping[str, Any]) -> str:
         value = str(info.get(key) or "").strip()
         if value:
             return value
+    return ""
+
+
+def collection_thumbnail(info: Mapping[str, Any]) -> str:
+    thumbnail = str(info.get("thumbnail") or "").strip()
+    if thumbnail:
+        return thumbnail
+    thumbnails = info.get("thumbnails")
+    if isinstance(thumbnails, list):
+        thumbnail = next((
+            str(item.get("url") or "").strip()
+            for item in reversed(thumbnails)
+            if isinstance(item, Mapping) and str(item.get("url") or "").strip()
+        ), "")
+        if thumbnail:
+            return thumbnail
+    extractor = str(
+        info.get("extractor_key")
+        or info.get("extractor")
+        or info.get("ie_key")
+        or ""
+    ).casefold()
+    video_id = str(info.get("id") or info.get("display_id") or "").strip()
+    if "youtube" in extractor and _YOUTUBE_VIDEO_ID.fullmatch(video_id):
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
     return ""
 
 
@@ -311,14 +343,6 @@ class CollectionProbeWorker(QObject):
         source_key, completed = self._entry_completed(info, url)
         duration = non_negative_float(info.get("duration"))
         estimated_bytes = self._entry_estimated_bytes(info, duration)
-        thumbnails = info.get("thumbnails")
-        thumbnail = str(info.get("thumbnail") or "")
-        if not thumbnail and isinstance(thumbnails, list):
-            thumbnail = next((
-                str(item.get("url") or "")
-                for item in reversed(thumbnails)
-                if isinstance(item, Mapping) and item.get("url")
-            ), "")
         return CollectionEntry(
             source_key=source_key,
             url=url,
@@ -326,7 +350,7 @@ class CollectionProbeWorker(QObject):
             uploader=str(info.get("uploader") or info.get("channel") or info.get("creator") or ""),
             duration=duration,
             upload_date=str(info.get("upload_date") or info.get("release_date") or ""),
-            thumbnail=thumbnail,
+            thumbnail=collection_thumbnail(info),
             live_status=str(info.get("live_status") or ("is_live" if info.get("is_live") else "")),
             availability=availability,
             index=index,

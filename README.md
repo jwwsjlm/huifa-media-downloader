@@ -39,9 +39,9 @@
 ## 下载与使用
 
 1. 打开 [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest)。
-2. 便携使用请选择 `HuifaMediaDownloader-<版本>-portable-win-x64.zip`，完整解压后运行根目录的 `Huifa Media Downloader.exe`，不要只复制 EXE。
+2. 便携使用请选择 `HuifaMediaDownloader-<版本>-portable-win-x64.zip`，完整解压后运行根目录的 `HuifaMediaDownloader.exe`，不要只复制 EXE。
 3. 需要安装到系统时请选择 `HuifaMediaDownloader-<版本>-installer-win-x64.zip`，解压后运行 `HuifaMediaDownloader-Setup.exe`，在向导中选择安装目录；之后可在 Windows“已安装的应用”中卸载。
-4. 便携版数据默认保存在解压目录的 `data/`，下载内容默认保存在根目录 `downloads/`；移动软件时需要移动整个文件夹。安装版默认下载到系统“下载”目录下的 `Huifa Video Downloader/`，避免卸载软件时影响媒体文件。
+4. 便携版数据默认保存在解压目录的 `data/`，下载内容默认保存在根目录 `downloads/`；移动软件时需要移动整个文件夹。安装版默认下载到系统“下载”目录下的 `HuifaMediaDownloader/`，避免卸载软件时影响媒体文件。
 
 便携版采用可自动更新的目录结构，FFmpeg、FFprobe、yt-dlp、Deno、yt-dlp-ejs 和 Chromium 位于软件自身的 `current/tools/` 中。Windows SmartScreen 提示未知发布者时，请先确认文件来自本仓库 Release，再决定是否运行。
 
@@ -50,12 +50,13 @@
 软件不会要求用户把数据放到“文档”目录，主要运行数据均位于程序旁的 `data/`：
 
 - `data/app.db`：下载、媒体及发布任务数据库。
-- `data/settings.ini`：软件设置。
+- `data/config.ini`：软件设置。
 - `data/browser/`：软件管理的浏览器资料和加密 Cookie 副本。
 - `data/logs/`：任务诊断日志。
 - `data/tools/`：可独立更新的本地运行组件。
 
 便携版默认媒体目录是根目录 `downloads/`，不再与数据库、Cookie 等私有运行数据混放。yt-dlp-ejs 更新会遵循当前内置 yt-dlp 声明的固定配套版本；外置官方 `yt-dlp.exe` 已自带 EJS。
+旧版本的 `data/settings.ini` 会在首次启动时自动复制迁移到 `data/config.ini`，原文件保留作备份。
 
 请勿公开上传整个 `data/` 目录，其中可能包含账号登录状态和私人任务信息。
 
