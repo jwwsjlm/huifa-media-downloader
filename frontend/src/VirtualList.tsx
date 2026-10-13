@@ -1,0 +1,47 @@
+import { memo, useEffect, useId, useRef, useState, type ReactNode } from 'react';
+
+export const ROW_HEIGHT = 56;
+export function virtualRange(count: number, top: number, height: number): [number, number] {
+  const start = Math.max(0, Math.min(count, Math.floor(Math.max(0, top) / ROW_HEIGHT) - 4));
+  return [start, Math.min(count, Math.max(start, Math.ceil((Math.max(0, top) + Math.max(height, ROW_HEIGHT)) / ROW_HEIGHT) + 4))];
+}
+export function keyboardIndex(key: string, current: number, length: number): number {
+  if (!length) return -1;
+  if (key === 'Home') return 0;
+  if (key === 'End') return length - 1;
+  if (key === 'ArrowUp') return Math.max(0, current - 1);
+  if (key === 'ArrowDown') return Math.min(length - 1, current + 1);
+  return Math.max(0, current);
+}
+interface Props { ids: string[]; selected: string; onSelect: (id: string) => void; renderRow: (id: string) => ReactNode; label: string; scrollKey: string }
+const scrolls = new Map<string, number>();
+export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, renderRow, label, scrollKey }: Props) {
+  const ref = useRef<HTMLDivElement>(null); const idPrefix = useId().replace(/:/g, '');
+  const [viewport, setViewport] = useState({ top: scrolls.get(scrollKey) || 0, height: 400 });
+  useEffect(() => {
+    const element = ref.current; if (!element) return;
+    element.scrollTop = scrolls.get(scrollKey) || 0;
+    const resize = new ResizeObserver(() => setViewport(value => ({ ...value, height: element.clientHeight })));
+    resize.observe(element);
+    return () => resize.disconnect();
+  }, [scrollKey]);
+  const [start, end] = virtualRange(ids.length, viewport.top, viewport.height);
+  const activeRendered = ids.slice(start, end).includes(selected);
+  return <div ref={ref} className="virtual-list" tabIndex={0} role="listbox" aria-label={label} aria-activedescendant={activeRendered ? `${idPrefix}-${selected}` : undefined}
+    onScroll={event => { const top = event.currentTarget.scrollTop; scrolls.set(scrollKey, top); setViewport(value => ({ ...value, top })); }}
+    onKeyDown={event => {
+      if (event.target !== event.currentTarget || !['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter'].includes(event.key)) return;
+      event.preventDefault();
+      const index = keyboardIndex(event.key, ids.indexOf(selected), ids.length); if (index < 0) return;
+      onSelect(ids[index]);
+      const element = event.currentTarget; const rowTop = index * ROW_HEIGHT;
+      if (rowTop < element.scrollTop) element.scrollTop = rowTop;
+      else if (rowTop + ROW_HEIGHT > element.scrollTop + element.clientHeight) element.scrollTop = rowTop + ROW_HEIGHT - element.clientHeight;
+    }}>
+    <div className="virtual-canvas" style={{ height: ids.length * ROW_HEIGHT }}>
+      {ids.slice(start, end).map((id, offset) => <div key={id} id={`${idPrefix}-${id}`} role="option" aria-selected={selected === id} aria-posinset={start + offset + 1} aria-setsize={ids.length}
+        className={`list-row ${selected === id ? 'selected' : ''}`} style={{ top: (start + offset) * ROW_HEIGHT, height: ROW_HEIGHT }}
+        onClick={event => { if (!(event.target as HTMLElement).closest('button,input,select,a')) { onSelect(id); ref.current?.focus({ preventScroll: true }); } }}>{renderRow(id)}</div>)}
+    </div>
+  </div>;
+});

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Huifa Media Downloader Rust",
+  "version": "0.2.0",
+  "identifier": "com.huifa.downloader.rust",
+  "build": {
+    "beforeDevCommand": { "script": "npm --prefix frontend run dev", "cwd": ".." },
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": { "script": "npm --prefix frontend run build", "cwd": ".." },
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [{ "label": "main", "title": "Huifa Media Downloader", "width": 1280, "height": 820, "minWidth": 760, "minHeight": 600, "backgroundColor": "#202023" }],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: http://huifa-media.localhost huifa-media:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; script-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'",
+      "devCsp": "default-src 'self'; img-src 'self' data: http://huifa-media.localhost huifa-media:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420; script-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'",
+      "capabilities": ["main"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "appimage", "deb"],
+    "createUpdaterArtifacts": true,
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
+    "resources": { "../runtime-tools/": "tools/" },
+    "windows": { "nsis": { "displayLanguageSelector": true, "languages": ["English", "SimpChinese"] } }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRGNTYyOTMyMEU1REIyMTAKUldRUXNsME9NaWxXVDhqcGQ3Y3FXRFE4VkZsVWZyWk50RXY5Q1lQbUZiSGlTdkpKWFJnOUR1cFEK",
+      "endpoints": ["https://github.com/jwwsjlm/huifa-media-downloader/releases/latest/download/rust-updates.json"]
+    }
+  }
+}
