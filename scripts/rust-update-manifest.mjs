@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { validateVersion, validateNotes } from './rust-release.mjs';
 
 export function makeManifest(version, notes, repository, records, now = new Date()) {
@@ -39,7 +40,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         throw new Error(`Artifact or signature changed: ${record.filename}`);
       }
     }
-    writeFileSync(join(folder, 'rust-updates.json'), JSON.stringify(makeManifest(version, notes, process.env.GITHUB_REPOSITORY, records), null, 2) + '\n');
+    const revision = process.env.RELEASE_SHA ?? 'HEAD';
+    if (revision !== 'HEAD' && !/^[a-f0-9]{40}$/.test(revision)) throw new Error('Invalid build commit');
+    const date = spawnSync('git', ['show', '-s', '--format=%cI', revision], { encoding: 'utf8', shell: false });
+    if (date.status !== 0) throw new Error('Cannot read build commit date');
+    writeFileSync(join(folder, 'rust-updates.json'), JSON.stringify(makeManifest(version, notes, process.env.GITHUB_REPOSITORY, records, new Date(date.stdout.trim())), null, 2) + '\n');
     const files = readdirSync(folder).filter(file => /\.(exe|AppImage|sig|json)$/.test(file)).sort();
     writeFileSync(join(folder, 'SHA256SUMS'), files.map(file => `${createHash('sha256').update(readFileSync(join(folder, file))).digest('hex')}  ${file}`).join('\n') + '\n');
   }

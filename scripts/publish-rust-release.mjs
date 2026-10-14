@@ -7,7 +7,7 @@ import { validateVersion } from './rust-release.mjs';
 function gh(args, optional404 = false) {
   const result = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, shell: false });
   if (result.status !== 0) {
-    if (optional404 && /HTTP 404/.test(result.stderr)) return null;
+    if (optional404 && /HTTP 404|release not found/.test(result.stderr)) return null;
     throw new Error(`GitHub command failed: ${result.stderr || result.error?.message}`);
   }
   return result.stdout;
@@ -15,6 +15,10 @@ function gh(args, optional404 = false) {
 function api(path, optional404 = false) {
   const text = gh(['api', path], optional404);
   return text === null ? null : JSON.parse(text);
+}
+function releaseForTag(repository, tag) {
+  const result = gh(['release', 'view', tag, '--repo', repository, '--json', 'databaseId'], true);
+  return result === null ? null : api(`repos/${repository}/releases/${JSON.parse(result).databaseId}`);
 }
 
 const version = validateVersion(process.env.RELEASE_VERSION ?? '');
@@ -45,10 +49,10 @@ if (reference) {
   gh(['api', `repos/${repository}/git/refs`, '--method', 'POST', '-f', `ref=refs/tags/${tag}`, '-f', `sha=${sha}`]);
 }
 
-let release = api(`repos/${repository}/releases/tags/${tag}`, true);
+let release = releaseForTag(repository, tag);
 if (!release) {
   gh(['release', 'create', tag, '--repo', repository, '--target', sha, '--draft', '--title', `Huifa Downloader ${version}`, '--notes-file', notesPath]);
-  release = api(`repos/${repository}/releases/tags/${tag}`);
+  release = releaseForTag(repository, tag);
 }
 const notes = readFileSync(notesPath, 'utf8').trim();
 if ((release.body ?? '').trim() !== notes) throw new Error('Existing release notes do not match this build');
