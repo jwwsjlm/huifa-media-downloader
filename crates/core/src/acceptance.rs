@@ -187,7 +187,7 @@ async fn wait_for(app: &App, ids: &[String], states: &[&str]) -> Result<Vec<Task
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires installed native yt-dlp, FFmpeg and FFprobe; run cargo test -p huifa-core -- --ignored"]
+#[ignore = "requires installed native yt-dlp, FFmpeg and FFprobe; run cargo test --release -p huifa-core -- --ignored"]
 async fn real_split_streams_queue_offline_restart_and_publication_recovery() -> Result<()> {
     let root = tempfile::tempdir()?;
     let fixtures = root.path().join("fixtures");
@@ -325,7 +325,7 @@ async fn real_split_streams_queue_offline_restart_and_publication_recovery() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires installed FFmpeg/FFprobe; run cargo test -p huifa-core -- --ignored"]
+#[ignore = "requires installed FFmpeg/FFprobe; run cargo test --release -p huifa-core -- --ignored"]
 async fn real_processing_failure_retry_uses_local_sources_and_manual_conversion_one_catalog_row()
 -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -376,7 +376,7 @@ async fn real_processing_failure_retry_uses_local_sources_and_manual_conversion_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires installed FFmpeg/FFprobe; run cargo test -p huifa-core -- --ignored"]
+#[ignore = "requires installed FFmpeg/FFprobe; run cargo test --release -p huifa-core -- --ignored"]
 async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> Result<()> {
     let root = tempfile::tempdir()?;
     let app = App::open(config(root.path())).await?;
@@ -725,7 +725,7 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires installed native yt-dlp, FFmpeg and FFprobe; run cargo test -p huifa-core -- --ignored"]
+#[ignore = "requires installed native yt-dlp, FFmpeg and FFprobe; run cargo test --release -p huifa-core -- --ignored"]
 async fn real_generic_http_mp4_and_audio_extraction() -> Result<()> {
     let root = tempfile::tempdir()?;
     let fixtures = root.path().join("fixtures");

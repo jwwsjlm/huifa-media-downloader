@@ -35,12 +35,12 @@ npm run build --prefix frontend
 node --test tests/*.test.mjs
 node scripts/acquire-rust-tools.mjs --self-test
 cargo fmt --all --check
-cargo test --locked -p huifa-core -p huifa-server -- --include-ignored --test-threads=1
+cargo test --locked --release -p huifa-core -p huifa-server -- --include-ignored --test-threads=1
 cargo clippy --locked -p huifa-core -p huifa-server --all-targets -- -D warnings
 cargo test --locked -p huifa-desktop
 ```
 
-真实媒体测试需要已下载的官方工具；`HUIFA_TEST_TOOLS` 可指定其目录。测试覆盖分离音视频、队列预算、处理失败离线恢复、发布日志恢复、多音轨、字幕重定时、章节切片、封面片头及音频输出。
+真实媒体测试需要已下载的官方工具；`HUIFA_TEST_TOOLS` 可指定其目录。使用发布构建运行验收，使大型冻结工具的校验耗时与发行程序一致。测试覆盖分离音视频、队列预算、处理失败离线恢复、发布日志恢复、多音轨、字幕重定时、章节切片、封面片头及音频输出。
 
 容器执行 `node scripts/check-rust-container.mjs` 和 `node docker/check-browser.mjs`，用 `HUIFA_IMAGE`、`HUIFA_PLATFORM` 指定镜像。它们创建并清理独立测试容器和数据卷。
 

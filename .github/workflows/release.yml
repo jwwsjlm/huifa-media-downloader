@@ -131,7 +131,7 @@ jobs:
       - name: Acquire pinned verified runtime tools
         run: node scripts/acquire-rust-tools.mjs ${{ matrix.platform }}
       - name: Test shared core and native file boundaries
-        run: cargo test --locked -p huifa-core -p huifa-server -p huifa-desktop -- --include-ignored --test-threads=1
+        run: cargo test --locked --release -p huifa-core -p huifa-server -p huifa-desktop -- --include-ignored --test-threads=1
       - name: Build signed desktop from shared frontend
         shell: bash
         run: |
