@@ -86,9 +86,22 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
     is_error: bool,
     callback: Option<LineCallback>,
 ) -> Result<String> {
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
+    let mut bytes = Vec::new();
     let mut captured = String::new();
-    while let Some(line) = lines.next_line().await? {
+    while reader.read_until(b'\n', &mut bytes).await? != 0 {
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        // Native diagnostics may use a Windows code page; structured stdout must stay strict.
+        let line = if is_error {
+            String::from_utf8_lossy(&bytes)
+        } else {
+            std::str::from_utf8(&bytes)?.into()
+        };
         if let Some(callback) = &callback {
             callback(is_error, &line);
         }
@@ -96,6 +109,7 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
             captured.push_str(&line);
             captured.push('\n');
         }
+        bytes.clear();
     }
     Ok(captured)
 }
@@ -206,6 +220,72 @@ mod tests {
     fn signed_urls_never_reach_errors() {
         let log = redact("failed https://example.com/a?token=secret Authorization cookie=secret");
         assert!(!log.contains("secret"));
+    }
+    #[tokio::test]
+    async fn legacy_encoded_stderr_does_not_discard_valid_metadata() {
+        #[cfg(windows)]
+        let (exe, args) = (
+            std::path::PathBuf::from("powershell.exe"),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "$out = [byte[]](123,34,116,105,116,108,101,34,58,34,228,184,173,230,150,135,34,125,13,10); [Console]::OpenStandardOutput().Write($out,0,$out.Length); $err = [byte[]](119,97,114,110,58,32,178,226,202,212,13,10,100,111,110,101); [Console]::OpenStandardError().Write($err,0,$err.Length)".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (exe, args) = (
+            std::path::PathBuf::from("sh"),
+            vec![
+                "-c".into(),
+                "printf '{\"title\":\"\\344\\270\\255\\346\\226\\207\"}\\r\\n'; printf 'warn: \\262\\342\\312\\324\\r\\ndone' >&2".into(),
+            ],
+        );
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = Arc::clone(&lines);
+        let callback: LineCallback = Arc::new(move |is_error, line| {
+            received.lock().unwrap().push((is_error, line.to_owned()));
+        });
+        let output = run(&exe, &args, None, &CancellationToken::new(), Some(callback))
+            .await
+            .expect("Non-UTF-8 tool warnings must not fail metadata parsing");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["title"],
+            "中文"
+        );
+        {
+            let lines = lines.lock().unwrap();
+            assert!(
+                lines
+                    .iter()
+                    .any(|(is_error, line)| !is_error && line == "{\"title\":\"中文\"}")
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|(is_error, line)| *is_error && line.starts_with("warn: "))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|(is_error, line)| *is_error && line == "done")
+            );
+        }
+        let mut failed_args = args;
+        failed_args.last_mut().unwrap().push_str("; exit 7");
+        let error = run(&exe, &failed_args, None, &CancellationToken::new(), None)
+            .await
+            .err()
+            .expect("A failed tool must remain a failure despite non-UTF-8 stderr");
+        assert!(error.to_string().starts_with("Tool exited with 7: warn: "));
+    }
+    #[tokio::test]
+    async fn invalid_utf8_metadata_is_still_rejected() {
+        assert!(
+            read_lines(&b"{\"title\":\"\xff\"}\n"[..], false, None)
+                .await
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn cancellation_stops_supervised_process() {

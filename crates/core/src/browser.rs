@@ -49,6 +49,8 @@ pub async fn import_browser(app: &crate::App, args: &Value) -> Result<Value> {
     // An empty local playlist makes yt-dlp export its jar without downloading or contacting a website.
     let arguments = vec![
         "--ignore-config".into(),
+        "--encoding".into(),
+        "utf-8".into(),
         "--no-plugin-dirs".into(),
         "--no-cache-dir".into(),
         "--simulate".into(),

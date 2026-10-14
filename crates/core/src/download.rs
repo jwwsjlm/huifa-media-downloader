@@ -56,6 +56,8 @@ fn base_args(
 ) -> Result<Vec<String>> {
     let mut args = vec![
         "--ignore-config".into(),
+        "--encoding".into(),
+        "utf-8".into(),
         "--no-js-runtimes".into(),
         "--no-warnings".into(),
         "--no-cache-dir".into(),
