@@ -11,6 +11,11 @@ on:
         description: 'Markdown describing changes in this version'
         required: true
         type: string
+      portable_only:
+        description: 'Add only the Windows portable ZIP to an existing published version'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -22,6 +27,7 @@ concurrency:
 
 jobs:
   prepare:
+    if: ${{ !inputs.portable_only }}
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.version.outputs.sha }}
@@ -68,6 +74,85 @@ jobs:
           git push origin "HEAD:$GITHUB_REF_NAME"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
+  portable-addition:
+    if: ${{ inputs.portable_only }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_NOTES: ${{ inputs.release_notes }}
+      GH_TOKEN: ${{ github.token }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate existing version and signing configuration
+        id: version
+        shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ($env:GITHUB_REF_NAME -ne $env:DEFAULT_BRANCH) { throw 'Use the reviewed default branch' }
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'Missing Tauri updater signing secret' }
+          node --test tests/*.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Release tests failed' }
+          node --input-type=module -e 'import fs from "node:fs"; import {validateVersion,validateNotes} from "./scripts/rust-release.mjs"; const version=validateVersion(process.env.RELEASE_VERSION); const notes=validateNotes(process.env.RELEASE_NOTES); if (JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json")).version!==version) throw Error("Requested version differs from the build"); if (validateNotes(fs.readFileSync("release-notes/"+version+".md","utf8"))!==notes) throw Error("Existing version notes differ");'
+          if ($LASTEXITCODE -ne 0) { throw 'Portable version validation failed' }
+          $taskRelease = gh release view "v$env:RELEASE_VERSION" --repo $env:GITHUB_REPOSITORY --json isDraft | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $taskRelease.isDraft) { throw 'An existing published release is required' }
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+      - run: npm ci --prefix frontend
+      - run: npm run check --prefix frontend
+      - run: npm test --prefix frontend
+      - run: node scripts/acquire-rust-tools.mjs windows-x86_64
+      - run: cargo test --locked --release -p huifa-desktop
+      - name: Build, verify and sign portable ZIP
+        shell: pwsh
+        run: |
+          node frontend/node_modules/@tauri-apps/cli/tauri.js build --no-bundle
+          if ($LASTEXITCODE -ne 0) { throw 'Portable desktop build failed' }
+          ./scripts/package-windows-portable.ps1
+          $taskArchive = "target/release/bundle/portable/HuifaDownloader-$env:RELEASE_VERSION-windows-x64-portable.zip"
+          node frontend/node_modules/@tauri-apps/cli/tauri.js signer sign $taskArchive
+          if ($LASTEXITCODE -ne 0) { throw 'Portable archive signing failed' }
+          New-Item -ItemType Directory -Path rust-release-assets -Force | Out-Null
+          Copy-Item -LiteralPath $taskArchive, "$taskArchive.sig" -Destination rust-release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: rust-release-assets
+          if-no-files-found: error
+
+  portable-publish:
+    needs: portable-addition
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_SHA: ${{ needs.portable-addition.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.portable-addition.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+          path: rust-release-assets
+      - name: Add portable files without replacing published artifacts
+        run: node scripts/publish-rust-release.mjs rust-release-assets --portable-only
 
   frontend:
     needs: prepare
@@ -137,6 +222,13 @@ jobs:
         run: |
           node --input-type=module -e 'import fs from "node:fs";fs.mkdirSync(".tmp",{recursive:true});fs.writeFileSync(".tmp/tauri-ci.json",JSON.stringify({build:{beforeBuildCommand:""}}));'
           node frontend/node_modules/@tauri-apps/cli/tauri.js build --config .tmp/tauri-ci.json
+      - name: Package and sign verified Windows portable ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/package-windows-portable.ps1
+          node frontend/node_modules/@tauri-apps/cli/tauri.js signer sign "target/release/bundle/portable/HuifaDownloader-$env:RELEASE_VERSION-windows-x64-portable.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'Portable archive signing failed' }
       - name: Stage signed artifacts
         run: node scripts/stage-rust-artifacts.mjs
       - uses: actions/upload-artifact@v4

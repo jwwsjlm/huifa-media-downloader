@@ -40,12 +40,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         throw new Error(`Artifact or signature changed: ${record.filename}`);
       }
     }
+    const portable = join(folder, `HuifaDownloader-${version}-windows-x64-portable.zip`);
+    if (!readFileSync(portable).length || !/^[A-Za-z0-9+/=\r\n]+$/.test(readFileSync(portable + '.sig', 'utf8').trim())) throw new Error('Missing signed Windows portable archive');
     const revision = process.env.RELEASE_SHA ?? 'HEAD';
     if (revision !== 'HEAD' && !/^[a-f0-9]{40}$/.test(revision)) throw new Error('Invalid build commit');
     const date = spawnSync('git', ['show', '-s', '--format=%cI', revision], { encoding: 'utf8', shell: false });
     if (date.status !== 0) throw new Error('Cannot read build commit date');
     writeFileSync(join(folder, 'rust-updates.json'), JSON.stringify(makeManifest(version, notes, process.env.GITHUB_REPOSITORY, records, new Date(date.stdout.trim())), null, 2) + '\n');
-    const files = readdirSync(folder).filter(file => /\.(exe|AppImage|sig|json)$/.test(file)).sort();
+    const files = readdirSync(folder).filter(file => /\.(exe|AppImage|zip|sig|json)$/.test(file)).sort();
     writeFileSync(join(folder, 'SHA256SUMS'), files.map(file => `${createHash('sha256').update(readFileSync(join(folder, file))).digest('hex')}  ${file}`).join('\n') + '\n');
   }
 }

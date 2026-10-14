@@ -17,14 +17,21 @@ export function stage(root, platform, version) {
   if (!windows && platform !== 'linux-x86_64') throw new Error('Unsupported release platform');
   const bundle = resolve(root, 'target/release/bundle', windows ? 'nsis' : 'appimage');
   const source = one(bundle, windows ? '.exe' : '.AppImage');
-  const signature = readFileSync(source + '.sig', 'utf8').trim();
-  if (!signature || !/^[A-Za-z0-9+/=\r\n]+$/.test(signature)) throw new Error('Missing or malformed desktop update signature');
+  const name = `HuifaDownloader-${version}-${windows ? 'windows-x64-setup.exe' : 'linux-x64.AppImage'}`;
+  const artifacts = [[source, name]];
+  if (windows) artifacts.push([one(resolve(root, 'target/release/bundle/portable'), '.zip'), `HuifaDownloader-${version}-windows-x64-portable.zip`]);
+  const signatures = artifacts.map(([file]) => {
+    const signature = readFileSync(file + '.sig', 'utf8').trim();
+    if (!signature || !/^[A-Za-z0-9+/=\r\n]+$/.test(signature)) throw new Error('Missing or malformed desktop update signature');
+    return signature;
+  });
   const folder = resolve(root, 'rust-release-assets');
   mkdirSync(folder, { recursive: true });
-  const name = `HuifaDownloader-${version}-${windows ? 'windows-x64-setup.exe' : 'linux-x64.AppImage'}`;
-  copyFileSync(source, join(folder, name));
-  writeFileSync(join(folder, name + '.sig'), signature + '\n');
-  const info = { platform, filename: name, signature, sha256: createHash('sha256').update(readFileSync(source)).digest('hex') };
+  for (const [index, [file, filename]] of artifacts.entries()) {
+    copyFileSync(file, join(folder, filename));
+    writeFileSync(join(folder, filename + '.sig'), signatures[index] + '\n');
+  }
+  const info = { platform, filename: name, signature: signatures[0], sha256: createHash('sha256').update(readFileSync(source)).digest('hex') };
   writeFileSync(join(folder, `${platform}.json`), JSON.stringify(info, null, 2) + '\n');
   return info;
 }

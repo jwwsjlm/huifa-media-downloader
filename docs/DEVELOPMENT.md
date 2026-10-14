@@ -54,6 +54,10 @@ gh workflow run release.yml --ref main -f version=0.2.0 -F release_notes=@releas
 
 工作流验证版本与说明，生成包含版本、锁文件和工具版本的一个提交；共享前端只构建一次。Windows、Linux 桌面和原生 amd64、ARM64 容器基于同一提交构建并验收。
 
-全部成功后才生成版本标签和 GitHub Release，发布签名 Windows 安装包、Linux AppImage、`rust-updates.json`、`SHA256SUMS`，并发布 Docker 多架构版本及 `latest`。已发布版本不可覆盖。中断时使用 **Re-run failed jobs** 恢复同一个构建；另发版本时重新填写版本号和说明。
+全部成功后才生成版本标签和 GitHub Release，发布签名 Windows 安装包、Windows 便携 ZIP、Linux AppImage、`rust-updates.json`、`SHA256SUMS`，并发布 Docker 多架构版本及 `latest`。已发布版本不可覆盖。中断时使用 **Re-run failed jobs** 恢复同一个构建；另发版本时重新填写版本号和说明。
+
+Windows 构建通过 `scripts/package-windows-portable.ps1` 打包原生程序及校验过的全部工具，执行隔离启动检查，再用同一 Tauri 密钥签名 ZIP。`portable.flag` 禁用安装包更新入口；便携版沿用系统用户数据目录，更新方式为手动解压覆盖程序。发布门禁要求安装包和便携 ZIP 均有签名，两个文件都进入 `SHA256SUMS`。
+
+为已有发行版补便携包时，在 **Release** 勾选 `portable_only`，填写当前源码一致的版本号和原有说明。此模式只增加 ZIP、签名和独立的 `.zip.sha256` 校验清单，保留原有产物、更新清单和标签；ZIP 内的说明记录实际构建提交。
 
 旧 Python 实现可从 Git 基线 `bf79d1a` 找回。当前源码、检查和发布以 Rust 为准。

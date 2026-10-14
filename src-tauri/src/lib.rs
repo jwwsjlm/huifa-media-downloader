@@ -20,6 +20,7 @@ struct Host {
     core: Arc<App>,
     data_dir: PathBuf,
     download_dir: PathBuf,
+    portable: bool,
     closing: AtomicBool,
     shutdown_done: AtomicBool,
     update: Mutex<Option<tauri_plugin_updater::Update>>,
@@ -44,8 +45,14 @@ async fn command(command: String, args: Value, host: State<'_, Host>) -> Result<
 }
 
 #[tauri::command]
-fn capabilities() -> Value {
-    json!({"desktop":true,"browserCookies":true,"remoteBrowser":false,"updates":true,"directoryPicker":true})
+fn capabilities(host: State<'_, Host>) -> Value {
+    json!({"desktop":true,"browserCookies":true,"remoteBrowser":false,"updates":!host.portable,"directoryPicker":true})
+}
+
+fn portable_mode(executable: &std::path::Path) -> bool {
+    executable
+        .parent()
+        .is_some_and(|directory| directory.join("portable.flag").is_file())
 }
 
 #[tauri::command]
@@ -222,6 +229,9 @@ fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), Stri
 
 #[tauri::command]
 async fn check_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<Value, String> {
+    if host.portable {
+        return Err("Download and extract the latest portable ZIP to update this edition".into());
+    }
     let update = app.updater().map_err(error)?.check().await.map_err(error)?;
     let value = update
         .as_ref()
@@ -233,6 +243,9 @@ async fn check_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<Va
 
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<(), String> {
+    if host.portable {
+        return Err("Portable ZIP updates do not run the installer".into());
+    }
     let mut guard = host.update.lock().await;
     let update = guard.as_mut().ok_or("Check for an update first")?;
     let bytes = update.download(|_, _| {}, || {}).await.map_err(error)?;
@@ -271,6 +284,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            let portable = portable_mode(&std::env::current_exe()?);
             let base = std::env::var_os("HUIFA_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or(app.path().local_data_dir()?.join("HuifaDownloaderRust"));
@@ -310,6 +324,7 @@ pub fn run() {
                 core,
                 data_dir: base,
                 download_dir,
+                portable,
                 closing: AtomicBool::new(false),
                 shutdown_done: AtomicBool::new(false),
                 update: Mutex::new(None),
@@ -407,6 +422,21 @@ fn begin_shutdown(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn portable_marker_only_applies_beside_the_executable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("app/HuifaDownloader.exe");
+        std::fs::create_dir_all(executable.parent().unwrap())?;
+        std::fs::write(directory.path().join("portable.flag"), b"")?;
+        assert!(!portable_mode(&executable));
+        let marker = executable.parent().unwrap().join("portable.flag");
+        std::fs::create_dir(&marker)?;
+        assert!(!portable_mode(&executable));
+        std::fs::remove_dir(&marker)?;
+        std::fs::write(&marker, b"")?;
+        assert!(portable_mode(&executable));
+        Ok(())
+    }
     #[test]
     fn only_owned_file_kinds_cross_host_boundary() {
         assert_eq!(file_kind("video").unwrap(), "media");

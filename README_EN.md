@@ -24,10 +24,13 @@ Choose a file from [Releases](https://github.com/jwwsjlm/huifa-media-downloader/
 | Platform | Artifact |
 | --- | --- |
 | Windows 10/11 x64 | `HuifaDownloader-<version>-windows-x64-setup.exe` |
+| Windows x64 portable | `HuifaDownloader-<version>-windows-x64-portable.zip` |
 | Linux x64 | `HuifaDownloader-<version>-linux-x64.AppImage` |
 | Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:<version>` |
 
 Run the Windows installer or make the AppImage executable. Download and processing tools are included; users do not need a separate Python or FFmpeg installation. Updater signatures verify update authenticity; the Windows installer currently has no Authenticode publisher certificate.
+
+For the portable edition, extract the entire ZIP and run `HuifaDownloader.exe`; keep `tools` and `portable.flag` beside it. Microsoft Edge WebView2 Runtime must be installed. Both Windows editions share the system user data and Downloads folders described below; close the other edition before switching. To update, close the app and extract the new portable ZIP over its program directory. Portable editions do not run installer updates; the ZIP has its own `.sig` and SHA-256 checksum.
 
 The application ID is `com.huifa.downloader.rust`. State is stored under `HuifaDownloaderRust` in the system local data directory; media defaults to the same folder name in the system Downloads directory. Legacy installations and data stay in place; back them up separately. Include `.credentials.key` in Rust data backups to retain encrypted Cookies and AI keys.
 

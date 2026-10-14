@@ -24,10 +24,13 @@ Rust 下载与媒体处理核心，Tauri 桌面应用与 Docker 网页共用 Rea
 | 平台 | 文件 |
 | --- | --- |
 | Windows 10/11 x64 | `HuifaDownloader-<版本>-windows-x64-setup.exe` |
+| Windows x64 便携版 | `HuifaDownloader-<版本>-windows-x64-portable.zip` |
 | Linux x64 | `HuifaDownloader-<版本>-linux-x64.AppImage` |
 | Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:<版本>` |
 
 Windows 运行安装包；Linux 给 AppImage 添加执行权限后运行。应用包含所需下载和处理工具，用户无需另行安装 Python 或 FFmpeg。更新签名用于验证更新来源，Windows 安装包目前没有 Authenticode 发布者证书。
+
+便携版解压后运行 `HuifaDownloader.exe`，保留旁边的 `tools` 目录和 `portable.flag`。Windows 需要已安装 Microsoft Edge WebView2 Runtime。便携版与安装版共用下述系统用户数据和下载目录，切换前关闭另一版本；更新时关闭程序，再用新的便携 ZIP 覆盖程序目录。便携版不执行安装包自动更新，ZIP 同样提供 `.sig` 签名及 SHA-256 校验。
 
 新应用标识为 `com.huifa.downloader.rust`，数据保存到系统本地数据目录下的 `HuifaDownloaderRust`，默认下载到系统下载目录下的同名文件夹。旧版本安装和数据保留在原处，需要单独备份。备份 Rust 数据时请同时备份 `.credentials.key`，否则无法恢复已加密的 Cookie 和 AI 密钥。
 
