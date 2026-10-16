@@ -74,13 +74,19 @@ async fn base_args(
     if !options.proxy.is_empty() {
         args.extend(["--proxy".into(), options.proxy.clone()]);
     }
-    let deno = match task {
-        Some(task) if task.tools.contains_key("deno") => Some(app.task_tool(task, "deno").await?),
-        Some(_) => None,
-        None => app.tool("deno").ok(),
-    };
-    if let Some(deno) = deno {
-        args.extend(["--js-runtimes".into(), format!("deno:{}", deno.display())]);
+    for (name, runtime) in [("qjs", "quickjs"), ("deno", "deno")] {
+        let path = match task {
+            Some(task) if task.tools.contains_key(name) => Some(app.task_tool(task, name).await?),
+            Some(_) => None,
+            None => app.tool(name).ok(),
+        };
+        if let Some(path) = path {
+            args.extend([
+                "--js-runtimes".into(),
+                format!("{runtime}:{}", path.display()),
+            ]);
+            break;
+        }
     }
     if options.request_delay > 0.0 {
         args.extend(["--sleep-requests".into(), options.request_delay.to_string()]);
@@ -1039,6 +1045,40 @@ mod tests {
                 .await
                 .is_err(),
             "An invalid frozen Deno runtime was silently omitted"
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn quickjs_uses_a_frozen_path_and_old_deno_tasks_keep_their_runtime() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let bundled = root.path().join("tools");
+        std::fs::create_dir_all(&bundled)?;
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "qjs", "deno"] {
+            std::fs::write(
+                bundled.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+                format!("{name}:fixture"),
+            )?;
+        }
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: Some(bundled.clone()),
+        })
+        .await?;
+        let task = crate::tests::paused_task(crate::tools::freeze(&app)?);
+        assert!(task.tools.contains_key("qjs") && !task.tools.contains_key("deno"));
+        let args = base_args(&app, &task.options, &Cookies { file: None }, Some(&task)).await?;
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("quickjs:") && arg.contains("frozen"))
+        );
+        std::fs::remove_file(bundled.join(format!("qjs{}", std::env::consts::EXE_SUFFIX)))?;
+        let old = crate::tests::paused_task(crate::tools::freeze(&app)?);
+        let args = base_args(&app, &old.options, &Cookies { file: None }, Some(&old)).await?;
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("deno:") && arg.contains("frozen"))
         );
         app.shutdown().await?;
         Ok(())

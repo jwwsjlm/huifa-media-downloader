@@ -73,6 +73,17 @@ checksum downloads do not depend on the unauthenticated GitHub API quota.
 Native execution and required CLI options are checked before switching the current
 tool pointer. Failed installation leaves that pointer unchanged.
 
+Windows bundles use the GPL shared FFmpeg build from BtbN/FFmpeg-Builds. FFmpeg,
+FFprobe and all seven libav/swresample/swscale DLLs travel together in installers,
+portable packages, managed updates and frozen task snapshots. DLL bytes are hashed
+before task execution, including rejection of unlisted DLLs. Linux desktop builds
+keep static FFmpeg; container FFmpeg comes from Debian. New bundles use QuickJS-NG
+for yt-dlp's EJS scripts; existing frozen Deno tasks continue using their Deno copy.
+Runtime payloads are stored once per SHA-256 under tools/objects. Frozen task sets
+hard-link these immutable objects where supported and fall back to copies on other
+filesystems. They never link mutable installations, overwrite old task snapshots,
+or remove old runtime versions automatically.
+
 The media DTO uses `{id, taskId, title, filename, size, duration}`; snapshots
 never expose Cookie text, AI keys or signed media URLs. Public YouTube watch URLs
 retain only a validated public video ID; other query parameters are removed. Desktop settings retain

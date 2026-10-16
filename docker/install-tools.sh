@@ -13,10 +13,10 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 cd "$work"
 test "$(jq -r .schemaVersion "$lock")" = 1
-for tool in yt-dlp deno; do
+for tool in yt-dlp qjs; do
   case "$tool" in
     yt-dlp) repository=yt-dlp/yt-dlp ;;
-    deno) repository=denoland/deno ;;
+    qjs) repository=quickjs-ng/quickjs ;;
   esac
   test "$(jq -r --arg tool "$tool" '.tools[$tool].repository' "$lock")" = "$repository"
   url=$(jq -r --arg tool "$tool" --arg target "$target" '.tools[$tool].assets[$target].url' "$lock")
@@ -26,11 +26,11 @@ for tool in yt-dlp deno; do
   case "$checksum" in *[!0-9a-f]*) echo "Invalid tool checksum" >&2; exit 1 ;; esac
   curl --fail --location --retry 3 --proto '=https' "$url" -o "$tool.archive"
   printf '%s  %s\n' "$checksum" "$tool.archive" | sha256sum --check -
-  if [ "$tool" = deno ]; then unzip -q "$tool.archive" deno; else mv "$tool.archive" yt-dlp; fi
+  mv "$tool.archive" "$tool"
   install -m 0755 "$tool" "/usr/local/bin/$tool"
 done
 
 /usr/local/bin/yt-dlp --version
-/usr/local/bin/deno --version
+/usr/local/bin/qjs --version
 ffmpeg -version | head -n 1
 chromium --version

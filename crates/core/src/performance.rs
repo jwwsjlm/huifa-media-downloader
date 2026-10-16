@@ -304,7 +304,16 @@ async fn performance_audit_baseline() -> Result<()> {
         .canonicalize()
         .context("Install local runtime tools before the opt-in performance audit")?;
     let mut runtime_sizes = serde_json::Map::new();
-    for name in ["yt-dlp", "ffmpeg", "ffprobe", "deno"] {
+    let mut runtime_payload_bytes = 0;
+    let javascript = if tool_directory
+        .join(format!("qjs{}", std::env::consts::EXE_SUFFIX))
+        .is_file()
+    {
+        "qjs"
+    } else {
+        "deno"
+    };
+    for name in ["yt-dlp", "ffmpeg", "ffprobe", javascript] {
         let path = tool_directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         let metadata = std::fs::metadata(&path)
             .with_context(|| format!("The performance audit requires local {name}"))?;
@@ -312,7 +321,21 @@ async fn performance_audit_baseline() -> Result<()> {
             metadata.is_file(),
             "The performance audit requires a regular runtime executable"
         );
-        runtime_sizes.insert(name.into(), json!(metadata.len()));
+        let mut size = metadata.len();
+        runtime_payload_bytes += metadata.len();
+        if cfg!(windows) && matches!(name, "ffmpeg" | "ffprobe") {
+            for entry in std::fs::read_dir(&tool_directory)? {
+                let entry = entry?;
+                if entry.file_name().to_string_lossy().ends_with(".dll") {
+                    let bytes = entry.metadata()?.len();
+                    size += bytes;
+                    if name == "ffmpeg" {
+                        runtime_payload_bytes += bytes;
+                    }
+                }
+            }
+        }
+        runtime_sizes.insert(name.into(), json!(size));
     }
     let root = tempfile::tempdir()?;
     let mut results = Vec::new();
@@ -334,12 +357,12 @@ async fn performance_audit_baseline() -> Result<()> {
         1,
         IO_SAMPLES,
         json!({
-            "runtime_bytes": runtime_sizes.values().filter_map(Value::as_u64).sum::<u64>(),
+            "runtime_bytes": runtime_payload_bytes,
             "first_freeze_excluded": true,
         }),
         || tools::freeze(&app),
     )?);
-    for name in ["ffmpeg", "ffprobe", "deno"] {
+    for name in ["ffmpeg", "ffprobe", javascript] {
         ensure!(app.task_tool(&task, name).await? == paths[name]);
         results.push(
             measure_async(

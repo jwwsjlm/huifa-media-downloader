@@ -23,44 +23,44 @@
       }
     },
     "ffmpeg": {
-      "repository": "yt-dlp/FFmpeg-Builds",
-      "version": "autobuild-2026-10-13-20-20",
+      "repository": "BtbN/FFmpeg-Builds",
+      "version": "autobuild-2026-10-15-13-03",
       "assets": {
         "windows-x86_64": {
-          "name": "ffmpeg-N-127511-g01cf1a5396-win64-gpl.zip",
-          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/autobuild-2026-10-13-20-20/ffmpeg-N-127511-g01cf1a5396-win64-gpl.zip",
-          "sha256": "cc4c8f3e15b317be771bce75e4f7cba40ab89991cf1a6bfc4c9385e3ae50baec"
+          "name": "ffmpeg-N-127564-g3c92f003c7-win64-gpl-shared.zip",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-15-13-03/ffmpeg-N-127564-g3c92f003c7-win64-gpl-shared.zip",
+          "sha256": "354af576d352cdcdbbbed1fc103e4ff80f1c05cccf2cc6847f4a66e59a1e1cea"
         },
         "linux-x86_64": {
-          "name": "ffmpeg-N-127511-g01cf1a5396-linux64-gpl.tar.xz",
-          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/autobuild-2026-10-13-20-20/ffmpeg-N-127511-g01cf1a5396-linux64-gpl.tar.xz",
-          "sha256": "9c1c037f28592c44fecc3cfb0c8e4b7e7d363a78680eb334231b8cdc5675c13b"
+          "name": "ffmpeg-N-127564-g3c92f003c7-linux64-gpl.tar.xz",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-15-13-03/ffmpeg-N-127564-g3c92f003c7-linux64-gpl.tar.xz",
+          "sha256": "b389df50ad23fc6e03c9e023dc3a28eb61aa480651789f56106f6ca4d169e319"
         },
         "linux-aarch64": {
-          "name": "ffmpeg-N-127511-g01cf1a5396-linuxarm64-gpl.tar.xz",
-          "url": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/autobuild-2026-10-13-20-20/ffmpeg-N-127511-g01cf1a5396-linuxarm64-gpl.tar.xz",
-          "sha256": "a5c6a967132bfd8846491d8c5a6c61bf7e236f0c9229de11563639c1a74b54b6"
+          "name": "ffmpeg-N-127564-g3c92f003c7-linuxarm64-gpl.tar.xz",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-15-13-03/ffmpeg-N-127564-g3c92f003c7-linuxarm64-gpl.tar.xz",
+          "sha256": "0ac1fb49c135d999ada6c0f540716231f7b37b8f1ff0ce433c6aaf98f06c327b"
         }
       }
     },
-    "deno": {
-      "repository": "denoland/deno",
-      "version": "v2.9.7",
+    "qjs": {
+      "repository": "quickjs-ng/quickjs",
+      "version": "v0.17.0",
       "assets": {
         "windows-x86_64": {
-          "name": "deno-x86_64-pc-windows-msvc.zip",
-          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-pc-windows-msvc.zip",
-          "sha256": "a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238"
+          "name": "qjs-windows-x86_64.exe",
+          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-windows-x86_64.exe",
+          "sha256": "2aeabf0092c3262d6b2609824418f7dd7ed1f1df939f73b2b15645230cac0d77"
         },
         "linux-x86_64": {
-          "name": "deno-x86_64-unknown-linux-gnu.zip",
-          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-unknown-linux-gnu.zip",
-          "sha256": "c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490"
+          "name": "qjs-linux-x86_64",
+          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-linux-x86_64",
+          "sha256": "0bfc02511a9f549c28b53880d988fc7cd5d361e90c5e8afdfcd7dc6774ceace5"
         },
         "linux-aarch64": {
-          "name": "deno-aarch64-unknown-linux-gnu.zip",
-          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-unknown-linux-gnu.zip",
-          "sha256": "c832298b1ad4422481334855f6003e0f54145762c5a134f20a489511d2f65bbf"
+          "name": "qjs-linux-aarch64",
+          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-linux-aarch64",
+          "sha256": "3372133484edf50a69f3c67903af41206d22a061e930e3cfb63269272ef56d2e"
         }
       }
     }

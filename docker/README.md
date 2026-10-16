@@ -2,7 +2,7 @@
 
 The Rust web host serves the same React build as the desktop app on port 19491.
 Both `linux/amd64` and `linux/arm64` use their corresponding official standalone
-yt-dlp and Deno binaries, verified against release checksums; FFmpeg and Chromium
+yt-dlp and QuickJS-NG binaries, verified against release checksums; FFmpeg and Chromium
 come from Debian packages. Python application code is not used at runtime.
 
 Set `HUIFA_ACCOUNT` and `HUIFA_PASSWORD`, then run `docker compose up --build -d`.
@@ -40,7 +40,7 @@ The proxy stops with the disposable browser session. See
 Runtime components are updated by updating the Docker image and recreating the
 container; the web interface offers component checks only.
 
-`runtime-tool-lock.json` pins the official yt-dlp and Deno assets and SHA-256
+`runtime-tool-lock.json` pins the official yt-dlp and QuickJS-NG assets and SHA-256
 checksums for both architectures. Build both architectures with
 `docker buildx build --platform linux/amd64,linux/arm64`.
 

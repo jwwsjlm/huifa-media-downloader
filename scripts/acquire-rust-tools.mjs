@@ -9,12 +9,13 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const targets = ['windows-x86_64', 'linux-x86_64', 'linux-aarch64'];
-const repositories = { 'yt-dlp': 'yt-dlp/yt-dlp', ffmpeg: 'yt-dlp/FFmpeg-Builds', deno: 'denoland/deno' };
+const repositories = { 'yt-dlp': 'yt-dlp/yt-dlp', ffmpeg: 'BtbN/FFmpeg-Builds', qjs: 'quickjs-ng/quickjs' };
 const names = {
   'yt-dlp': ['yt-dlp.exe', 'yt-dlp_linux', 'yt-dlp_linux_aarch64'],
-  deno: ['deno-x86_64-pc-windows-msvc.zip', 'deno-x86_64-unknown-linux-gnu.zip', 'deno-aarch64-unknown-linux-gnu.zip'],
+  qjs: ['qjs-windows-x86_64.exe', 'qjs-linux-x86_64', 'qjs-linux-aarch64'],
 };
-const ffmpegSuffixes = ['-win64-gpl.zip', '-linux64-gpl.tar.xz', '-linuxarm64-gpl.tar.xz'];
+const ffmpegSuffixes = ['-win64-gpl-shared.zip', '-linux64-gpl.tar.xz', '-linuxarm64-gpl.tar.xz'];
+export const isFfmpegDll = name => /^(?:avcodec|avdevice|avfilter|avformat|avutil|swresample|swscale)-\d+\.dll$/.test(name);
 
 export function ffmpegRelease(releases) {
   const release = releases.find(item => /^autobuild-\d{4}-\d{2}-\d{2}-/.test(item.tag_name) && !item.draft);
@@ -87,11 +88,27 @@ export async function download(asset, destination) {
   }
 }
 
-function extract(archive, filename, destination) {
+export function runtimeEntries(entries, windows) {
+  const filenames = [windows ? 'ffmpeg.exe' : 'ffmpeg', windows ? 'ffprobe.exe' : 'ffprobe'];
+  for (const filename of filenames) archiveEntry(entries, filename);
+  if (windows) {
+    const libraries = entries.filter(entry => isFfmpegDll(basename(entry))).map(entry => basename(entry));
+    for (const prefix of ['avcodec', 'avdevice', 'avfilter', 'avformat', 'avutil', 'swresample', 'swscale']) {
+      if (libraries.filter(name => name.startsWith(prefix + '-')).length !== 1) throw new Error(`Expected one ${prefix} runtime DLL`);
+    }
+    filenames.push(...libraries);
+  }
+  return filenames;
+}
+function entries(archive) {
   const zip = archive.endsWith('.zip') && process.platform !== 'win32';
   const list = spawnSync(zip ? 'unzip' : 'tar', zip ? ['-Z1', archive] : ['-tf', archive], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, shell: false });
   if (list.status !== 0) throw new Error(`Cannot inspect tool archive: ${list.stderr}`);
-  const entry = archiveEntry(list.stdout.trim().split(/\r?\n/), filename);
+  return list.stdout.trim().split(/\r?\n/);
+}
+function extract(archive, filename, destination, members) {
+  const zip = archive.endsWith('.zip') && process.platform !== 'win32';
+  const entry = archiveEntry(members, filename);
   const fd = openSync(destination, 'wx');
   try {
     const result = spawnSync(zip ? 'unzip' : 'tar', zip ? ['-p', archive, entry] : ['-xOf', archive, entry], { stdio: ['ignore', fd, 'pipe'], shell: false });
@@ -107,6 +124,7 @@ export async function acquire(lock, target, destination) {
   const suffix = target.startsWith('windows') ? '.exe' : '';
   const native = `${process.platform === 'win32' ? 'windows' : 'linux'}-${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}`;
   const receipt = {};
+  const files = {};
   try {
     for (const [tool, repository] of Object.entries(repositories)) {
       const record = lock.tools[tool];
@@ -118,22 +136,33 @@ export async function acquire(lock, target, destination) {
       const archive = join(temporary, 'archive-' + asset.name);
       console.log(`Acquiring ${tool} ${record.version} for ${target}`);
       await download(asset, archive);
-      for (const name of tool === 'ffmpeg' ? ['ffmpeg', 'ffprobe'] : [tool]) {
-        const filename = name + suffix;
+      const members = tool === 'ffmpeg' ? entries(archive) : [];
+      const filenames = tool === 'ffmpeg' ? runtimeEntries(members, suffix === '.exe') : [tool + suffix];
+      for (const filename of filenames) {
+        const name = filename.replace(/\.exe$/, '');
         const staged = join(temporary, filename);
-        if (tool === 'yt-dlp') copyFileSync(archive, staged); else extract(archive, filename, staged);
+        if (tool !== 'ffmpeg') copyFileSync(archive, staged); else extract(archive, filename, staged, members);
         chmodSync(staged, 0o755);
         const executable = readFileSync(staged);
         if (suffix ? executable.subarray(0, 2).toString() !== 'MZ' : !executable.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) throw new Error('Tool payload is not a native executable');
-        if (native === target) {
-          const result = spawnSync(staged, [name === 'ffmpeg' || name === 'ffprobe' ? '-version' : '--version'], { encoding: 'utf8', timeout: 30_000, shell: false });
-          if (result.status !== 0) throw new Error(`${name} cannot run on this platform: ${result.stderr}`);
-        }
-        copyFileSync(staged, join(destination, filename)); chmodSync(join(destination, filename), 0o755);
-        receipt[name] = { version: record.version, sha256: createHash('sha256').update(executable).digest('hex'), archiveSha256: asset.sha256 };
+        const sha256 = createHash('sha256').update(executable).digest('hex');
+        files[filename] = sha256;
+        if (!isFfmpegDll(filename)) receipt[name] = { version: record.version, sha256, archiveSha256: asset.sha256 };
       }
     }
-    writeFileSync(join(destination, 'manifest.json'), JSON.stringify({ target, tools: receipt }, null, 2) + '\n');
+    if (native === target) for (const name of Object.keys(receipt)) {
+      const result = spawnSync(join(temporary, name + suffix), [name === 'ffmpeg' || name === 'ffprobe' ? '-version' : '--version'], { encoding: 'utf8', timeout: 30_000, shell: false });
+      if (result.status !== 0) throw new Error(`${name} cannot run on this platform: ${result.stderr}`);
+    }
+    const previous = join(destination, 'manifest.json');
+    if (readdirSync(destination).includes('manifest.json')) {
+      const manifest = JSON.parse(readFileSync(previous, 'utf8'));
+      for (const filename of Object.keys(manifest.files || Object.fromEntries(Object.keys(manifest.tools || {}).map(name => [name + suffix, ''])))) {
+        if (/^(?:yt-dlp|ffmpeg|ffprobe|deno|qjs)(?:\.exe)?$/.test(filename) || isFfmpegDll(filename)) rmSync(join(destination, filename), { force: true });
+      }
+    }
+    for (const filename of Object.keys(files)) { copyFileSync(join(temporary, filename), join(destination, filename)); chmodSync(join(destination, filename), 0o755); }
+    writeFileSync(previous, JSON.stringify({ target, tools: receipt, files }, null, 2) + '\n');
   } finally {
     if (dirname(resolve(temporary)) !== resolve(parent) || !basename(temporary).startsWith('huifa-rust-tools-')) throw new Error('Unsafe temporary cleanup path');
     rmSync(temporary, { recursive: true, force: true });

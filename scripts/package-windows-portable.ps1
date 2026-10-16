@@ -1,4 +1,4 @@
-param([string]$Version = $env:RELEASE_VERSION)
+param([string]$Version = $env:RELEASE_VERSION, [switch]$Lite)
 
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'An explicit release version is required' }
@@ -16,22 +16,30 @@ $taskTemporary = [IO.Path]::GetFullPath((Join-Path $taskWorkspace ('.tmp/portabl
 if (-not $taskTemporary.StartsWith($taskWorkspace + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Portable staging escapes the workspace' }
 $taskContents = Join-Path $taskTemporary 'package'
 $taskBundle = Join-Path $taskWorkspace 'target/release/bundle/portable'
-$taskArchivePath = Join-Path $taskBundle "HuifaDownloader-$Version-windows-x64-portable.zip"
-New-Item -ItemType Directory -Path (Join-Path $taskContents 'tools') -Force | Out-Null
+$taskVariant = if ($Lite) { '-lite' } else { '' }
+$taskArchivePath = Join-Path $taskBundle "HuifaDownloader-$Version-windows-x64-portable$taskVariant.zip"
+New-Item -ItemType Directory -Path $taskContents -Force | Out-Null
 try {
     Copy-Item -LiteralPath $taskExecutable -Destination (Join-Path $taskContents 'HuifaDownloader.exe')
-    foreach ($taskTool in @('yt-dlp', 'ffmpeg', 'ffprobe', 'deno')) {
-        $taskSource = Join-Path $taskTools "$taskTool.exe"
-        if ((Get-FileHash -LiteralPath $taskSource -Algorithm SHA256).Hash -ine $taskReceipt.tools.$taskTool.sha256) { throw "Tool checksum mismatch: $taskTool" }
-        Copy-Item -LiteralPath $taskSource -Destination (Join-Path $taskContents "tools/$taskTool.exe")
+    if (-not $Lite) {
+        New-Item -ItemType Directory -Path (Join-Path $taskContents 'tools') -Force | Out-Null
+        if (-not $taskReceipt.files -or @(@('yt-dlp', 'ffmpeg', 'ffprobe', 'qjs') | Where-Object { -not $taskReceipt.tools.$_ }).Count) { throw 'Portable runtime receipt is incomplete' }
+        foreach ($taskFile in $taskReceipt.files.PSObject.Properties) {
+            if ($taskFile.Name -notmatch '^(?:(?:yt-dlp|ffmpeg|ffprobe|qjs)\.exe|(?:avcodec|avdevice|avfilter|avformat|avutil|swresample|swscale)-\d+\.dll)$') { throw 'Unexpected runtime payload' }
+            $taskSource = Join-Path $taskTools $taskFile.Name
+            if ((Get-FileHash -LiteralPath $taskSource -Algorithm SHA256).Hash -ine $taskFile.Value) { throw "Tool checksum mismatch: $($taskFile.Name)" }
+            Copy-Item -LiteralPath $taskSource -Destination (Join-Path $taskContents "tools/$($taskFile.Name)")
+        }
+        Copy-Item -LiteralPath (Join-Path $taskTools 'manifest.json') -Destination (Join-Path $taskContents 'tools/manifest.json')
     }
-    Copy-Item -LiteralPath (Join-Path $taskTools 'manifest.json') -Destination (Join-Path $taskContents 'tools/manifest.json')
+    $taskToolInstructions = if ($Lite) { 'Lightweight edition: open Settings > Tools & updates and install yt-dlp, FFmpeg (includes FFprobe), and qjs (QuickJS-NG). Internet access is required for the first installation. Use the full portable package for offline setup.' } else { 'Runtime components are included. Keep the tools folder beside the executable.' }
     [IO.File]::WriteAllText((Join-Path $taskContents 'portable.flag'), '')
     [IO.File]::WriteAllText((Join-Path $taskContents 'README.txt'), @"
 Huifa Media Downloader $Version - Windows x64 portable
 Portable build source: https://github.com/jwwsjlm/huifa-media-downloader/tree/$taskSourceRevision
 
-Extract the whole ZIP and run HuifaDownloader.exe. Keep the tools folder beside it.
+Extract the whole ZIP and run HuifaDownloader.exe.
+$taskToolInstructions
 Requires Microsoft Edge WebView2 Runtime: https://developer.microsoft.com/microsoft-edge/webview2/
 
 Tasks and settings use %LOCALAPPDATA%\HuifaDownloaderRust, shared with the installed edition.
@@ -67,13 +75,16 @@ https://github.com/jwwsjlm/huifa-media-downloader/releases/latest
     }
 
     New-Item -ItemType Directory -Path $taskBundle -Force | Out-Null
-    [IO.Compression.ZipFile]::CreateFromDirectory($taskContents, $taskArchivePath)
-    $taskArchive = [IO.Compression.ZipFile]::OpenRead($taskArchivePath)
+    $taskStagedArchive = Join-Path $taskTemporary 'archive.zip'
+    [IO.Compression.ZipFile]::CreateFromDirectory($taskContents, $taskStagedArchive)
+    $taskArchive = [IO.Compression.ZipFile]::OpenRead($taskStagedArchive)
     try {
-        $taskExpected = @('HuifaDownloader.exe', 'portable.flag', 'README.txt', 'tools/yt-dlp.exe', 'tools/ffmpeg.exe', 'tools/ffprobe.exe', 'tools/deno.exe', 'tools/manifest.json')
+        $taskExpected = @('HuifaDownloader.exe', 'portable.flag', 'README.txt')
+        if (-not $Lite) { $taskExpected += @('tools/manifest.json') + @($taskReceipt.files.PSObject.Properties | ForEach-Object { "tools/$($_.Name)" }) }
         $taskEntries = @($taskArchive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
         if ($taskEntries.Count -ne $taskExpected.Count -or @(Compare-Object $taskExpected $taskEntries).Count) { throw 'Portable archive contents differ from the required program and tools' }
     } finally { $taskArchive.Dispose() }
+    Move-Item -LiteralPath $taskStagedArchive -Destination $taskArchivePath -Force
     Write-Output "Portable archive verified: $taskArchivePath"
 } finally {
     $taskCleanup = (Resolve-Path -LiteralPath $taskTemporary).ProviderPath

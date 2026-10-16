@@ -15,7 +15,7 @@ export function explainError(message: string, t: Translate): string {
     [/HTTP(?: Error)? 403/i, '来源网站拒绝访问。请检查访问权限、Cookie 和下载代理；修改身份设置后需重新添加链接。', 'The source site refused access. Check permissions, cookies, and the download proxy; add the link again after changing credentials.'],
     [/Selected format .*no longer available|No (?:downloadable|video|audio).*format|No audio stream|Requested subtitles.*unavailable/i, '当前视频没有符合方案的格式或字幕。请重新解析，并调整画质、格式或字幕选择。', 'The video has no matching format or subtitles. Read its formats again and adjust quality, format, or subtitle choices.'],
     [/no such option|unrecognized (?:option|argument)/i, '当前工具不支持应用所需参数。请更新运行时组件后重新添加链接；Docker 需更新镜像。', 'The tool does not support the required options. Update runtime components and add the link again; Docker installations require an updated image.'],
-    [/is not installed|Cannot start (?:yt-dlp|ffmpeg|ffprobe|deno)/i, '运行时组件缺失或无法启动。请在“工具与更新”检查或重新安装组件；Docker 需检查镜像内组件。', 'A runtime component is missing or cannot start. Check or reinstall it under Tools & updates; Docker installations must check the image components.'],
+    [/is not installed|Cannot start (?:yt-dlp|ffmpeg|ffprobe|deno|qjs)/i, '运行时组件缺失或无法启动。请在“工具与更新”检查或重新安装组件；Docker 需检查镜像内组件。', 'A runtime component is missing or cannot start. Check or reinstall it under Tools & updates; Docker installations must check the image components.'],
     [/timed? ?out|timeout|connection refused|unable to download webpage/i, '连接来源网站失败。请检查网络和下载代理后重试。', 'Connection to the source site failed. Check the network and download proxy, then retry.'],
   ];
   const hint = hints.find(([pattern]) => pattern.test(message));

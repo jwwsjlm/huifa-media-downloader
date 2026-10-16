@@ -12,6 +12,32 @@ fn executable(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+fn ffmpeg_dll(name: &str) -> bool {
+    [
+        "avcodec",
+        "avdevice",
+        "avfilter",
+        "avformat",
+        "avutil",
+        "swresample",
+        "swscale",
+    ]
+    .iter()
+    .any(|prefix| {
+        name.strip_prefix(&format!("{prefix}-"))
+            .and_then(|s| s.strip_suffix(".dll"))
+            .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+fn payload_name(name: &str) -> String {
+    if ffmpeg_dll(name) {
+        name.into()
+    } else {
+        executable(name)
+    }
+}
+
 fn file_digest(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
@@ -36,8 +62,24 @@ pub(crate) fn freeze(app: &App) -> Result<HashMap<String, PathBuf>> {
     for name in ["yt-dlp", "ffmpeg", "ffprobe"] {
         sources.insert(name.to_string(), resolve(app, name)?);
     }
-    if let Ok(path) = resolve(app, "deno") {
+    if let Ok(path) = resolve(app, "qjs") {
+        sources.insert("qjs".into(), path);
+    } else if let Ok(path) = resolve(app, "deno") {
         sources.insert("deno".into(), path);
+    }
+    if cfg!(windows) {
+        let parent = sources["ffmpeg"].parent().context("Invalid FFmpeg path")?;
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if ffmpeg_dll(&name) {
+                anyhow::ensure!(
+                    entry.file_type()?.is_file(),
+                    "FFmpeg DLL must be a regular file"
+                );
+                sources.insert(name, entry.path());
+            }
+        }
     }
     let hashes = sources
         .iter()
@@ -50,13 +92,35 @@ pub(crate) fn freeze(app: &App) -> Result<HashMap<String, PathBuf>> {
     if !destination.exists() {
         let temporary = tempfile::tempdir_in(&directory)?;
         for (name, source) in &sources {
-            let target = temporary.path().join(executable(name));
-            let mut input = std::fs::File::open(source)?;
-            let mut output = std::fs::File::create(&target)?;
-            std::io::copy(&mut input, &mut output)?;
-            output.sync_all()?;
-            #[cfg(unix)]
-            std::fs::set_permissions(&target, input.metadata()?.permissions())?;
+            let object_dir = app
+                .config
+                .data_dir
+                .join("tools/objects")
+                .join(&hashes[name]);
+            std::fs::create_dir_all(&object_dir)?;
+            let object = object_dir.join(payload_name(name));
+            if !object.exists() {
+                let mut input = std::fs::File::open(source)?;
+                let mut output = tempfile::NamedTempFile::new_in(&object_dir)?;
+                std::io::copy(&mut input, &mut output)?;
+                output.as_file().sync_all()?;
+                #[cfg(unix)]
+                std::fs::set_permissions(output.path(), input.metadata()?.permissions())?;
+                anyhow::ensure!(
+                    file_digest(output.path())? == hashes[name],
+                    "Runtime changed while freezing {name}"
+                );
+                output.persist_noclobber(&object).map_err(|e| e.error)?;
+            }
+            anyhow::ensure!(
+                file_digest(&object)? == hashes[name],
+                "Cached runtime checksum mismatch: {name}"
+            );
+            let target = temporary.path().join(payload_name(name));
+            // Link only immutable cached bytes; mutable installations never share task storage.
+            if std::fs::hard_link(&object, &target).is_err() {
+                std::fs::copy(&object, &target)?;
+            }
             anyhow::ensure!(
                 file_digest(&target)? == hashes[name],
                 "Runtime changed while freezing {name}"
@@ -82,7 +146,7 @@ pub(crate) fn freeze(app: &App) -> Result<HashMap<String, PathBuf>> {
         "Existing frozen runtime set differs"
     );
     let mut paths = HashMap::new();
-    for name in sources.keys() {
+    for name in sources.keys().filter(|name| !ffmpeg_dll(name)) {
         let path = destination.join(executable(name)).canonicalize()?;
         validate_frozen(app, &path, name)?;
         paths.insert(name.clone(), path);
@@ -92,7 +156,7 @@ pub(crate) fn freeze(app: &App) -> Result<HashMap<String, PathBuf>> {
 
 pub(crate) fn validate_frozen(app: &App, path: &Path, name: &str) -> Result<()> {
     anyhow::ensure!(
-        matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe" | "deno"),
+        matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe" | "deno" | "qjs"),
         "Unknown frozen runtime"
     );
     let path = path.canonicalize()?;
@@ -105,7 +169,7 @@ pub(crate) fn validate_frozen(app: &App, path: &Path, name: &str) -> Result<()> 
     );
     let manifest_path = directory.join("manifest.json");
     anyhow::ensure!(
-        std::fs::metadata(&manifest_path)?.len() <= 1024,
+        std::fs::metadata(&manifest_path)?.len() <= 8192,
         "Frozen runtime manifest is too large"
     );
     let manifest = std::fs::read(&manifest_path)?;
@@ -119,11 +183,31 @@ pub(crate) fn validate_frozen(app: &App, path: &Path, name: &str) -> Result<()> 
         hashes.get(name) == Some(&file_digest(&path)?),
         "Frozen {name} runtime checksum mismatch; restore its saved tool version before retrying"
     );
+    if matches!(name, "ffmpeg" | "ffprobe") {
+        for (filename, digest) in &hashes {
+            if ffmpeg_dll(filename) {
+                anyhow::ensure!(
+                    file_digest(&directory.join(filename))? == *digest,
+                    "Frozen FFmpeg DLL checksum mismatch: {filename}"
+                );
+            }
+        }
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            if filename.to_ascii_lowercase().ends_with(".dll") {
+                anyhow::ensure!(
+                    entry.file_type()?.is_file() && hashes.contains_key(&filename),
+                    "Unverified DLL in frozen runtime: {filename}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
 pub(crate) fn resolve(app: &App, name: &str) -> Result<PathBuf> {
-    if !matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe" | "deno") {
+    if !matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe" | "deno" | "qjs") {
         bail!("Unknown runtime tool");
     }
     let executable = executable(name);
@@ -199,9 +283,10 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
         ("yt-dlp", "stable") => "yt-dlp/yt-dlp",
         ("yt-dlp", "nightly") => "yt-dlp/yt-dlp-nightly-builds",
         ("yt-dlp", _) => bail!("Unknown yt-dlp channel; choose stable or nightly"),
-        ("ffmpeg" | "ffprobe", "stable") if version.is_empty() => "yt-dlp/FFmpeg-Builds",
+        ("ffmpeg" | "ffprobe", "stable") if version.is_empty() => "BtbN/FFmpeg-Builds",
         ("deno", "stable") if version.is_empty() => "denoland/deno",
-        ("ffmpeg" | "ffprobe" | "deno", _) => {
+        ("qjs", "stable") if version.is_empty() => "quickjs-ng/quickjs",
+        ("ffmpeg" | "ffprobe" | "deno" | "qjs", _) => {
             bail!("Channel and version selection is only supported for yt-dlp")
         }
         _ => bail!("Unknown runtime tool"),
@@ -277,12 +362,15 @@ fn asset_name(name: &str, platform: &str) -> Result<&'static str> {
         ("yt-dlp", "windows-aarch64") => "yt-dlp_arm64.exe",
         ("yt-dlp", "linux-x86_64") => "yt-dlp_linux",
         ("yt-dlp", "linux-aarch64") => "yt-dlp_linux_aarch64",
-        ("ffmpeg" | "ffprobe", "windows-x86_64") => "ffmpeg-master-latest-win64-gpl.zip",
+        ("ffmpeg" | "ffprobe", "windows-x86_64") => "ffmpeg-master-latest-win64-gpl-shared.zip",
         ("ffmpeg" | "ffprobe", "linux-x86_64") => "ffmpeg-master-latest-linux64-gpl.tar.xz",
         ("ffmpeg" | "ffprobe", "linux-aarch64") => "ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
         ("deno", "windows-x86_64") => "deno-x86_64-pc-windows-msvc.zip",
         ("deno", "linux-x86_64") => "deno-x86_64-unknown-linux-gnu.zip",
         ("deno", "linux-aarch64") => "deno-aarch64-unknown-linux-gnu.zip",
+        ("qjs", "windows-x86_64") => "qjs-windows-x86_64.exe",
+        ("qjs", "linux-x86_64") => "qjs-linux-x86_64",
+        ("qjs", "linux-aarch64") => "qjs-linux-aarch64",
         _ => bail!("Unsupported runtime platform or architecture: {platform}"),
     })
 }
@@ -564,10 +652,16 @@ async fn update_inner(
     let extraction_dir = temporary.path().to_path_buf();
     let format = asset_name.to_string();
     let extracted_names = filenames.clone();
-    tokio::task::spawn_blocking(move || {
+    let extracted = tokio::task::spawn_blocking(move || {
         extract_archive(&archive, &format, &extracted_names, &extraction_dir)
     })
     .await??;
+    for filename in extracted.iter().filter(|filename| ffmpeg_dll(filename)) {
+        ensure!(
+            std::fs::read(temporary.path().join(filename))?.starts_with(b"MZ"),
+            "Runtime DLL is not a native library"
+        );
+    }
     for (tool, filename) in wanted.iter().zip(&filenames) {
         let path = temporary.path().join(filename);
         let header = std::fs::read(&path)?;
@@ -613,7 +707,7 @@ async fn update_inner(
             .sync_all()?;
     }
     if version_dir.exists() {
-        for filename in &filenames {
+        for filename in &extracted {
             ensure!(
                 std::fs::read(version_dir.join(filename))?
                     == std::fs::read(temporary.path().join(filename))?,
@@ -683,7 +777,7 @@ fn extract_archive(
     name: &str,
     wanted: &[String],
     destination: &Path,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     use std::io::{Read, Write};
     let mut found = std::collections::HashSet::new();
     let mut save = |path: &Path, reader: &mut dyn Read, size: u64| -> Result<()> {
@@ -693,7 +787,12 @@ fn extract_archive(
             "Unsafe runtime archive path"
         );
         let filename = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
-        if !wanted.iter().any(|wanted| wanted == filename) {
+        if !wanted.iter().any(|wanted| wanted == filename)
+            && !(wanted
+                .iter()
+                .any(|name| name == "ffmpeg.exe" || name == "ffprobe.exe")
+                && ffmpeg_dll(filename))
+        {
             return Ok(());
         }
         anyhow::ensure!(
@@ -746,15 +845,41 @@ fn extract_archive(
         save(Path::new(&wanted[0]), &mut reader, archive.len() as u64)?;
     }
     anyhow::ensure!(
-        found.len() == wanted.len(),
+        wanted.iter().all(|name| found.contains(name)),
         "Runtime archive does not contain every required binary"
     );
-    Ok(())
+    if name.ends_with("-gpl-shared.zip") {
+        for prefix in [
+            "avcodec",
+            "avdevice",
+            "avfilter",
+            "avformat",
+            "avutil",
+            "swresample",
+            "swscale",
+        ] {
+            anyhow::ensure!(
+                found
+                    .iter()
+                    .filter(|filename| filename.starts_with(&format!("{prefix}-"))
+                        && ffmpeg_dll(filename))
+                    .count()
+                    == 1,
+                "Runtime archive is missing a unique {prefix} DLL"
+            );
+        }
+    }
+    Ok(found.into_iter().collect())
 }
 
 pub(crate) async fn check(app: &App) -> Result<Value> {
     let mut tools = Vec::new();
-    for name in ["yt-dlp", "ffmpeg", "ffprobe", "deno"] {
+    let javascript = if resolve(app, "qjs").is_ok() || resolve(app, "deno").is_err() {
+        "qjs"
+    } else {
+        "deno"
+    };
+    for name in ["yt-dlp", "ffmpeg", "ffprobe", javascript] {
         let mut tool = match resolve(app, name) {
             Ok(path) => {
                 let flag = if name == "ffmpeg" || name == "ffprobe" {
@@ -819,6 +944,47 @@ pub(crate) fn mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn component_cache_reuses_unchanged_bytes_and_freezes_dlls() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let bundled = root.path().join("bundled");
+        std::fs::create_dir_all(&bundled)?;
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "qjs"] {
+            std::fs::write(bundled.join(executable(name)), format!("{name}:v1"))?;
+        }
+        if cfg!(windows) {
+            std::fs::write(bundled.join("avcodec-63.dll"), b"MZoriginal DLL")?;
+        }
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: Some(bundled.clone()),
+        })
+        .await?;
+        let old = freeze(&app)?;
+        std::fs::write(bundled.join(executable("yt-dlp")), b"yt-dlp:v2")?;
+        let new = freeze(&app)?;
+        assert_ne!(old["yt-dlp"], new["yt-dlp"]);
+        assert_eq!(
+            std::fs::read_dir(app.config.data_dir.join("tools/objects"))?.count(),
+            if cfg!(windows) { 6 } else { 5 }
+        );
+        for name in ["ffmpeg", "ffprobe", "qjs"] {
+            validate_frozen(&app, &old[name], name)?;
+            validate_frozen(&app, &new[name], name)?;
+        }
+        let before = std::fs::read(&old["ffmpeg"])?;
+        std::fs::write(bundled.join(executable("ffmpeg")), b"mutable update")?;
+        assert_eq!(std::fs::read(&old["ffmpeg"])?, before);
+        if cfg!(windows) {
+            let dll = new["ffmpeg"].parent().unwrap().join("avcodec-63.dll");
+            std::fs::write(&dll, b"MZtampered DLL")?;
+            assert!(validate_frozen(&app, &new["ffmpeg"], "ffmpeg").is_err());
+            assert!(validate_frozen(&app, &new["ffprobe"], "ffprobe").is_err());
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
     #[test]
     fn packages_match_the_runtime_system_and_architecture() -> Result<()> {
         for (platform, asset) in [
@@ -1063,6 +1229,72 @@ mod tests {
             .is_err()
         );
         assert!(!directory.path().join("readme.txt").exists());
+        Ok(())
+    }
+    #[test]
+    fn verified_shared_archive_keeps_libraries_and_rejects_duplicate_payloads() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let archive = |duplicate: bool, missing: bool| -> Result<Vec<u8>> {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for name in [
+                "ffmpeg.exe",
+                "ffprobe.exe",
+                "avcodec-63.dll",
+                "avutil-61.dll",
+                "avdevice-63.dll",
+                "avfilter-12.dll",
+                "avformat-63.dll",
+                "swresample-7.dll",
+                "swscale-10.dll",
+                "unrelated.dll",
+            ] {
+                if missing && name == "swscale-10.dll" {
+                    continue;
+                }
+                writer.start_file(
+                    format!("bin/{name}"),
+                    zip::write::SimpleFileOptions::default(),
+                )?;
+                writer.write_all(b"MZfixture")?;
+            }
+            if duplicate {
+                writer.start_file(
+                    "other/avcodec-63.dll",
+                    zip::write::SimpleFileOptions::default(),
+                )?;
+                writer.write_all(b"MZduplicate")?;
+            }
+            Ok(writer.finish()?.into_inner())
+        };
+        let wanted = ["ffmpeg.exe".into(), "ffprobe.exe".into()];
+        let files = extract_archive(
+            &archive(false, false)?,
+            "ffmpeg-gpl-shared.zip",
+            &wanted,
+            root.path(),
+        )?;
+        assert_eq!(files.len(), 9);
+        assert!(!root.path().join("unrelated.dll").exists());
+        let other = tempfile::tempdir()?;
+        assert!(
+            extract_archive(
+                &archive(true, false)?,
+                "ffmpeg-gpl-shared.zip",
+                &wanted,
+                other.path()
+            )
+            .is_err()
+        );
+        let missing = tempfile::tempdir()?;
+        assert!(
+            extract_archive(
+                &archive(false, true)?,
+                "ffmpeg-gpl-shared.zip",
+                &wanted,
+                missing.path()
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

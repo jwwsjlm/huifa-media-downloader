@@ -8,7 +8,7 @@ A Rust download and media processing core with a shared React interface for Taur
 
 ## Features
 
-- Official yt-dlp, FFmpeg, FFprobe and Deno for videos, audio, collections and batch URLs.
+- Official yt-dlp, FFmpeg, FFprobe and lightweight QuickJS-NG (existing Deno tasks remain supported) for videos, audio, collections and batch URLs.
 - Separate queues: three ordinary downloads, one special or live download, and one media processing job.
 - Format selection, multiple audio tracks, subtitles, chapters, cuts, SponsorBlock, transcoding and audio export.
 - Frozen per-task plans and runtime versions, retained sources, pause/resume, restart recovery and offline processing retries.
