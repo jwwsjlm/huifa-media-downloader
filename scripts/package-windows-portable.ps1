@@ -89,5 +89,13 @@ https://github.com/jwwsjlm/huifa-media-downloader/releases/latest
 } finally {
     $taskCleanup = (Resolve-Path -LiteralPath $taskTemporary).ProviderPath
     if (-not $taskCleanup.StartsWith($taskWorkspace + '\', [StringComparison]::OrdinalIgnoreCase) -or (Get-Item -LiteralPath $taskCleanup).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Unsafe portable staging cleanup target' }
-    Remove-Item -LiteralPath $taskCleanup -Recurse -Force
+    for ($taskAttempt = 0; $taskAttempt -lt 20; $taskAttempt++) {
+        try {
+            if (Test-Path -LiteralPath $taskCleanup) { Remove-Item -LiteralPath $taskCleanup -Recurse -Force }
+            break
+        } catch {
+            if ($taskAttempt -eq 19) { throw }
+            Start-Sleep -Milliseconds 250
+        }
+    }
 }

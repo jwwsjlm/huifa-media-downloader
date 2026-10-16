@@ -79,6 +79,9 @@ portable packages, managed updates and frozen task snapshots. DLL bytes are hash
 before task execution, including rejection of unlisted DLLs. Linux desktop builds
 keep static FFmpeg; container FFmpeg comes from Debian. New bundles use QuickJS-NG
 for yt-dlp's EJS scripts; existing frozen Deno tasks continue using their Deno copy.
+Desktop users can optionally install Deno under Tools & updates for faster YouTube
+JavaScript parsing. Installed Deno is preferred for new probes and tasks, while
+existing QuickJS snapshots retain QuickJS.
 Runtime payloads are stored once per SHA-256 under tools/objects. Frozen task sets
 hard-link these immutable objects where supported and fall back to copies on other
 filesystems. They never link mutable installations, overwrite old task snapshots,

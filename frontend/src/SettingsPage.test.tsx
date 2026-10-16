@@ -2,12 +2,19 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { SettingsPage } from './SettingsPage';
 import { initialState } from './state';
+import type { Tool } from './types';
 
 const transport = vi.hoisted(() => ({ desktop: false, command: vi.fn(), paths: vi.fn() }));
 vi.mock('./transport', () => ({ host: { get desktop() { return transport.desktop; }, command: transport.command, paths: transport.paths, capabilities: () => ({ updates: false }) } }));
 beforeEach(() => { transport.desktop = false; transport.command.mockReset().mockResolvedValue([]); transport.paths.mockReset().mockResolvedValue({ downloadDir: '/downloads' }); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
-function show() { render(<SettingsPage state={{ ...initialState, tools: [{ name: 'yt-dlp', available: true, version: '2026.08.19', platform: 'windows-x86_64', asset: 'yt-dlp.exe' }], view: { ...initialState.view, settingsTab: 'tools' } }} dispatch={vi.fn()} t={(_zh, en) => en} run={run} message={vi.fn()} />); }
+function show(tools: Tool[] = [{ name: 'yt-dlp', available: true, version: '2026.08.19', platform: 'windows-x86_64', asset: 'yt-dlp.exe' }]) { render(<SettingsPage state={{ ...initialState, tools, view: { ...initialState.view, settingsTab: 'tools' } }} dispatch={vi.fn()} t={(_zh, en) => en} run={run} message={vi.fn()} />); }
+it('offers optional faster Deno parsing only on desktop and explains the size tradeoff', async () => {
+  transport.desktop = true; show([{ name: 'qjs', available: true, version: '0.17.0' }]);
+  expect(screen.getByText(/executable is about 93 MiB/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Install Deno for faster parsing' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'deno' }));
+});
 it('explains Docker image updates instead of offering a forbidden tool command', async () => {
   show();
   await waitFor(() => expect(transport.command).toHaveBeenCalledWith('cookies.list'));

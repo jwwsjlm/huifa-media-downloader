@@ -62,10 +62,10 @@ pub(crate) fn freeze(app: &App) -> Result<HashMap<String, PathBuf>> {
     for name in ["yt-dlp", "ffmpeg", "ffprobe"] {
         sources.insert(name.to_string(), resolve(app, name)?);
     }
-    if let Ok(path) = resolve(app, "qjs") {
-        sources.insert("qjs".into(), path);
-    } else if let Ok(path) = resolve(app, "deno") {
+    if let Ok(path) = resolve(app, "deno") {
         sources.insert("deno".into(), path);
+    } else if let Ok(path) = resolve(app, "qjs") {
+        sources.insert("qjs".into(), path);
     }
     if cfg!(windows) {
         let parent = sources["ffmpeg"].parent().context("Invalid FFmpeg path")?;
@@ -187,7 +187,7 @@ pub(crate) fn validate_frozen(app: &App, path: &Path, name: &str) -> Result<()> 
         for (filename, digest) in &hashes {
             if ffmpeg_dll(filename) {
                 anyhow::ensure!(
-                    file_digest(&directory.join(filename))? == *digest,
+                    file_digest(&directory.join(filename)).with_context(|| format!("Frozen FFmpeg DLL is missing or unreadable: {filename}; restore its saved tool version before retrying"))? == *digest,
                     "Frozen FFmpeg DLL checksum mismatch: {filename}"
                 );
             }
@@ -874,10 +874,10 @@ fn extract_archive(
 
 pub(crate) async fn check(app: &App) -> Result<Value> {
     let mut tools = Vec::new();
-    let javascript = if resolve(app, "qjs").is_ok() || resolve(app, "deno").is_err() {
-        "qjs"
-    } else {
+    let javascript = if resolve(app, "deno").is_ok() {
         "deno"
+    } else {
+        "qjs"
     };
     for name in ["yt-dlp", "ffmpeg", "ffprobe", javascript] {
         let mut tool = match resolve(app, name) {
@@ -981,6 +981,14 @@ mod tests {
             std::fs::write(&dll, b"MZtampered DLL")?;
             assert!(validate_frozen(&app, &new["ffmpeg"], "ffmpeg").is_err());
             assert!(validate_frozen(&app, &new["ffprobe"], "ffprobe").is_err());
+            std::fs::remove_file(&dll)?;
+            assert!(
+                format!(
+                    "{:#}",
+                    validate_frozen(&app, &new["ffmpeg"], "ffmpeg").unwrap_err()
+                )
+                .contains("DLL is missing or unreadable: avcodec-63.dll")
+            );
         }
         app.shutdown().await?;
         Ok(())

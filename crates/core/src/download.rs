@@ -74,7 +74,7 @@ async fn base_args(
     if !options.proxy.is_empty() {
         args.extend(["--proxy".into(), options.proxy.clone()]);
     }
-    for (name, runtime) in [("qjs", "quickjs"), ("deno", "deno")] {
+    for (name, runtime) in [("deno", "deno"), ("qjs", "quickjs")] {
         let path = match task {
             Some(task) if task.tools.contains_key(name) => Some(app.task_tool(task, name).await?),
             Some(_) => None,
@@ -1054,7 +1054,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let bundled = root.path().join("tools");
         std::fs::create_dir_all(&bundled)?;
-        for name in ["yt-dlp", "ffmpeg", "ffprobe", "qjs", "deno"] {
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "qjs"] {
             std::fs::write(
                 bundled.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
                 format!("{name}:fixture"),
@@ -1073,12 +1073,20 @@ mod tests {
             args.iter()
                 .any(|arg| arg.starts_with("quickjs:") && arg.contains("frozen"))
         );
-        std::fs::remove_file(bundled.join(format!("qjs{}", std::env::consts::EXE_SUFFIX)))?;
+        std::fs::write(
+            bundled.join(format!("deno{}", std::env::consts::EXE_SUFFIX)),
+            b"deno:fixture",
+        )?;
         let old = crate::tests::paused_task(crate::tools::freeze(&app)?);
         let args = base_args(&app, &old.options, &Cookies { file: None }, Some(&old)).await?;
         assert!(
             args.iter()
                 .any(|arg| arg.starts_with("deno:") && arg.contains("frozen"))
+        );
+        let args = base_args(&app, &task.options, &Cookies { file: None }, Some(&task)).await?;
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("quickjs:") && arg.contains("frozen"))
         );
         app.shutdown().await?;
         Ok(())

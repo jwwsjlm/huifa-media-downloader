@@ -306,12 +306,12 @@ async fn performance_audit_baseline() -> Result<()> {
     let mut runtime_sizes = serde_json::Map::new();
     let mut runtime_payload_bytes = 0;
     let javascript = if tool_directory
-        .join(format!("qjs{}", std::env::consts::EXE_SUFFIX))
+        .join(format!("deno{}", std::env::consts::EXE_SUFFIX))
         .is_file()
     {
-        "qjs"
-    } else {
         "deno"
+    } else {
+        "qjs"
     };
     for name in ["yt-dlp", "ffmpeg", "ffprobe", javascript] {
         let path = tool_directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
