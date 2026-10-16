@@ -15,11 +15,11 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-struct Cookies {
+pub(crate) struct Cookies {
     file: Option<tempfile::NamedTempFile>,
 }
 impl Cookies {
-    fn new(app: &App, text: Option<&str>) -> Result<Self> {
+    pub(crate) fn new(app: &App, text: Option<&str>) -> Result<Self> {
         let file = if let Some(text) = text {
             let mut file = tempfile::Builder::new()
                 .prefix(".cookie-")
@@ -48,7 +48,7 @@ impl Cookies {
     }
 }
 
-async fn base_args(
+pub(crate) async fn base_args(
     app: &App,
     options: &DownloadOptions,
     cookies: &Cookies,

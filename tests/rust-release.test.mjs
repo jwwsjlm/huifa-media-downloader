@@ -40,8 +40,9 @@ test('an unsigned desktop build cannot be staged or reach the updater', () => {
     writeFileSync(join(bundle, 'installer.exe.sig'), 'dGVzdA==\n');
     const portable = join(root, 'target/release/bundle/portable');
     mkdirSync(portable, { recursive: true });
-    writeFileSync(join(portable, 'portable.zip'), 'fixture portable');
-    writeFileSync(join(portable, 'portable.zip.sig'), 'dGVzdA==\n');
+    const name = 'HuifaDownloader-2.1.3-windows-x64-portable.zip';
+    writeFileSync(join(portable, name), 'fixture portable');
+    writeFileSync(join(portable, name + '.sig'), 'dGVzdA==\n');
     const record = stage(root, 'windows-x86_64', '2.1.3');
     assert.equal(record.platform, 'windows-x86_64');
     assert.match(record.sha256, /^[a-f0-9]{64}$/);
@@ -59,11 +60,12 @@ test('Windows releases require a signed portable archive alongside the installer
     writeFileSync(join(bundle, 'installer.exe'), 'fixture installer');
     writeFileSync(join(bundle, 'installer.exe.sig'), 'dGVzdA==\n');
     assert.throws(() => stage(root, 'windows-x86_64', '2.1.3'), /zip/);
-    writeFileSync(join(portable, 'portable.zip'), 'fixture portable');
+    const archive = join(portable, 'HuifaDownloader-2.1.3-windows-x64-portable.zip');
+    writeFileSync(archive, 'fixture portable');
     assert.throws(() => stage(root, 'windows-x86_64', '2.1.3'));
-    writeFileSync(join(portable, 'portable.zip.sig'), 'not a signature!');
+    writeFileSync(archive + '.sig', 'not a signature!');
     assert.throws(() => stage(root, 'windows-x86_64', '2.1.3'), /signature/);
-    writeFileSync(join(portable, 'portable.zip.sig'), 'dGVzdA==\n');
+    writeFileSync(archive + '.sig', 'dGVzdA==\n');
     stage(root, 'windows-x86_64', '2.1.3');
     const staged = join(root, 'rust-release-assets/HuifaDownloader-2.1.3-windows-x64-portable.zip');
     assert.equal(readFileSync(staged, 'utf8'), 'fixture portable');

@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 struct Host {
     core: Arc<App>,
+    mcp: huifa_mcp::DesktopMcp,
     data_dir: PathBuf,
     download_dir: PathBuf,
     portable: bool,
@@ -32,6 +33,39 @@ fn error(error: impl std::fmt::Display) -> String {
 
 #[tauri::command]
 async fn command(command: String, args: Value, host: State<'_, Host>) -> Result<Value, String> {
+    match command.as_str() {
+        "mcp.status" => return host.mcp.status().map_err(error),
+        "mcp.configure" => {
+            return host
+                .mcp
+                .configure(
+                    args["enabled"].as_bool().ok_or("enabled must be boolean")?,
+                    true,
+                    args["port"]
+                        .as_u64()
+                        .filter(|n| *n > 0 && *n <= 65535)
+                        .ok_or("Invalid MCP port")? as u16,
+                )
+                .await
+                .map_err(error);
+        }
+        "mcp.connection" => {
+            let bridge = std::env::current_exe()
+                .map_err(error)?
+                .parent()
+                .ok_or("Application directory unavailable")?
+                .join(if cfg!(windows) {
+                    "huifa-mcp-bridge.exe"
+                } else {
+                    "huifa-mcp-bridge"
+                });
+            return host
+                .mcp
+                .connection(&bridge.to_string_lossy())
+                .map_err(error);
+        }
+        _ => {}
+    }
     if command == "media.file" {
         return Err("File paths are internal to the desktop host".into());
     }
@@ -320,7 +354,19 @@ pub fn run() {
                     }
                 }
             });
+            let mcp = huifa_mcp::DesktopMcp::new(core.clone());
+            let config = mcp.status()?;
+            if config["enabled"] == true
+                && let Err(reason) = tauri::async_runtime::block_on(mcp.configure(
+                    true,
+                    true,
+                    config["port"].as_u64().unwrap_or(19492) as u16,
+                ))
+            {
+                eprintln!("MCP startup failed: {reason}");
+            }
             app.manage(Host {
+                mcp,
                 core,
                 data_dir: base,
                 download_dir,
@@ -400,6 +446,7 @@ fn begin_shutdown(app: &tauri::AppHandle) {
     let core = Arc::clone(&host.core);
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
+        handle.state::<Host>().mcp.shutdown().await;
         match core.shutdown().await {
             Ok(()) => {
                 handle

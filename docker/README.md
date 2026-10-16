@@ -40,6 +40,21 @@ The proxy stops with the disposable browser session. See
 Runtime components are updated by updating the Docker image and recreating the
 container; the web interface offers component checks only.
 
+## MCP interface
+
+After signing in, open **AI 视频服务（MCP）** in the sidebar or visit `/mcp`.
+The browser page and AI transport have separate paths: the JSON configuration
+uses `/mcp-server` on the same external origin and published port. For example,
+`http://NAS-IP:19491/mcp` displays the page while an AI client connects to
+`http://NAS-IP:19491/mcp-server`. No additional port needs publishing.
+
+One switch enables or disables the service, and `/data` preserves its state.
+The page displays generated JSON, a copy button and the available tools.
+MCP calls do not require a token; management actions retain the normal web
+session and CSRF checks. Calls use the saved Cookie/proxy and existing download
+queue. Set `HUIFA_PUBLIC_ORIGIN` to the externally accessed origin when using
+a NAS address, mapped port or reverse proxy. The service is disabled initially.
+
 `runtime-tool-lock.json` pins the official yt-dlp and QuickJS-NG assets and SHA-256
 checksums for both architectures. Build both architectures with
 `docker buildx build --platform linux/amd64,linux/arm64`.

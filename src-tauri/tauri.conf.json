@@ -1,16 +1,16 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Huifa Media Downloader Rust",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "identifier": "com.huifa.downloader.rust",
   "build": {
     "beforeDevCommand": {
-      "script": "npm --prefix frontend run dev",
+      "script": "node scripts/prepare-mcp-bridge.mjs --debug && npm --prefix frontend run dev",
       "cwd": ".."
     },
     "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": {
-      "script": "npm --prefix frontend run build",
+      "script": "node scripts/prepare-mcp-bridge.mjs && npm --prefix frontend run build",
       "cwd": ".."
     },
     "frontendDist": "../frontend/dist"
@@ -36,6 +36,9 @@
     }
   },
   "bundle": {
+    "externalBin": [
+      "binaries/huifa-mcp-bridge"
+    ],
     "active": true,
     "targets": [
       "nsis",

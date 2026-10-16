@@ -19,7 +19,12 @@ export function stage(root, platform, version) {
   const source = one(bundle, windows ? '.exe' : '.AppImage');
   const name = `HuifaDownloader-${version}-${windows ? 'windows-x64-setup.exe' : 'linux-x64.AppImage'}`;
   const artifacts = [[source, name]];
-  if (windows) artifacts.push([one(resolve(root, 'target/release/bundle/portable'), '.zip'), `HuifaDownloader-${version}-windows-x64-portable.zip`]);
+  if (windows) {
+    const filename = `HuifaDownloader-${version}-windows-x64-portable.zip`;
+    const file = resolve(root, 'target/release/bundle/portable', filename);
+    if (!readFileSync(file).length) throw new Error(`Empty portable archive: ${filename}`);
+    artifacts.push([file, filename]);
+  }
   const signatures = artifacts.map(([file]) => {
     const signature = readFileSync(file + '.sig', 'utf8').trim();
     if (!signature || !/^[A-Za-z0-9+/=\r\n]+$/.test(signature)) throw new Error('Missing or malformed desktop update signature');

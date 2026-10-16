@@ -33,5 +33,5 @@ export interface VideoProbe { title: string; formats: Format[]; duration?: numbe
 export interface CollectionEntry { id?: string; url: string; title: string; index?: number; duration?: number; available?: boolean; error?: string }
 export interface CollectionProbe { title: string; entries: CollectionEntry[] }
 export interface CoverResult { assetId?: string; id?: string; url?: string; filename?: string }
-export type Page = 'downloads' | 'completed' | 'settings' | 'about';
+export type Page = 'downloads' | 'completed' | 'settings' | 'mcp' | 'about';
 export type Locale = 'zh-CN' | 'en-US';

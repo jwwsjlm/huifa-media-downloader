@@ -1,0 +1,25 @@
+[package]
+name = "huifa-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+huifa-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+rmcp = { version = "=3.5.1", features = ["transport-streamable-http-server", "transport-io", "client", "transport-streamable-http-client-reqwest"] }
+axum = "0.8"
+reqwest.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[[bin]]
+name = "huifa-mcp-bridge"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

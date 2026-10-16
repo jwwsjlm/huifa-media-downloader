@@ -115,6 +115,7 @@ jobs:
       - run: npm run check --prefix frontend
       - run: npm test --prefix frontend
       - run: node scripts/acquire-rust-tools.mjs windows-x86_64
+      - run: node scripts/prepare-mcp-bridge.mjs
       - run: cargo test --locked --release -p huifa-desktop
       - name: Build, verify and sign portable ZIP
         shell: pwsh
@@ -215,8 +216,10 @@ jobs:
           path: frontend/dist
       - name: Acquire pinned verified runtime tools
         run: node scripts/acquire-rust-tools.mjs ${{ matrix.platform }}
+      - name: Build MCP stdio bridge
+        run: node scripts/prepare-mcp-bridge.mjs
       - name: Test shared core and native file boundaries
-        run: cargo test --locked --release -p huifa-core -p huifa-server -p huifa-desktop -- --include-ignored --test-threads=1
+        run: cargo test --locked --release -p huifa-core -p huifa-mcp -p huifa-server -p huifa-desktop -- --include-ignored --test-threads=1
       - name: Build signed desktop from shared frontend
         shell: bash
         run: |

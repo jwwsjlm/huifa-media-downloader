@@ -13,7 +13,7 @@ use axum::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use futures_util::Stream;
 use huifa_core::{App, AppConfig};
@@ -27,6 +27,7 @@ use std::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
 pub struct Config {
@@ -42,6 +43,9 @@ pub struct Config {
 
 pub struct Server {
     app: Arc<App>,
+    mcp: huifa_mcp::DesktopMcp,
+    mcp_transport: tokio::sync::RwLock<(CancellationToken, Router)>,
+    public_origin: Option<String>,
     auth: Arc<auth::Auth>,
     browser: Arc<browser::Browser>,
     assets: PathBuf,
@@ -79,7 +83,7 @@ impl Server {
         let auth = Arc::new(auth::Auth::new(
             &config.account,
             &config.password,
-            config.public_origin,
+            config.public_origin.clone(),
         )?);
         let app = App::open(AppConfig {
             data_dir: config.data_dir.clone(),
@@ -100,14 +104,24 @@ impl Server {
             config.chromium,
             config.data_dir.join("browser"),
         )?;
+        let mcp = huifa_mcp::DesktopMcp::new(app.clone());
+        // The container uses its existing web port rather than a second loopback listener.
+        let saved = mcp.status()?;
+        app.mcp_save_settings(json!({"enabled":saved["enabled"]==true,"downloads":true,"port":saved["port"].as_u64().unwrap_or(19492)}))?;
+        let shutdown = CancellationToken::new();
+        let mcp_stop = shutdown.child_token();
+        let mcp_router = huifa_mcp::web_router(app.clone(), mcp_stop.clone());
         Ok(Arc::new(Self {
+            mcp,
+            mcp_transport: tokio::sync::RwLock::new((mcp_stop, mcp_router)),
+            public_origin: config.public_origin,
             app,
             auth,
             browser,
             assets,
             downloads,
             frontend: config.frontend_dir,
-            shutdown: CancellationToken::new(),
+            shutdown,
         }))
     }
 
@@ -115,12 +129,16 @@ impl Server {
         let static_files = ServeDir::new(&self.frontend)
             .not_found_service(ServeFile::new(self.frontend.join("index.html")));
         Router::new()
+            .route_service("/mcp", ServeFile::new(self.frontend.join("index.html")))
+            .route_service("/mcp/", ServeFile::new(self.frontend.join("index.html")))
+            .route("/mcp-server", any(mcp_dispatch))
             .route("/api/session", get(session))
             .route(
                 "/api/login",
                 post(login).layer(DefaultBodyLimit::max(32 * 1024)),
             )
             .route("/api/logout", post(logout))
+            .route("/api/mcp", get(mcp_status).post(mcp_configure))
             .route(
                 "/api/command",
                 post(command).layer(DefaultBodyLimit::max(3 * 1024 * 1024)),
@@ -150,6 +168,16 @@ impl Server {
             .with_state(self.clone())
     }
 
+    async fn configure_mcp(&self, enabled: bool) -> Result<()> {
+        let mut transport = self.mcp_transport.write().await;
+        let config = self.mcp.status()?;
+        self.app.mcp_save_settings(json!({"enabled":enabled,"downloads":true,"port":config["port"].as_u64().unwrap_or(19492)}))?;
+        transport.0.cancel();
+        let stop = self.shutdown.child_token();
+        *transport = (stop.clone(), huifa_mcp::web_router(self.app.clone(), stop));
+        Ok(())
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
         self.browser.shutdown().await;
@@ -157,6 +185,66 @@ impl Server {
             tracing::error!("core shutdown failed: {error}");
         }
     }
+}
+
+async fn mcp_dispatch(
+    State(server): State<Arc<Server>>,
+    request: axum::extract::Request,
+) -> Response {
+    let headers = request.headers();
+    let Some(authority) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let allowed = if let Some(origin) = &server.public_origin {
+        reqwest::Url::parse(origin).ok().is_some_and(|expected| {
+            reqwest::Url::parse(&format!("{}://{authority}", expected.scheme()))
+                .is_ok_and(|actual| actual.origin() == expected.origin())
+        })
+    } else {
+        reqwest::Url::parse(&format!("http://{authority}")).is_ok_and(|url| {
+            url.username().is_empty()
+                && url.host_str().is_some_and(|host| {
+                    host == "localhost" || host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok()
+                })
+        })
+    };
+    if !allowed {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let router = server.mcp_transport.read().await.1.clone();
+    router.oneshot(request).await.unwrap()
+}
+
+fn mcp_state(server: &Server) -> HttpResult<Value> {
+    let config = server.mcp.status().map_err(failed)?;
+    let mut connection = server.mcp.connection("").map_err(failed)?;
+    connection.as_object_mut().unwrap().remove("stdio");
+    // The browser builds the external URL from its origin, including Docker port mapping.
+    connection["url"] = json!("/mcp-server");
+    connection["http"] = json!({"mcpServers":{"huifa":{"url":"/mcp-server"}}});
+    connection["codex"] = json!("");
+    Ok(json!({"enabled":config["enabled"]==true,"connection":connection}))
+}
+async fn mcp_status(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> HttpResult<Json<Value>> {
+    server.auth.authorize(&headers, false)?;
+    Ok(Json(mcp_state(&server)?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpToggle {
+    enabled: bool,
+}
+async fn mcp_configure(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+    Json(toggle): Json<McpToggle>,
+) -> HttpResult<Json<Value>> {
+    server.auth.authorize(&headers, true)?;
+    server.configure_mcp(toggle.enabled).await.map_err(failed)?;
+    Ok(Json(mcp_state(&server)?))
 }
 
 fn capabilities() -> Value {
@@ -637,6 +725,112 @@ mod tests {
         let message = failed(reason).1;
         assert!(message.contains("Failed to parse video with yt-dlp: HTTP 403"));
         assert!(!message.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn docker_mcp_page_is_separate_from_ai_transport() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let frontend = root.path().join("frontend");
+        std::fs::create_dir(&frontend)?;
+        std::fs::write(
+            frontend.join("index.html"),
+            "<!doctype html><title>MCP management page</title>",
+        )?;
+        let server = Server::open(Config {
+            account: "admin".into(),
+            password: "test-password".into(),
+            public_origin: None,
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+            frontend_dir: frontend,
+            chromium: "missing-chromium".into(),
+        })
+        .await?;
+        let router = server.router();
+        let page = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp")
+                    .header("accept", "text/html")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(
+            String::from_utf8(page.into_body().collect().await?.to_bytes().to_vec())?
+                .contains("MCP management page")
+        );
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri("/api/mcp").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let request = || {
+            Request::builder().method("POST").uri("/mcp-server").header("host","192.168.5.23:11510").header("content-type","application/json").header("accept","application/json, text/event-stream").body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"docker-test","version":"1"}}}"#))
+        };
+        assert_eq!(
+            router.clone().oneshot(request()?).await?.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        server.configure_mcp(true).await?;
+        let response = router.clone().oneshot(request()?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let old_session = response.headers()["mcp-session-id"].clone();
+        let old_stop = server.mcp_transport.read().await.0.clone();
+        let body = String::from_utf8(response.into_body().collect().await?.to_bytes().to_vec())?;
+        assert!(body.contains("serverInfo"), "{body}");
+        server.configure_mcp(false).await?;
+        assert!(
+            old_stop.is_cancelled(),
+            "Disabling must stop existing sessions and queries"
+        );
+        assert_eq!(
+            router.clone().oneshot(request()?).await?.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        server.configure_mcp(true).await?;
+        let mut old_request = request()?;
+        old_request
+            .headers_mut()
+            .insert("mcp-session-id", old_session);
+        assert_eq!(
+            router.clone().oneshot(old_request).await?.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            router.clone().oneshot(request()?).await?.status(),
+            StatusCode::OK
+        );
+        let rejected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp-server")
+                    .header("host", "evil.example")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        let rejected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp-server")
+                    .header("host", "192.168.5.23:11510")
+                    .header("origin", "https://evil.example")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        let state = mcp_state(&server).map_err(|error| anyhow::anyhow!(error.1))?;
+        assert_eq!(state["connection"]["url"], "/mcp-server");
+        assert!(state["connection"].get("token").is_none());
+        server.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]

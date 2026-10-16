@@ -1,47 +1,56 @@
 # Huifa Media Downloader
 
-A Rust download and media processing core with a shared React interface for Tauri desktop and Docker web hosts.
+Huifa Media Downloader is a Rust media downloader and processing app. The Tauri desktop host and the Docker/NAS web host share one React interface. Official yt-dlp handles extraction, while FFmpeg handles merging, transcoding and cover processing. You can save videos, audio, collections and batches, or expose yt-dlp metadata and the download queue to your own AI client through MCP.
 
 [简体中文](README.md) · [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) · [Issues](https://github.com/jwwsjlm/huifa-media-downloader/issues)
 
-![Download tasks](docs/images/download-tasks.jpg)
+![Docker download queue](docs/images/docker-downloads.jpg)
 
 ## Features
 
-- Official yt-dlp, FFmpeg, FFprobe and lightweight QuickJS-NG (existing Deno tasks remain supported) for videos, audio, collections and batch URLs.
-- Separate queues: three ordinary downloads, one special or live download, and one media processing job.
-- Format selection, multiple audio tracks, subtitles, chapters, cuts, SponsorBlock, transcoding and audio export.
-- Frozen per-task plans and runtime versions, retained sources, pause/resume, restart recovery and offline processing retries.
-- Completed media, JPEG crop/padding exports, and AI image editing based on the original cover.
-- Encrypted Cookies and AI keys; desktop browser Cookie import and authenticated remote browser login in Docker.
-- Chinese/English, dark/light themes, virtual task lists and responsive layouts.
-- GitHub Actions releases with SHA-256 checksums and signed desktop updates.
+- Official yt-dlp, FFmpeg, FFprobe and lightweight QuickJS-NG for videos, audio, collections, batches and multiple sites; existing tasks keep their frozen Deno runtime when needed.
+- Automatic best/worst quality selection, formats and audio tracks, subtitles, chapters, cuts, SponsorBlock, transcoding and audio export.
+- Separate download and processing queues. Each task freezes its plan, runtime versions and input, and supports pause, restart recovery and offline retries after processing failures.
+- Completed media management, JPEG crop/padding exports and AI cover editing based on the original image.
+- Encrypted Cookies, proxy settings and AI keys; browser Cookie import on desktop and a disposable remote browser login in Docker.
+- Built-in MCP service. An AI client can query metadata, formats, collections, subtitles and comments, then create or control downloads. The service is disabled by default and the page displays copyable JSON configuration.
+- Chinese/English, dark/light themes, virtual task lists, responsive layouts, SHA-256 checksums and signed desktop updates.
+
+## Screenshots
+
+These screenshots are from a real Docker container with isolated test data.
+
+| Download queue | Completed media |
+| --- | --- |
+| ![Docker download queue](docs/images/docker-downloads.jpg) | ![Docker completed media](docs/images/docker-completed.jpg) |
+
+| Settings | AI Video Service (MCP) |
+| --- | --- |
+| ![Docker settings](docs/images/docker-settings.jpg) | ![Docker MCP page](docs/images/mcp-docker.jpg) |
 
 ## Install
 
-Choose a file from [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest):
+Choose an artifact from [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest):
 
 | Platform | Artifact |
 | --- | --- |
-| Windows 10/11 x64 | `HuifaDownloader-<version>-windows-x64-setup.exe` |
+| Windows 10/11 x64 installer | `HuifaDownloader-<version>-windows-x64-setup.exe` |
 | Windows x64 portable | `HuifaDownloader-<version>-windows-x64-portable.zip` |
 | Linux x64 | `HuifaDownloader-<version>-linux-x64.AppImage` |
 | Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:<version>` |
 
-Run the Windows installer or make the AppImage executable. Download and processing tools are included; users do not need a separate Python or FFmpeg installation. Updater signatures verify update authenticity; the Windows installer currently has no Authenticode publisher certificate.
+The installer and portable ZIP contain the same application with verified download and processing tools. You do not need a separate Python or FFmpeg install. The Windows installer currently has no Authenticode publisher certificate, but installers, portable archives and update manifests carry signatures and SHA-256 checksums.
 
-For the portable edition, extract the entire ZIP and run `HuifaDownloader.exe`; keep `tools` and `portable.flag` beside it. Microsoft Edge WebView2 Runtime must be installed. Both Windows editions share the system user data and Downloads folders described below; close the other edition before switching. To update, close the app and extract the new portable ZIP over its program directory. Portable editions do not run installer updates; the ZIP has its own `.sig` and SHA-256 checksum.
+Extract a portable ZIP and run `HuifaDownloader.exe`; keep `tools` and `portable.flag` beside it. Microsoft Edge WebView2 Runtime is required. Both Windows editions share system user data and Downloads folders. Close the other edition before switching, and replace the portable directory only while the app is closed.
 
-The application ID is `com.huifa.downloader.rust`. State is stored under `HuifaDownloaderRust` in the system local data directory; media defaults to the same folder name in the system Downloads directory. Legacy installations and data stay in place; back them up separately. Include `.credentials.key` in Rust data backups to retain encrypted Cookies and AI keys.
+The application ID is `com.huifa.downloader.rust`. Rust state is stored under `HuifaDownloaderRust` in the system local data directory, with media in the matching Downloads folder. Include `.credentials.key` in backups so encrypted Cookies and AI keys can be restored.
 
-Video publishing and publishing accounts are currently disabled.
+## Docker web host
 
-## Docker
-
-Use `compose.yaml` with a local `.env` file:
+Create `.env` in the repository root:
 
 ```dotenv
-HUIFA_IMAGE=ghcr.io/jwwsjlm/huifa-media-downloader:0.2.0
+HUIFA_IMAGE=ghcr.io/jwwsjlm/huifa-media-downloader:0.3.0
 HUIFA_ACCOUNT=your-account
 HUIFA_PASSWORD=your-password
 HUIFA_PUBLIC_ORIGIN=http://localhost:19491
@@ -51,9 +60,25 @@ HUIFA_PUBLIC_ORIGIN=http://localhost:19491
 docker compose up -d --no-build
 ```
 
-Open the configured origin. For remote access, set it to the actual server hostname or IP. Volumes `rust-data` and `rust-downloads` preserve state and media. Avoid `docker compose down -v` when this data is needed.
+Open `HUIFA_PUBLIC_ORIGIN` and sign in. For remote access, set it to the complete origin used by the browser. The `rust-data` and `rust-downloads` volumes preserve configuration and media; do not run `docker compose down -v` when that data matters. See the [Docker guide](docker/README.md) for container hardening, browser login and multi-architecture builds.
 
-Direct HTTP sends login traffic in plaintext; use an HTTPS reverse proxy for public deployment. The container runs as a non-root user; remote Chromium relies on container isolation. Some sites may reject headless login. See [Docker details](docker/README.md).
+## MCP: use yt-dlp from your AI client
+
+After signing in, open **AI 视频服务（MCP）** in the sidebar and enable the single switch. Desktop listens on `127.0.0.1:19492/mcp`. In Docker, `/mcp` is the management page and `/mcp-server` is the protocol endpoint on the same origin and published port:
+
+```json
+{
+  "mcpServers": {
+    "huifa": {
+      "url": "http://localhost:19491/mcp-server"
+    }
+  }
+}
+```
+
+The page generates the address for the current origin. MCP calls do not use a token; changing the switch still requires the normal web session and CSRF protection. MCP inherits saved Cookies, proxy and download settings, and returns sanitized metadata, task state and errors without Cookie contents, proxy passwords, internal paths or signed media URLs. Give the endpoint only to trusted AI clients. Desktop also offers stdio configuration using the bundled `huifa-mcp-bridge`, with no separate Python or Node install.
+
+See [MCP usage](docs/MCP.md) for the complete tool list and schemas.
 
 ## Development and releases
 
@@ -65,6 +90,4 @@ node scripts/acquire-rust-tools.mjs
 npm --prefix frontend run tauri -- dev
 ```
 
-See [development and release instructions](docs/DEVELOPMENT.md) and the [implementation contract](docs/RUST_IMPLEMENTATION.md).
-
-The current tree contains the Rust application. Legacy Python, Qt and Electron code remains recoverable from Git baseline `bf79d1a`; local legacy files were moved to the Windows Recycle Bin.
+See [development and release instructions](docs/DEVELOPMENT.md) for checks, MCP bridge preparation and GitHub publishing. The current Rust implementation is the source of truth for builds and releases.

@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 huifa-core = { path = "../core" }
+huifa-mcp = { path = "../mcp" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,6 +20,7 @@ tempfile.workspace = true
 reqwest.workspace = true
 axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["fs", "limit"] }
+tower = { version = "0.5", features = ["util"] }
 argon2 = "0.5"
 rand_core = { version = "0.6", features = ["getrandom"] }
 subtle = "2"
@@ -32,5 +34,4 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

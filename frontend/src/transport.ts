@@ -34,6 +34,8 @@ export const host = {
     capabilities = { ...capabilities, ...value.capabilities };
   },
   async logout(): Promise<void> { await post('/api/logout', {}); csrfToken = ''; },
+  async mcpStatus<T>(): Promise<T> { return response<T>(await fetch('/api/mcp', { credentials: 'same-origin', cache: 'no-store' })); },
+  async mcpConfigure<T>(enabled: boolean): Promise<T> { return post<T>('/api/mcp', { enabled }); },
   async command<T = Json>(command: string, args: unknown = {}): Promise<T> {
     if (desktop) return invoke<T>('command', { command, args });
     return (await post<{ value: T }>('/api/command', { command, args })).value;

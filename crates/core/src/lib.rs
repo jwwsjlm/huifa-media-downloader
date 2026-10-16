@@ -10,6 +10,7 @@ pub(crate) mod model;
 mod performance;
 pub mod process;
 mod processing;
+pub mod research;
 mod tools;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -595,9 +596,15 @@ impl App {
         Ok(value)
     }
     fn save_settings(&self, mut value: Value) -> Result<Value> {
+        // MCP listener state is managed by the desktop host, never by stale settings drafts.
+        let mcp = self.db.settings()?["mcp"].clone();
         let object = value
             .as_object_mut()
             .context("settings must be an object")?;
+        object.remove("mcp");
+        if !mcp.is_null() {
+            object.insert("mcp".into(), mcp);
+        }
         if let Some(options) = object.get("downloadOptions") {
             DownloadOptions::parse(options.clone())?;
         }

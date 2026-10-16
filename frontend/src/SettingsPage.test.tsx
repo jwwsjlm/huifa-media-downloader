@@ -23,6 +23,22 @@ it('explains Docker image updates instead of offering a forbidden tool command',
   expect(screen.queryByLabelText('yt-dlp update channel')).toBeNull();
   expect(screen.queryByLabelText('yt-dlp download source')).toBeNull();
   expect(screen.getByRole('button', { name: 'Check yt-dlp updates' })).toBeTruthy();
+  expect(screen.queryByLabelText('Enable local MCP')).toBeNull();
+});
+it('shows a URL-only JSON example, tool reference and one immediate MCP switch', async () => {
+  transport.desktop = true;
+  const http = { mcpServers: { huifa: { url: 'http://127.0.0.1:19492/mcp' } } };
+  transport.command.mockImplementation(async command => command === 'mcp.status' ? { enabled: false, port: 19492 } : command === 'mcp.connection' ? { url: http.mcpServers.huifa.url, http, tools: [{ name: 'get_video_info', description: 'Get video information', inputSchema: { properties: { url: {} }, required: ['url'] }, annotations: { readOnlyHint: true } }] } : command === 'mcp.configure' ? { enabled: true } : []);
+  render(<SettingsPage state={{ ...initialState, view: { ...initialState.view, settingsTab: 'mcp' } }} dispatch={vi.fn()} t={(_zh, en) => en} run={run} message={vi.fn()} />);
+  const toggle = screen.getByRole('switch', { name: 'Enable MCP service' });
+  await waitFor(() => expect((toggle as HTMLInputElement).disabled).toBe(false));
+  expect(JSON.parse(screen.getByLabelText('MCP configuration example').textContent || '')).toEqual(http);
+  expect(screen.getByText('get_video_info(url)')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Reset token' })).toBeNull();
+  expect(screen.getAllByRole('switch')).toHaveLength(1);
+  fireEvent.click(toggle);
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('mcp.configure', { enabled: true, port: 19492 }));
+  expect(await screen.findByText('Running')).toBeTruthy();
 });
 it('keeps runtime tool installation available on desktop', async () => {
   transport.desktop = true; show();

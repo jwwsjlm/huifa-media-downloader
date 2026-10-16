@@ -5,7 +5,7 @@ export interface ViewState { page: Page; urls: string; quality: string | null; t
 export interface AppState { loaded: boolean; connected: boolean; version: string; tasks: Record<string, Task>; taskIds: string[]; taskListVersion: number; activeTaskCount: number; media: Record<string, Media>; mediaIds: string[]; mediaByTask: Record<string, string>; settings: Settings; tools: Tool[]; view: ViewState }
 export const initialState: AppState = {
   loaded: false, connected: false, version: '', tasks: {}, taskIds: [], taskListVersion: 0, activeTaskCount: 0, media: {}, mediaIds: [], mediaByTask: {}, settings: {}, tools: [],
-  view: { page: 'downloads', urls: '', quality: null, taskSearch: '', taskStatus: 'all', taskSort: 'newest', taskSelection: '', mediaSearch: '', mediaSelection: '', settingsDraft: null, optionsDraft: null, settingsTab: 'downloads' },
+  view: { page: /^\/mcp\/?$/.test(window.location.pathname) ? 'mcp' : 'downloads', urls: '', quality: null, taskSearch: '', taskStatus: 'all', taskSort: 'newest', taskSelection: '', mediaSearch: '', mediaSelection: '', settingsDraft: null, optionsDraft: null, settingsTab: 'downloads' },
 };
 export type Action = { type: 'snapshot'; snapshot: Snapshot } | { type: 'event'; event: CoreEvent } | { type: 'connection'; connected: boolean } | { type: 'view'; patch: Partial<ViewState> } | { type: 'setting'; key: string; value: Json } | { type: 'option'; key: string; value: DownloadOptions[string] } | { type: 'saved'; settings: Settings };
 const active = (task?: Task): number => task && ['downloading', 'probing', 'processing'].includes(task.status) ? 1 : 0;
