@@ -74,8 +74,8 @@ services:
       HUIFA_PASSWORD: admin
       HUIFA_PUBLIC_ORIGIN: http://localhost:19491
     volumes:
-      - rust-data:/data
-      - rust-downloads:/downloads
+      - ./data:/data
+      - ./downloads:/downloads
     read_only: true
     tmpfs:
       - /tmp:rw,exec,nosuid,nodev,size=512m
@@ -86,13 +86,21 @@ services:
       - no-new-privileges:true
     stop_grace_period: 30s
     restart: unless-stopped
-
-volumes:
-  rust-data:
-  rust-downloads:
 ```
 
-Run in that directory:
+`./data` and `./downloads` are relative to the directory containing `compose.yaml`. Create them there before starting:
+
+```sh
+mkdir -p data downloads
+```
+
+On Linux/NAS, the container runs as UID/GID `10001:10001` and needs write access to both directories. For newly created directories, run the command below. Handle existing directories according to their current permissions rather than recursively changing user data. Windows Docker Desktop does not need `chown`.
+
+```sh
+sudo chown 10001:10001 data downloads
+```
+
+Then start the service:
 
 ```sh
 docker compose pull
@@ -101,9 +109,11 @@ docker compose up -d
 
 Open [http://localhost:19491](http://localhost:19491). For NAS or remote access, set `HUIFA_PUBLIC_ORIGIN` to the complete origin used by the browser (scheme, host and port), such as `http://192.168.1.10:19491`. With an HTTPS reverse proxy, use `https://download.example.com` without a path. Update this origin when changing the published host port. The image supports amd64 and ARM64 and selects the matching architecture automatically.
 
-The initial web account and password are both `admin`. Change the shared web/MCP password under **Settings → Access password** by entering the current and new password. A successful change invalidates old web and MCP sessions; sign in again and update AI clients. Desktop has no added login screen and uses the same settings for its MCP password. `HUIFA_ACCOUNT` and `HUIFA_PASSWORD` seed a new data directory only; later restarts use the password hash in `access.json`. Preserve the data volume and change the default before allowing access from other devices.
+The initial web account and password are both `admin`. Change the shared web/MCP password under **Settings → Access password** by entering the current and new password. A successful change invalidates old web and MCP sessions; sign in again and update AI clients. Desktop has no added login screen and uses the same settings for its MCP password. `HUIFA_ACCOUNT` and `HUIFA_PASSWORD` seed a new data directory only; later restarts use the password hash in `access.json`. Preserve the `data` directory and change the default before allowing access from other devices.
 
-`rust-data` stores configuration, Cookies and the access password; `rust-downloads` stores media. To upgrade, edit the `image` version in the original Compose directory and rerun `pull` and `up -d` above. Keep the project name and volume configuration to reuse existing data; there is no need to stop the stack or remove volumes first. Do not run `docker compose down -v`, which deletes both data volumes. See the [Docker guide](docker/README.md) for container hardening, remote browser login, host-directory mounts and multi-architecture builds.
+`data` stores configuration, Cookies and the access password; `downloads` stores media. Stop the container before backing up both directories and `compose.yaml`. To upgrade, edit the `image` version in the original Compose directory and rerun `pull` and `up -d` above. Keep both local directories and their mount paths to reuse existing data; there is no need to delete containers or data first.
+
+If you already use the `rust-data`/`rust-downloads` named volumes, keep the original mount configuration or migrate the data into local directories before switching. Changing mounts does not migrate existing volumes automatically. Do not run `docker compose down -v`, which deletes named volumes referenced by the configuration. See the [Docker guide](docker/README.md) for container hardening, remote browser login, directory permissions and multi-architecture builds.
 
 ## MCP: use yt-dlp from your AI client
 

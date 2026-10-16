@@ -5,7 +5,18 @@ Both `linux/amd64` and `linux/arm64` use their corresponding official standalone
 yt-dlp and QuickJS-NG binaries, verified against release checksums; FFmpeg and Chromium
 come from Debian packages. Python application code is not used at runtime.
 
-Run `docker compose up --build -d`; a new installation defaults to account `admin`
+For a source build, prepare the relative host directories and start Compose:
+
+```sh
+mkdir -p data downloads
+# Linux/NAS: grant the container user access to these new directories.
+sudo chown 10001:10001 data downloads
+docker compose up --build -d
+```
+
+Docker Desktop on Windows does not require `chown`. For a released image, use the
+complete [Compose example in README](../README_EN.md#docker-web-host).
+A new installation defaults to account `admin`
 and password `admin`. Optional `HUIFA_ACCOUNT` and `HUIFA_PASSWORD` seed a new data
 directory only. After initialization the persisted configuration takes precedence.
 An explicitly empty initial credential is rejected. Set
@@ -14,11 +25,15 @@ The default is `http://localhost:19491`. For an HTTPS reverse proxy, use its pub
 HTTPS origin; the session cookie then gains the Secure flag. A direct HTTP URL is
 supported as requested, and its login traffic is plaintext on the network.
 
-The new named volumes `rust-data` and `rust-downloads` are separate from legacy
-application data. Cookies, proxy settings and AI keys are plaintext files under
-`/data/credentials`; back up `/data`. Old encrypted records migrate at startup, so
-retain their `.credentials.key` until migration completes. Mounted host directories
-must be owned by UID/GID 10001. `/app` runs read-only, with a non-root UID, dropped
+Compose binds `./data` to `/data` and `./downloads` to `/downloads`, relative to the
+directory containing `compose.yaml`. Back up those host directories and keep the
+same paths when upgrading. Existing `rust-data` / `rust-downloads` named volumes
+are not copied automatically when changing mounts; retain the old configuration
+until their contents have been migrated, and do not delete them with `down -v`.
+Cookies, proxy settings and AI keys are plaintext files under `/data/credentials`.
+Old encrypted records migrate at startup, so retain their `.credentials.key` until
+migration completes. Mounted directories must be writable by UID/GID 10001.
+`/app` runs read-only, with a non-root UID, dropped
 capabilities, and a writable temporary filesystem. No Docker socket is mounted.
 The `/tmp` tmpfs uses `exec,nosuid,nodev`: the official standalone yt-dlp binary
 extracts bundled native libraries there and needs executable memory mappings.

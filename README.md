@@ -74,8 +74,8 @@ services:
       HUIFA_PASSWORD: admin
       HUIFA_PUBLIC_ORIGIN: http://localhost:19491
     volumes:
-      - rust-data:/data
-      - rust-downloads:/downloads
+      - ./data:/data
+      - ./downloads:/downloads
     read_only: true
     tmpfs:
       - /tmp:rw,exec,nosuid,nodev,size=512m
@@ -86,13 +86,21 @@ services:
       - no-new-privileges:true
     stop_grace_period: 30s
     restart: unless-stopped
-
-volumes:
-  rust-data:
-  rust-downloads:
 ```
 
-在该目录执行：
+`./data` 和 `./downloads` 相对于 `compose.yaml` 所在目录。启动前在该目录创建它们：
+
+```sh
+mkdir -p data downloads
+```
+
+Linux／NAS 上容器使用 UID/GID `10001:10001`，这两个目录必须允许该用户写入。新建目录可执行以下命令；已有目录应按现有权限配置处理，避免递归修改用户数据。Windows Docker Desktop 无需执行 `chown`。
+
+```sh
+sudo chown 10001:10001 data downloads
+```
+
+然后启动：
 
 ```sh
 docker compose pull
@@ -101,9 +109,11 @@ docker compose up -d
 
 本机打开 [http://localhost:19491](http://localhost:19491)。NAS 或远程访问时，将 `HUIFA_PUBLIC_ORIGIN` 改成浏览器实际访问的完整来源（协议、主机和端口），例如 `http://192.168.1.10:19491`；HTTPS 反向代理使用 `https://download.example.com`，不带路径。修改宿主机端口时，也要同步修改此地址。容器同时支持 amd64 和 ARM64，会自动选择对应架构。
 
-首次安装默认账号和密码均为 `admin`。登录后在“设置 → 访问密码”输入当前密码和新密码即可修改；该密码同时用于网页登录和 HTTP MCP 的 Bearer 鉴权。修改后旧网页会话和 MCP 会话失效，重新登录并更新 AI 客户端密码。桌面端不增加登录页面，也可在相同设置处修改 MCP 访问密码。`HUIFA_ACCOUNT`、`HUIFA_PASSWORD` 仅在数据目录首次初始化时生效；之后以数据目录 `access.json` 中的密码哈希为准，重启或重建容器不会覆盖已修改的密码。请保留数据卷，并在向其他设备开放前修改默认密码。
+首次安装默认账号和密码均为 `admin`。登录后在“设置 → 访问密码”输入当前密码和新密码即可修改；该密码同时用于网页登录和 HTTP MCP 的 Bearer 鉴权。修改后旧网页会话和 MCP 会话失效，重新登录并更新 AI 客户端密码。桌面端不增加登录页面，也可在相同设置处修改 MCP 访问密码。`HUIFA_ACCOUNT`、`HUIFA_PASSWORD` 仅在数据目录首次初始化时生效；之后以数据目录 `access.json` 中的密码哈希为准，重启或重建容器不会覆盖已修改的密码。请保留 `data` 目录，并在向其他设备开放前修改默认密码。
 
-`rust-data` 保存配置、Cookie 和访问密码，`rust-downloads` 保存媒体。升级时在原 Compose 目录修改 `image` 的版本号，再执行上面的 `pull`、`up -d`；保留原项目名和卷配置即可沿用数据，无需先停止或删除卷。不要运行 `docker compose down -v`，它会删除这两个数据卷。容器安全、远程浏览器登录、宿主机目录挂载及多架构构建见 [Docker 文档](docker/README.md)。
+`data` 保存配置、Cookie 和访问密码，`downloads` 保存媒体；备份时先停止容器，再备份这两个目录及 `compose.yaml`。升级时在原 Compose 目录修改 `image` 的版本号，再执行上面的 `pull`、`up -d`，保留两个本地目录及挂载路径即可沿用数据，无需先删除容器或数据。
+
+已有 `rust-data`／`rust-downloads` 命名卷的用户请先保留原挂载配置，或将数据迁移到本地目录后再切换；修改挂载不会自动迁移旧卷。不要运行 `docker compose down -v`，它会删除配置中引用的命名卷。容器安全、远程浏览器登录、目录权限及多架构构建见 [Docker 文档](docker/README.md)。
 
 ## MCP：让自己的 AI 使用 yt-dlp
 

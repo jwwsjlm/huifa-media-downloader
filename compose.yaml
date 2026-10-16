@@ -10,8 +10,8 @@ services:
       HUIFA_PASSWORD: ${HUIFA_PASSWORD:-admin}
       HUIFA_PUBLIC_ORIGIN: ${HUIFA_PUBLIC_ORIGIN:-http://localhost:19491}
     volumes:
-      - rust-data:/data
-      - rust-downloads:/downloads
+      - ./data:/data
+      - ./downloads:/downloads
     read_only: true
     tmpfs:
       - /tmp:rw,exec,nosuid,nodev,size=512m
@@ -22,7 +22,3 @@ services:
       - no-new-privileges:true
     stop_grace_period: 30s
     restart: unless-stopped
-
-volumes:
-  rust-data:
-  rust-downloads:
