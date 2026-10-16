@@ -42,6 +42,8 @@ cargo test --locked -p huifa-desktop
 
 真实媒体测试需要已下载的官方工具；`HUIFA_TEST_TOOLS` 可指定其目录。使用发布构建运行验收，使大型冻结工具的校验耗时与发行程序一致。测试覆盖分离音视频、队列预算、处理失败离线恢复、发布日志恢复、多音轨、字幕重定时、章节切片、封面片头及音频输出。
 
+性能基准、优化前后结果和复现方式见 [2026-10-16 性能审计](PERFORMANCE_AUDIT.md)。
+
 容器执行 `node scripts/check-rust-container.mjs` 和 `node docker/check-browser.mjs`，用 `HUIFA_IMAGE`、`HUIFA_PLATFORM` 指定镜像。它们创建并清理独立测试容器和数据卷。
 
 ## GitHub Actions 正式发布

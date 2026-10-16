@@ -80,10 +80,13 @@ impl Database {
             .collect()
     }
     pub fn media_by_id(&self, id: &str) -> Result<Media> {
-        self.media()?
-            .into_iter()
-            .find(|m| m.id == id)
-            .context("Media does not exist")
+        let record: Option<String> = self
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT record FROM media WHERE id=?1", [id], |r| r.get(0))
+            .optional()?;
+        serde_json::from_str(&record.context("Media does not exist")?).map_err(Into::into)
     }
     pub fn save_media(&self, media: &Media) -> Result<()> {
         let changed = self.connection.lock().unwrap().execute(
@@ -94,7 +97,18 @@ impl Database {
         Ok(())
     }
     pub fn media_for_task(&self, id: &str) -> Result<Option<Media>> {
-        Ok(self.media()?.into_iter().find(|m| m.task_id == id))
+        let record: Option<String> = self
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT record FROM media WHERE task_id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        record
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(Into::into)
     }
     pub fn complete(&self, task: &Task, media: &Media) -> Result<()> {
         let mut db = self.connection.lock().unwrap();
@@ -136,6 +150,52 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn single_media_queries_preserve_results_and_ignore_unrelated_corrupt_records() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
+        let media = Media {
+            id: "media-1".into(),
+            task_id: "task-1".into(),
+            title: "Original".into(),
+            filename: "video.mp4".into(),
+            size: 1234,
+            duration: 12.0,
+            path: temp.path().join("video.mp4"),
+            assets: vec![temp.path().join("cover.jpg")],
+        };
+        {
+            let connection = db.connection.lock().unwrap();
+            connection.execute(
+                "INSERT INTO media VALUES(?1,?2,?3)",
+                params![media.id, media.task_id, serde_json::to_string(&media)?],
+            )?;
+            connection.execute(
+                "INSERT INTO media VALUES('broken-media','broken-task','invalid-json')",
+                [],
+            )?;
+        }
+        assert_eq!(
+            serde_json::to_value(db.media_by_id("media-1")?)?,
+            serde_json::to_value(&media)?
+        );
+        assert_eq!(
+            serde_json::to_value(db.media_for_task("task-1")?.unwrap())?,
+            serde_json::to_value(&media)?
+        );
+        assert_eq!(
+            db.media_by_id("missing").unwrap_err().to_string(),
+            "Media does not exist"
+        );
+        assert!(db.media_for_task("missing")?.is_none());
+        assert!(db.media_by_id("broken-media").is_err());
+        assert!(db.media_for_task("broken-task").is_err());
+        let mut edited = media;
+        edited.title = "Edited".into();
+        db.save_media(&edited)?;
+        assert_eq!(db.media_for_task("task-1")?.unwrap().title, "Edited");
+        Ok(())
+    }
     #[test]
     fn rejects_future_schema_without_mutating_it() {
         let temp = tempfile::tempdir().unwrap();

@@ -44,4 +44,27 @@ describe('live interface stability', () => {
     expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('still editing');
     expect(within(screen.getByRole('listbox')).getByRole('option', { selected: true }).textContent).toContain('Alpha');
   });
+  it('updates filtered and sorted rows when metadata changes after progress-only events', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const rows = () => within(screen.getByRole('listbox')).getAllByRole('option');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Sort' }), { target: { value: 'title' } });
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', progress: 45 } }));
+    expect(rows()[0].textContent).toContain('Alpha');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', title: 'Aardvark' } }));
+    expect(rows()[0].textContent).toContain('Aardvark');
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: 'needle' } });
+    expect(screen.getByText('No matching tasks')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', url: 'https://example.test/needle' } }));
+    expect(rows()[0].textContent).toContain('Alpha');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Status filter' }), { target: { value: 'paused' } });
+    expect(screen.getByText('No matching tasks')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'paused' } }));
+    expect(rows()[0].textContent).toContain('Alpha');
+    expect(screen.getByText('2 tasks · 1 active')).toBeTruthy();
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: '' } });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Status filter' }), { target: { value: 'all' } });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Sort' }), { target: { value: 'newest' } });
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', createdAt: '2030-01-01T00:00:00Z' } }));
+    expect(rows()[0].textContent).toContain('Aardvark');
+  });
 });

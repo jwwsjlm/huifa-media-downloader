@@ -1,0 +1,1379 @@
+{
+  "date": "2026-10-16",
+  "baselineCommit": "432a326967c4a28e95960896b580a456792fd08e",
+  "optimizedBranch": "main",
+  "environment": {
+    "os": "Windows x64",
+    "cpu": "Intel Core i5-14600KF",
+    "logicalProcessors": 20,
+    "rustc": "1.99.0",
+    "node": "24.16.0",
+    "coreProfile": "release",
+    "frontendProfile": "jsdom, development React, without StrictMode",
+    "network": "Loopback HTTP and locally generated media; no public download speed measurements"
+  },
+  "core": {
+    "before": {
+      "architecture": "x86_64",
+      "measurements": [
+        {
+          "details": {
+            "catalog_records": 1000,
+            "hit_index": 500,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 506000
+          },
+          "max_ms": 1.3454000000000002,
+          "median_ms": 1.1622,
+          "min_ms": 1.1198,
+          "name": "database.media_by_id.hit",
+          "p95_ms": 1.2757,
+          "samples": 21,
+          "samples_ms": [
+            1.1300999999999999,
+            1.1389,
+            1.129,
+            1.1516,
+            1.1873,
+            1.1622,
+            1.1299000000000001,
+            1.1221,
+            1.1296,
+            1.2757,
+            1.1794,
+            1.3454000000000002,
+            1.1649,
+            1.1697000000000002,
+            1.1833,
+            1.1854,
+            1.2646,
+            1.1829,
+            1.1479000000000001,
+            1.1489,
+            1.1198
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 1000,
+            "hit_index": 500,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 506000
+          },
+          "max_ms": 1.2229,
+          "median_ms": 1.1245,
+          "min_ms": 1.1034,
+          "name": "database.media_for_task.hit",
+          "p95_ms": 1.1927999999999999,
+          "samples": 21,
+          "samples_ms": [
+            1.1927999999999999,
+            1.1383999999999999,
+            1.1171,
+            1.1112,
+            1.1226,
+            1.1491,
+            1.1171,
+            1.1163,
+            1.1219999999999999,
+            1.1128,
+            1.1034,
+            1.1279000000000001,
+            1.2229,
+            1.1815,
+            1.1157000000000001,
+            1.1194,
+            1.1252,
+            1.1417000000000002,
+            1.1322999999999999,
+            1.1249,
+            1.1245
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 1000,
+            "hit_index": 500,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 506000
+          },
+          "max_ms": 1.2291999999999998,
+          "median_ms": 1.1212,
+          "min_ms": 1.1096000000000001,
+          "name": "database.media_by_id.miss",
+          "p95_ms": 1.2201,
+          "samples": 21,
+          "samples_ms": [
+            1.1359,
+            1.123,
+            1.1226,
+            1.2201,
+            1.1406999999999998,
+            1.1181999999999999,
+            1.1193,
+            1.1197,
+            1.1149,
+            1.1115000000000002,
+            1.1434,
+            1.1209,
+            1.1263,
+            1.1212,
+            1.1198,
+            1.1096000000000001,
+            1.1142,
+            1.2291999999999998,
+            1.1338,
+            1.1181999999999999,
+            1.1280999999999999
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 1000,
+            "hit_index": 500,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 506000
+          },
+          "max_ms": 1.3771,
+          "median_ms": 1.1641,
+          "min_ms": 1.1280999999999999,
+          "name": "database.media_for_task.miss",
+          "p95_ms": 1.2946,
+          "samples": 21,
+          "samples_ms": [
+            1.1495,
+            1.1466,
+            1.1776,
+            1.1492,
+            1.1582000000000001,
+            1.1363,
+            1.1855,
+            1.2946,
+            1.1624999999999999,
+            1.1280999999999999,
+            1.1586,
+            1.1518,
+            1.1876,
+            1.1773,
+            1.2016,
+            1.1641,
+            1.1688,
+            1.158,
+            1.1643999999999999,
+            1.1876,
+            1.3771
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "hit_index": 5000,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 5093000
+          },
+          "max_ms": 18.601599999999998,
+          "median_ms": 17.4193,
+          "min_ms": 16.8176,
+          "name": "database.media_by_id.hit",
+          "p95_ms": 18.3848,
+          "samples": 21,
+          "samples_ms": [
+            16.935200000000002,
+            17.1975,
+            17.2372,
+            17.295,
+            18.3848,
+            17.4193,
+            17.721600000000002,
+            18.601599999999998,
+            17.9002,
+            18.0838,
+            17.9026,
+            16.8176,
+            17.5414,
+            17.1783,
+            17.448999999999998,
+            17.1077,
+            17.354000000000003,
+            17.8076,
+            17.1591,
+            17.063399999999998,
+            17.805999999999997
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "hit_index": 5000,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 5093000
+          },
+          "max_ms": 23.5783,
+          "median_ms": 17.525599999999997,
+          "min_ms": 16.8669,
+          "name": "database.media_for_task.hit",
+          "p95_ms": 20.365000000000002,
+          "samples": 21,
+          "samples_ms": [
+            18.2879,
+            17.188599999999997,
+            17.8973,
+            17.8011,
+            17.525599999999997,
+            16.8669,
+            17.122700000000002,
+            17.2978,
+            16.9742,
+            17.6317,
+            18.482599999999998,
+            17.5625,
+            17.253,
+            17.401799999999998,
+            17.1922,
+            18.696,
+            23.5783,
+            20.365000000000002,
+            17.3806,
+            17.528100000000002,
+            17.2529
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "hit_index": 5000,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 5093000
+          },
+          "max_ms": 19.2213,
+          "median_ms": 17.8763,
+          "min_ms": 17.098599999999998,
+          "name": "database.media_by_id.miss",
+          "p95_ms": 18.9997,
+          "samples": 21,
+          "samples_ms": [
+            19.2213,
+            18.4187,
+            18.4501,
+            18.0559,
+            18.688799999999997,
+            18.9997,
+            17.9117,
+            17.2568,
+            18.294600000000003,
+            17.2634,
+            17.4978,
+            17.8763,
+            17.4632,
+            17.1994,
+            17.098599999999998,
+            18.413800000000002,
+            17.3325,
+            18.0119,
+            17.2992,
+            17.103,
+            17.4664
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "hit_index": 5000,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 5093000
+          },
+          "max_ms": 19.421,
+          "median_ms": 17.461100000000002,
+          "min_ms": 16.814,
+          "name": "database.media_for_task.miss",
+          "p95_ms": 19.36,
+          "samples": 21,
+          "samples_ms": [
+            19.36,
+            18.7881,
+            17.3243,
+            17.2642,
+            19.209799999999998,
+            19.421,
+            18.1359,
+            18.5094,
+            17.2976,
+            16.814,
+            17.308400000000002,
+            17.3686,
+            17.352,
+            17.461100000000002,
+            17.0636,
+            16.9083,
+            18.4678,
+            17.9561,
+            17.2989,
+            17.5959,
+            17.9132
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "first_freeze_excluded": true,
+            "runtime_bytes": 452989999
+          },
+          "max_ms": 505.16459999999995,
+          "median_ms": 490.7107,
+          "min_ms": 486.1403,
+          "name": "tools.freeze_existing",
+          "p95_ms": 505.16459999999995,
+          "samples": 7,
+          "samples_ms": [
+            490.7107,
+            486.1403,
+            492.84119999999996,
+            489.9293,
+            505.16459999999995,
+            491.4437,
+            489.51090000000005
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "runtime_bytes": 168951296
+          },
+          "max_ms": 94.6401,
+          "median_ms": 94.0149,
+          "min_ms": 93.17689999999999,
+          "name": "tools.task_tool.ffmpeg",
+          "p95_ms": 94.6401,
+          "samples": 7,
+          "samples_ms": [
+            93.967,
+            94.0149,
+            93.17689999999999,
+            94.2663,
+            94.0262,
+            93.7316,
+            94.6401
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "runtime_bytes": 168736256
+          },
+          "max_ms": 94.9808,
+          "median_ms": 94.376,
+          "min_ms": 93.5992,
+          "name": "tools.task_tool.ffprobe",
+          "p95_ms": 94.9808,
+          "samples": 7,
+          "samples_ms": [
+            94.2902,
+            93.5992,
+            94.376,
+            94.5383,
+            94.381,
+            93.90220000000001,
+            94.9808
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "runtime_bytes": 97462048
+          },
+          "max_ms": 56.5927,
+          "median_ms": 54.514199999999995,
+          "min_ms": 54.3619,
+          "name": "tools.task_tool.deno",
+          "p95_ms": 56.5927,
+          "samples": 7,
+          "samples_ms": [
+            56.5927,
+            54.6921,
+            54.4195,
+            54.3619,
+            54.514199999999995,
+            54.394600000000004,
+            56.453700000000005
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "heartbeat_period_ms": 5,
+            "measurement": "heartbeat lateness relative to its scheduled deadline",
+            "runtime_worker_threads": 1,
+            "tool_resolutions": 7
+          },
+          "max_ms": 127.70190000000001,
+          "median_ms": 107.6882,
+          "min_ms": 7.6392,
+          "name": "scheduler.task_tool_ffprobe.current_thread",
+          "p95_ms": 127.70190000000001,
+          "samples": 9,
+          "samples_ms": [
+            108.9899,
+            107.6882,
+            115.92280000000001,
+            127.70190000000001,
+            7.6392,
+            108.9617,
+            106.2298,
+            103.9832,
+            13.8995
+          ],
+          "warmups": 0
+        },
+        {
+          "details": {
+            "runtime_processes_per_sample": 4
+          },
+          "max_ms": 1005.9499000000001,
+          "median_ms": 998.6659,
+          "min_ms": 957.1039,
+          "name": "tools.check",
+          "p95_ms": 1005.9499000000001,
+          "samples": 5,
+          "samples_ms": [
+            998.6659,
+            1005.9499000000001,
+            968.6929,
+            957.1039,
+            999.3088
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "excludes_host_transport_serialization": true,
+            "includes_tools_check": true,
+            "task_records": 0
+          },
+          "max_ms": 1108.9298000000001,
+          "median_ms": 1025.5890000000002,
+          "min_ms": 998.2911,
+          "name": "core.snapshot",
+          "p95_ms": 1108.9298000000001,
+          "samples": 5,
+          "samples_ms": [
+            1029.8457999999998,
+            1025.5890000000002,
+            998.2911,
+            1108.9298000000001,
+            1004.4314
+          ],
+          "warmups": 1
+        }
+      ],
+      "os": "windows",
+      "package_version": "0.2.1",
+      "percentile_method": "nearest rank; p95 is the maximum for fewer than 20 samples",
+      "profile": "release",
+      "runtime_bytes": {
+        "deno": 97462048,
+        "ffmpeg": 168951296,
+        "ffprobe": 168736256,
+        "yt-dlp": 17840399
+      },
+      "schema_version": 1,
+      "scope": "isolated synthetic catalog and local official runtime tools; warmed OS file cache"
+    },
+    "after": {
+      "architecture": "x86_64",
+      "measurements": [
+        {
+          "details": {
+            "catalog_records": 1000,
+            "hit_index": 500,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 506000
+          },
+          "max_ms": 0.0426,
+          "median_ms": 0.0054,
+          "min_ms": 0.0051,
+          "name": "database.media_by_id.hit",
+          "p95_ms": 0.0089,
+          "samples": 21,
+          "samples_ms": [
+            0.006,
+            0.0426,
+            0.005699999999999999,
+            0.0055,
+            0.0089,
+            0.0054,
+            0.0052,
+            0.0053,
+            0.0054,
+            0.0052,
+            0.0053,
+            0.0053,
+            0.0055,
+            0.0051,
+            0.0053,
+            0.0063999999999999994,
+            0.0052,
+            0.0052,
+            0.006,
+            0.0061,
+            0.0059
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 1000,
+            "hit_index": 500,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 506000
+          },
+          "max_ms": 0.0059,
+          "median_ms": 0.0053,
+          "min_ms": 0.0051,
+          "name": "database.media_for_task.hit",
+          "p95_ms": 0.0056,
+          "samples": 21,
+          "samples_ms": [
+            0.0052,
+            0.0056,
+            0.0051,
+            0.0053,
+            0.0051,
+            0.0051,
+            0.0053,
+            0.0054,
+            0.0054,
+            0.0054,
+            0.0053,
+            0.0059,
+            0.0055,
+            0.0055,
+            0.0054,
+            0.0052,
+            0.0052,
+            0.0052,
+            0.0051,
+            0.0051,
+            0.0056
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 1000,
+            "hit_index": 500,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 506000
+          },
+          "max_ms": 0.0040999999999999995,
+          "median_ms": 0.0038,
+          "min_ms": 0.0037,
+          "name": "database.media_by_id.miss",
+          "p95_ms": 0.0040999999999999995,
+          "samples": 21,
+          "samples_ms": [
+            0.0039,
+            0.0038,
+            0.0039,
+            0.0040999999999999995,
+            0.0039,
+            0.0040999999999999995,
+            0.0039,
+            0.004,
+            0.0037,
+            0.0037,
+            0.0037,
+            0.0038,
+            0.0038,
+            0.0038,
+            0.0039,
+            0.0038,
+            0.0038,
+            0.0037,
+            0.0038,
+            0.0038,
+            0.0037
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 1000,
+            "hit_index": 500,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 506000
+          },
+          "max_ms": 0.004,
+          "median_ms": 0.0038,
+          "min_ms": 0.0037,
+          "name": "database.media_for_task.miss",
+          "p95_ms": 0.0039,
+          "samples": 21,
+          "samples_ms": [
+            0.0038,
+            0.0038,
+            0.0037,
+            0.0037,
+            0.0037,
+            0.0037,
+            0.0038,
+            0.0038,
+            0.0037,
+            0.004,
+            0.0038,
+            0.0037,
+            0.0039,
+            0.0038,
+            0.0038,
+            0.0037,
+            0.0038,
+            0.0038,
+            0.0038,
+            0.0037,
+            0.0039
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "hit_index": 5000,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 5093000
+          },
+          "max_ms": 0.0059,
+          "median_ms": 0.0053,
+          "min_ms": 0.0051,
+          "name": "database.media_by_id.hit",
+          "p95_ms": 0.0056,
+          "samples": 21,
+          "samples_ms": [
+            0.0056,
+            0.0054,
+            0.0053,
+            0.0051,
+            0.0053,
+            0.0052,
+            0.0052,
+            0.0053,
+            0.0054,
+            0.0053,
+            0.0053,
+            0.0052,
+            0.0053,
+            0.0059,
+            0.0055,
+            0.0052,
+            0.0052,
+            0.0051,
+            0.0055,
+            0.0052,
+            0.0051
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "hit_index": 5000,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 5093000
+          },
+          "max_ms": 0.0056,
+          "median_ms": 0.0053,
+          "min_ms": 0.0051,
+          "name": "database.media_for_task.hit",
+          "p95_ms": 0.0056,
+          "samples": 21,
+          "samples_ms": [
+            0.0055,
+            0.0055,
+            0.0052,
+            0.0053,
+            0.0052,
+            0.0052,
+            0.0052,
+            0.0054,
+            0.0052,
+            0.0056,
+            0.0055,
+            0.0054,
+            0.0053,
+            0.0051,
+            0.0051,
+            0.0053,
+            0.0052,
+            0.0053,
+            0.0056,
+            0.0051,
+            0.0052
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "hit_index": 5000,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 5093000
+          },
+          "max_ms": 0.004,
+          "median_ms": 0.0039,
+          "min_ms": 0.0038,
+          "name": "database.media_by_id.miss",
+          "p95_ms": 0.004,
+          "samples": 21,
+          "samples_ms": [
+            0.004,
+            0.0039,
+            0.0038,
+            0.0039,
+            0.004,
+            0.0039,
+            0.0039,
+            0.004,
+            0.0039,
+            0.0039,
+            0.0039,
+            0.0039,
+            0.0038,
+            0.0038,
+            0.0038,
+            0.0039,
+            0.0039,
+            0.004,
+            0.0039,
+            0.0039,
+            0.0038
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "hit_index": 5000,
+            "query_operations_per_sample": 1,
+            "record_bytes_total": 5093000
+          },
+          "max_ms": 0.0040999999999999995,
+          "median_ms": 0.0038,
+          "min_ms": 0.0037,
+          "name": "database.media_for_task.miss",
+          "p95_ms": 0.0039,
+          "samples": 21,
+          "samples_ms": [
+            0.0040999999999999995,
+            0.0038,
+            0.0038,
+            0.0038,
+            0.0038,
+            0.0039,
+            0.0039,
+            0.0038,
+            0.0039,
+            0.0038,
+            0.0037,
+            0.0038,
+            0.0038,
+            0.0039,
+            0.0038,
+            0.0039,
+            0.0038,
+            0.0038,
+            0.0039,
+            0.0038,
+            0.0038
+          ],
+          "warmups": 2
+        },
+        {
+          "details": {
+            "first_freeze_excluded": true,
+            "runtime_bytes": 452989999
+          },
+          "max_ms": 510.8028,
+          "median_ms": 502.6646,
+          "min_ms": 496.7563,
+          "name": "tools.freeze_existing",
+          "p95_ms": 510.8028,
+          "samples": 7,
+          "samples_ms": [
+            502.6646,
+            497.7772,
+            496.7563,
+            510.8028,
+            504.5533,
+            505.02570000000003,
+            497.6508
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "runtime_bytes": 168951296
+          },
+          "max_ms": 100.9023,
+          "median_ms": 95.1242,
+          "min_ms": 94.8624,
+          "name": "tools.task_tool.ffmpeg",
+          "p95_ms": 100.9023,
+          "samples": 7,
+          "samples_ms": [
+            95.3506,
+            95.1242,
+            100.9023,
+            96.0618,
+            94.9194,
+            94.8624,
+            95.0826
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "runtime_bytes": 168736256
+          },
+          "max_ms": 95.8832,
+          "median_ms": 95.08579999999999,
+          "min_ms": 93.9816,
+          "name": "tools.task_tool.ffprobe",
+          "p95_ms": 95.8832,
+          "samples": 7,
+          "samples_ms": [
+            95.08579999999999,
+            94.8342,
+            93.9816,
+            95.8832,
+            94.89930000000001,
+            95.54849999999999,
+            95.8685
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "runtime_bytes": 97462048
+          },
+          "max_ms": 57.3547,
+          "median_ms": 54.771899999999995,
+          "min_ms": 53.863099999999996,
+          "name": "tools.task_tool.deno",
+          "p95_ms": 57.3547,
+          "samples": 7,
+          "samples_ms": [
+            54.262299999999996,
+            53.863099999999996,
+            57.3547,
+            54.764399999999995,
+            54.771899999999995,
+            54.787099999999995,
+            54.9556
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "heartbeat_period_ms": 5,
+            "measurement": "heartbeat lateness relative to its scheduled deadline",
+            "runtime_worker_threads": 1,
+            "tool_resolutions": 7
+          },
+          "max_ms": 15.4956,
+          "median_ms": 12.8255,
+          "min_ms": 1.7107999999999999,
+          "name": "scheduler.task_tool_ffprobe.current_thread",
+          "p95_ms": 15.3947,
+          "samples": 55,
+          "samples_ms": [
+            2.4305,
+            12.8255,
+            13.691699999999999,
+            14.6728,
+            14.6575,
+            15.3628,
+            10.366999999999999,
+            11.4182,
+            11.6555,
+            11.3726,
+            11.3589,
+            12.3729,
+            13.413599999999999,
+            14.2127,
+            14.2262,
+            1.7107999999999999,
+            9.600900000000001,
+            14.6307,
+            14.7811,
+            14.5135,
+            15.4956,
+            11.4639,
+            11.1557,
+            11.8811,
+            11.9196,
+            12.9377,
+            12.8386,
+            13.0753,
+            13.4381,
+            13.7926,
+            5.0577,
+            4.3626000000000005,
+            15.449900000000001,
+            10.8895,
+            11.458,
+            11.4518,
+            11.6692,
+            12.7066,
+            13.6695,
+            13.4025,
+            14.3917,
+            15.3947,
+            11.4219,
+            12.1206,
+            12.0488,
+            12.0698,
+            12.423,
+            13.0853,
+            13.138399999999999,
+            14.0945,
+            14.1004,
+            14.808200000000001,
+            14.856100000000001,
+            2.9316,
+            10.847000000000001
+          ],
+          "warmups": 0
+        },
+        {
+          "details": {
+            "runtime_processes_per_sample": 4
+          },
+          "max_ms": 1012.7946000000001,
+          "median_ms": 994.9846,
+          "min_ms": 917.4574,
+          "name": "tools.check",
+          "p95_ms": 1012.7946000000001,
+          "samples": 5,
+          "samples_ms": [
+            929.0483,
+            917.4574,
+            1009.2890000000001,
+            1012.7946000000001,
+            994.9846
+          ],
+          "warmups": 1
+        },
+        {
+          "details": {
+            "catalog_records": 10000,
+            "excludes_host_transport_serialization": true,
+            "includes_tools_check": true,
+            "task_records": 0
+          },
+          "max_ms": 1779.8986000000002,
+          "median_ms": 1018.7229,
+          "min_ms": 963.8801,
+          "name": "core.snapshot",
+          "p95_ms": 1779.8986000000002,
+          "samples": 5,
+          "samples_ms": [
+            963.8801,
+            1023.6996,
+            1011.6814999999999,
+            1018.7229,
+            1779.8986000000002
+          ],
+          "warmups": 1
+        }
+      ],
+      "os": "windows",
+      "package_version": "0.2.1",
+      "percentile_method": "nearest rank; p95 is the maximum for fewer than 20 samples",
+      "profile": "release",
+      "runtime_bytes": {
+        "deno": 97462048,
+        "ffmpeg": 168951296,
+        "ffprobe": 168736256,
+        "yt-dlp": 17840399
+      },
+      "schema_version": 1,
+      "scope": "isolated synthetic catalog and local official runtime tools; warmed OS file cache"
+    }
+  },
+  "frontend": {
+    "before": [
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "reducer",
+        "tasks": 1000,
+        "events": 240,
+        "warmups": 1,
+        "medianMs": 0.6321000000000367,
+        "p95Ms": 0.7030999999999494,
+        "samplesMs": [
+          0.32990000000006603,
+          0.3451000000000022,
+          0.592899999999986,
+          0.7030999999999494,
+          0.6877000000000635,
+          0.6383999999999332,
+          0.6321000000000367
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "App",
+        "scenario": "newest",
+        "tasks": 1000,
+        "events": 60,
+        "warmups": 1,
+        "medianMs": 92.74389999999994,
+        "p95Ms": 217.5313000000001,
+        "samplesMs": [
+          217.5313000000001,
+          92.74389999999994,
+          92.05210000000011,
+          91.86110000000008,
+          93.25789999999984
+        ],
+        "profiler": {
+          "medianMs": 53.760400000002846,
+          "p95Ms": 175.10770000000082,
+          "samplesMs": [
+            175.10770000000082,
+            54.208600000003116,
+            53.760400000002846,
+            52.0680000000084,
+            52.6823000000054
+          ]
+        },
+        "commitCounts": [
+          60,
+          60,
+          60,
+          60,
+          60
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "App",
+        "scenario": "title-search",
+        "tasks": 1000,
+        "events": 60,
+        "warmups": 1,
+        "medianMs": 196.09310000000005,
+        "p95Ms": 501.06669999999986,
+        "samplesMs": [
+          282.4991000000002,
+          196.09310000000005,
+          189.1917999999996,
+          189.42030000000022,
+          501.06669999999986
+        ],
+        "profiler": {
+          "medianMs": 162.28409999997803,
+          "p95Ms": 451.07479999999805,
+          "samplesMs": [
+            246.25630000000137,
+            162.28409999997803,
+            147.27809999996816,
+            146.62469999999848,
+            451.07479999999805
+          ]
+        },
+        "commitCounts": [
+          60,
+          60,
+          60,
+          60,
+          60
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "reducer",
+        "tasks": 10000,
+        "events": 240,
+        "warmups": 1,
+        "medianMs": 910.4737999999998,
+        "p95Ms": 936.7995000000001,
+        "samplesMs": [
+          928.9256000000005,
+          910.4737999999998,
+          936.7995000000001,
+          913.4683999999997,
+          892.5375000000013,
+          906.239599999999,
+          886.0584999999992
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "App",
+        "scenario": "newest",
+        "tasks": 10000,
+        "events": 60,
+        "warmups": 1,
+        "medianMs": 742.6756999999998,
+        "p95Ms": 792.3740999999991,
+        "samplesMs": [
+          792.3740999999991,
+          684.9118999999992,
+          742.6756999999998,
+          708.25,
+          788.5694000000003
+        ],
+        "profiler": {
+          "medianMs": 666.7625999999091,
+          "p95Ms": 727.5939999998027,
+          "samplesMs": [
+            727.5939999998027,
+            613.0794999999889,
+            666.7625999999091,
+            625.8548999998693,
+            715.595500000074
+          ]
+        },
+        "commitCounts": [
+          60,
+          60,
+          60,
+          60,
+          60
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "App",
+        "scenario": "title-search",
+        "tasks": 10000,
+        "events": 60,
+        "warmups": 1,
+        "medianMs": 1519.7667000000001,
+        "p95Ms": 2693.7808000000005,
+        "samplesMs": [
+          2516.7189,
+          1519.7667000000001,
+          1299.9566000000013,
+          1403.6071999999986,
+          2693.7808000000005
+        ],
+        "profiler": {
+          "medianMs": 1468.6315999999933,
+          "p95Ms": 2614.878200000214,
+          "samplesMs": [
+            2441.675700000047,
+            1468.6315999999933,
+            1256.3223000004,
+            1351.2665000001434,
+            2614.878200000214
+          ]
+        },
+        "commitCounts": [
+          60,
+          60,
+          60,
+          60,
+          60
+        ]
+      }
+    ],
+    "after": [
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "reducer",
+        "tasks": 1000,
+        "events": 240,
+        "warmups": 1,
+        "medianMs": 0.6757999999999811,
+        "p95Ms": 0.7283999999999651,
+        "samplesMs": [
+          0.7283999999999651,
+          0.7047999999999774,
+          0.6811999999999898,
+          0.4012000000000171,
+          0.3211000000000013,
+          0.36000000000001364,
+          0.6757999999999811
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "App",
+        "scenario": "newest",
+        "tasks": 1000,
+        "events": 60,
+        "warmups": 1,
+        "medianMs": 61.63930000000005,
+        "p95Ms": 170.71910000000003,
+        "samplesMs": [
+          60.63300000000004,
+          170.71910000000003,
+          62.08400000000006,
+          60.64239999999995,
+          61.63930000000005
+        ],
+        "profiler": {
+          "medianMs": 26.75690000000236,
+          "p95Ms": 139.38289999999597,
+          "samplesMs": [
+            26.75690000000236,
+            139.38289999999597,
+            27.64199999999596,
+            26.42149999999424,
+            25.943599999997787
+          ]
+        },
+        "commitCounts": [
+          60,
+          60,
+          60,
+          60,
+          60
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "App",
+        "scenario": "title-search",
+        "tasks": 1000,
+        "events": 60,
+        "warmups": 1,
+        "medianMs": 49.179099999999835,
+        "p95Ms": 52.62310000000002,
+        "samplesMs": [
+          49.85479999999984,
+          52.62310000000002,
+          49.179099999999835,
+          47.46600000000012,
+          49.0489
+        ],
+        "profiler": {
+          "medianMs": 23.036400000014282,
+          "p95Ms": 26.283900000005815,
+          "samplesMs": [
+            23.71300000000474,
+            26.283900000005815,
+            22.631999999993468,
+            23.036400000014282,
+            22.79770000000758
+          ]
+        },
+        "commitCounts": [
+          60,
+          60,
+          60,
+          60,
+          60
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "reducer",
+        "tasks": 10000,
+        "events": 240,
+        "warmups": 1,
+        "medianMs": 508.29379999999946,
+        "p95Ms": 912.4775,
+        "samplesMs": [
+          504.88239999999996,
+          511.4843999999998,
+          495.63650000000007,
+          505.46370000000024,
+          508.29379999999946,
+          699.3386,
+          912.4775
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "App",
+        "scenario": "newest",
+        "tasks": 10000,
+        "events": 60,
+        "warmups": 1,
+        "medianMs": 545.1926999999996,
+        "p95Ms": 612.2898999999998,
+        "samplesMs": [
+          401.97220000000016,
+          571.6823999999997,
+          494.6326000000008,
+          545.1926999999996,
+          612.2898999999998
+        ],
+        "profiler": {
+          "medianMs": 455.5841999999757,
+          "p95Ms": 542.6478999998526,
+          "samplesMs": [
+            331.68359999999757,
+            504.32150000000365,
+            435.9991999999129,
+            455.5841999999757,
+            542.6478999998526
+          ]
+        },
+        "commitCounts": [
+          60,
+          60,
+          60,
+          60,
+          60
+        ]
+      },
+      {
+        "suite": "frontend-progress-v1",
+        "environment": "jsdom/development-react/no-strict-mode",
+        "path": "App",
+        "scenario": "title-search",
+        "tasks": 10000,
+        "events": 60,
+        "warmups": 1,
+        "medianMs": 604.6121999999996,
+        "p95Ms": 637.3027000000002,
+        "samplesMs": [
+          604.6121999999996,
+          637.3027000000002,
+          443.2466000000004,
+          567.1482999999989,
+          627.1175999999996
+        ],
+        "profiler": {
+          "medianMs": 528.7159000001429,
+          "p95Ms": 568.2069000000574,
+          "samplesMs": [
+            528.7159000001429,
+            568.2069000000574,
+            364.0886999999984,
+            485.73079999991205,
+            560.0204999997368
+          ]
+        },
+        "commitCounts": [
+          60,
+          60,
+          60,
+          60,
+          60
+        ]
+      }
+    ]
+  }
+}

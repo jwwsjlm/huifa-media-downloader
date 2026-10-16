@@ -6,6 +6,8 @@ mod credentials;
 mod db;
 mod download;
 pub(crate) mod model;
+#[cfg(test)]
+mod performance;
 pub mod process;
 mod processing;
 mod tools;
@@ -120,17 +122,29 @@ impl App {
     pub(crate) fn tool(&self, name: &str) -> Result<PathBuf> {
         tools::resolve(self, name)
     }
-    pub(crate) fn task_tool(&self, task: &Task, name: &str) -> Result<PathBuf> {
+    pub(crate) async fn task_tool(&self, task: &Task, name: &str) -> Result<PathBuf> {
         let path = task
             .tools
             .get(name)
-            .with_context(|| format!("Task has no frozen {name} runtime"))?;
-        ensure!(
-            path.is_file(),
-            "Frozen {name} runtime is missing; restore its saved tool version before retrying"
-        );
-        tools::validate_frozen(self, path, name)?;
-        Ok(path.clone())
+            .with_context(|| format!("Task has no frozen {name} runtime"))?
+            .clone();
+        let app = self
+            .myself
+            .get()
+            .and_then(Weak::upgrade)
+            .context("Application is closed")?;
+        let name = name.to_string();
+        // Hash every byte before use without occupying a Tokio runtime worker.
+        tokio::task::spawn_blocking(move || {
+            ensure!(
+                path.is_file(),
+                "Frozen {name} runtime is missing; restore its saved tool version before retrying"
+            );
+            tools::validate_frozen(&app, &path, &name)?;
+            Ok(path)
+        })
+        .await
+        .context("Runtime verification worker stopped")?
     }
     async fn freeze_tools(&self) -> Result<HashMap<String, PathBuf>> {
         let _guard = tokio::select! {
@@ -766,8 +780,8 @@ mod tests {
         let new = paused_task(app.freeze_tools().await?);
         app.db.insert_task(&new)?;
         for name in names {
-            let old_path = app.task_tool(&saved, name)?;
-            let new_path = app.task_tool(&new, name)?;
+            let old_path = app.task_tool(&saved, name).await?;
+            let new_path = app.task_tool(&new, name).await?;
             ensure!(
                 old_path == old.tools[name] && old_path != new_path,
                 "Upgrade changed a frozen runtime or failed to adopt a new runtime"
@@ -789,15 +803,15 @@ mod tests {
         let new = app.db.task(&new.id)?;
         for name in names {
             ensure!(
-                app.task_tool(&saved, name)? == old.tools[name]
-                    && app.task_tool(&new, name)? == new.tools[name],
+                app.task_tool(&saved, name).await? == old.tools[name]
+                    && app.task_tool(&new, name).await? == new.tools[name],
                 "Restart lost a runtime snapshot"
             );
         }
         let mut unsafe_task = saved.clone();
         unsafe_task.tools.insert("ffmpeg".into(), source("ffmpeg"));
         ensure!(
-            app.task_tool(&unsafe_task, "ffmpeg").is_err(),
+            app.task_tool(&unsafe_task, "ffmpeg").await.is_err(),
             "A mutable runtime path was accepted"
         );
         let cached = &saved.tools["ffmpeg"];
@@ -813,10 +827,15 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(cached, std::fs::Permissions::from_mode(0o700))?;
         }
-        std::fs::write(cached, "tampered")?;
+        let original = std::fs::metadata(cached)?;
+        std::fs::write(cached, vec![b'X'; original.len() as usize])?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(cached)?
+            .set_times(std::fs::FileTimes::new().set_modified(original.modified()?))?;
         ensure!(
-            app.task_tool(&saved, "ffmpeg").is_err(),
-            "Changed frozen runtime bytes were accepted"
+            app.task_tool(&saved, "ffmpeg").await.is_err(),
+            "Changed frozen runtime bytes with the same size and modification time were accepted"
         );
 
         let missing = paused_task(HashMap::new());

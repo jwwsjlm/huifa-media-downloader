@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 ARG USE_PREBUILT_FRONTEND=0
-FROM node:22-bookworm-slim AS frontend-0
+FROM node:24-bookworm-slim AS frontend-0
 WORKDIR /source/frontend
 COPY frontend/package*.json ./
 RUN npm ci

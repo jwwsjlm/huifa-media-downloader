@@ -1237,7 +1237,14 @@ async fn probe_file(
         "json".into(),
         path.to_string_lossy().into(),
     ];
-    let output = process::run(&app.task_tool(task, "ffprobe")?, &args, None, cancel, None).await?;
+    let output = process::run(
+        &app.task_tool(task, "ffprobe").await?,
+        &args,
+        None,
+        cancel,
+        None,
+    )
+    .await?;
     let value: Value = serde_json::from_str(&output.stdout)?;
     ensure!(
         value["streams"].as_array().is_some_and(|s| !s.is_empty()),
@@ -1311,7 +1318,7 @@ async fn run_ffmpeg(
         }
     });
     process::run(
-        &app.task_tool(&app.db.task(id)?, "ffmpeg")?,
+        &app.task_tool(&app.db.task(id)?, "ffmpeg").await?,
         args,
         None,
         cancel,
@@ -1480,7 +1487,14 @@ async fn subtitle_convert(
         input.to_string_lossy().into(),
         output.to_string_lossy().into(),
     ];
-    process::run(&app.task_tool(task, "ffmpeg")?, &args, None, cancel, None).await?;
+    process::run(
+        &app.task_tool(task, "ffmpeg").await?,
+        &args,
+        None,
+        cancel,
+        None,
+    )
+    .await?;
     Ok(())
 }
 

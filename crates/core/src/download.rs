@@ -48,7 +48,7 @@ impl Cookies {
     }
 }
 
-fn base_args(
+async fn base_args(
     app: &App,
     options: &DownloadOptions,
     cookies: &Cookies,
@@ -75,7 +75,7 @@ fn base_args(
         args.extend(["--proxy".into(), options.proxy.clone()]);
     }
     let deno = match task {
-        Some(task) if task.tools.contains_key("deno") => Some(app.task_tool(task, "deno")?),
+        Some(task) if task.tools.contains_key("deno") => Some(app.task_tool(task, "deno").await?),
         Some(_) => None,
         None => app.tool("deno").ok(),
     };
@@ -97,7 +97,7 @@ pub(crate) async fn probe(
     task: Option<&Task>,
 ) -> Result<Value> {
     let cookies = Cookies::new(app, cookies)?;
-    let mut args = base_args(app, options, &cookies, task)?;
+    let mut args = base_args(app, options, &cookies, task).await?;
     args.extend([
         "--dump-single-json".into(),
         "--skip-download".into(),
@@ -117,7 +117,7 @@ pub(crate) async fn probe(
     }
     args.extend(["--".into(), url.into()]);
     let executable = if let Some(task) = task {
-        app.task_tool(task, "yt-dlp")?
+        app.task_tool(task, "yt-dlp").await?
     } else {
         app.tool("yt-dlp")?
     };
@@ -170,7 +170,7 @@ pub(crate) async fn collection(
 ) -> Result<Value> {
     let _permit = app.network.acquire().await?;
     let cookies = Cookies::new(app, cookie_text)?;
-    let mut args = base_args(app, options, &cookies, None)?;
+    let mut args = base_args(app, options, &cookies, None).await?;
     args.extend([
         "--dump-single-json".into(),
         "--flat-playlist".into(),
@@ -483,7 +483,7 @@ pub(crate) async fn transfer(
             None,
         )?;
         let output_template = directory.join(format!("source-{index}.%(ext)s"));
-        let mut args = base_args(app, &runtime_options, &cookies, Some(&task))?;
+        let mut args = base_args(app, &runtime_options, &cookies, Some(&task)).await?;
         args.extend([
             "--no-playlist".into(),
             "--no-simulate".into(),
@@ -511,7 +511,10 @@ pub(crate) async fn transfer(
                 "--downloader".into(),
                 "ffmpeg".into(),
                 "--ffmpeg-location".into(),
-                app.task_tool(&task, "ffmpeg")?.to_string_lossy().into(),
+                app.task_tool(&task, "ffmpeg")
+                    .await?
+                    .to_string_lossy()
+                    .into(),
             ]);
             if task.options.live_from_start {
                 args.push("--live-from-start".into());
@@ -561,7 +564,7 @@ pub(crate) async fn transfer(
             }
         });
         let output = process::run(
-            &app.task_tool(&task, "yt-dlp")?,
+            &app.task_tool(&task, "yt-dlp").await?,
             &args,
             Some(&directory),
             cancel,
@@ -750,7 +753,7 @@ async fn download_subtitles(
         selected.extend(matched);
     }
     let runtime_options = app.runtime_options(task)?;
-    let mut args = base_args(app, &runtime_options, cookies, Some(task))?;
+    let mut args = base_args(app, &runtime_options, cookies, Some(task)).await?;
     args.extend([
         "--no-playlist".into(),
         "--skip-download".into(),
@@ -767,7 +770,7 @@ async fn download_subtitles(
     }
     args.extend(["--".into(), task.url.clone()]);
     process::run(
-        &app.task_tool(task, "yt-dlp")?,
+        &app.task_tool(task, "yt-dlp").await?,
         &args,
         Some(directory),
         cancel,
@@ -993,7 +996,7 @@ mod tests {
         .await?;
         let cookies = Cookies { file: None };
         let mut task = crate::tests::paused_task(std::collections::HashMap::new());
-        let args = base_args(&app, &task.options, &cookies, Some(&task))?;
+        let args = base_args(&app, &task.options, &cookies, Some(&task)).await?;
         ensure!(
             args.iter().any(|a| a == "--no-js-runtimes")
                 && !args.iter().any(|a| a == "--js-runtimes"),
@@ -1005,7 +1008,9 @@ mod tests {
         std::fs::write(&mutable, "mutable runtime")?;
         task.tools.insert("deno".into(), mutable);
         ensure!(
-            base_args(&app, &task.options, &cookies, Some(&task)).is_err(),
+            base_args(&app, &task.options, &cookies, Some(&task))
+                .await
+                .is_err(),
             "An invalid frozen Deno runtime was silently omitted"
         );
         app.shutdown().await?;
