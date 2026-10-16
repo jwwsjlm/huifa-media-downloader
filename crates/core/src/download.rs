@@ -1433,7 +1433,8 @@ mod tests {
                 }
             }
         });
-        let started = Mutex::new(Some(started));
+        let (fail, failed) = tokio::sync::oneshot::channel();
+        let failed = Mutex::new(Some(failed));
         let cancel = CancellationToken::new();
         let exe = PathBuf::from("powershell.exe");
         let args = vec![
@@ -1445,23 +1446,39 @@ mod tests {
             let cancel = &cancel;
             let exe = &exe;
             let args = &args;
-            let started = &started;
+            let failed = &failed;
             async move {
                 if index == 0 {
                     process::run(exe, args, None, cancel, Some(callback)).await?;
                     Ok(())
                 } else {
-                    let started = started.lock().unwrap().take().unwrap();
-                    started.await?;
+                    let failed = failed.lock().unwrap().take().unwrap();
+                    tokio::select! {
+                        result = failed => result?,
+                        _ = cancel.cancelled() => bail!("Operation interrupted"),
+                    }
                     bail!("capture failed")
                 }
             }
         });
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            collect_transfers(transfers, true, &cancel),
-        )
-        .await?;
+        let captures = collect_transfers(transfers, true, &cancel);
+        tokio::pin!(captures);
+        // PowerShell cold startup is separate from the process cleanup deadline.
+        tokio::select! {
+            result = &mut captures => bail!("Capture ended before the fixture was ready: {result:?}"),
+            ready = tokio::time::timeout(Duration::from_secs(30), started) => {
+                if !matches!(ready, Ok(Ok(()))) {
+                    cancel.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut captures).await;
+                    bail!("Supervised PowerShell fixture did not become ready: {ready:?}");
+                }
+            }
+        }
+        assert_eq!(pids.lock().unwrap().len(), 2);
+        fail.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut captures)
+            .await
+            .context("Supervised captures did not exit within the cleanup deadline")?;
         assert_eq!(result.unwrap_err().to_string(), "capture failed");
         for pid in pids.lock().unwrap().iter().copied() {
             let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };

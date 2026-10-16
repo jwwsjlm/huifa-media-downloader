@@ -613,6 +613,8 @@ pub(crate) struct Chapter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Publication {
+    #[serde(default)]
+    pub committed: bool,
     pub temporary: PathBuf,
     pub target: PathBuf,
     pub hash: String,
@@ -702,6 +704,15 @@ pub(crate) fn validate_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_publication_journals_start_uncommitted() {
+        let journal: Publication = serde_json::from_value(json!({
+            "temporary":"prepared.publish", "target":"output.mp4", "hash":"hash", "size":1,
+            "duration":1.0, "auxiliary":[], "backup":null
+        }))
+        .unwrap();
+        assert!(!journal.committed);
+    }
     #[test]
     fn new_downloads_use_automatic_cookies_and_bounded_fragment_defaults() {
         let defaults = DownloadOptions::parse(json!({})).unwrap();

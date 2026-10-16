@@ -464,7 +464,10 @@ impl App {
                         created_at: chrono::Utc::now().to_rfc3339(),
                         options: frozen_options,
                         output_path: previous.as_ref().and_then(|task| task.output_path.clone()),
-                        previous_outputs: vec![],
+                        previous_outputs: previous
+                            .as_ref()
+                            .map(|task| task.previous_outputs.clone())
+                            .unwrap_or_default(),
                         cookie_snapshot,
                         proxy_snapshot,
                         manifest: None,
@@ -559,10 +562,8 @@ impl App {
                             self.remove_owned(&auxiliary.target)?;
                         }
                     }
-                    if task.kind == "assets" {
-                        for path in &task.previous_outputs {
-                            self.remove_owned(path)?;
-                        }
+                    for path in &task.previous_outputs {
+                        self.remove_owned(path)?;
                     }
                     if !task.options.processing_temp_dir.is_empty() {
                         remove_task_directory(&processing::workspace(self, &task))?;
@@ -1297,6 +1298,9 @@ mod tests {
         task.stage("completed", "completed", Some(100.0));
         let path = app.config.download_dir.join("original.mp4");
         std::fs::write(&path, b"original media")?;
+        let obsolete = app.config.download_dir.join("obsolete.mkv");
+        std::fs::write(&obsolete, b"pending cleanup")?;
+        task.previous_outputs = vec![obsolete.clone()];
         task.output_path = Some(path.clone());
         app.db.insert_task(&task)?;
         app.db.complete(
@@ -1335,6 +1339,10 @@ mod tests {
             .await?;
         assert_eq!(added["ids"][0], task.id);
         assert_eq!(added["results"][0]["action"], "restarted");
+        assert_eq!(
+            app.db.task(&task.id)?.previous_outputs,
+            vec![obsolete.clone()]
+        );
         assert_eq!(std::fs::read(&path)?, b"original media");
         app.command("tasks.delete", json!({"id":task.id,"deleteFiles":false}))
             .await?;
@@ -1344,6 +1352,7 @@ mod tests {
         assert!(app.db.task(&task.id).is_err());
         assert!(app.db.media_for_task(&task.id)?.is_none());
         assert!(!path.exists());
+        assert!(!obsolete.exists());
         drop(processor);
         drop(network);
         app.shutdown().await?;

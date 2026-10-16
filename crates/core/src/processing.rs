@@ -74,7 +74,6 @@ pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Resu
     options.content_mode = "video".into();
     task.options = options;
     task.conversion = true;
-    task.previous_outputs.clear();
     task.steps.clear();
     task.step_index = None;
     task.publication = None;
@@ -1190,6 +1189,7 @@ pub(crate) async fn process_task(
     let (hash, size) = hash_file(&temporary)?;
     let mut prepared = app.db.task(id)?;
     prepared.publication = Some(Publication {
+        committed: false,
         temporary,
         target: target.clone(),
         hash,
@@ -1300,6 +1300,7 @@ async fn prepare_assets(app: &Arc<App>, mut task: Task, cancel: &CancellationTok
     }
     let primary = outputs.remove(0);
     task.publication = Some(Publication {
+        committed: false,
         temporary: primary.temporary,
         target: primary.target,
         hash: primary.hash,
@@ -1551,6 +1552,13 @@ fn publication_files(
 pub(crate) async fn prepare_redownload(app: &App, task: &Task) -> Result<()> {
     let _publication_guard = app.publication_lock.lock().await;
     let mut task = app.db.task(&task.id)?;
+    if task
+        .publication
+        .as_ref()
+        .is_some_and(|publication| publication.committed)
+    {
+        return finish_publication(app, task, &app.db.media()?);
+    }
     if task.status == "completed" {
         return Ok(());
     }
@@ -1627,9 +1635,10 @@ pub(crate) async fn prepare_redownload(app: &App, task: &Task) -> Result<()> {
 }
 
 pub(crate) async fn prepare_task_deletion(app: &App, id: &str) -> Result<()> {
-    let task = app.db.task(id)?;
+    let mut task = app.db.task(id)?;
     if task.status != "completed" {
-        return prepare_redownload(app, &task).await;
+        prepare_redownload(app, &task).await?;
+        task = app.db.task(id)?;
     }
     let _publication_guard = app.publication_lock.lock().await;
     let Some(publication) = &task.publication else {
@@ -1681,6 +1690,9 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
         .publication
         .clone()
         .context("Publication journal is missing")?;
+    if publication.committed {
+        return finish_publication(app, task, &app.db.media()?);
+    }
     let previous = app.db.media_for_task(&task.id)?;
     let (entries, backups) = publication_files(&publication, &task.id);
     let all_media = app.db.media()?;
@@ -1796,18 +1808,13 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
         };
         task.output_path = Some(publication.target);
         task.error = None;
-        task.stage("completed", "completed", Some(100.0));
-        if let Err(error) = app.save_task(&task) {
+        task.publication.as_mut().unwrap().committed = true;
+        task.stage("processing", "saving_results", None);
+        if let Err(error) = app.db.save_task(&task) {
             rollback_publication(&entries, &backups, &installed)?;
             return Err(error);
         }
-        cleanup_backups(&backups);
-        let current = entries
-            .iter()
-            .map(|entry| entry.target.clone())
-            .collect::<Vec<_>>();
-        cleanup_replaced_paths(app, &task.id, &task.previous_outputs, &current, &all_media);
-        return Ok(());
+        return finish_publication(app, task, &all_media);
     }
     let mut assets = if task.conversion {
         previous
@@ -1845,7 +1852,14 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
     };
     task.output_path = Some(publication.target.clone());
     task.error = None;
-    task.stage("completed", "completed", Some(100.0));
+    if let Some(previous) = previous {
+        task.previous_outputs.push(previous.path);
+        task.previous_outputs.extend(previous.assets);
+    }
+    task.previous_outputs.sort();
+    task.previous_outputs.dedup();
+    task.publication.as_mut().unwrap().committed = true;
+    task.stage("processing", "saving_results", None);
     let media = match app.db.complete(&task, &media) {
         Ok(media) => media,
         Err(error) => {
@@ -1853,19 +1867,58 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
             return Err(error);
         }
     };
-    app.emit("task.upsert", task.public());
     app.emit("media.upsert", media.public());
-    cleanup_backups(&backups);
-    if let Some(previous) = previous {
-        let old = std::iter::once(previous.path)
-            .chain(previous.assets)
-            .collect::<Vec<_>>();
-        let current = std::iter::once(media.path.clone())
-            .chain(media.assets.clone())
-            .collect::<Vec<_>>();
-        cleanup_replaced_paths(app, &task.id, &old, &current, &all_media);
+    finish_publication(app, task, &all_media)
+}
+
+fn finish_publication(app: &App, mut task: Task, all_media: &[Media]) -> Result<()> {
+    let publication = task
+        .publication
+        .as_ref()
+        .context("Publication journal is missing")?;
+    let (entries, backups) = publication_files(publication, &task.id);
+    for (entry, backup) in entries.iter().zip(&backups) {
+        for path in [&entry.target, &entry.temporary, backup] {
+            crate::reject_links(path)?;
+            ensure!(
+                path.parent()
+                    .context("Publication path has no directory")?
+                    .canonicalize()?
+                    .starts_with(&app.config.download_dir),
+                "Publication path is outside the owned downloads directory"
+            );
+        }
+        if backup.exists() {
+            ensure!(
+                entry.target.is_file()
+                    && hash_file(&entry.target)? == (entry.hash.clone(), entry.size),
+                "Publication destination changed; original backup was preserved"
+            );
+        }
     }
-    Ok(())
+    let backups_cleaned = cleanup_backups(&backups);
+    let current = if task.kind == "assets" {
+        entries
+            .iter()
+            .map(|entry| entry.target.clone())
+            .collect::<Vec<_>>()
+    } else {
+        let media = app
+            .db
+            .media_for_task(&task.id)?
+            .context("Committed media does not exist")?;
+        std::iter::once(media.path).chain(media.assets).collect()
+    };
+    task.previous_outputs =
+        cleanup_replaced_paths(app, &task.id, &task.previous_outputs, &current, all_media);
+    let warning =
+        "Some previous output files could not be removed; they were preserved for a later cleanup.";
+    task.warnings.retain(|value| value != warning);
+    if !backups_cleaned || !task.previous_outputs.is_empty() {
+        task.warnings.push(warning.into());
+    }
+    task.stage("completed", "completed", Some(100.0));
+    app.save_task(&task)
 }
 
 fn rollback_publication(
@@ -1893,12 +1946,14 @@ fn rollback_publication(
     Ok(())
 }
 
-fn cleanup_backups(backups: &[PathBuf]) {
+fn cleanup_backups(backups: &[PathBuf]) -> bool {
+    let mut cleaned = true;
     for backup in backups {
-        if backup.exists() {
-            let _ = std::fs::remove_file(backup);
+        if backup.exists() && std::fs::remove_file(backup).is_err() {
+            cleaned = false;
         }
     }
+    cleaned
 }
 
 fn cleanup_replaced_paths(
@@ -1907,7 +1962,8 @@ fn cleanup_replaced_paths(
     previous: &[PathBuf],
     current: &[PathBuf],
     other_media: &[Media],
-) {
+) -> Vec<PathBuf> {
+    let mut remaining = Vec::new();
     for path in previous {
         if current.contains(path)
             || other_media.iter().any(|media| {
@@ -1916,18 +1972,22 @@ fn cleanup_replaced_paths(
         {
             continue;
         }
-        if path.exists()
-            && let Ok(owned) = app.owned_path(path)
+        if !path.exists() {
+            continue;
+        }
+        let Ok(owned) = app.owned_path(path) else {
+            remaining.push(path.clone());
+            continue;
+        };
+        if std::fs::remove_file(&owned).is_err() {
+            remaining.push(path.clone());
+        } else if let Some(parent) = owned.parent()
+            && parent.file_name().is_some_and(|name| name == &task_id[..8])
         {
-            // A failed cleanup must not turn a successfully committed download into a failed task.
-            if std::fs::remove_file(&owned).is_ok()
-                && let Some(parent) = owned.parent()
-                && parent.file_name().is_some_and(|name| name == &task_id[..8])
-            {
-                let _ = std::fs::remove_dir(parent);
-            }
+            let _ = std::fs::remove_dir(parent);
         }
     }
+    remaining
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -2517,6 +2577,7 @@ mod tests {
         write_sync(&source, b"new subtitle")?;
         let subtitle = make_auxiliary(&source, sidecar.clone(), &task.id)?;
         task.publication = Some(Publication {
+            committed: false,
             temporary: main.temporary.clone(),
             target: target.clone(),
             hash: main.hash,
@@ -2559,6 +2620,7 @@ mod tests {
         write_sync(&source, b"downloaded notes")?;
         let output = make_auxiliary(&source, target.clone(), &task.id)?;
         task.publication = Some(Publication {
+            committed: false,
             temporary: output.temporary.clone(),
             target: target.clone(),
             hash: output.hash,
@@ -2605,6 +2667,7 @@ mod tests {
             let sidecar = make_auxiliary(&source, subtitle.clone(), &task.id)?;
             task.previous_outputs = vec![target.clone()];
             task.publication = Some(Publication {
+                committed: false,
                 temporary: main.temporary.clone(),
                 target: target.clone(),
                 hash: main.hash,
@@ -2652,6 +2715,7 @@ mod tests {
         write_sync(&target, b"new notes")?;
         let main = make_auxiliary(&target, target.clone(), &task.id)?;
         task.publication = Some(Publication {
+            committed: false,
             temporary: main.temporary.clone(),
             target: target.clone(),
             hash: main.hash,
@@ -2691,6 +2755,7 @@ mod tests {
         let main = make_auxiliary(&source, target.clone(), &task.id)?;
         task.previous_outputs = vec![target.clone()];
         task.publication = Some(Publication {
+            committed: false,
             temporary: main.temporary.clone(),
             target: target.clone(),
             hash: main.hash,
@@ -2735,6 +2800,7 @@ mod tests {
         let cover = make_auxiliary(&source, sidecar.clone(), &task.id)?;
         write_sync(&sidecar, b"user-owned image")?;
         task.publication = Some(Publication {
+            committed: false,
             temporary: main.temporary,
             target: target.clone(),
             hash: main.hash,
@@ -2753,6 +2819,221 @@ mod tests {
         );
         assert!(!target.exists());
         assert_eq!(std::fs::read(sidecar)?, b"user-owned image");
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_publication_recovers_cleanup_without_revalidating_or_rolling_back()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        let target = app.config.download_dir.join("new.mp4");
+        let obsolete = app.config.download_dir.join("old.mkv");
+        write_sync(&target, b"committed media")?;
+        write_sync(&obsolete, b"old media")?;
+        let (hash, size) = hash_file(&target)?;
+        task.publication = Some(Publication {
+            committed: true,
+            temporary: target.with_extension("publish"),
+            target: target.clone(),
+            hash,
+            size,
+            duration: 1.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        task.manifest = Some(SourceManifest {
+            version: 1,
+            directory: app.config.download_dir.clone(),
+            files: vec![],
+            metadata: json!({}),
+            duration: Some(1.0),
+            chapters: vec![],
+            sponsor_segments: vec![],
+            output_extension: "mp4".into(),
+        });
+        task.previous_outputs = vec![obsolete.clone()];
+        task.stage("processing", "saving_results", None);
+        app.db.insert_task(&task)?;
+        app.db.complete(
+            &task,
+            &Media {
+                id: "committed-media".into(),
+                task_id: task.id.clone(),
+                title: "Committed".into(),
+                filename: "new.mp4".into(),
+                size,
+                duration: 1.0,
+                path: target.clone(),
+                assets: vec![],
+            },
+        )?;
+        let (_, backups) = publication_files(task.publication.as_ref().unwrap(), &task.id);
+        write_sync(&backups[0], b"old destination")?;
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = app.db.task(&task.id)?;
+                ensure!(current.status != "processing_failed", "{:?}", current.error);
+                if current.status == "completed" {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        assert_eq!(std::fs::read(&target)?, b"committed media");
+        assert!(!obsolete.exists());
+        assert!(!backups[0].exists());
+        assert!(app.db.task(&task.id)?.previous_outputs.is_empty());
+        assert_eq!(app.db.media_for_task(&task.id)?.unwrap().path, target);
+        // Cancellation after the result commit must finish cleanup rather than restoring the backup.
+        let mut interrupted = app.db.task(&task.id)?;
+        write_sync(&obsolete, b"another obsolete output")?;
+        write_sync(&backups[0], b"another old destination")?;
+        interrupted.previous_outputs = vec![obsolete.clone()];
+        interrupted.stage("paused", "saving_results", None);
+        app.db.save_task(&interrupted)?;
+        app.command("tasks.cancel", json!({"id":task.id})).await?;
+        prepare_redownload(&app, &interrupted).await?;
+        assert_eq!(app.db.task(&task.id)?.status, "completed");
+        assert_eq!(std::fs::read(&target)?, b"committed media");
+        assert!(!obsolete.exists());
+        assert!(!backups[0].exists());
+        // A keep-files deletion after a committed interruption must retain the new result.
+        interrupted = app.db.task(&task.id)?;
+        write_sync(&backups[0], b"last old destination")?;
+        interrupted.stage("paused", "saving_results", None);
+        app.db.save_task(&interrupted)?;
+        app.command("tasks.delete", json!({"id":task.id,"deleteFiles":false}))
+            .await?;
+        assert_eq!(std::fs::read(&target)?, b"committed media");
+        assert!(!backups[0].exists());
+        assert_eq!(app.db.task(&task.id)?.status, "retained");
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_cleanup_failure_warns_and_preserves_paths_for_a_later_retry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        let obsolete = app.config.download_dir.join("obsolete.txt");
+        std::fs::create_dir(&obsolete)?;
+        write_sync(&obsolete.join("external.txt"), b"external replacement")?;
+        let target = app.config.download_dir.join("new.txt");
+        write_sync(&target, b"committed notes")?;
+        let (hash, size) = hash_file(&target)?;
+        task.publication = Some(Publication {
+            committed: true,
+            temporary: target.with_extension("publish"),
+            target: target.clone(),
+            hash,
+            size,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        task.previous_outputs = vec![obsolete.clone()];
+        task.stage("paused", "saving_results", None);
+        app.db.insert_task(&task)?;
+        prepare_redownload(&app, &task).await?;
+        let saved = app.db.task(&task.id)?;
+        assert_eq!(saved.status, "completed");
+        assert_eq!(saved.previous_outputs, vec![obsolete.clone()]);
+        assert!(
+            saved
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("previous output files"))
+        );
+        assert_eq!(std::fs::read(&target)?, b"committed notes");
+        assert!(obsolete.join("external.txt").exists());
+        std::fs::remove_file(obsolete.join("external.txt"))?;
+        std::fs::remove_dir(&obsolete)?;
+        write_sync(&obsolete, b"obsolete notes")?;
+        prepare_redownload(&app, &saved).await?;
+        let cleaned = app.db.task(&task.id)?;
+        assert!(cleaned.previous_outputs.is_empty());
+        assert!(cleaned.warnings.is_empty());
+        assert!(!obsolete.exists());
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_publication_is_observable_only_after_obsolete_files_are_removed()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        for index in 0..512 {
+            let path = app
+                .config
+                .download_dir
+                .join(format!("obsolete-{index}.txt"));
+            write_sync(&path, b"old notes")?;
+            task.previous_outputs.push(path);
+        }
+        let source = app.config.download_dir.join("source.txt");
+        let target = app.config.download_dir.join("current.txt");
+        write_sync(&source, b"new notes")?;
+        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        task.publication = Some(Publication {
+            committed: false,
+            temporary: output.temporary,
+            target,
+            hash: output.hash,
+            size: output.size,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        app.db.insert_task(&task)?;
+        let observer_app = app.clone();
+        let observer_id = task.id.clone();
+        let obsolete = task.previous_outputs.last().unwrap().clone();
+        let (ready, started) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || -> Result<()> {
+            ready.send(())?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if observer_app.db.task(&observer_id)?.status == "completed" {
+                    ensure!(
+                        !obsolete.exists(),
+                        "Obsolete managed output remained after successful replacement"
+                    );
+                    return Ok(());
+                }
+                ensure!(Instant::now() < deadline, "Publication did not complete");
+                std::thread::yield_now();
+            }
+        });
+        started.recv()?;
+        publish(&app, task, &CancellationToken::new()).await?;
+        observer.join().unwrap()?;
         app.shutdown().await?;
         Ok(())
     }
@@ -2777,6 +3058,7 @@ mod tests {
         write_sync(&source, b"updated notes")?;
         let output = make_auxiliary(&source, target.clone(), &task.id)?;
         task.publication = Some(Publication {
+            committed: false,
             temporary: output.temporary,
             target: target.clone(),
             hash: output.hash,
@@ -2820,6 +3102,7 @@ mod tests {
         let sidecar = make_auxiliary(&source, subtitle.clone(), &task.id)?;
         task.previous_outputs = vec![target.clone(), subtitle.clone()];
         task.publication = Some(Publication {
+            committed: false,
             temporary: main.temporary.clone(),
             target: target.clone(),
             hash: main.hash,
@@ -3319,6 +3602,7 @@ mod tests {
         let mut replacement = app.db.task(&task.id)?;
         replacement.stage("processing", "publishing", None);
         replacement.publication = Some(Publication {
+            committed: false,
             temporary: prepared.temporary,
             target: target.clone(),
             hash: prepared.hash,

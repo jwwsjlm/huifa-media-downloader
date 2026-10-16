@@ -240,6 +240,7 @@ mod tests {
             std::fs::write(&auxiliary, b"Notes")?;
             task.output_path = Some(target.clone());
             task.publication = Some(crate::model::Publication {
+                committed: false,
                 temporary: target.with_extension("publish"),
                 target: target.clone(),
                 hash: String::new(),
