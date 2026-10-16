@@ -13,9 +13,9 @@ export function keyboardIndex(key: string, current: number, length: number): num
   if (key === 'ArrowDown') return Math.min(length - 1, current + 1);
   return Math.max(0, current);
 }
-interface Props { ids: string[]; selected: string; onSelect: (id: string) => void; renderRow: (id: string) => ReactNode; label: string; scrollKey: string }
+interface Props { ids: string[]; selected: string; onSelect: (id: string) => void; renderRow: (id: string) => ReactNode; label: string; scrollKey: string; onContextMenu?: (id: string, position: { x: number; y: number }, trigger: HTMLElement) => void }
 const scrolls = new Map<string, number>();
-export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, renderRow, label, scrollKey }: Props) {
+export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, renderRow, label, scrollKey, onContextMenu }: Props) {
   const ref = useRef<HTMLDivElement>(null); const idPrefix = useId().replace(/:/g, '');
   const [viewport, setViewport] = useState({ top: scrolls.get(scrollKey) || 0, height: 400 });
   useEffect(() => {
@@ -30,6 +30,12 @@ export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, 
   return <div ref={ref} className="virtual-list" tabIndex={0} role="listbox" aria-label={label} aria-activedescendant={activeRendered ? `${idPrefix}-${selected}` : undefined}
     onScroll={event => { const top = event.currentTarget.scrollTop; scrolls.set(scrollKey, top); setViewport(value => ({ ...value, top })); }}
     onKeyDown={event => {
+      if (event.target === event.currentTarget && onContextMenu && (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') && ids.includes(selected)) {
+        event.preventDefault();
+        const row = document.getElementById(`${idPrefix}-${selected}`); const bounds = (row || event.currentTarget).getBoundingClientRect();
+        onContextMenu(selected, { x: bounds.left + 12, y: Math.max(bounds.top, event.currentTarget.getBoundingClientRect().top) + Math.min(bounds.height, ROW_HEIGHT) }, event.currentTarget);
+        return;
+      }
       if (event.target !== event.currentTarget || !['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter'].includes(event.key)) return;
       event.preventDefault();
       const index = keyboardIndex(event.key, ids.indexOf(selected), ids.length); if (index < 0) return;
@@ -41,6 +47,7 @@ export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, 
     <div className="virtual-canvas" style={{ height: ids.length * ROW_HEIGHT }}>
       {ids.slice(start, end).map((id, offset) => <div key={id} id={`${idPrefix}-${id}`} role="option" aria-selected={selected === id} aria-posinset={start + offset + 1} aria-setsize={ids.length}
         className={`list-row ${selected === id ? 'selected' : ''}`} style={{ top: (start + offset) * ROW_HEIGHT, height: ROW_HEIGHT }}
+        onContextMenu={onContextMenu ? event => { event.preventDefault(); onSelect(id); onContextMenu(id, { x: event.clientX, y: event.clientY }, ref.current!); } : undefined}
         onClick={event => { if (!(event.target as HTMLElement).closest('button,input,select,a')) { onSelect(id); ref.current?.focus({ preventScroll: true }); } }}>{renderRow(id)}</div>)}
     </div>
   </div>;

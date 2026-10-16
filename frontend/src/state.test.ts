@@ -3,6 +3,29 @@ import { initialState, reducer } from './state';
 import { taskProgress } from './task';
 import { makeTask, makeSnapshot } from './test-fixtures';
 describe('task delta state', () => {
+  it('enables automatic cookies from a background sync while preserving unrelated drafts and task snapshots', () => {
+    let state = reducer(initialState, { type: 'snapshot', snapshot: makeSnapshot() });
+    state = reducer(state, { type: 'view', patch: { settingsDraft: { uiLanguage: 'zh-CN' }, optionsDraft: { cookieId: '', quality: '720p', proxy: 'draft-proxy' } } });
+    const previous = state;
+    state = reducer(state, { type: 'event', event: { kind: 'settings.updated', data: { ...state.settings, downloadOptions: { ...state.settings.downloadOptions, cookieId: 'auto' } } } });
+    expect(state.settings.downloadOptions?.cookieId).toBe('auto');
+    expect(state.view.optionsDraft).toEqual({ cookieId: 'auto', quality: '720p', proxy: 'draft-proxy' });
+    expect(state.view.settingsDraft).toBe(previous.view.settingsDraft);
+    expect(state.tasks).toBe(previous.tasks);
+  });
+  it('enables login cookies without overwriting other drafts or existing task identities', () => {
+    let state = reducer(initialState, { type: 'snapshot', snapshot: makeSnapshot() });
+    state = reducer(state, { type: 'view', patch: { settingsDraft: { uiLanguage: 'zh-CN' }, optionsDraft: { cookieId: 'old', quality: '720p', proxy: 'draft-proxy' } } });
+    const previous = state;
+    state = reducer(state, { type: 'cookie.saved', id: 'new' });
+    expect(state.settings.downloadOptions?.cookieId).toBe('new');
+    expect(state.view.optionsDraft).toEqual({ cookieId: 'new', quality: '720p', proxy: 'draft-proxy' });
+    expect(state.view.settingsDraft).toBe(previous.view.settingsDraft);
+    expect(state.settings.uiLanguage).toBe(previous.settings.uiLanguage);
+    expect(state.tasks).toBe(previous.tasks);
+    const clean = reducer(initialState, { type: 'cookie.saved', id: 'new' });
+    expect(clean.view.optionsDraft).toBeNull();
+  });
   it('removes media in another client without removing retained results on task removal', () => {
     const snapshot = makeSnapshot();
     snapshot.media = [{ id: 'm', taskId: 'a', title: 'Media', filename: 'a.mp4', size: 12, duration: 1 }];

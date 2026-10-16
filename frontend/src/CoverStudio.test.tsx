@@ -38,7 +38,7 @@ describe('cover operation lifecycle', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Generate AI variation' }));
     fireEvent.click(screen.getByRole('button', { name: 'Cancel AI creation' }));
     await waitFor(() => expect(transport.command).toHaveBeenCalledWith('cover.cancel', { mediaId: media.id }));
-    expect((screen.getByRole('button', { name: 'Generate AI variation' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Generating…' }) as HTMLButtonElement).disabled).toBe(true);
     await act(async () => rejectGeneration(new Error('Cancelled')));
     expect((screen.getByRole('button', { name: 'Generate AI variation' }) as HTMLButtonElement).disabled).toBe(false);
     expect(screen.getByRole('status').textContent).toBe('AI creation cancelled');

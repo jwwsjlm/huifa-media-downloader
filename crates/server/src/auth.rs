@@ -1,60 +1,40 @@
 use anyhow::{Result, ensure};
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::http::{HeaderMap, StatusCode, header};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    net::IpAddr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 
 const SESSION_LIFETIME: Duration = Duration::from_secs(12 * 3600);
-const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 pub struct Auth {
-    account: [u8; 32],
-    password_hash: String,
+    app: Arc<huifa_core::App>,
     public_origin: Option<String>,
     sessions: Mutex<HashMap<[u8; 32], Session>>,
-    attempts: Mutex<HashMap<IpAddr, (Instant, u32)>>,
-    global: Mutex<(Instant, u32)>,
-    pub password_slots: tokio::sync::Semaphore,
+    pub password_slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
 pub struct Session {
     pub csrf: String,
     expires: Instant,
+    generation: u64,
 }
 
 impl Auth {
-    pub fn new(account: &str, password: &str, public_origin: Option<String>) -> Result<Self> {
-        ensure!(
-            !account.trim().is_empty() && account.len() <= 128,
-            "HUIFA_ACCOUNT must be set and at most 128 bytes"
-        );
-        ensure!(
-            !password.trim().is_empty() && password.len() <= 4096,
-            "HUIFA_PASSWORD must be set and at most 4096 bytes"
-        );
-        let password_hash = Argon2::default()
-            .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
-            .map_err(|_| anyhow::anyhow!("password hashing failed"))?
-            .to_string();
+    pub fn new(app: Arc<huifa_core::App>, public_origin: Option<String>) -> Result<Self> {
         let public_origin = public_origin
             .map(|origin| normalized_origin(&origin))
             .transpose()?;
         Ok(Self {
-            account: digest(account.as_bytes()),
-            password_hash,
+            app,
             public_origin,
             sessions: Mutex::new(HashMap::new()),
-            attempts: Mutex::new(HashMap::new()),
-            global: Mutex::new((Instant::now(), 0)),
-            password_slots: tokio::sync::Semaphore::new(2),
+            password_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
 
@@ -83,43 +63,12 @@ impl Auth {
             .is_some_and(|v| v.starts_with("https://"))
     }
 
-    pub fn check_attempt(&self, ip: IpAddr) -> bool {
-        let now = Instant::now();
-        let mut global = self.global.lock().unwrap();
-        if now.duration_since(global.0) >= Duration::from_secs(60) {
-            *global = (now, 0);
-        }
-        if global.1 >= 30 {
-            return false;
-        }
-        let mut attempts = self.attempts.lock().unwrap();
-        attempts.retain(|_, (at, _)| now.duration_since(*at) < LOGIN_WINDOW);
-        if attempts.len() >= 1024 && !attempts.contains_key(&ip) {
-            return false;
-        }
-        let item = attempts.entry(ip).or_insert((now, 0));
-        if item.1 >= 5 {
-            return false;
-        }
-        item.1 += 1;
-        global.1 += 1;
-        true
-    }
-
-    pub fn verify(&self, account: &str, password: &str) -> bool {
-        let hash = PasswordHash::new(&self.password_hash).expect("validated Argon2 hash");
-        let valid_password = Argon2::default()
-            .verify_password(password.as_bytes(), &hash)
-            .is_ok();
-        let valid_account: bool = self.account.ct_eq(&digest(account.as_bytes())).into();
-        valid_password & valid_account
-    }
-
-    pub fn create_session(&self) -> (String, Session) {
+    pub fn create_session(&self, generation: u64) -> (String, Session) {
         let token = random_token();
         let session = Session {
             csrf: random_token(),
             expires: Instant::now() + SESSION_LIFETIME,
+            generation,
         };
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, item| item.expires > Instant::now());
@@ -138,7 +87,9 @@ impl Auth {
     pub fn session(&self, headers: &HeaderMap) -> Option<Session> {
         let token = cookie(headers)?;
         let mut sessions = self.sessions.lock().unwrap();
-        sessions.retain(|_, s| s.expires > Instant::now());
+        sessions.retain(|_, s| {
+            s.expires > Instant::now() && s.generation == self.app.access.generation()
+        });
         sessions.get(&digest(token.as_bytes())).cloned()
     }
 
@@ -225,16 +176,24 @@ mod tests {
         h.insert(header::ORIGIN, origin.parse().unwrap());
         h
     }
-    #[test]
-    fn session_origin_and_limits() -> Result<()> {
-        let auth = Auth::new("admin", "test-password", None)?;
-        assert!(auth.verify("admin", "test-password"));
-        assert!(!auth.verify("wrong", "test-password"));
-        assert!(!auth.verify("admin", "wrong"));
+    #[tokio::test]
+    async fn session_origin_and_limits() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        huifa_core::access::Access::initialize(directory.path(), "admin", "test-password")?;
+        let app = huifa_core::App::open(huifa_core::AppConfig {
+            data_dir: directory.path().into(),
+            download_dir: directory.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let auth = Auth::new(app.clone(), None)?;
+        assert!(app.access.verify("admin", "test-password"));
+        assert!(!app.access.verify("wrong", "test-password"));
+        assert!(!app.access.verify("admin", "wrong"));
         assert!(!auth.same_origin(&headers("http://evil.test")));
         assert!(!auth.same_origin(&HeaderMap::new()));
         assert!(auth.same_origin(&headers("http://localhost:19491")));
-        let (token, session) = auth.create_session();
+        let (token, session) = auth.create_session(app.access.generation());
         let mut h = headers("http://localhost:19491");
         h.insert(
             header::COOKIE,
@@ -249,12 +208,19 @@ mod tests {
             auth.authorize(&h, false).err(),
             Some(StatusCode::UNAUTHORIZED)
         );
-        let ip = "127.0.0.1".parse().unwrap();
-        for _ in 0..5 {
-            assert!(auth.check_attempt(ip));
-        }
-        assert!(!auth.check_attempt(ip));
-        assert!(Auth::new("admin", "", None).is_err());
+        let (token, _) = auth.create_session(app.access.generation());
+        h.insert(
+            header::COOKIE,
+            format!("huifa_session={token}").parse().unwrap(),
+        );
+        app.access
+            .change_password("test-password", "changed-password")?;
+        assert_eq!(
+            auth.authorize(&h, false).err(),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert!(app.access.verify("admin", "changed-password"));
+        app.shutdown().await?;
         Ok(())
     }
 }

@@ -80,10 +80,11 @@ async fn native_metadata_download_and_upstream_diagnostics() -> Result<()> {
     let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = socket.local_addr()?.port();
     drop(socket);
-    host.configure(true, true, port).await?;
+    host.configure(true, true, port, None).await?;
     let client = ()
         .serve(StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")),
+            StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
+                .auth_header("admin"),
         ))
         .await?;
     let request = |name: &'static str, args: Value| {

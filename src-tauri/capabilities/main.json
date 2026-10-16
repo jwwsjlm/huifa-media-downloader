@@ -3,5 +3,10 @@
   "identifier": "main",
   "description": "Main application window. Native operations stay behind ID-based host commands.",
   "windows": ["main"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+  "permissions": [
+    "core:event:allow-listen", "core:event:allow-unlisten",
+    "allow-command", "allow-capabilities", "allow-open-download-directory", "allow-choose-directory",
+    "allow-result-action", "allow-upload-asset", "allow-notify", "allow-check-update", "allow-install-update",
+    "allow-task-copy-value", "allow-release-status", "allow-open-release"
+  ]
 }

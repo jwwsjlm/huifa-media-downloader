@@ -20,12 +20,17 @@ chrono.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 chacha20poly1305.workspace = true
-rand_core.workspace = true
 image.workspace = true
 base64.workspace = true
 zip.workspace = true
 tar.workspace = true
 xz2.workspace = true
+futures-util = "0.3"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+subtle = "2"
+semver = "1"
+tokio-tungstenite = "0.26"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

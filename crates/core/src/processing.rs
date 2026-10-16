@@ -2,8 +2,8 @@ use crate::{
     App, DownloadOptions,
     download::{hash_file, write_sync},
     model::{
-        AuxiliaryPublication, Chapter, Media, Publication, SourceFile, SourceManifest, Task,
-        parse_time, text,
+        AuxiliaryPublication, Chapter, GeneratedFile, Media, Publication, SourceFile,
+        SourceManifest, Task, parse_time, text,
     },
     process::{self, LineCallback},
 };
@@ -39,7 +39,7 @@ pub(crate) fn workspace(app: &App, task: &Task) -> PathBuf {
 pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Result<Value> {
     let mut task = app.db.task(id)?;
     ensure!(
-        task.status == "completed",
+        matches!(task.status.as_str(), "completed" | "retained"),
         "Only completed tasks can be converted"
     );
     let media = app
@@ -74,6 +74,9 @@ pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Resu
     options.content_mode = "video".into();
     task.options = options;
     task.conversion = true;
+    task.previous_outputs.clear();
+    task.steps.clear();
+    task.step_index = None;
     task.publication = None;
     task.error = None;
     task.manifest = Some(SourceManifest {
@@ -107,12 +110,330 @@ pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Resu
     Ok(task.public())
 }
 
+pub(crate) async fn queue_conversion_options(
+    app: &App,
+    id: &str,
+    changes: &Value,
+) -> Result<Value> {
+    queue_conversion_prepared(app, id, changes, None).await
+}
+
+pub(crate) async fn preview_conversion(
+    app: &App,
+    id: &str,
+    changes: &Value,
+    strategy: &str,
+) -> Result<Value> {
+    let task = app.db.task(id)?;
+    ensure!(
+        matches!(task.status.as_str(), "completed" | "retained") && task.kind == "media",
+        "Only completed media can be converted"
+    );
+    let media = app
+        .db
+        .media_for_task(id)?
+        .context("Completed media does not exist")?;
+    let path = app.owned_path(&media.path)?;
+    let container = changes
+        .get("container")
+        .and_then(Value::as_str)
+        .filter(|value| *value != "auto")
+        .unwrap_or_else(|| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("mkv")
+        });
+    let probe = probe_file(app, &task, &path, &app.shutdown_token).await?;
+    conversion_plan(&probe, container, strategy, text(changes, "encoder"))
+}
+
+pub(crate) async fn queue_conversion_options_with_strategy(
+    app: &App,
+    id: &str,
+    changes: &Value,
+    strategy: &str,
+) -> Result<Value> {
+    let plan = preview_conversion(app, id, changes, strategy).await?;
+    queue_conversion_prepared(app, id, changes, Some(&plan)).await
+}
+
+fn conversion_plan(probe: &Value, container: &str, strategy: &str, encoder: &str) -> Result<Value> {
+    ensure!(
+        matches!(container, "mp4" | "mkv" | "mov" | "webm"),
+        "Unsupported conversion container: {container}"
+    );
+    ensure!(
+        matches!(strategy, "auto" | "remux" | "transcode"),
+        "Invalid conversion strategy: {strategy}"
+    );
+    let compatible = streams(probe)
+        .filter(|stream| matches!(text(stream, "codec_type"), "video" | "audio"))
+        .all(|stream| {
+            container_accepts(
+                container,
+                text(stream, "codec_type"),
+                text(stream, "codec_name"),
+            )
+        });
+    ensure!(
+        strategy != "remux" || compatible,
+        "The source codecs cannot be copied into {container}; choose automatic conversion or re-encoding"
+    );
+    let transcode = strategy == "transcode" || !compatible;
+    let encoder = if !transcode {
+        "copy"
+    } else if strategy != "transcode" || matches!(encoder, "" | "copy" | "original") {
+        if container == "webm" {
+            "libvpx-vp9"
+        } else {
+            "libx264"
+        }
+    } else {
+        encoder
+    };
+    let codec = if encoder == "libvpx-vp9" {
+        "vp9"
+    } else if encoder.contains("264") {
+        "h264"
+    } else if encoder.contains("265") || encoder.starts_with("hevc_") {
+        "hevc"
+    } else if encoder.contains("av1") {
+        "av1"
+    } else {
+        encoder
+    };
+    ensure!(
+        !transcode || container_accepts(container, "video", codec),
+        "The selected video encoder is incompatible with {container}"
+    );
+    let audio = if !transcode {
+        "copy"
+    } else if container == "webm" {
+        "libopus"
+    } else {
+        "aac"
+    };
+    Ok(
+        json!({"strategy":if transcode {"transcode"} else {"remux"}, "container":container,"encoder":encoder,"audioEncoder":audio,
+        "reason":if transcode { if compatible {"Re-encoding was selected"} else {"The source codecs are incompatible with the target container"} } else {"The source codecs can be copied without quality loss"}}),
+    )
+}
+
+fn container_accepts(container: &str, kind: &str, codec: &str) -> bool {
+    match (container, kind) {
+        ("mkv", _) => !matches!(codec, "" | "unknown" | "none"),
+        ("webm", "video") => matches!(codec, "vp8" | "vp9" | "av1"),
+        ("webm", "audio") => matches!(codec, "vorbis" | "opus"),
+        ("mp4" | "mov", "video") => matches!(codec, "h264" | "hevc" | "av1" | "mpeg4" | "mjpeg"),
+        ("mp4" | "mov", "audio") => matches!(codec, "aac" | "alac" | "mp3"),
+        _ => false,
+    }
+}
+
+async fn queue_conversion_prepared(
+    app: &App,
+    id: &str,
+    changes: &Value,
+    plan: Option<&Value>,
+) -> Result<Value> {
+    let original = app.db.task(id)?;
+    ensure!(
+        matches!(original.status.as_str(), "completed" | "retained") && original.kind == "media",
+        "Only completed media can be converted"
+    );
+    let media = app
+        .db
+        .media_for_task(id)?
+        .context("Completed media does not exist")?;
+    let changes = changes
+        .as_object()
+        .context("Conversion options must be an object")?;
+    ensure!(!changes.is_empty(), "Choose at least one conversion option");
+    let mut options = original.options.clone();
+    options.encoder = "copy".into();
+    options.content_mode = "video".into();
+    options.audio_format = "best".into();
+    options.container = "auto".into();
+    options.section_start.clear();
+    options.section_end.clear();
+    options.sponsorblock_mode = "off".into();
+    options.prepend_cover_enabled = false;
+    options.split_chapters = false;
+    options.embed_subtitles = false;
+    options.embed_thumbnail = false;
+    options.embed_metadata = false;
+    options.embed_chapters = false;
+    options.write_thumbnail = false;
+    options.write_info_json = false;
+    options.write_description = false;
+    options.write_comments = false;
+    let mut raw = serde_json::to_value(&options)?;
+    for (key, value) in changes {
+        ensure!(
+            matches!(
+                key.as_str(),
+                "contentMode"
+                    | "audioFormat"
+                    | "container"
+                    | "encoder"
+                    | "embedSubtitles"
+                    | "embedThumbnail"
+                    | "embedMetadata"
+                    | "embedChapters"
+                    | "subtitleFormat"
+            ),
+            "Unsupported conversion option: {key}"
+        );
+        raw[key] = value.clone();
+    }
+    if let Some(plan) = plan {
+        raw["container"] = plan["container"].clone();
+        raw["encoder"] = plan["encoder"].clone();
+    }
+    if raw["embedSubtitles"].as_bool() == Some(true) && options.languages().is_empty() {
+        raw["subtitleLanguage"] = json!("all");
+    }
+    let options = DownloadOptions::parse(raw)?;
+    ensure!(
+        matches!(options.content_mode.as_str(), "video" | "audio"),
+        "Conversion contentMode must be video or audio"
+    );
+    let path = app.owned_path(&media.path)?;
+    let (hash, size) = hash_file(&path)?;
+    let mut files = vec![SourceFile {
+        path: path.clone(),
+        hash,
+        size,
+        kind: "video".into(),
+        format_id: "local".into(),
+        language: None,
+    }];
+    for asset in &media.assets {
+        let kind = conversion_asset_kind(asset);
+        if !(kind == "subtitle" && options.embed_subtitles
+            || kind == "thumbnail" && options.embed_thumbnail)
+        {
+            continue;
+        }
+        let owned = app.owned_path(asset)?;
+        let (hash, size) = hash_file(&owned)?;
+        files.push(SourceFile {
+            path: owned,
+            hash,
+            size,
+            kind: kind.into(),
+            format_id: String::new(),
+            language: asset
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|stem| stem.rsplit('.').next())
+                .map(str::to_string),
+        });
+    }
+    ensure!(
+        !options.embed_subtitles || files.iter().any(|f| f.kind == "subtitle"),
+        "No saved subtitles are available; download subtitles before embedding them"
+    );
+    ensure!(
+        !options.embed_thumbnail || files.iter().any(|f| f.kind == "thumbnail"),
+        "No saved thumbnail is available; download a thumbnail before embedding it"
+    );
+    let mut metadata = original
+        .manifest
+        .as_ref()
+        .map(|m| m.metadata.clone())
+        .unwrap_or(Value::Null);
+    ensure!(
+        !options.embed_metadata || metadata.is_object(),
+        "Saved metadata is unavailable for this media"
+    );
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove("_conversionAudioEncoder");
+    }
+    if let Some(plan) = plan {
+        if !metadata.is_object() {
+            metadata = json!({"title":media.title});
+        }
+        metadata["_conversionAudioEncoder"] = plan["audioEncoder"].clone();
+    }
+    let chapters = original
+        .manifest
+        .as_ref()
+        .map(|m| m.chapters.clone())
+        .unwrap_or_default();
+    ensure!(
+        !options.embed_chapters || !chapters.is_empty(),
+        "No saved chapters are available for this media"
+    );
+    let extension = if options.content_mode == "audio" {
+        crate::download::output_extension(
+            &options,
+            &[json!({"ext":"mka","acodec":"unknown","vcodec":"none"})],
+        )
+    } else if options.effective_container() != "auto" {
+        options.effective_container().into()
+    } else {
+        path.extension()
+            .and_then(|v| v.to_str())
+            .context("Media has no extension")?
+            .into()
+    };
+    let mut task = original;
+    task.id = uuid::Uuid::new_v4().to_string();
+    task.thumbnail = None;
+    task.created_at = chrono::Utc::now().to_rfc3339();
+    task.options = options;
+    task.conversion = true;
+    task.previous_outputs.clear();
+    task.steps.clear();
+    task.step_index = None;
+    task.files.clear();
+    task.warnings.clear();
+    task.publication = None;
+    task.error = None;
+    task.cookie_snapshot = None;
+    task.proxy_snapshot = None;
+    task.output_path = Some(path.with_file_name(format!(
+        "{} [converted-{}].{}",
+        path.file_stem().unwrap().to_string_lossy(),
+        &task.id[..8],
+        extension
+    )));
+    task.manifest = Some(SourceManifest {
+        version: 1,
+        directory: path.parent().unwrap().to_path_buf(),
+        files,
+        metadata,
+        duration: Some(media.duration),
+        chapters,
+        sponsor_segments: vec![],
+        output_extension: extension,
+    });
+    task.stage("waiting_processing", "waiting_processing", None);
+    app.db.insert_task(&task)?;
+    app.emit("task.upsert", task.public());
+    app.schedule(&task.id)?;
+    Ok(task.public())
+}
+
+fn conversion_asset_kind(path: &Path) -> &str {
+    match path.extension().and_then(|v| v.to_str()).unwrap_or("") {
+        "srt" | "vtt" | "ass" | "ssa" | "ttml" | "lrc" => "subtitle",
+        "jpg" | "jpeg" | "png" | "webp" => "thumbnail",
+        _ => "other",
+    }
+}
+
 pub(crate) async fn process_task(
     app: &Arc<App>,
     id: &str,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let task = app.db.task(id)?;
+    let mut task = app.db.task(id)?;
+    if task.steps.is_empty() && task.status != "completed" {
+        crate::workflow::plan(&mut task);
+        app.save_task(&task)?;
+    }
     if task.publication.is_some() {
         return publish(app, task, cancel).await;
     }
@@ -149,6 +470,9 @@ pub(crate) async fn process_task(
                 .to_string_lossy()
         );
     }
+    if task.kind == "assets" {
+        return prepare_assets(app, task, cancel).await;
+    }
     let workspace = workspace(app, &task);
     crate::reject_links(&workspace)?;
     std::fs::create_dir_all(&workspace)?;
@@ -179,7 +503,7 @@ pub(crate) async fn process_task(
     let mut audio = Vec::new();
     let separate = inputs.iter().any(|i| i.kind == "audio");
     for (index, input) in inputs.iter().enumerate() {
-        if separate && input.kind != "audio" {
+        if separate && input.kind != "audio" && task.options.audio_track != "all" {
             continue;
         }
         for stream in streams(&input.probe).filter(|s| text(s, "codec_type") == "audio") {
@@ -557,7 +881,15 @@ pub(crate) async fn process_task(
             args.extend(["-r".into(), fps.to_string()]);
         }
     }
-    let audio_codec = audio_codec(&task.options, filtering, extension);
+    let audio_codec = (task.conversion && task.options.content_mode == "video")
+        .then(|| {
+            manifest
+                .metadata
+                .get("_conversionAudioEncoder")
+                .and_then(Value::as_str)
+        })
+        .flatten()
+        .unwrap_or_else(|| audio_codec(&task.options, filtering, extension));
     if !audio.is_empty() {
         args.extend(["-c:a".into(), audio_codec.into()]);
         if !matches!(audio_codec, "copy" | "pcm_s16le" | "flac" | "alac" | "aac") {
@@ -765,30 +1097,19 @@ pub(crate) async fn process_task(
         );
     }
     let directory = if task.options.organize_task_folder {
-        app.config
-            .download_dir
-            .join(sanitize_filename(&task.title))
-            .join(&task.id[..8])
+        app.config.download_dir.join(sanitize_filename(&task.title))
     } else {
         app.config.download_dir.clone()
     };
     crate::reject_links(&directory)?;
     std::fs::create_dir_all(&directory)?;
-    let mut target = if task.conversion {
+    let target = if task.conversion {
         task.output_path
             .clone()
             .context("Conversion task has no output path")?
     } else {
         directory.join(output_filename(&task, extension))
     };
-    if !task.conversion && target.exists() {
-        target = target.with_file_name(format!(
-            "{} [{}].{}",
-            target.file_stem().unwrap().to_string_lossy(),
-            &task.id[..8],
-            extension
-        ));
-    }
     let mut auxiliary = Vec::new();
     if !task.conversion {
         for source in manifest
@@ -804,7 +1125,7 @@ pub(crate) async fn process_task(
                 "description.txt"
             };
             let destination = target.with_extension(suffix);
-            auxiliary.push(make_auxiliary(&source.path, destination)?);
+            auxiliary.push(make_auxiliary(&source.path, destination, &task.id)?);
         }
         if task.options.write_thumbnail
             && let Some(path) = &thumbnail
@@ -812,6 +1133,7 @@ pub(crate) async fn process_task(
             auxiliary.push(make_auxiliary(
                 path,
                 target.with_extension(path.extension().unwrap()),
+                &task.id,
             )?);
         }
         for (path, language) in &subtitles {
@@ -821,6 +1143,7 @@ pub(crate) async fn process_task(
                     "{language}.{}",
                     path.extension().unwrap().to_string_lossy()
                 )),
+                &task.id,
             )?);
         }
         if task.options.split_chapters {
@@ -854,7 +1177,7 @@ pub(crate) async fn process_task(
                     sanitize_filename(&chapter.title),
                     extension
                 );
-                auxiliary.push(make_auxiliary(&path, directory.join(name))?);
+                auxiliary.push(make_auxiliary(&path, directory.join(name), &task.id)?);
             }
         }
     }
@@ -884,6 +1207,110 @@ pub(crate) async fn process_task(
     prepared.stage("processing", "publishing", None);
     app.save_task(&prepared)?;
     publish(app, prepared, cancel).await
+}
+
+async fn prepare_assets(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> Result<()> {
+    let manifest = task
+        .manifest
+        .as_ref()
+        .context("Asset source manifest is missing")?;
+    let workspace = workspace(app, &task);
+    crate::reject_links(&workspace)?;
+    std::fs::create_dir_all(&workspace)?;
+    let mut assets: Vec<(PathBuf, String, String)> = manifest
+        .files
+        .iter()
+        .filter(|source| matches!(source.kind.as_str(), "info" | "description"))
+        .map(|source| {
+            (
+                source.path.clone(),
+                source.kind.clone(),
+                if source.kind == "info" {
+                    "info.json".into()
+                } else {
+                    "description.txt".into()
+                },
+            )
+        })
+        .collect();
+    if let Some(thumbnail) = prepare_thumbnail(&task, &workspace)? {
+        let suffix = thumbnail
+            .extension()
+            .context("Thumbnail has no extension")?
+            .to_string_lossy()
+            .into_owned();
+        assets.push((thumbnail, "thumbnail".into(), suffix));
+    }
+    for (path, language) in prepare_subtitles(
+        app,
+        &task,
+        &workspace,
+        &[(0.0, manifest.duration.unwrap_or(0.0))],
+        false,
+        0.0,
+        cancel,
+    )
+    .await?
+    {
+        let extension = path
+            .extension()
+            .context("Subtitle has no extension")?
+            .to_string_lossy();
+        let suffix = format!("{}.{}", sanitize_filename(&language), extension);
+        assets.push((path, "subtitle".into(), suffix));
+    }
+    if assets.is_empty() {
+        task = app.db.task(&task.id)?;
+        task.warnings
+            .push("The requested assets were not provided by this media source.".into());
+        task.stage("completed", "completed", Some(100.0));
+        return app.save_task(&task);
+    }
+    let directory = if task.options.organize_task_folder {
+        app.config.download_dir.join(sanitize_filename(&task.title))
+    } else {
+        app.config.download_dir.clone()
+    };
+    crate::reject_links(&directory)?;
+    std::fs::create_dir_all(&directory)?;
+    let stem = format!(
+        "{} [assets-{}]",
+        sanitize_filename(&task.title),
+        &task.id[..8]
+    );
+    let mut outputs = Vec::new();
+    task.files.clear();
+    for (path, kind, suffix) in assets {
+        if cancel.is_cancelled() {
+            bail!("Operation interrupted");
+        }
+        let target = directory.join(format!("{stem}.{suffix}"));
+        let output = make_auxiliary(&path, target, &task.id)?;
+        task.files.push(GeneratedFile {
+            filename: output
+                .target
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            kind,
+            size: output.size,
+        });
+        outputs.push(output);
+    }
+    let primary = outputs.remove(0);
+    task.publication = Some(Publication {
+        temporary: primary.temporary,
+        target: primary.target,
+        hash: primary.hash,
+        size: primary.size,
+        duration: 0.0,
+        auxiliary: outputs,
+        backup: None,
+    });
+    task.stage("processing", "publishing", None);
+    app.save_task(&task)?;
+    publish(app, task, cancel).await
 }
 
 struct ChapterSplit<'a> {
@@ -1064,9 +1491,9 @@ async fn split_chapter(
     Ok(())
 }
 
-fn make_auxiliary(source: &Path, target: PathBuf) -> Result<AuxiliaryPublication> {
+fn make_auxiliary(source: &Path, target: PathBuf, task_id: &str) -> Result<AuxiliaryPublication> {
     let temporary = target.with_file_name(format!(
-        ".{}.publish",
+        ".{}.{task_id}.publish",
         target.file_name().unwrap().to_string_lossy()
     ));
     copy_sync(source, &temporary)?;
@@ -1091,87 +1518,297 @@ fn copy_sync(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+fn publication_files(
+    publication: &Publication,
+    task_id: &str,
+) -> (Vec<AuxiliaryPublication>, Vec<PathBuf>) {
+    let entries = std::iter::once(AuxiliaryPublication {
+        temporary: publication.temporary.clone(),
+        target: publication.target.clone(),
+        hash: publication.hash.clone(),
+        size: publication.size,
+    })
+    .chain(publication.auxiliary.clone())
+    .collect::<Vec<_>>();
+    let backups = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if index == 0
+                && let Some(path) = &publication.backup
+            {
+                return path.clone();
+            }
+            entry.target.with_file_name(format!(
+                ".{}.{task_id}.before-publication",
+                entry.target.file_name().unwrap().to_string_lossy()
+            ))
+        })
+        .collect();
+    (entries, backups)
+}
+
+pub(crate) async fn prepare_redownload(app: &App, task: &Task) -> Result<()> {
+    let _publication_guard = app.publication_lock.lock().await;
+    let mut task = app.db.task(&task.id)?;
+    if task.status == "completed" {
+        return Ok(());
+    }
+    let Some(publication) = &task.publication else {
+        return Ok(());
+    };
+    let (entries, backups) = publication_files(publication, &task.id);
+    let previous = app.db.media_for_task(&task.id)?;
+    let result = (|| -> Result<()> {
+        let mut installed = Vec::new();
+        for (index, (entry, backup)) in entries.iter().zip(&backups).enumerate() {
+            for path in [&entry.target, &entry.temporary, backup] {
+                crate::reject_links(path)?;
+                ensure!(
+                    path.parent()
+                        .context("Publication path has no directory")?
+                        .canonicalize()?
+                        .starts_with(&app.config.download_dir),
+                    "Publication path is outside the owned downloads directory"
+                );
+            }
+            if entry.temporary.exists() {
+                ensure!(
+                    hash_file(&entry.temporary)? == (entry.hash.clone(), entry.size),
+                    "Prepared output changed; publication files were preserved"
+                );
+            }
+            let target_matches = entry.target.exists()
+                && hash_file(&entry.target)? == (entry.hash.clone(), entry.size);
+            let old_owned = task.previous_outputs.contains(&entry.target)
+                || previous.as_ref().is_some_and(|media| {
+                    media.path == entry.target || media.assets.contains(&entry.target)
+                })
+                || task.conversion
+                    && task.manifest.as_ref().is_some_and(|manifest| {
+                        manifest
+                            .files
+                            .iter()
+                            .any(|source| source.path == entry.target)
+                    });
+            if backup.exists() {
+                ensure!(
+                    old_owned,
+                    "Publication backup has no previously managed output; files were preserved"
+                );
+                ensure!(
+                    backup.is_file(),
+                    "Original publication backup is not a regular file"
+                );
+                ensure!(
+                    !entry.target.exists() || target_matches,
+                    "Publication destination changed; original backup was preserved"
+                );
+                installed.push(index);
+            } else if target_matches && !entry.temporary.exists() && !old_owned {
+                installed.push(index);
+            }
+        }
+        rollback_publication(&entries, &backups, &installed)?;
+        for entry in &entries {
+            if entry.temporary.exists() {
+                ensure!(
+                    hash_file(&entry.temporary)? == (entry.hash.clone(), entry.size),
+                    "Prepared output changed during recovery"
+                );
+                std::fs::remove_file(&entry.temporary)?;
+            }
+        }
+        Ok(())
+    })();
+    result.context("Cannot safely restart this download; saved files and the publication journal were preserved. Retry processing to recover the previous publication")?;
+    task.publication = None;
+    app.save_task(&task)
+}
+
+pub(crate) async fn prepare_task_deletion(app: &App, id: &str) -> Result<()> {
+    let task = app.db.task(id)?;
+    if task.status != "completed" {
+        return prepare_redownload(app, &task).await;
+    }
+    let _publication_guard = app.publication_lock.lock().await;
+    let Some(publication) = &task.publication else {
+        return Ok(());
+    };
+    let (entries, backups) = publication_files(publication, id);
+    for (entry, backup) in entries.iter().zip(&backups) {
+        for path in [&entry.target, &entry.temporary, backup] {
+            crate::reject_links(path)?;
+            ensure!(
+                path.parent()
+                    .context("Publication path has no directory")?
+                    .canonicalize()?
+                    .starts_with(&app.config.download_dir),
+                "Publication path is outside the owned downloads directory"
+            );
+        }
+        if entry.temporary.exists() {
+            ensure!(
+                hash_file(&entry.temporary)? == (entry.hash.clone(), entry.size),
+                "Prepared output changed; publication files were preserved"
+            );
+        }
+        if backup.exists() {
+            ensure!(
+                entry.target.is_file()
+                    && hash_file(&entry.target)? == (entry.hash.clone(), entry.size),
+                "Publication destination changed; original backup was preserved"
+            );
+        }
+    }
+    for (entry, backup) in entries.iter().zip(&backups) {
+        if entry.temporary.exists() {
+            std::fs::remove_file(&entry.temporary)?;
+        }
+        if backup.exists() {
+            std::fs::remove_file(backup)?;
+        }
+    }
+    Ok(())
+}
+
 async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> Result<()> {
+    let _publication_guard = tokio::select! {
+        guard = app.publication_lock.lock() => guard,
+        _ = cancel.cancelled() => bail!("Operation interrupted"),
+    };
     let publication = task
         .publication
         .clone()
         .context("Publication journal is missing")?;
-    for path in std::iter::once(&publication.target)
-        .chain(std::iter::once(&publication.temporary))
-        .chain(publication.backup.iter())
-        .chain(
-            publication
-                .auxiliary
-                .iter()
-                .flat_map(|a| [&a.target, &a.temporary]),
-        )
-    {
-        crate::reject_links(path)?;
-        ensure!(
-            path.parent()
-                .context("Publication path has no directory")?
-                .canonicalize()?
-                .starts_with(&app.config.download_dir),
-            "Publication path is outside the owned downloads directory"
-        );
-    }
-    if cancel.is_cancelled() {
-        bail!("Operation interrupted");
-    }
-    let target_matches = publication.target.exists()
-        && hash_file(&publication.target)? == (publication.hash.clone(), publication.size);
-    if !target_matches {
-        ensure!(
-            publication.temporary.exists(),
-            "Publication output is missing; saved sources remain available"
-        );
-        ensure!(
-            hash_file(&publication.temporary)? == (publication.hash.clone(), publication.size),
-            "Prepared output changed after validation"
-        );
-        if publication.target.exists() {
-            let backup = publication
-                .backup
-                .as_ref()
-                .context("Publication filename is already occupied")?;
-            if !backup.exists() {
-                let original = task
-                    .manifest
-                    .as_ref()
-                    .and_then(|m| m.files.iter().find(|s| s.path == publication.target))
-                    .context("Conversion source is missing from its manifest")?;
-                ensure!(
-                    hash_file(&publication.target)? == (original.hash.clone(), original.size),
-                    "Conversion source changed before publication"
-                );
-                std::fs::rename(&publication.target, backup)?;
-            } else {
-                bail!("Conversion destination is occupied; original backup is preserved");
-            }
+    let previous = app.db.media_for_task(&task.id)?;
+    let (entries, backups) = publication_files(&publication, &task.id);
+    let all_media = app.db.media()?;
+    let mut destinations = std::collections::HashSet::new();
+    for (entry, backup) in entries.iter().zip(&backups) {
+        for path in [&entry.target, &entry.temporary, backup] {
+            crate::reject_links(path)?;
+            ensure!(
+                path.parent()
+                    .context("Publication path has no directory")?
+                    .canonicalize()?
+                    .starts_with(&app.config.download_dir),
+                "Publication path is outside the owned downloads directory"
+            );
         }
-        std::fs::rename(&publication.temporary, &publication.target)?;
-        sync_directory(publication.target.parent().unwrap())?;
-    }
-    for auxiliary in &publication.auxiliary {
-        if auxiliary.target.exists()
-            && hash_file(&auxiliary.target)? == (auxiliary.hash.clone(), auxiliary.size)
-        {
+        let destination = entry.target.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let destination = destination.to_lowercase();
+        ensure!(
+            destinations.insert(destination),
+            "Two generated files have the same publication filename"
+        );
+        ensure!(
+            !all_media.iter().any(|media| media.task_id != task.id
+                && (media.path == entry.target || media.assets.contains(&entry.target))),
+            "Publication filename belongs to another task"
+        );
+        let matches =
+            entry.target.exists() && hash_file(&entry.target)? == (entry.hash.clone(), entry.size);
+        let owned = previous.as_ref().is_some_and(|media| {
+            media.path == entry.target || media.assets.contains(&entry.target)
+        }) || task.kind == "assets" && task.previous_outputs.contains(&entry.target);
+        if matches {
+            ensure!(
+                owned || !entry.temporary.exists() || task.status == "completed",
+                "Publication filename is already occupied by an unmanaged file"
+            );
             continue;
         }
         ensure!(
-            !auxiliary.target.exists(),
-            "An output sidecar filename is occupied"
+            entry.temporary.is_file(),
+            "Publication output is missing; saved sources remain available"
         );
         ensure!(
-            hash_file(&auxiliary.temporary)? == (auxiliary.hash.clone(), auxiliary.size),
-            "Prepared output sidecar changed"
+            hash_file(&entry.temporary)? == (entry.hash.clone(), entry.size),
+            "Prepared output changed after validation"
         );
-        std::fs::rename(&auxiliary.temporary, &auxiliary.target)?;
+        if entry.target.exists() {
+            ensure!(
+                !backup.exists(),
+                "Publication destination is occupied; original backup is preserved"
+            );
+            let conversion_source = task.conversion
+                && task.manifest.as_ref().is_some_and(|manifest| {
+                    manifest.files.iter().any(|source| {
+                        source.path == entry.target
+                            && hash_file(&entry.target)
+                                .is_ok_and(|value| value == (source.hash.clone(), source.size))
+                    })
+                });
+            ensure!(
+                owned || conversion_source,
+                "Publication filename is already occupied by an unmanaged file"
+            );
+        }
     }
-    sync_directory(publication.target.parent().unwrap())?;
-    app.set_stage(&task.id, "processing", "validating_publication", None)?;
-    let _ = probe_file(app, &task, &publication.target, cancel).await?;
-    let previous = app.db.media_for_task(&task.id)?;
+    let mut installed = backups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, backup)| backup.exists().then_some(index))
+        .collect::<Vec<_>>();
+    let result = async {
+        for (index, (entry, backup)) in entries.iter().zip(&backups).enumerate() {
+            ensure!(!cancel.is_cancelled(), "Operation interrupted");
+            if entry.target.exists()
+                && hash_file(&entry.target)? == (entry.hash.clone(), entry.size)
+            {
+                continue;
+            }
+            if entry.target.exists() {
+                std::fs::rename(&entry.target, backup)?;
+            }
+            // Record before rename so a failed installation also restores the old file.
+            if !installed.contains(&index) {
+                installed.push(index);
+            }
+            std::fs::rename(&entry.temporary, &entry.target)?;
+        }
+        sync_directory(publication.target.parent().unwrap())?;
+        app.set_stage(&task.id, "processing", "validating_publication", None)?;
+        if task.kind != "assets" {
+            probe_file(app, &task, &publication.target, cancel).await?;
+        }
+        ensure!(!cancel.is_cancelled(), "Operation interrupted");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        return match rollback_publication(&entries, &backups, &installed) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(error.context(format!(
+                "Original files are preserved in publication backups; rollback failed: {rollback:#}"
+            ))),
+        };
+    }
+    if task.kind == "assets" {
+        task = match app.db.task(&task.id) {
+            Ok(task) => task,
+            Err(error) => {
+                rollback_publication(&entries, &backups, &installed)?;
+                return Err(error);
+            }
+        };
+        task.output_path = Some(publication.target);
+        task.error = None;
+        task.stage("completed", "completed", Some(100.0));
+        if let Err(error) = app.save_task(&task) {
+            rollback_publication(&entries, &backups, &installed)?;
+            return Err(error);
+        }
+        cleanup_backups(&backups);
+        let current = entries
+            .iter()
+            .map(|entry| entry.target.clone())
+            .collect::<Vec<_>>();
+        cleanup_replaced_paths(app, &task.id, &task.previous_outputs, &current, &all_media);
+        return Ok(());
+    }
     let mut assets = if task.conversion {
         previous
             .as_ref()
@@ -1199,19 +1836,98 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
         path: publication.target.clone(),
         assets,
     };
-    task = app.db.task(&task.id)?;
+    task = match app.db.task(&task.id) {
+        Ok(task) => task,
+        Err(error) => {
+            rollback_publication(&entries, &backups, &installed)?;
+            return Err(error);
+        }
+    };
     task.output_path = Some(publication.target.clone());
     task.error = None;
     task.stage("completed", "completed", Some(100.0));
-    let media = app.db.complete(&task, &media)?;
+    let media = match app.db.complete(&task, &media) {
+        Ok(media) => media,
+        Err(error) => {
+            rollback_publication(&entries, &backups, &installed)?;
+            return Err(error);
+        }
+    };
     app.emit("task.upsert", task.public());
     app.emit("media.upsert", media.public());
-    if let Some(backup) = publication.backup
-        && backup.exists()
-    {
-        std::fs::remove_file(backup)?;
+    cleanup_backups(&backups);
+    if let Some(previous) = previous {
+        let old = std::iter::once(previous.path)
+            .chain(previous.assets)
+            .collect::<Vec<_>>();
+        let current = std::iter::once(media.path.clone())
+            .chain(media.assets.clone())
+            .collect::<Vec<_>>();
+        cleanup_replaced_paths(app, &task.id, &old, &current, &all_media);
     }
     Ok(())
+}
+
+fn rollback_publication(
+    entries: &[AuxiliaryPublication],
+    backups: &[PathBuf],
+    installed: &[usize],
+) -> Result<()> {
+    for index in installed.iter().rev().copied() {
+        let entry = &entries[index];
+        if entry.target.exists() {
+            ensure!(
+                hash_file(&entry.target)? == (entry.hash.clone(), entry.size),
+                "Published file changed; original backup was preserved"
+            );
+            if entry.temporary.exists() {
+                std::fs::remove_file(&entry.target)?;
+            } else {
+                std::fs::rename(&entry.target, &entry.temporary)?;
+            }
+        }
+        if backups[index].exists() {
+            std::fs::rename(&backups[index], &entry.target)?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_backups(backups: &[PathBuf]) {
+    for backup in backups {
+        if backup.exists() {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+}
+
+fn cleanup_replaced_paths(
+    app: &App,
+    task_id: &str,
+    previous: &[PathBuf],
+    current: &[PathBuf],
+    other_media: &[Media],
+) {
+    for path in previous {
+        if current.contains(path)
+            || other_media.iter().any(|media| {
+                media.task_id != task_id && (media.path == *path || media.assets.contains(path))
+            })
+        {
+            continue;
+        }
+        if path.exists()
+            && let Ok(owned) = app.owned_path(path)
+        {
+            // A failed cleanup must not turn a successfully committed download into a failed task.
+            if std::fs::remove_file(&owned).is_ok()
+                && let Some(parent) = owned.parent()
+                && parent.file_name().is_some_and(|name| name == &task_id[..8])
+            {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -1744,6 +2460,888 @@ fn srt_time(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conversion_preview_selects_copy_or_compatible_encoders() -> Result<()> {
+        let h264 = json!({"streams":[{"codec_type":"video","codec_name":"h264"},{"codec_type":"audio","codec_name":"aac"}]});
+        let plan = conversion_plan(&h264, "mp4", "auto", "")?;
+        assert_eq!(plan["strategy"], "remux");
+        assert_eq!(plan["encoder"], "copy");
+        assert_eq!(plan["audioEncoder"], "copy");
+        let webm = conversion_plan(&h264, "webm", "auto", "")?;
+        assert_eq!(webm["strategy"], "transcode");
+        assert_eq!(webm["encoder"], "libvpx-vp9");
+        assert_eq!(webm["audioEncoder"], "libopus");
+        let vp9 = json!({"streams":[{"codec_type":"video","codec_name":"vp9"},{"codec_type":"audio","codec_name":"opus"}]});
+        assert_eq!(
+            conversion_plan(&vp9, "mp4", "auto", "")?["encoder"],
+            "libx264"
+        );
+        assert!(conversion_plan(&vp9, "mp4", "remux", "").is_err());
+        assert!(conversion_plan(&h264, "webm", "transcode", "libx264").is_err());
+        assert!(conversion_plan(&h264, "outside", "auto", "").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_restores_original_media_and_sidecars() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        let target = app.config.download_dir.join("视频.mkv");
+        let sidecar = target.with_extension("en.srt");
+        write_sync(&target, b"old video")?;
+        write_sync(&sidecar, b"old subtitle")?;
+        task.stage("completed", "completed", Some(100.0));
+        app.db.insert_task(&task)?;
+        app.db.complete(
+            &task,
+            &Media {
+                id: "old-media".into(),
+                task_id: task.id.clone(),
+                title: "视频".into(),
+                filename: "视频.mkv".into(),
+                size: 9,
+                duration: 1.0,
+                path: target.clone(),
+                assets: vec![sidecar.clone()],
+            },
+        )?;
+        let source = app.config.download_dir.join("new-source.bin");
+        write_sync(&source, b"new invalid video")?;
+        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        write_sync(&source, b"new subtitle")?;
+        let subtitle = make_auxiliary(&source, sidecar.clone(), &task.id)?;
+        task.publication = Some(Publication {
+            temporary: main.temporary.clone(),
+            target: target.clone(),
+            hash: main.hash,
+            size: main.size,
+            duration: 1.0,
+            auxiliary: vec![subtitle.clone()],
+            backup: None,
+        });
+        task.stage("processing", "publishing", None);
+        app.db.save_task(&task)?;
+        // Missing frozen FFprobe makes final validation fail after both files were installed.
+        assert!(
+            publish(&app, task.clone(), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&target)?, b"old video");
+        assert_eq!(std::fs::read(&sidecar)?, b"old subtitle");
+        assert_eq!(std::fs::read(&main.temporary)?, b"new invalid video");
+        assert_eq!(std::fs::read(&subtitle.temporary)?, b"new subtitle");
+        assert_eq!(app.db.media_for_task(&task.id)?.unwrap().id, "old-media");
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_failed_asset_publication_preserves_unmanaged_destinations() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        let target = app.config.download_dir.join("user-notes.txt");
+        let source = app.config.download_dir.join("source.bin");
+        write_sync(&target, b"user notes")?;
+        write_sync(&source, b"downloaded notes")?;
+        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        task.publication = Some(Publication {
+            temporary: output.temporary.clone(),
+            target: target.clone(),
+            hash: output.hash,
+            size: output.size,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        task.stage("processing_failed", "publishing", None);
+        app.db.insert_task(&task)?;
+        assert!(
+            publish(&app, task.clone(), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        app.command("tasks.delete", json!({"id":task.id,"deleteFiles":true}))
+            .await?;
+        assert_eq!(std::fs::read(target)?, b"user notes");
+        assert!(!output.temporary.exists());
+        assert!(app.db.task(&task.id).is_err());
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_interrupted_publication_cleans_its_journal_and_restores_kept_files()
+    -> Result<()> {
+        for delete_files in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let app = App::open(crate::AppConfig {
+                data_dir: temp.path().join("data"),
+                download_dir: temp.path().join("output"),
+                tool_dir: None,
+            })
+            .await?;
+            let mut task = crate::tests::paused_task(Default::default());
+            task.kind = "assets".into();
+            let target = app.config.download_dir.join("notes.txt");
+            let subtitle = app.config.download_dir.join("notes.en.srt");
+            let source = app.config.download_dir.join("source.bin");
+            write_sync(&target, b"old notes")?;
+            write_sync(&source, b"new notes")?;
+            let main = make_auxiliary(&source, target.clone(), &task.id)?;
+            let sidecar = make_auxiliary(&source, subtitle.clone(), &task.id)?;
+            task.previous_outputs = vec![target.clone()];
+            task.publication = Some(Publication {
+                temporary: main.temporary.clone(),
+                target: target.clone(),
+                hash: main.hash,
+                size: main.size,
+                duration: 0.0,
+                auxiliary: vec![sidecar.clone()],
+                backup: None,
+            });
+            app.db.insert_task(&task)?;
+            let (_, backups) = publication_files(task.publication.as_ref().unwrap(), &task.id);
+            std::fs::rename(&target, &backups[0])?;
+            std::fs::rename(&main.temporary, &target)?;
+            app.command(
+                "tasks.delete",
+                json!({"id":task.id,"deleteFiles":delete_files}),
+            )
+            .await?;
+            assert_eq!(target.exists(), !delete_files);
+            if !delete_files {
+                assert_eq!(std::fs::read(target)?, b"old notes");
+            }
+            assert!(!subtitle.exists());
+            assert!(!main.temporary.exists());
+            assert!(!sidecar.temporary.exists());
+            assert!(backups.iter().all(|path| !path.exists()));
+            assert!(app.db.task(&task.id).is_err());
+            app.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_cleans_artifacts_left_after_a_committed_publication() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        task.stage("completed", "completed", Some(100.0));
+        let target = app.config.download_dir.join("notes.txt");
+        write_sync(&target, b"new notes")?;
+        let main = make_auxiliary(&target, target.clone(), &task.id)?;
+        task.publication = Some(Publication {
+            temporary: main.temporary.clone(),
+            target: target.clone(),
+            hash: main.hash,
+            size: main.size,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        app.db.insert_task(&task)?;
+        let (_, backups) = publication_files(task.publication.as_ref().unwrap(), &task.id);
+        write_sync(&backups[0], b"old notes")?;
+        app.command("tasks.delete", json!({"id":task.id,"deleteFiles":false}))
+            .await?;
+        assert_eq!(std::fs::read(target)?, b"new notes");
+        assert!(!main.temporary.exists());
+        assert!(!backups[0].exists());
+        assert!(app.db.task(&task.id).is_err());
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_preserves_a_journal_that_cannot_be_recovered_safely() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        let target = app.config.download_dir.join("notes.txt");
+        let source = app.config.download_dir.join("source.bin");
+        write_sync(&target, b"old notes")?;
+        write_sync(&source, b"new notes")?;
+        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        task.previous_outputs = vec![target.clone()];
+        task.publication = Some(Publication {
+            temporary: main.temporary.clone(),
+            target: target.clone(),
+            hash: main.hash,
+            size: main.size,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        app.db.insert_task(&task)?;
+        let (_, backups) = publication_files(task.publication.as_ref().unwrap(), &task.id);
+        std::fs::rename(&target, &backups[0])?;
+        write_sync(&target, b"external edits")?;
+        assert!(
+            app.command("tasks.delete", json!({"id":task.id,"deleteFiles":true}))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(target)?, b"external edits");
+        assert_eq!(std::fs::read(&backups[0])?, b"old notes");
+        assert!(main.temporary.exists());
+        assert!(app.db.task(&task.id)?.publication.is_some());
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publication_preflight_does_not_overwrite_unmanaged_sidecars() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        let target = app.config.download_dir.join("notes.txt");
+        let sidecar = app.config.download_dir.join("cover.jpg");
+        let source = app.config.download_dir.join("source.bin");
+        write_sync(&source, b"new notes")?;
+        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        let cover = make_auxiliary(&source, sidecar.clone(), &task.id)?;
+        write_sync(&sidecar, b"user-owned image")?;
+        task.publication = Some(Publication {
+            temporary: main.temporary,
+            target: target.clone(),
+            hash: main.hash,
+            size: main.size,
+            duration: 0.0,
+            auxiliary: vec![cover],
+            backup: None,
+        });
+        app.db.insert_task(&task)?;
+        assert!(
+            publish(&app, task, &CancellationToken::new())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unmanaged")
+        );
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(sidecar)?, b"user-owned image");
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_asset_download_replaces_only_its_managed_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        let target = app.config.download_dir.join("notes.txt");
+        let obsolete = app.config.download_dir.join("obsolete.en.srt");
+        write_sync(&target, b"old notes")?;
+        write_sync(&obsolete, b"obsolete captions")?;
+        task.previous_outputs = vec![target.clone(), obsolete.clone()];
+        let source = app.config.download_dir.join("source.bin");
+        write_sync(&source, b"updated notes")?;
+        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        task.publication = Some(Publication {
+            temporary: output.temporary,
+            target: target.clone(),
+            hash: output.hash,
+            size: output.size,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        app.db.insert_task(&task)?;
+        publish(&app, task.clone(), &CancellationToken::new()).await?;
+        assert_eq!(std::fs::read(&target)?, b"updated notes");
+        assert!(!obsolete.exists());
+        assert!(app.db.media()?.is_empty());
+        publish(&app, app.db.task(&task.id)?, &CancellationToken::new()).await?;
+        assert_eq!(std::fs::read(target)?, b"updated notes");
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redownload_recovers_interrupted_publication_and_preserves_changed_destinations()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        task.status = "cancelled".into();
+        let target = app.config.download_dir.join("notes.txt");
+        let subtitle = app.config.download_dir.join("notes.en.srt");
+        let source = app.config.download_dir.join("source.bin");
+        write_sync(&target, b"old notes")?;
+        write_sync(&subtitle, b"old captions")?;
+        write_sync(&source, b"new notes")?;
+        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        write_sync(&source, b"new captions")?;
+        let sidecar = make_auxiliary(&source, subtitle.clone(), &task.id)?;
+        task.previous_outputs = vec![target.clone(), subtitle.clone()];
+        task.publication = Some(Publication {
+            temporary: main.temporary.clone(),
+            target: target.clone(),
+            hash: main.hash,
+            size: main.size,
+            duration: 0.0,
+            auxiliary: vec![sidecar.clone()],
+            backup: None,
+        });
+        app.db.insert_task(&task)?;
+        let (_, backups) = publication_files(task.publication.as_ref().unwrap(), &task.id);
+        // Simulate a crash between installing the main file and its subtitle.
+        std::fs::rename(&target, &backups[0])?;
+        std::fs::rename(&main.temporary, &target)?;
+        prepare_redownload(&app, &task).await?;
+        assert_eq!(std::fs::read(&target)?, b"old notes");
+        assert_eq!(std::fs::read(&subtitle)?, b"old captions");
+        assert!(!backups[0].exists());
+        assert!(!sidecar.temporary.exists());
+        assert!(app.db.task(&task.id)?.publication.is_none());
+
+        // An externally edited destination must block reset instead of losing its recovery journal.
+        write_sync(&source, b"new notes")?;
+        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        task.publication.as_mut().unwrap().temporary = main.temporary;
+        app.db.save_task(&task)?;
+        std::fs::rename(&target, &backups[0])?;
+        write_sync(&target, b"external changes")?;
+        let error = prepare_redownload(&app, &task)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Retry processing"), "{error}");
+        assert_eq!(std::fs::read(&target)?, b"external changes");
+        assert_eq!(std::fs::read(&backups[0])?, b"old notes");
+        assert!(app.db.task(&task.id)?.publication.is_some());
+        app.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn asset_publication_is_persistent_idempotent_and_not_media() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        task.title = "Podcast".into();
+        task.options.organize_task_folder = true;
+        let directory = app
+            .config
+            .data_dir
+            .join("tasks")
+            .join(&task.id)
+            .join("sources");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("description.txt");
+        write_sync(&path, b"Episode notes")?;
+        let (hash, size) = hash_file(&path)?;
+        task.manifest = Some(SourceManifest {
+            version: 1,
+            directory,
+            files: vec![SourceFile {
+                path,
+                hash,
+                size,
+                kind: "description".into(),
+                format_id: String::new(),
+                language: None,
+            }],
+            metadata: json!({"title":"Podcast"}),
+            duration: None,
+            chapters: vec![],
+            sponsor_segments: vec![],
+            output_extension: String::new(),
+        });
+        app.db.insert_task(&task)?;
+        process_task(&app, &task.id, &CancellationToken::new()).await?;
+        let published = app.db.task(&task.id)?;
+        assert_eq!(
+            published.output_path.as_ref().unwrap().parent().unwrap(),
+            app.config.download_dir.join("Podcast")
+        );
+        assert_eq!(published.status, "completed");
+        assert!(app.db.media()?.is_empty());
+        assert_eq!(published.public()["files"][0]["kind"], "description");
+        assert_eq!(published.public()["files"][0]["size"], 13);
+        assert!(!published.public().to_string().contains("Episode notes"));
+        assert!(
+            !published
+                .public()
+                .to_string()
+                .contains(temp.path().to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            std::fs::read(published.output_path.as_ref().unwrap())?,
+            b"Episode notes"
+        );
+        process_task(&app, &task.id, &CancellationToken::new()).await?;
+        app.shutdown().await?;
+        let reopened = App::open(config).await?;
+        assert_eq!(reopened.db.task(&task.id)?.files[0].size, 13);
+        assert!(reopened.db.media()?.is_empty());
+        reopened.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conversion_rejects_paths_and_reports_missing_saved_inputs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.stage("completed", "completed", Some(100.0));
+        let path = app.config.download_dir.join("source.mp4");
+        write_sync(&path, b"original")?;
+        task.output_path = Some(path.clone());
+        app.db.insert_task(&task)?;
+        app.db.complete(
+            &task,
+            &Media {
+                id: "media".into(),
+                task_id: task.id.clone(),
+                title: "Source".into(),
+                filename: "source.mp4".into(),
+                size: 8,
+                duration: 1.0,
+                path: path.clone(),
+                assets: vec![],
+            },
+        )?;
+        for (changes, expected) in [
+            (json!({"path":"outside"}), "Unsupported conversion option"),
+            (json!({"embedSubtitles":true}), "No saved subtitles"),
+            (json!({"embedThumbnail":true}), "No saved thumbnail"),
+            (
+                json!({"embedMetadata":true}),
+                "Saved metadata is unavailable",
+            ),
+            (json!({"embedChapters":true}), "No saved chapters"),
+        ] {
+            let error = app
+                .research_convert_media_options("media", &changes)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        assert_eq!(app.db.tasks()?.len(), 1);
+        assert_eq!(std::fs::read(path)?, b"original");
+        let mut serialized = serde_json::to_value(&task)?;
+        serialized.as_object_mut().unwrap().remove("kind");
+        serialized.as_object_mut().unwrap().remove("files");
+        let legacy: Task = serde_json::from_value(serialized)?;
+        assert_eq!(legacy.kind, "media");
+        assert!(legacy.files.is_empty());
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bundled FFmpeg/FFprobe runtimes"]
+    async fn all_audio_tracks_maps_combined_and_separate_inputs_without_extra_video() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let tool_dir = std::env::var_os("HUIFA_TEST_TOOLS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools")
+            });
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: Some(tool_dir),
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(app.freeze_tools().await?);
+        task.options.audio_track = "all".into();
+        task.options.write_thumbnail = false;
+        task.options.write_info_json = false;
+        let directory = app
+            .config
+            .data_dir
+            .join("tasks")
+            .join(&task.id)
+            .join("sources");
+        std::fs::create_dir_all(&directory)?;
+        let mut files = Vec::new();
+        for (index, language) in ["en", "zh", "ja"].into_iter().enumerate() {
+            let path = directory.join(format!("source-{index}.mkv"));
+            let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            if index < 2 {
+                args.extend([
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "testsrc2=size=160x90:rate=12".into(),
+                ]);
+            }
+            args.extend([
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                format!("sine=frequency={}:sample_rate=44100", 440 + index * 220),
+                "-t".into(),
+                "1".into(),
+                "-c:v".into(),
+                "libx264".into(),
+                "-preset".into(),
+                "ultrafast".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-threads".into(),
+                "1".into(),
+                path.to_string_lossy().into_owned(),
+            ]);
+            process::run(
+                &app.tool("ffmpeg")?,
+                &args,
+                None,
+                &CancellationToken::new(),
+                None,
+            )
+            .await?;
+            let (hash, size) = hash_file(&path)?;
+            files.push(SourceFile {
+                path,
+                hash,
+                size,
+                kind: if index < 2 { "video" } else { "audio" }.into(),
+                format_id: index.to_string(),
+                language: Some(language.into()),
+            });
+        }
+        task.manifest = Some(SourceManifest {
+            version: 1,
+            directory,
+            files,
+            metadata: json!({"id":"all-audio"}),
+            duration: Some(1.0),
+            chapters: vec![],
+            sponsor_segments: vec![],
+            output_extension: "mkv".into(),
+        });
+        app.db.insert_task(&task)?;
+        process_task(&app, &task.id, &CancellationToken::new()).await?;
+        let completed = app.db.task(&task.id)?;
+        let probe = probe_file(
+            &app,
+            &completed,
+            completed.output_path.as_ref().unwrap(),
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(count_streams(&probe, "video"), 1);
+        assert_eq!(count_streams(&probe, "audio"), 3);
+        let languages = streams(&probe)
+            .filter(|stream| text(stream, "codec_type") == "audio")
+            .map(|stream| text(&stream["tags"], "language").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(languages, ["en", "zh", "ja"]);
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bundled FFmpeg/FFprobe runtimes"]
+    async fn conversion_options_extract_audio_and_embed_saved_assets_without_replacing_source()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tool_dir = std::env::var_os("HUIFA_TEST_TOOLS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools")
+            });
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: Some(tool_dir),
+        })
+        .await?;
+        let path = app.config.download_dir.join("original.mp4");
+        let args: Vec<String> = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=12",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-t",
+            "2",
+            "-threads",
+            "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .chain([path.to_string_lossy().into_owned()])
+        .collect();
+        process::run(
+            &app.tool("ffmpeg")?,
+            &args,
+            None,
+            &CancellationToken::new(),
+            None,
+        )
+        .await?;
+        let (original_hash, size) = hash_file(&path)?;
+        let subtitle = app.config.download_dir.join("original.en.srt");
+        write_sync(
+            &subtitle,
+            b"1\n00:00:00,100 --> 00:00:01,500\nPodcast subtitle\n\n",
+        )?;
+        let thumbnail = app.config.download_dir.join("original.jpg");
+        image::RgbImage::from_pixel(16, 16, image::Rgb([50, 20, 80])).save(&thumbnail)?;
+        let mut task = crate::tests::paused_task(app.freeze_tools().await?);
+        task.output_path = Some(path.clone());
+        task.title = "Podcast".into();
+        task.manifest = Some(SourceManifest {
+            version: 1,
+            directory: app.config.download_dir.clone(),
+            files: vec![],
+            metadata: json!({"title":"Podcast","uploader":"Author"}),
+            duration: Some(2.0),
+            chapters: vec![Chapter {
+                start: 0.0,
+                end: 2.0,
+                title: "Episode".into(),
+            }],
+            sponsor_segments: vec![],
+            output_extension: "mp4".into(),
+        });
+        task.stage("completed", "completed", Some(100.0));
+        app.db.insert_task(&task)?;
+        app.db.complete(
+            &task,
+            &Media {
+                id: "original-media".into(),
+                task_id: task.id.clone(),
+                title: task.title.clone(),
+                filename: "original.mp4".into(),
+                size,
+                duration: 2.0,
+                path: path.clone(),
+                assets: vec![subtitle, thumbnail],
+            },
+        )?;
+        for options in [
+            json!({"contentMode":"audio","audioFormat":"mp3"}),
+            json!({"container":"mkv","encoder":"libx264","embedSubtitles":true,"embedThumbnail":true,"embedMetadata":true,"embedChapters":true,"subtitleFormat":"ass"}),
+        ] {
+            let queued = app
+                .research_convert_media_options("original-media", &options)
+                .await?;
+            let id = queued["id"].as_str().unwrap();
+            let completed = tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    let current = app.db.task(id)?;
+                    ensure!(
+                        !matches!(current.status.as_str(), "failed" | "processing_failed"),
+                        "{:?}",
+                        current.error
+                    );
+                    if current.status == "completed" {
+                        return Ok::<_, anyhow::Error>(current);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await??;
+            assert_ne!(completed.id, task.id);
+            let probe = probe_file(
+                &app,
+                &completed,
+                completed.output_path.as_ref().unwrap(),
+                &CancellationToken::new(),
+            )
+            .await?;
+            if options["contentMode"] == "audio" {
+                assert_eq!(count_streams(&probe, "video"), 0);
+                assert_eq!(
+                    text(
+                        streams(&probe)
+                            .find(|s| text(s, "codec_type") == "audio")
+                            .unwrap(),
+                        "codec_name"
+                    ),
+                    "mp3"
+                );
+            } else {
+                assert_eq!(count_streams(&probe, "subtitle"), 1);
+                assert!(
+                    streams(&probe).any(|s| text(s, "codec_type") == "attachment"
+                        || s["disposition"]["attached_pic"] == 1)
+                );
+                assert_eq!(probe["format"]["tags"]["title"], "Podcast");
+            }
+            assert_eq!(hash_file(&path)?.0, original_hash);
+            assert_eq!(app.db.task(&task.id)?.status, "completed");
+        }
+        let mut source_id = task.id.clone();
+        for (container, expected_strategy, video_codec, audio_codec) in [
+            ("mkv", "remux", "h264", "aac"),
+            ("webm", "transcode", "vp9", "opus"),
+            ("mp4", "transcode", "h264", "aac"),
+        ] {
+            let changes = json!({"container":container});
+            let preview = preview_conversion(&app, &source_id, &changes, "auto").await?;
+            assert_eq!(preview["strategy"], expected_strategy);
+            let queued =
+                queue_conversion_options_with_strategy(&app, &source_id, &changes, "auto").await?;
+            let id = queued["id"].as_str().unwrap();
+            let completed = tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    let current = app.db.task(id)?;
+                    ensure!(
+                        !matches!(current.status.as_str(), "failed" | "processing_failed"),
+                        "{:?}",
+                        current.error
+                    );
+                    if current.status == "completed" {
+                        return Ok::<_, anyhow::Error>(current);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await??;
+            let probe = probe_file(
+                &app,
+                &completed,
+                completed.output_path.as_ref().unwrap(),
+                &CancellationToken::new(),
+            )
+            .await?;
+            assert_eq!(
+                text(
+                    streams(&probe)
+                        .find(|stream| text(stream, "codec_type") == "video")
+                        .unwrap(),
+                    "codec_name"
+                ),
+                video_codec
+            );
+            assert_eq!(
+                text(
+                    streams(&probe)
+                        .find(|stream| text(stream, "codec_type") == "audio")
+                        .unwrap(),
+                    "codec_name"
+                ),
+                audio_codec
+            );
+            assert_eq!(hash_file(&path)?.0, original_hash);
+            source_id = completed.id;
+        }
+        assert_eq!(app.db.media()?.len(), 6);
+
+        // Re-download publication migrates this task out of an old short-ID directory only after success.
+        let legacy = app.config.download_dir.join("Podcast").join(&task.id[..8]);
+        std::fs::create_dir_all(&legacy)?;
+        let old_path = legacy.join("original.mp4");
+        let old_subtitle = legacy.join("original.en.srt");
+        copy_sync(&path, &old_path)?;
+        write_sync(&old_subtitle, b"obsolete subtitle")?;
+        let previous = app.db.media_for_task(&task.id)?.unwrap();
+        app.db.complete(
+            &task,
+            &Media {
+                path: old_path.clone(),
+                assets: vec![old_subtitle.clone()],
+                ..previous
+            },
+        )?;
+        let target = legacy.parent().unwrap().join("original.mp4");
+        let prepared = make_auxiliary(&path, target.clone(), &task.id)?;
+        let mut replacement = app.db.task(&task.id)?;
+        replacement.stage("processing", "publishing", None);
+        replacement.publication = Some(Publication {
+            temporary: prepared.temporary,
+            target: target.clone(),
+            hash: prepared.hash,
+            size: prepared.size,
+            duration: 2.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        app.db.save_task(&replacement)?;
+        publish(&app, replacement.clone(), &CancellationToken::new()).await?;
+        assert!(target.is_file());
+        assert!(!old_path.exists());
+        assert!(!old_subtitle.exists());
+        assert!(!legacy.exists());
+        assert_eq!(
+            app.db.media_for_task(&task.id)?.unwrap().id,
+            "original-media"
+        );
+        // Repeating an already committed journal is idempotent.
+        publish(&app, app.db.task(&task.id)?, &CancellationToken::new()).await?;
+        app.shutdown().await?;
+        Ok(())
+    }
     #[test]
     fn cuts_remove_overlapping_sponsors_and_retime_captions() {
         let options=DownloadOptions::parse(json!({"sectionStart":"2","sectionEnd":"10","sponsorblockMode":"remove","sponsorblockCategories":["sponsor"]})).unwrap();

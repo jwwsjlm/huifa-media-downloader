@@ -145,7 +145,7 @@ impl Default for DownloadOptions {
             section_start: String::new(),
             section_end: String::new(),
             split_chapters: false,
-            subtitle_format: "best".into(),
+            subtitle_format: "srt".into(),
             subtitle_language: "none".into(),
             subtitle_languages: vec![],
             automatic_subtitles: true,
@@ -168,9 +168,9 @@ impl Default for DownloadOptions {
             format_id: String::new(),
             video_format_id: String::new(),
             audio_format_ids: vec![],
-            cookie_id: String::new(),
+            cookie_id: "auto".into(),
             proxy: String::new(),
-            fragment_concurrent: 1,
+            fragment_concurrent: 4,
             request_delay: 0.0,
             filename_template: "%(title)s [%(id)s].%(ext)s".into(),
             convert_cover_jpeg: true,
@@ -181,8 +181,12 @@ impl Default for DownloadOptions {
 
 impl DownloadOptions {
     pub fn parse(value: Value) -> Result<Self> {
-        let options: Self =
+        let mut options: Self =
             serde_json::from_value(if value.is_null() { json!({}) } else { value })?;
+        if (9..=32).contains(&options.fragment_concurrent) {
+            options.fragment_concurrent = 8;
+        }
+        options.cookie_id = "auto".into();
         options.validate()?;
         Ok(options)
     }
@@ -204,7 +208,7 @@ impl DownloadOptions {
                 &self.audio_format,
                 "best aac alac flac m4a mp3 opus vorbis wav",
             ),
-            ("container", &self.container, "auto mp4 mkv"),
+            ("container", &self.container, "auto mp4 mkv mov webm"),
             ("videoFps", &self.video_fps, "best 240 120 60 50 30 25 24"),
             (
                 "sourceVideoCodec",
@@ -237,7 +241,7 @@ impl DownloadOptions {
             (
                 "encoder",
                 &self.encoder,
-                "copy original libx264 libx265 libsvtav1 libaom-av1 librav1e h264_nvenc hevc_nvenc av1_nvenc h264_qsv hevc_qsv av1_qsv h264_amf hevc_amf av1_amf",
+                "copy original libx264 libx265 libvpx-vp9 libsvtav1 libaom-av1 librav1e h264_nvenc hevc_nvenc av1_nvenc h264_qsv hevc_qsv av1_qsv h264_amf hevc_amf av1_amf",
             ),
             (
                 "audioTrack",
@@ -260,8 +264,8 @@ impl DownloadOptions {
             "Cover frames must be 1–300"
         );
         ensure!(
-            (1..=32).contains(&self.fragment_concurrent),
-            "Fragment concurrency must be 1–32"
+            (1..=8).contains(&self.fragment_concurrent),
+            "Fragment concurrency must be 1–8"
         );
         ensure!(
             (1..=100).contains(&self.cover_jpeg_quality),
@@ -499,19 +503,33 @@ pub fn parse_rate(value: &str) -> Option<u64> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Task {
     pub id: String,
+    #[serde(default = "media_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub files: Vec<GeneratedFile>,
     pub url: String,
     pub title: String,
+    #[serde(default)]
+    pub thumbnail: Option<PathBuf>,
     pub status: String,
     pub stage: String,
+    #[serde(default)]
+    pub steps: Vec<String>,
+    #[serde(default)]
+    pub step_index: Option<usize>,
     pub progress: f64,
     pub stage_progress: Option<f64>,
     pub stage_indeterminate: bool,
     pub speed: Option<f64>,
     pub eta: Option<f64>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub created_at: String,
     pub options: DownloadOptions,
     pub output_path: Option<PathBuf>,
+    #[serde(default)]
+    pub previous_outputs: Vec<PathBuf>,
     #[serde(default)]
     pub cookie_snapshot: Option<String>,
     #[serde(default)]
@@ -529,14 +547,17 @@ pub(crate) struct Task {
 
 impl Task {
     pub fn public(&self) -> Value {
-        json!({"id":self.id,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,
-            "progress":self.progress,"stageProgress":self.stage_progress,"stageIndeterminate":self.stage_indeterminate,
-            "speed":self.speed,"eta":self.eta,"error":self.error,"createdAt":self.created_at,"options":self.options.public(),
+        json!({"id":self.id,"kind":self.kind,"files":self.files,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,
+            "progress":self.progress,"stageProgress":self.stage_progress,"stageIndeterminate":self.stage_indeterminate,"stepIndex":self.step_index,"stepCount":self.steps.len(),
+            "speed":self.speed,"eta":self.eta,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
             "outputPath":self.output_path.as_ref().and_then(|p|p.file_name()).map(|p|p.to_string_lossy())})
     }
     pub fn stage(&mut self, status: &str, stage: &str, percent: Option<f64>) {
         self.status = status.into();
         self.stage = stage.into();
+        if let Some(index) = crate::workflow::position(stage, &self.steps) {
+            self.step_index = Some(index);
+        }
         self.stage_progress = percent;
         self.stage_indeterminate = percent.is_none();
         self.speed = None;
@@ -547,6 +568,18 @@ impl Task {
             percent.unwrap_or(0.0).min(99.0)
         };
     }
+}
+
+fn media_kind() -> String {
+    "media".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeneratedFile {
+    pub filename: String,
+    pub kind: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +702,41 @@ pub(crate) fn validate_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_downloads_use_automatic_cookies_and_bounded_fragment_defaults() {
+        let defaults = DownloadOptions::parse(json!({})).unwrap();
+        assert_eq!(defaults.fragment_concurrent, 4);
+        assert_eq!(defaults.subtitle_language, "none");
+        assert_eq!(defaults.subtitle_format, "srt");
+        for value in [1, 4, 6, 8] {
+            assert_eq!(
+                DownloadOptions::parse(json!({"fragmentConcurrent":value}))
+                    .unwrap()
+                    .fragment_concurrent,
+                value
+            );
+        }
+        assert_eq!(
+            DownloadOptions::parse(json!({"fragmentConcurrent":32,"cookieId":"legacy-id"}))
+                .unwrap()
+                .fragment_concurrent,
+            8
+        );
+        assert_eq!(
+            DownloadOptions::parse(json!({"cookieId":"legacy-id"}))
+                .unwrap()
+                .cookie_id,
+            "auto"
+        );
+        for value in [0, 33] {
+            assert!(DownloadOptions::parse(json!({"fragmentConcurrent":value})).is_err());
+        }
+        let legacy: DownloadOptions =
+            serde_json::from_value(json!({"fragmentConcurrent":32,"cookieId":"legacy-id"}))
+                .unwrap();
+        assert_eq!(legacy.fragment_concurrent, 32);
+        assert_eq!(legacy.cookie_id, "legacy-id");
+    }
     #[test]
     fn public_youtube_links_keep_only_the_video_id() {
         assert_eq!(

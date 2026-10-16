@@ -34,6 +34,13 @@ impl Database {
         })
     }
     pub fn tasks(&self) -> Result<Vec<Task>> {
+        Ok(self
+            .tasks_including_retained()?
+            .into_iter()
+            .filter(|task| task.status != "retained")
+            .collect())
+    }
+    pub fn tasks_including_retained(&self) -> Result<Vec<Task>> {
         let db = self.connection.lock().unwrap();
         let mut query = db.prepare("SELECT state FROM tasks ORDER BY rowid DESC")?;
         query
@@ -64,12 +71,31 @@ impl Database {
         ensure!(changed == 1, "Task does not exist");
         Ok(())
     }
-    pub fn remove_task(&self, id: &str, delete_media: bool) -> Result<()> {
+    pub fn remove_task(&self, task: &Task, delete_media: bool) -> Result<()> {
         let mut db = self.connection.lock().unwrap();
         let transaction = db.transaction()?;
-        transaction.execute("DELETE FROM tasks WHERE id=?1", [id])?;
+        let retained = !delete_media
+            && transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM media WHERE task_id=?1)",
+                [&task.id],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if retained {
+            // Library media still needs its source metadata and frozen tools after queue removal.
+            let mut task = task.clone();
+            task.status = "retained".into();
+            task.cookie_snapshot = None;
+            task.proxy_snapshot = None;
+            task.publication = None;
+            transaction.execute(
+                "UPDATE tasks SET state=?2 WHERE id=?1",
+                params![task.id, serde_json::to_string(&task)?],
+            )?;
+        } else {
+            transaction.execute("DELETE FROM tasks WHERE id=?1", [&task.id])?;
+        }
         if delete_media {
-            transaction.execute("DELETE FROM media WHERE task_id=?1", [id])?;
+            transaction.execute("DELETE FROM media WHERE task_id=?1", [&task.id])?;
         }
         transaction.commit()?;
         Ok(())
@@ -162,6 +188,14 @@ impl Database {
             .transpose()?
             .unwrap_or(json!({})))
     }
+    pub fn activate_cookie(&self, id: &str) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE settings SET value=json_set(value, '$.downloadOptions.cookieId', ?1) WHERE id=1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     pub fn save_settings(&self, value: &Value) -> Result<()> {
         self.connection.lock().unwrap().execute(
             "UPDATE settings SET value=?1 WHERE id=1",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { automaticQuality, commandOptions, defaults, optionGroups } from './options';
+import { automaticQuality, commandOptions, defaults, optionGroups, optionLabel } from './options';
 
 describe('download option boundary', () => {
   it('removes a public secret marker while preserving omitted and explicitly cleared proxies', () => {
@@ -21,5 +21,13 @@ describe('download option boundary', () => {
     expect(automaticQuality(saved, 'best')).toEqual({ quality: 'best', contentMode: 'video', formatId: '', videoFormatId: '', audioFormatIds: [] });
     expect(automaticQuality({ ...saved, contentMode: 'audio' }, 'worst').contentMode).toBe('audio');
     expect(saved.formatId).toBe('old');
+  });
+  it('shows readable choice labels without changing submitted ids', () => {
+    const t = (zh: string, en: string) => en;
+    expect(optionLabel('best', t)).toBe('Best match');
+    expect(optionLabel('auto', t)).toBe('Automatic');
+    const field = optionGroups.flatMap(group => group.fields).find(value => value.key === 'compatibilityTarget');
+    expect(field?.choices?.find(([id]) => id === 'windows')?.[0]).toBe('windows');
+    expect(field?.choices?.find(([id]) => id === 'windows')?.[2]).toBe('Windows');
   });
 });

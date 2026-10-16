@@ -12,7 +12,7 @@ const paths: Record<string, string> = {
   video: 'M3 5h12v14H3V5Zm12 5 6-4v12l-6-4', search: 'm21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
 };
 export function Icon({ name }: { name: string }) { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name] || paths.info} /></svg>; }
-export function Button({ icon, tone = '', className = '', children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { icon?: string; tone?: string }) { return <button type="button" className={`button ${tone} ${className}`} {...props}>{icon && <Icon name={icon} />}{children}</button>; }
+export function Button({ icon, tone = '', size = 'default', className = '', children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { icon?: string; tone?: string; size?: 'default' | 'small' }) { return <button type="button" className={`button ${size === 'small' ? 'small' : ''} ${tone} ${className}`} {...props}>{icon && <Icon name={icon} />}{children}</button>; }
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) { return <label className="field"><span className="field-label">{label}</span>{children}{hint && <small>{hint}</small>}</label>; }
 export function Check({ label, ...props }: Omit<React.InputHTMLAttributes<HTMLInputElement>, 'type'> & { label: string }) { return <label className="check"><input type="checkbox" {...props} /><span>{label}</span></label>; }
 export function Empty({ title, detail, icon = 'download' }: { title: string; detail?: string; icon?: string }) { return <div className="empty"><Icon name={icon} /><h3>{title}</h3>{detail && <p>{detail}</p>}</div>; }
@@ -21,9 +21,10 @@ export function Badge({ children, tone = '' }: { children: ReactNode; tone?: str
 export function Modal({ title, subtitle, children, footer, close, wide = false, t }: { title: string; subtitle?: string; children: ReactNode; footer?: ReactNode; close: () => void; wide?: boolean; t: Translate }) {
   const ref = useRef<HTMLDialogElement>(null); const titleId = useId();
   useEffect(() => {
+    const dialog = ref.current;
     const focus = document.activeElement as HTMLElement | null;
-    ref.current?.showModal();
-    return () => { focus?.focus({ preventScroll: true }); };
+    dialog?.showModal();
+    return () => { dialog?.close(); focus?.focus({ preventScroll: true }); };
   }, []);
   return <dialog ref={ref} className={`dialog ${wide ? 'wide' : ''}`} aria-labelledby={titleId} onCancel={event => { event.preventDefault(); close(); }}>
     <header className="dialog-header"><div><h2 id={titleId}>{title}</h2>{subtitle && <p className="muted">{subtitle}</p>}</div><Button icon="close" tone="icon-only" aria-label={t('关闭对话框', 'Close dialog')} onClick={close} /></header>

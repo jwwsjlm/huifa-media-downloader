@@ -5,14 +5,220 @@ import { AppProvider } from './state';
 import { makeSnapshot } from './test-fixtures';
 import type { CoreEvent } from './types';
 
-const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn() }));
+const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn() }));
 vi.mock('./transport', () => ({ host: {
   desktop: false, capabilities: () => ({ browserCookies: false, remoteBrowser: false, updates: false }),
   session: async () => ({ authenticated: true }), subscribe: async (listener: (event: CoreEvent) => void, connection: (value: boolean) => void) => { transport.listener = listener; connection(true); return () => { transport.listener = null; }; },
-  command: transport.command, assetUrl: (id: string) => `/api/files/${id}`, notify: async () => {},
+  command: transport.command, assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: async () => {}, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, copyTask: async () => {},
 } }));
-beforeEach(() => { transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true); });
+beforeEach(() => {
+  transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true);
+  transport.releaseStatus.mockReset().mockResolvedValue({ currentVersion:'0.3.0', latestVersion:'0.3.0', updateAvailable:false, url:'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.0' });
+  transport.openRelease.mockReset().mockResolvedValue(undefined);
+});
 describe('live interface stability', () => {
+  it('shows a task cover during download before a completed media record exists', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const detail = screen.getByRole('complementary', { name: 'Task details' });
+    expect(detail.querySelector('.thumbnail img')).toBeNull();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'downloading', hasThumbnail: true } }));
+    await waitFor(() => expect(detail.querySelector('.thumbnail img')?.getAttribute('src')).toBe('/api/files/a?kind=taskThumbnail'));
+  });
+  it('opens task actions with right click and acts on that task rather than the previous selection', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const row = screen.getByRole('option', { name: /Beta/ });
+    const nativeMenu = fireEvent.contextMenu(row, { clientX: 800, clientY: 500 });
+    expect(nativeMenu).toBe(false);
+    const menu = screen.getByRole('menu', { name: 'Task actions' });
+    expect(within(menu).getByRole('menuitem', { name: 'Pause' })).toBeTruthy();
+    expect(row.getAttribute('aria-selected')).toBe('true');
+    fireEvent.click(within(menu).getByRole('menuitem', { name: 'Pause' }));
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.pause', { id: 'b' }));
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+  it('supports keyboard context menus, status-specific actions and dismissing stale virtual rows', async () => {
+    render(<AppProvider><App /></AppProvider>); const list = await screen.findByRole('listbox');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'paused' } }));
+    list.focus(); fireEvent.keyDown(list, { key: 'F10', shiftKey: true });
+    let menu = screen.getByRole('menu', { name: 'Task actions' });
+    expect(within(menu).getByRole('menuitem', { name: 'Resume' })).toBeTruthy();
+    fireEvent.keyDown(menu, { key: 'End' });
+    expect(document.activeElement).toBe(within(menu).getByRole('menuitem', { name: 'Delete task' }));
+    fireEvent.keyDown(menu, { key: 'Escape' });
+    expect(screen.queryByRole('menu')).toBeNull(); expect(document.activeElement).toBe(list);
+    fireEvent.contextMenu(screen.getByRole('option', { name: /Alpha/ }));
+    fireEvent.scroll(list, { target: { scrollTop: 56 } });
+    expect(screen.queryByRole('menu')).toBeNull();
+    fireEvent.contextMenu(screen.getByRole('option', { name: /Alpha/ }));
+    menu = screen.getByRole('menu');
+    fireEvent.click(within(menu).getByRole('menuitem', { name: 'Delete task' }));
+    expect(await screen.findByRole('dialog')).toBeTruthy();
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.delete')).toBe(false);
+  });
+  it('closes the task menu when a filter removes its task', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.contextMenu(screen.getByRole('option', { name: /Alpha/ }));
+    expect(screen.getByRole('menu')).toBeTruthy();
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: 'Beta' } });
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+  it('immediately queues a single YouTube video with automatic quality even when a playlist parameter is present', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const url = 'https://www.youtube.com/watch?v=abcdefghijk&list=PL123';
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: url } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [url], options: expect.objectContaining({ quality: 'best', cookieId: 'auto', fragmentConcurrent: 4, collectionMode: 'single' }), report: true }));
+    expect(screen.queryByRole('dialog')).toBeNull(); expect(transport.command.mock.calls.some(([name]) => name.startsWith('probe.'))).toBe(false);
+  });
+  it.each(['downloading', 'paused'] as const)('selects the existing %s task instead of adding another task', async status => {
+    const snapshot = makeSnapshot(); const url = 'https://youtu.be/abcdefghijk';
+    snapshot.tasks[1].status = status; snapshot.tasks[1].url = url;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tasks.add' ? { ids: ['b'], results: [{ id: 'b', status, action: 'existing' }] } : true);
+    render(<AppProvider><App /></AppProvider>); const list = await screen.findByRole('listbox');
+    expect(within(list).getByRole('option', { selected: true }).textContent).toContain('Alpha');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: url } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    const message = await screen.findByRole('status');
+    expect(message.textContent).toBe(status === 'paused' ? 'This task is paused. Resume it from task details.' : 'This task already exists: Downloading. No duplicate was added.');
+    expect(within(list).getAllByRole('option')).toHaveLength(2);
+    expect(within(list).getByRole('option', { selected: true }).textContent).toContain('Beta');
+    const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
+    expect(detail.getByRole('heading', { name: 'Beta' })).toBeTruthy();
+    expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('');
+    expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.add')).toHaveLength(1);
+    expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [url], options: expect.any(Object), report: true });
+    if (status === 'paused') {
+      fireEvent.click(detail.getByRole('button', { name: 'Resume' }));
+      await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.resume', { id: 'b' }));
+    } else expect(detail.getByRole('button', { name: 'Pause' })).toBeTruthy();
+  });
+  it('updates processing step counts in both the task row and selected task details', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'processing', stage: 'muxing', stepIndex: 2, stepCount: 4, stageProgress: 35 } }));
+    const row = within(screen.getByRole('option', { name: /Alpha/ }));
+    const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
+    expect(row.getByText('2/4 Merging video and audio')).toBeTruthy();
+    expect(detail.getByText('2/4 Merging video and audio')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', stage: 'verifying_output', stepIndex: 3, stageProgress: 80 } }));
+    expect(row.getByText('3/4 Validating result file')).toBeTruthy();
+    expect(detail.getByText('3/4 Validating result file')).toBeTruthy();
+    expect(row.queryByText('2/4 Merging video and audio')).toBeNull();
+  });
+  it('returns collection duplicate reports to the task list and selects the existing paused task', async () => {
+    const snapshot = makeSnapshot(); snapshot.tasks[1].status = 'paused';
+    const entries = [snapshot.tasks[1], snapshot.tasks[0]].map(task => ({ url: task.url, title: task.title }));
+    transport.command.mockImplementation(async (command, args) => {
+      if (command === 'snapshot') return snapshot;
+      if (command === 'probe.collection') return { kind: 'collection', entries };
+      if (command === 'tasks.add') {
+        const task = snapshot.tasks.find(task => task.url === args.urls[0])!;
+        return { ids: [task.id], results: [{ id: task.id, status: task.status, action: 'existing' }] };
+      }
+      return true;
+    });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'https://example.test/collection' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    const dialog = within(await screen.findByRole('dialog'));
+    const confirm = dialog.getByRole('button', { name: 'Download selected items' });
+    await waitFor(() => expect((confirm as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(confirm);
+    expect((await screen.findByRole('status')).textContent).toBe('This task is paused. Resume it from task details.');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    const list = within(screen.getByRole('listbox'));
+    expect(list.getAllByRole('option')).toHaveLength(2);
+    expect(list.getByRole('option', { selected: true }).textContent).toContain('Beta');
+    expect(within(screen.getByRole('complementary', { name: 'Task details' })).getByRole('button', { name: 'Resume' })).toBeTruthy();
+    expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.add')).toHaveLength(2);
+    for (const entry of entries) expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [entry.url], options: expect.any(Object), report: true });
+  });
+  it('previews the selected local conversion container and method before submitting structured options', async () => {
+    const snapshot = makeSnapshot(); snapshot.tasks[0].status = 'completed';
+    snapshot.media = [{ id: 'media-a', taskId: 'a', title: 'Alpha', filename: 'alpha.mp4', size: 1024, duration: 60 }];
+    let finishPreview!: (value: unknown) => void;
+    transport.command.mockImplementation(async (command, args) => {
+      if (command === 'snapshot') return snapshot;
+      if (command === 'tasks.convertPreview') {
+        if (args.options.container === 'mkv' && args.strategy === 'remux') return new Promise(resolve => { finishPreview = resolve; });
+        return { strategy: 'remux', encoder: 'copy', audioEncoder: 'copy', reason: 'compatible codecs' };
+      }
+      return true;
+    });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
+    fireEvent.click(detail.getByText('More actions'));
+    fireEvent.click(detail.getByRole('button', { name: 'Convert format' }));
+    const dialog = within(await screen.findByRole('dialog'));
+    await dialog.findByText('Will remux and preserve the source codecs.');
+    fireEvent.change(dialog.getByRole('combobox', { name: 'Target format' }), { target: { value: 'mkv' } });
+    fireEvent.click(dialog.getByText('Advanced options'));
+    fireEvent.change(dialog.getByRole('combobox', { name: 'Conversion method' }), { target: { value: 'remux' } });
+    const start = dialog.getByRole('button', { name: 'Start conversion' }) as HTMLButtonElement;
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.convertPreview', { id: 'a', options: { container: 'mkv' }, strategy: 'remux' }));
+    expect(start.disabled).toBe(true);
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.convert')).toBe(false);
+    await act(async () => finishPreview({ strategy: 'remux', encoder: 'copy', audioEncoder: 'copy', reason: 'compatible codecs' }));
+    expect(dialog.getByText('Will remux and preserve the source codecs.')).toBeTruthy();
+    expect(start.disabled).toBe(false);
+    fireEvent.click(start);
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.convert', { id: 'a', options: { container: 'mkv' }, strategy: 'remux' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  });
+  it('opens version details from an up-to-date sidebar link and lets the user recheck', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    await waitFor(() => expect(transport.releaseStatus).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole('button', { name: 'v0.2.0' }));
+    expect(await screen.findByText('You have the latest stable release.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Open new release page' })).toBeNull();
+    expect(transport.openRelease).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
+    await waitFor(() => expect(transport.releaseStatus).toHaveBeenCalledTimes(2));
+  });
+  it('opens the detected release directly from the sidebar update badge', async () => {
+    const url = 'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.1';
+    transport.releaseStatus.mockResolvedValue({ currentVersion: '0.3.0', latestVersion: '0.3.1', updateAvailable: true, url });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const version = await screen.findByRole('button', { name: /v0\.2\.0.*Update/ });
+    expect(version.title).toBe('Open new release page');
+    fireEvent.click(version);
+    await waitFor(() => expect(transport.openRelease).toHaveBeenCalledWith(url));
+    expect(transport.releaseStatus).toHaveBeenCalledOnce();
+    expect(screen.getByRole('listbox')).toBeTruthy();
+  });
+  it.each(['video','collection'])('uses backend classification for a one-item %s', async kind => {
+    const url = 'https://example.test/unknown';
+    transport.command.mockImplementation(async name => name === 'snapshot' ? makeSnapshot() : name === 'probe.collection' ? { kind, entries: [{ url, title: 'One item' }] } : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: url } }); fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    if (kind === 'collection') { expect(await screen.findByRole('dialog')).toBeTruthy(); expect(transport.command.mock.calls.some(([name]) => name === 'tasks.add')).toBe(false); }
+    else { await waitFor(() => expect(transport.command.mock.calls.some(([name]) => name === 'tasks.add')).toBe(true)); expect(screen.queryByRole('dialog')).toBeNull(); }
+  });
+  it('opens only the format picker for a manually configured single video', async () => {
+    const snapshot = makeSnapshot(); snapshot.settings.downloadOptions = { contentMode: 'manual', quality: 'best' };
+    transport.command.mockImplementation(async name => name === 'snapshot' ? snapshot : name === 'probe.video' ? { title: 'Manual video', formats: [{ id:'137', formatId:'137', vcodec:'h264', acodec:'none' }] } : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'https://youtu.be/abcdefghijk' } }); fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    expect(await screen.findByRole('heading', { name: 'Choose download format' })).toBeTruthy(); expect(screen.queryByRole('heading', { name: 'Choose download items' })).toBeNull();
+    expect(transport.command.mock.calls.some(([name]) => name === 'probe.collection')).toBe(false);
+  });
+  it('queues clipboard links once and preserves remaining links after a partial failure', async () => {
+    let release!: (value: string) => void; const readText = vi.fn(() => new Promise<string>(resolve => { release = resolve; }));
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText } });
+    let calls = 0; transport.command.mockImplementation(async name => { if (name === 'snapshot') return makeSnapshot(); if (name === 'tasks.add' && ++calls === 2) throw new Error('Queue fixture failed'); return true; });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const button = screen.getByRole('button', { name: 'Download clipboard' }); fireEvent.click(button); fireEvent.click(button);
+    expect(readText).toHaveBeenCalledTimes(1);
+    await act(async () => release('https://youtu.be/abcdefghijk\nhttps://youtu.be/abcdefghijk\nhttps://youtu.be/zyxwvutsrqp'));
+    expect((await screen.findByRole('alert')).textContent).toContain('Added 1 tasks');
+    expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('https://youtu.be/zyxwvutsrqp');
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+  });
+  it('recovers from clipboard permission failures without starting a download', async () => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText: vi.fn().mockRejectedValue(new Error('Denied')) } });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox'); fireEvent.click(screen.getByRole('button', { name: 'Download clipboard' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('Paste the links manually');
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.add')).toBe(false);
+  });
   it.each(['best', 'worst'])('adds a batch with %s quality without opening the manual format picker', async quality => {
     const snapshot = makeSnapshot();
     snapshot.settings.downloadOptions = { contentMode: 'manual', quality: 'best', formatId: 'old', videoFormatId: 'old-video', audioFormatIds: ['old-audio'] };
@@ -30,7 +236,7 @@ describe('live interface stability', () => {
     await waitFor(() => expect(confirm.hasAttribute('disabled')).toBe(false));
     fireEvent.click(confirm);
     await waitFor(() => expect(transport.command.mock.calls.filter(([command]) => command === 'tasks.add')).toHaveLength(2));
-    for (const entry of entries) expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [entry.url], options: expect.objectContaining({ quality, contentMode: 'video', collectionMode: 'single', formatId: '', videoFormatId: '', audioFormatIds: [] }) });
+    for (const entry of entries) expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [entry.url], options: expect.objectContaining({ quality, contentMode: 'video', collectionMode: 'single', formatId: '', videoFormatId: '', audioFormatIds: [] }), report: true });
     expect(transport.command.mock.calls.some(([command]) => command === 'probe.video')).toBe(false);
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(selector.value).toBe(quality);
@@ -51,7 +257,7 @@ describe('live interface stability', () => {
   it('gives recovery guidance for failed downloads while keeping the diagnostic', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'failed', error: 'yt-dlp.exe exited with code 1: Sign in to confirm you are not a bot' } }));
-    expect(screen.getByRole('alert').textContent).toContain('Import or read signed-in cookies');
+    expect(screen.getByRole('alert').textContent).toContain('Open browser sign-in');
     expect(screen.getByRole('alert').textContent).toContain('yt-dlp.exe exited with code 1');
   });
   it('keeps URL drafts, caret, filter, selected hidden task and virtual viewport during progress updates', async () => {

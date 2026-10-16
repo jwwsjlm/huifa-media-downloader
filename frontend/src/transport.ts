@@ -1,13 +1,26 @@
-import type { Capabilities, CoreEvent, Json, Session } from './types';
+import type { Capabilities, CoreEvent, Json, Session, Task } from './types';
+
+type McpConfiguration = { enabled?: boolean; autoStart?: boolean; port?: number };
+type ReleaseStatus = { currentVersion: string; latestVersion: string; updateAvailable: boolean; url: string; publishedAt?: string };
 
 const desktop = '__TAURI_INTERNALS__' in window;
 let csrfToken = '';
 let capabilities: Capabilities = { desktop, browserCookies: desktop, remoteBrowser: false, updates: desktop, directoryPicker: desktop };
 
 async function response<T>(result: Response): Promise<T> {
-  const value = await result.json();
   if (result.status === 401) window.dispatchEvent(new Event('huifa-session-expired'));
-  if (!result.ok) throw new Error(value.error || `Request failed (${result.status})`);
+  const body = await result.text();
+  let value: unknown;
+  try { value = JSON.parse(body); } catch { /* Proxies may return an empty body or HTML. */ }
+  if (result.status === 401) throw new Error('Session expired. Sign in again.');
+  if (result.status === 503) throw new Error('Service unavailable. Check that the server is running and try again.');
+  if (!result.ok) {
+    const message = value && typeof value === 'object' && 'error' in value ? value.error : undefined;
+    if (typeof message === 'string' && message && !/<[^>]*>|(?:authorization|password|api[-_ ]?key|token)\s*[:=]/i.test(message)) throw new Error(message);
+    throw new Error(`Request failed (HTTP ${result.status}). Please try again.`);
+  }
+  if (!body.trim()) throw new Error('Server returned an empty response. Please try again.');
+  if (value === undefined) throw new Error('Server returned an invalid response. Please try again.');
   return value as T;
 }
 async function invoke<T>(name: string, args: Record<string, unknown> = {}): Promise<T> {
@@ -35,7 +48,7 @@ export const host = {
   },
   async logout(): Promise<void> { await post('/api/logout', {}); csrfToken = ''; },
   async mcpStatus<T>(): Promise<T> { return response<T>(await fetch('/api/mcp', { credentials: 'same-origin', cache: 'no-store' })); },
-  async mcpConfigure<T>(enabled: boolean): Promise<T> { return post<T>('/api/mcp', { enabled }); },
+  async mcpConfigure<T>(config: boolean | McpConfiguration): Promise<T> { return post<T>('/api/mcp', typeof config === 'boolean' ? { enabled: config } : config); },
   async command<T = Json>(command: string, args: unknown = {}): Promise<T> {
     if (desktop) return invoke<T>('command', { command, args });
     return (await post<{ value: T }>('/api/command', { command, args })).value;
@@ -64,6 +77,12 @@ export const host = {
     const link = document.createElement('a');
     link.href = this.assetUrl(id, kind); link.download = ''; document.body.append(link); link.click(); link.remove();
   },
+  async copyTask(task: Pick<Task, 'id' | 'title' | 'url'>, kind: 'title' | 'source' | 'path'): Promise<void> {
+    if (!desktop && kind === 'path') throw new Error('Local file paths are available in the desktop app only.');
+    const value = desktop ? await invoke<string>('task_copy_value', { id: task.id, kind }) : kind === 'title' ? task.title : task.url;
+    if (!navigator.clipboard?.writeText) throw new Error('Clipboard is unavailable. Allow clipboard access and try again.');
+    await navigator.clipboard.writeText(value);
+  },
   async directory(defaultPath = ''): Promise<string | null> { return desktop ? invoke('choose_directory', { defaultPath }) : null; },
   async openDownloadDirectory(): Promise<void> { if (desktop) await invoke('open_download_directory'); },
   async paths(): Promise<{ downloadDir: string }> { return desktop ? invoke('command', { command: 'host.paths', args: {} }) : { downloadDir: '/downloads' }; },
@@ -78,6 +97,14 @@ export const host = {
   },
   async checkUpdate(): Promise<{ version?: string; body?: string }> { return invoke('check_update'); },
   async installUpdate(): Promise<void> { await invoke('install_update'); },
+  async releaseStatus<T = ReleaseStatus>(): Promise<T> { return desktop ? invoke<T>('release_status') : this.command<T>('app.release_status'); },
+  async openRelease(url: string): Promise<void> {
+    let release: URL;
+    try { release = new URL(url); } catch { throw new Error('Unsupported release URL.'); }
+    if (release.protocol !== 'https:' || release.hostname !== 'github.com' || release.port || release.username || release.password || release.search || release.hash || !/^\/jwwsjlm\/huifa-media-downloader\/releases(?:\/latest|\/tag\/[^/]+)?\/?$/.test(release.pathname)) throw new Error('Unsupported release URL.');
+    if (desktop) await invoke('open_release', { url: release.href });
+    else window.open(release.href, '_blank', 'noopener,noreferrer');
+  },
   async notify(title: string, body: string): Promise<void> { if (desktop) await invoke('notify', { title, body }); },
   browserGet: async () => response<{ active: boolean; targetUrl?: string }>(await fetchResult('/api/browser')),
   browserStart: (url: string) => post('/api/browser/start', { url }),

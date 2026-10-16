@@ -2,7 +2,7 @@
 
 ## 目录与依赖
 
-- `crates/core`：下载队列、固定处理计划、SQLite、加密凭据、进程监督、FFmpeg 与封面。
+- `crates/core`：下载队列、固定处理计划、SQLite、本地明文凭据、进程监督、FFmpeg 与封面。
 - `crates/mcp`：复用核心的 Streamable HTTP MCP 协议服务和 stdio 桥接程序；桌面与 Docker 只保留一个服务开关。
 - `src-tauri`：桌面窗口、受控文件访问、通知、更新和退出保存。
 - `crates/server`：认证网页、SSE、受控下载与一次性远程浏览器。
@@ -51,10 +51,10 @@ cargo test --locked -p huifa-desktop
 
 ## GitHub Actions 正式发布
 
-从默认分支运行 **Release**，填写 `version`（例如 `0.3.0`）和 Markdown `release_notes`。仓库需要 `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 两个 Secrets；Tauri 配置的公钥必须对应。私钥不可提交到 Git。
+从默认分支运行 **Release**，填写 `version`（例如 `0.4.0`）和 Markdown `release_notes`。仓库需要 `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 两个 Secrets；Tauri 配置的公钥必须对应。私钥不可提交到 Git。
 
 ```sh
-gh workflow run release.yml --ref main -f version=0.3.0 -F release_notes=@release-notes/0.3.0.md
+gh workflow run release.yml --ref main -f version=0.4.0 -F release_notes=@release-notes/0.4.0.md
 ```
 
 工作流验证版本与说明，生成包含版本、锁文件和工具版本的一个提交；共享前端只构建一次。Windows、Linux 桌面和原生 amd64、ARM64 容器基于同一提交构建并验收。

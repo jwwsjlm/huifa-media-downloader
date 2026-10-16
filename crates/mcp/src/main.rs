@@ -58,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
         parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost")),
         "Bridge only connects to the local desktop app"
     );
-    let config = StreamableHttpClientTransportConfig::with_uri(url);
+    let password = std::env::var("HUIFA_MCP_PASSWORD").unwrap_or_else(|_| "admin".into());
+    let config = StreamableHttpClientTransportConfig::with_uri(url).auth_header(password);
     let transport = StreamableHttpClientTransport::from_config(config);
     let client = ().serve(transport).await.map_err(|_| {
         anyhow::anyhow!(

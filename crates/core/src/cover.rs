@@ -355,6 +355,84 @@ fn endpoint(base: &str) -> Result<url::Url> {
     url.set_path(&path);
     Ok(url)
 }
+pub(crate) async fn models(app: &App, args: &Value) -> Result<Value> {
+    let settings = app.db.settings()?;
+    let base = args
+        .get("baseUrl")
+        .map(|value| value.as_str().context("AI endpoint must be text"))
+        .transpose()?
+        .unwrap_or_else(|| settings["aiBaseUrl"].as_str().unwrap_or(""));
+    ensure!(base.len() <= 8192, "AI endpoint is too long");
+    let mut url = endpoint(base)?;
+    let path = url
+        .path()
+        .strip_suffix("/images/edits")
+        .context("Invalid AI endpoint")?;
+    let path = format!("{path}/models");
+    url.set_path(&path);
+    let key = args
+        .get("apiKey")
+        .map(|value| value.as_str().context("AI API key must be text"))
+        .transpose()?
+        .filter(|key| !key.trim().is_empty())
+        .map(str::to_owned)
+        .or(app.credentials.secret("aiApiKey")?)
+        .context("Configure an AI API key first")?;
+    ensure!(
+        !key.trim().is_empty() && key.len() <= 16384 && !key.chars().any(char::is_control),
+        "Invalid AI API key"
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let action = async {
+        let response = client
+            .get(url)
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|error| error.without_url())?;
+        match response.status().as_u16() {
+            401 | 403 => {
+                bail!("Model list authentication failed; check the API key and its permissions")
+            }
+            404 | 405 => bail!(
+                "This AI service does not support listing models; enter the model ID manually"
+            ),
+            status => ensure!(
+                (200..300).contains(&status),
+                "AI model service returned HTTP {status}"
+            ),
+        }
+        let value: Value =
+            serde_json::from_slice(&response_bytes(response, 2 * 1024 * 1024).await?)?;
+        let records = value["data"]
+            .as_array()
+            .context("AI service returned an invalid model list")?;
+        ensure!(
+            records.len() <= 10000,
+            "AI service returned too many models"
+        );
+        let mut ids = Vec::new();
+        for record in records {
+            let id = record["id"]
+                .as_str()
+                .context("AI service returned an invalid model ID")?;
+            ensure!(
+                !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control),
+                "AI service returned an invalid model ID"
+            );
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(json!({"models":ids}))
+    };
+    tokio::select! { value=action=>value, _=app.shutdown_token.cancelled()=>bail!("Operation interrupted") }.context("Cannot fetch AI models")
+}
+
 async fn response_bytes(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     ensure!(
         response.content_length().is_none_or(|n| n <= limit as u64),
@@ -468,6 +546,104 @@ async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn model_discovery_uses_drafts_without_changing_saved_settings_and_handles_errors()
+    -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        app.command("settings.save", json!({"settings":{"aiApiKey":"saved-fixture-key","aiModel":"keep-model","appearanceTheme":"light"}})).await?;
+        let before = app.db.settings()?;
+        for (status, body, declared, expected) in [
+            (
+                200,
+                r#"{"data":[{"id":"z-image","secret":"never-return"},{"id":"a-image"},{"id":"z-image"}]}"#,
+                None,
+                "",
+            ),
+            (401, "{}", None, "authentication failed"),
+            (404, "{}", None, "does not support listing models"),
+            (200, r#"{"data":[{"id":42}]}"#, None, "invalid model ID"),
+            (200, "{}", Some(2 * 1024 * 1024 + 1), "too large"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = vec![0; 8192];
+                let count = socket.read(&mut request).await?;
+                let request = String::from_utf8_lossy(&request[..count]);
+                ensure!(
+                    request.starts_with("GET /custom/v1/models HTTP/1.1"),
+                    "Wrong model endpoint"
+                );
+                ensure!(
+                    request.to_ascii_lowercase().contains(if status == 200 {
+                        "authorization: bearer saved-fixture-key"
+                    } else {
+                        "authorization: bearer draft-fixture-key"
+                    }),
+                    "Wrong model key source"
+                );
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", declared.unwrap_or(body.len())).as_bytes()).await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            let mut args = json!({"baseUrl":format!("http://{address}/custom/v1/images/edits")});
+            if status != 200 {
+                args["apiKey"] = json!("draft-fixture-key");
+            }
+            let result = app.command("ai.models", args).await;
+            if expected.is_empty() {
+                assert_eq!(result?, json!({"models":["a-image","z-image"]}));
+            } else {
+                assert!(format!("{:#}", result.unwrap_err()).contains(expected));
+            }
+            server.await??;
+            assert_eq!(app.db.settings()?, before);
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_discovery_times_out_without_losing_the_saved_model() -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let result = app
+            .command(
+                "ai.models",
+                json!({"baseUrl":format!("http://{address}/v1"),"apiKey":"timeout-fixture"}),
+            )
+            .await;
+        assert!(
+            format!("{:#}", result.unwrap_err())
+                .to_lowercase()
+                .contains("timed out")
+        );
+        server.abort();
+        assert_eq!(app.db.settings()?, json!({}));
+        app.shutdown().await?;
+        Ok(())
+    }
     #[tokio::test]
     async fn audit_ai_completion_preserves_concurrent_export_and_publication() -> Result<()> {
         use tokio::{

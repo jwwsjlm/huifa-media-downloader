@@ -12,7 +12,7 @@ Huifa Media Downloader is a Rust media downloader and processing app. The Tauri 
 - Automatic best/worst quality selection, formats and audio tracks, subtitles, chapters, cuts, SponsorBlock, transcoding and audio export.
 - Separate download and processing queues. Each task freezes its plan, runtime versions and input, and supports pause, restart recovery and offline retries after processing failures.
 - Completed media management, JPEG crop/padding exports and AI cover editing based on the original image.
-- Encrypted Cookies, proxy settings and AI keys; browser Cookie import on desktop and a disposable remote browser login in Docker.
+- Cookies, proxy settings and AI keys stored in ordinary local files; built-in and compatible local browser sign-in plus existing-browser Cookie import on desktop, and disposable remote browser sign-in in Docker.
 - Built-in MCP service. An AI client can query metadata, formats, collections, subtitles and comments, then create or control downloads. The service is disabled by default and the page displays copyable JSON configuration.
 - Chinese/English, dark/light themes, virtual task lists, responsive layouts, SHA-256 checksums and signed desktop updates.
 
@@ -24,7 +24,7 @@ These screenshots are from a real Docker container with isolated test data.
 | --- | --- |
 | ![Docker download queue](docs/images/docker-downloads.jpg) | ![Docker completed media](docs/images/docker-completed.jpg) |
 
-| Settings | AI Video Service (MCP) |
+| Settings | AI Media Service (MCP) |
 | --- | --- |
 | ![Docker settings](docs/images/docker-settings.jpg) | ![Docker MCP page](docs/images/mcp-docker.jpg) |
 
@@ -43,40 +43,84 @@ The installer and portable ZIP contain the same application with verified downlo
 
 Extract a portable ZIP and run `HuifaDownloader.exe`; keep `tools` and `portable.flag` beside it. Microsoft Edge WebView2 Runtime is required. Both Windows editions share system user data and Downloads folders. Close the other edition before switching, and replace the portable directory only while the app is closed.
 
-The application ID is `com.huifa.downloader.rust`. Rust state is stored under `HuifaDownloaderRust` in the system local data directory, with media in the matching Downloads folder. Include `.credentials.key` in backups so encrypted Cookies and AI keys can be restored.
+The application ID is `com.huifa.downloader.rust`. Rust state is stored under `HuifaDownloaderRust` in the system local data directory, with media in the matching Downloads folder. Cookies, proxy settings and AI keys are plaintext files in `credentials`; back up the entire data directory. Older encrypted records migrate automatically at startup and their key is removed after migration. Keep the original `.credentials.key` until that migration completes.
+
+Under desktop **Settings → Network & cookies**, select **Open browser sign-in** and enter the source website. Use the built-in browser (Windows WebView2 / Linux WebKit), or a window from an installed Edge, Chrome or Chromium. Cookies sync automatically during sign-in and once more before the browser closes. No save click is needed. New downloads and media queries match cookies to the target domain by default and pass them to yt-dlp through its cookie file; existing tasks retain their frozen credentials. Use the local browser for sites such as Google that reject embedded sign-in.
+
+The dialog shows the automatically saved cookie count. Select **View cookies** to inspect a saved record. All saved records are matched to the destination website automatically; no cookie-source selection is needed. Entries show domains, counts and sync times. Viewing, hiding and refreshing do not change download settings.
+
+Automatic quality queues known single videos directly, including YouTube video URLs with playlist parameters. Unknown URLs are classified first; only actual collections show item selection. Manual mode opens the format picker. **Download clipboard** extracts, deduplicates and queues links. Fragment concurrency defaults to 4, recommends 6 and is capped at 8; existing valid settings are retained. Subtitles are off by default; choose a language to prefer manual tracks with automatic fallback and external SRT output. Missing subtitles produce a warning while the video continues. AI cover settings can fetch model IDs from the configured service or accept a manually entered ID.
+
+New output uses `downloads/title/filename`, without a short task-ID directory. Adding the same source again selects its queued, running, processing or paused task without starting another download. Completed, failed or cancelled downloads reuse their record with the new settings. Existing results remain until the replacement has been validated; failure or cancellation preserves them. Historical folders are not moved in bulk; a successful replacement cleans only the old managed files and empty ID directory.
+
+Stage prefixes such as `2/6` show the current major step and actual workflow size. Task menus and details can copy the video title or source; desktop results also provide the full file path including the filename. Format conversion offers MP4, MKV, MOV and WebM, preferring remuxing and transcoding only when needed, with advanced codec controls and preserved input files. The sidebar indicates newer releases and opens their download page; About can recheck manually. Portable builds do not launch an updater installer.
+
+Sign-in persists in separate profiles under the app data directory's `login-browser` folder. Login browsers use system network settings. Each profile can contain multiple sites, and saving exports that profile's cookies. Deleting a saved cookie entry does not sign the browser out; sign out on the website when needed. Browser profiles contain login information and should be kept private.
+
+On Windows, run `node scripts/check-login-browser.mjs` for the native regression test (requires WebView2 and Edge / Chrome). It uses isolated temporary profiles and local test pages to check cookie scopes, popups, persistence and IPC isolation, without personal browser profiles or real accounts.
 
 ## Docker web host
 
-Create `.env` in the repository root:
+Create a directory and save the following as `compose.yaml`. No repository clone is needed:
 
-```dotenv
-HUIFA_IMAGE=ghcr.io/jwwsjlm/huifa-media-downloader:0.3.0
-HUIFA_ACCOUNT=your-account
-HUIFA_PASSWORD=your-password
-HUIFA_PUBLIC_ORIGIN=http://localhost:19491
+```yaml
+services:
+  downloader:
+    image: ghcr.io/jwwsjlm/huifa-media-downloader:0.4.0
+    ports:
+      - "19491:19491"
+    environment:
+      HUIFA_ACCOUNT: admin
+      HUIFA_PASSWORD: admin
+      HUIFA_PUBLIC_ORIGIN: http://localhost:19491
+    volumes:
+      - rust-data:/data
+      - rust-downloads:/downloads
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m
+    shm_size: 256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  rust-data:
+  rust-downloads:
 ```
+
+Run in that directory:
 
 ```sh
-docker compose up -d --no-build
+docker compose pull
+docker compose up -d
 ```
 
-Open `HUIFA_PUBLIC_ORIGIN` and sign in. For remote access, set it to the complete origin used by the browser. The `rust-data` and `rust-downloads` volumes preserve configuration and media; do not run `docker compose down -v` when that data matters. See the [Docker guide](docker/README.md) for container hardening, browser login and multi-architecture builds.
+Open [http://localhost:19491](http://localhost:19491). For NAS or remote access, set `HUIFA_PUBLIC_ORIGIN` to the complete origin used by the browser (scheme, host and port), such as `http://192.168.1.10:19491`. With an HTTPS reverse proxy, use `https://download.example.com` without a path. Update this origin when changing the published host port. The image supports amd64 and ARM64 and selects the matching architecture automatically.
+
+The initial web account and password are both `admin`. Change the shared web/MCP password under **Settings → Access password** by entering the current and new password. A successful change invalidates old web and MCP sessions; sign in again and update AI clients. Desktop has no added login screen and uses the same settings for its MCP password. `HUIFA_ACCOUNT` and `HUIFA_PASSWORD` seed a new data directory only; later restarts use the password hash in `access.json`. Preserve the data volume and change the default before allowing access from other devices.
+
+`rust-data` stores configuration, Cookies and the access password; `rust-downloads` stores media. To upgrade, edit the `image` version in the original Compose directory and rerun `pull` and `up -d` above. Keep the project name and volume configuration to reuse existing data; there is no need to stop the stack or remove volumes first. Do not run `docker compose down -v`, which deletes both data volumes. See the [Docker guide](docker/README.md) for container hardening, remote browser login, host-directory mounts and multi-architecture builds.
 
 ## MCP: use yt-dlp from your AI client
 
-After signing in, open **AI 视频服务（MCP）** in the sidebar and enable the single switch. Desktop listens on `127.0.0.1:19492/mcp`. In Docker, `/mcp` is the management page and `/mcp-server` is the protocol endpoint on the same origin and published port:
+After signing in, open **AI 媒体服务（MCP）** in the sidebar and enable the single switch. Desktop listens on `127.0.0.1:19492/mcp`. In Docker, `/mcp` is the management page and `/mcp-server` is the protocol endpoint on the same origin and published port:
 
 ```json
 {
   "mcpServers": {
     "huifa": {
-      "url": "http://localhost:19491/mcp-server"
+      "url": "http://localhost:19491/mcp-server",
+      "headers": { "Authorization": "Bearer YOUR_ACCESS_PASSWORD" }
     }
   }
 }
 ```
 
-The page generates the address for the current origin. MCP calls do not use a token; changing the switch still requires the normal web session and CSRF protection. MCP inherits saved Cookies, proxy and download settings, and returns sanitized metadata, task state and errors without Cookie contents, proxy passwords, internal paths or signed media URLs. Give the endpoint only to trusted AI clients. Desktop also offers stdio configuration using the bundled `huifa-mcp-bridge`, with no separate Python or Node install.
+The page generates the address for the current origin. Replace `YOUR_ACCESS_PASSWORD` with the access password (`admin` initially). The service switch takes effect immediately; the independent **Start MCP when the app starts** option controls the next launch, defaults off for new installations and inherits the prior enabled state for existing installations. Management actions retain web session and CSRF checks. MCP inherits saved Cookies, proxy and download settings, and returns sanitized metadata, task state and errors without Cookie contents, proxy passwords, internal paths or signed media URLs. Give the endpoint and password only to trusted AI clients. Desktop also offers stdio configuration using the bundled `huifa-mcp-bridge`; set the same password in `HUIFA_MCP_PASSWORD`, with no separate Python or Node install.
 
 See [MCP usage](docs/MCP.md) for the complete tool list and schemas.
 

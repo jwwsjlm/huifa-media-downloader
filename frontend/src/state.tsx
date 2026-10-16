@@ -7,7 +7,7 @@ export const initialState: AppState = {
   loaded: false, connected: false, version: '', tasks: {}, taskIds: [], taskListVersion: 0, activeTaskCount: 0, media: {}, mediaIds: [], mediaByTask: {}, settings: {}, tools: [],
   view: { page: /^\/mcp\/?$/.test(window.location.pathname) ? 'mcp' : 'downloads', urls: '', quality: null, taskSearch: '', taskStatus: 'all', taskSort: 'newest', taskSelection: '', mediaSearch: '', mediaSelection: '', settingsDraft: null, optionsDraft: null, settingsTab: 'downloads' },
 };
-export type Action = { type: 'snapshot'; snapshot: Snapshot } | { type: 'event'; event: CoreEvent } | { type: 'connection'; connected: boolean } | { type: 'view'; patch: Partial<ViewState> } | { type: 'setting'; key: string; value: Json } | { type: 'option'; key: string; value: DownloadOptions[string] } | { type: 'saved'; settings: Settings };
+export type Action = { type: 'snapshot'; snapshot: Snapshot } | { type: 'event'; event: CoreEvent } | { type: 'connection'; connected: boolean } | { type: 'view'; patch: Partial<ViewState> } | { type: 'setting'; key: string; value: Json } | { type: 'option'; key: string; value: DownloadOptions[string] } | { type: 'saved'; settings: Settings } | { type: 'cookie.saved'; id: string };
 const active = (task?: Task): number => task && ['downloading', 'probing', 'processing'].includes(task.status) ? 1 : 0;
 export function reducer(state: AppState, action: Action): AppState {
   if (action.type === 'connection') return { ...state, connected: action.connected };
@@ -15,6 +15,7 @@ export function reducer(state: AppState, action: Action): AppState {
   if (action.type === 'setting') return { ...state, view: { ...state.view, settingsDraft: { ...(state.view.settingsDraft || state.settings), [action.key]: action.value } } };
   if (action.type === 'option') return { ...state, view: { ...state.view, optionsDraft: { ...(state.view.optionsDraft || state.settings.downloadOptions || {}), [action.key]: action.value } } };
   if (action.type === 'saved') return { ...state, settings: action.settings, view: { ...state.view, settingsDraft: null, optionsDraft: null, quality: null } };
+  if (action.type === 'cookie.saved') return { ...state, settings: { ...state.settings, downloadOptions: { ...state.settings.downloadOptions, cookieId: action.id } }, view: { ...state.view, optionsDraft: state.view.optionsDraft ? { ...state.view.optionsDraft, cookieId: action.id } : null } };
   if (action.type === 'snapshot') {
     const tasks = Object.fromEntries(action.snapshot.tasks.map(task => [String(task.id), task]));
     const media = Object.fromEntries(action.snapshot.media.map(item => [String(item.id), item]));
@@ -50,7 +51,11 @@ export function reducer(state: AppState, action: Action): AppState {
     if (mediaByTask[item.taskId] === id) delete mediaByTask[item.taskId];
     return { ...state, media, mediaIds: state.mediaIds.filter(value => value !== id), mediaByTask, view: state.view.mediaSelection === id ? { ...state.view, mediaSelection: '' } : state.view };
   }
-  if (kind === 'settings.updated') return { ...state, settings: data as Settings };
+  if (kind === 'settings.updated') {
+    const settings = data as Settings;
+    const changedCookie = settings.downloadOptions?.cookieId !== state.settings.downloadOptions?.cookieId;
+    return { ...state, settings, view: changedCookie && state.view.optionsDraft ? { ...state.view, optionsDraft: { ...state.view.optionsDraft, cookieId: settings.downloadOptions?.cookieId ?? 'auto' } } : state.view };
+  }
   if (kind === 'tools.updated') return { ...state, tools: Array.isArray(data) ? data as unknown as Tool[] : state.tools };
   return state;
 }

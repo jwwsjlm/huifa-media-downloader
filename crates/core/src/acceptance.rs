@@ -54,6 +54,19 @@ impl LocalServer {
                     if path.contains("..") || path.contains('\\') {
                         return;
                     }
+                    if path == "generic.mp4"
+                        && !request.lines().any(|line| {
+                            line.split_once(':').is_some_and(|(name, value)| {
+                                name.eq_ignore_ascii_case("cookie")
+                                    && value
+                                        .split(';')
+                                        .any(|cookie| cookie.trim() == "login_sid=local-auth")
+                            })
+                        })
+                    {
+                        let _ = socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
                     let file = root.join(path);
                     let body = tokio::fs::read(&file).await.unwrap_or_default();
                     let status = if file.is_file() {
@@ -194,9 +207,11 @@ async fn real_split_streams_queue_offline_restart_and_publication_recovery() -> 
     std::fs::create_dir_all(&fixtures)?;
     let app = App::open(config(root.path())).await?;
     fixture(&app, &fixtures).await?;
+    image::RgbImage::from_pixel(160, 90, image::Rgb([60, 30, 90]))
+        .save(fixtures.join("preview.png"))?;
     let server = LocalServer::start(fixtures.clone()).await?;
     for index in 0..4 {
-        let metadata = json!({"@context":"https://schema.org","@type":"VideoObject","name":format!("local split {index}"),"duration":"PT4S","contentUrl":format!("{}/sample.mpd",server.url)});
+        let metadata = json!({"@context":"https://schema.org","@type":"VideoObject","name":format!("local split {index}"),"duration":"PT4S","contentUrl":format!("{}/sample.mpd",server.url),"thumbnailUrl":format!("{}/preview.png?signature=private",server.url)});
         std::fs::write(
             fixtures.join(format!("sample-{index}.html")),
             format!(
@@ -206,7 +221,49 @@ async fn real_split_streams_queue_offline_restart_and_publication_recovery() -> 
     }
     let processor = app.processor.clone().acquire_owned().await?;
     let options = json!({"writeThumbnail":false,"encoder":"copy","writeInfoJson":true});
+    let mut events = app.subscribe();
     let ids:Vec<String>=serde_json::from_value(app.command("tasks.add",json!({"urls":(0..4).map(|i|format!("{}/sample-{i}.html",server.url)).collect::<Vec<_>>(),"options":options})).await?)?;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let event = events.recv().await?;
+            if event.kind == "task.upsert" && event.data["hasThumbnail"] == true {
+                let id = event.data["id"]
+                    .as_str()
+                    .context("Preview event has no task ID")?;
+                ensure!(
+                    ids.iter().any(|candidate| candidate == id),
+                    "Unexpected preview task"
+                );
+                ensure!(
+                    event.data["status"] == "probing",
+                    "Preview was not ready immediately after metadata parsing"
+                );
+                ensure!(
+                    app.db.media_for_task(id)?.is_none(),
+                    "Task preview required completed media"
+                );
+                let file = app
+                    .command("media.file", json!({"id":id,"kind":"taskThumbnail"}))
+                    .await?;
+                let path = PathBuf::from(file["path"].as_str().context("Preview path is missing")?);
+                ensure!(
+                    file["mimeType"] == "image/jpeg",
+                    "Preview was not converted to JPEG"
+                );
+                ensure!(
+                    image::guess_format(&std::fs::read(path)?)? == image::ImageFormat::Jpeg,
+                    "Preview endpoint did not return local JPEG bytes"
+                );
+                ensure!(
+                    !event.data.to_string().contains("signature=private"),
+                    "Task preview exposed a signed source URL"
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await
+    .context("Timed out waiting for a task thumbnail before media publication")??;
     let waiting = wait_for(&app, &ids, &["waiting_processing"]).await?;
     ensure!(
         app.network.available_permits() == 3,
@@ -217,6 +274,10 @@ async fn real_split_streams_queue_offline_restart_and_publication_recovery() -> 
         "A task was published before processing"
     );
     for task in &waiting {
+        ensure!(
+            task.public()["hasThumbnail"] == true,
+            "Preview was lost when cover export was disabled"
+        );
         let manifest = task.manifest.as_ref().context("No source manifest")?;
         ensure!(
             manifest.files.iter().filter(|f| f.kind == "video").count() == 1
@@ -487,9 +548,14 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         output_extension: "mkv".into(),
     };
     let task = Task {
+        kind: "media".into(),
+        files: vec![],
         id: id.clone(),
         url: "https://example.test/offline".into(),
         title: "Option sample".into(),
+        thumbnail: None,
+        steps: vec![],
+        step_index: None,
         status: "waiting_processing".into(),
         stage: "waiting_processing".into(),
         progress: 0.0,
@@ -498,9 +564,11 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         speed: None,
         eta: None,
         error: None,
+        warnings: vec![],
         created_at: chrono::Utc::now().to_rfc3339(),
         options,
         output_path: None,
+        previous_outputs: vec![],
         cookie_snapshot: None,
         proxy_snapshot: None,
         manifest: Some(manifest),
@@ -771,30 +839,91 @@ async fn real_generic_http_mp4_and_audio_extraction() -> Result<()> {
     .await?;
     let server = LocalServer::start(fixtures).await?;
     let url = format!("{}/generic.mp4", server.url);
-    let mut cases = Vec::new();
-    for options in [
-        json!({"container":"mp4","encoder":"libx264","writeThumbnail":false,"writeInfoJson":false}),
-        json!({"contentMode":"audio","audioFormat":"flac","sectionStart":"1","sectionEnd":"3","writeThumbnail":false,"writeInfoJson":false}),
-        json!({"contentMode":"audio","audioFormat":"mp3","writeThumbnail":false,"writeInfoJson":false}),
-        json!({"contentMode":"audio","audioFormat":"aac","writeThumbnail":false,"writeInfoJson":false}),
+    ensure!(
+        download::public_probe(&app, &url, &DownloadOptions::default(), None)
+            .await
+            .is_err(),
+        "Cookie-protected media was available without login"
+    );
+    let cookies = crate::browser::netscape(
+        &json!([{"domain":"127.0.0.1","path":"/","name":"login_sid","value":"local-auth","httpOnly":true,"secure":false,"session":true}]),
+    )?;
+    app.sync_login_cookies("embedded", "Local login", Some(&cookies))?;
+    app.command("probe.video", json!({"url":url})).await?;
+    let mut previous: Option<crate::model::Media> = None;
+    for (options, video, codec, duration) in [
+        (
+            json!({"container":"mp4","encoder":"libx264","writeThumbnail":false,"writeInfoJson":false}),
+            true,
+            "aac",
+            4.0,
+        ),
+        (
+            json!({"contentMode":"audio","audioFormat":"flac","sectionStart":"1","sectionEnd":"3","writeThumbnail":false,"writeInfoJson":false}),
+            false,
+            "flac",
+            2.0,
+        ),
+        (
+            json!({"contentMode":"audio","audioFormat":"mp3","writeThumbnail":false,"writeInfoJson":false}),
+            false,
+            "mp3",
+            4.0,
+        ),
+        (
+            json!({"contentMode":"audio","audioFormat":"aac","writeThumbnail":false,"writeInfoJson":false}),
+            false,
+            "aac",
+            4.0,
+        ),
     ] {
+        let processor = app.processor.clone().acquire_owned().await?;
+        let old_hash = previous
+            .as_ref()
+            .map(|media| download::hash_file(&media.path))
+            .transpose()?;
         let ids: Vec<String> = serde_json::from_value(
             app.command("tasks.add", json!({"urls":[url],"options":options}))
                 .await?,
         )?;
-        cases.push(ids[0].clone());
-    }
-    wait_for(&app, &cases, &["completed"]).await?;
-    for (id, video, codec, duration) in [
-        (cases[0].clone(), true, "aac", 4.0),
-        (cases[1].clone(), false, "flac", 2.0),
-        (cases[2].clone(), false, "mp3", 4.0),
-        (cases[3].clone(), false, "aac", 4.0),
-    ] {
+        let id = &ids[0];
+        if let Some(previous) = &previous {
+            ensure!(
+                id == &previous.task_id,
+                "Repeated URL did not reuse its task ID"
+            );
+        }
+        wait_for(&app, &ids, &["waiting_processing"]).await?;
+        if let Some(previous) = &previous {
+            let retained = app
+                .db
+                .media_for_task(id)?
+                .context("Previous media disappeared while re-downloading")?;
+            ensure!(
+                retained.id == previous.id && retained.path == previous.path,
+                "Previous media record changed before publication"
+            );
+            ensure!(
+                download::hash_file(&previous.path)? == old_hash.unwrap(),
+                "Previous result changed before new publication succeeded"
+            );
+        }
+        drop(processor);
+        wait_for(&app, &ids, &["completed"]).await?;
         let media = app
             .db
-            .media_for_task(&id)?
+            .media_for_task(id)?
             .context("Generic MP4 task was not published")?;
+        if let Some(previous) = &previous {
+            ensure!(
+                media.id == previous.id,
+                "Re-downloading changed the media ID"
+            );
+            ensure!(
+                media.path == previous.path || !previous.path.exists(),
+                "Obsolete managed output remained after successful replacement"
+            );
+        }
         let output = crate::process::run(
             &app.tool("ffprobe")?,
             &[
@@ -833,9 +962,14 @@ async fn real_generic_http_mp4_and_audio_extraction() -> Result<()> {
             "Generic output duration is invalid: {}",
             media.duration
         );
+        ensure!(
+            app.db.media()?.len() == 1,
+            "Re-downloading created duplicate media rows"
+        );
+        previous = Some(media);
     }
     ensure!(
-        app.db.media()?.len() == 4,
+        app.db.media()?.len() == 1 && app.db.tasks()?.len() == 1,
         "Generic media catalog rows are invalid"
     );
     server.shutdown().await;

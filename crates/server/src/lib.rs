@@ -49,6 +49,7 @@ pub struct Server {
     auth: Arc<auth::Auth>,
     browser: Arc<browser::Browser>,
     assets: PathBuf,
+    tasks: PathBuf,
     downloads: PathBuf,
     frontend: PathBuf,
     shutdown: CancellationToken,
@@ -79,18 +80,18 @@ fn failed(error: anyhow::Error) -> ApiError {
 
 impl Server {
     pub async fn open(config: Config) -> Result<Arc<Self>> {
-        // Validate authentication before opening storage or starting any work.
-        let auth = Arc::new(auth::Auth::new(
+        huifa_core::access::Access::initialize(
+            &config.data_dir,
             &config.account,
             &config.password,
-            config.public_origin.clone(),
-        )?);
+        )?;
         let app = App::open(AppConfig {
             data_dir: config.data_dir.clone(),
             download_dir: config.download_dir.clone(),
             tool_dir: config.tool_dir,
         })
         .await?;
+        let auth = Arc::new(auth::Auth::new(app.clone(), config.public_origin.clone())?);
         let assets = config.data_dir.join("assets");
         std::fs::create_dir_all(&assets)?;
         anyhow::ensure!(
@@ -98,6 +99,9 @@ impl Server {
             "asset storage must not be a link"
         );
         let assets = assets.canonicalize()?;
+        let tasks = config.data_dir.join("tasks");
+        std::fs::create_dir_all(&tasks)?;
+        let tasks = tasks.canonicalize()?;
         let downloads = config.download_dir.canonicalize()?;
         let browser = browser::Browser::new(
             app.clone(),
@@ -107,7 +111,7 @@ impl Server {
         let mcp = huifa_mcp::DesktopMcp::new(app.clone());
         // The container uses its existing web port rather than a second loopback listener.
         let saved = mcp.status()?;
-        app.mcp_save_settings(json!({"enabled":saved["enabled"]==true,"downloads":true,"port":saved["port"].as_u64().unwrap_or(19492)}))?;
+        app.mcp_save_settings(json!({"enabled":saved["autoStart"]==true,"autoStart":saved["autoStart"]==true,"downloads":true,"port":saved["port"].as_u64().unwrap_or(19492)}))?;
         let shutdown = CancellationToken::new();
         let mcp_stop = shutdown.child_token();
         let mcp_router = huifa_mcp::web_router(app.clone(), mcp_stop.clone());
@@ -119,6 +123,7 @@ impl Server {
             auth,
             browser,
             assets,
+            tasks,
             downloads,
             frontend: config.frontend_dir,
             shutdown,
@@ -168,10 +173,14 @@ impl Server {
             .with_state(self.clone())
     }
 
-    async fn configure_mcp(&self, enabled: bool) -> Result<()> {
+    async fn configure_mcp(&self, enabled: Option<bool>, auto_start: Option<bool>) -> Result<()> {
         let mut transport = self.mcp_transport.write().await;
         let config = self.mcp.status()?;
-        self.app.mcp_save_settings(json!({"enabled":enabled,"downloads":true,"port":config["port"].as_u64().unwrap_or(19492)}))?;
+        let enabled = enabled.unwrap_or(config["enabled"] == true);
+        self.app.mcp_save_settings(json!({"enabled":enabled,"autoStart":auto_start.unwrap_or(config["autoStart"] == true),"downloads":true,"port":config["port"].as_u64().unwrap_or(19492)}))?;
+        if auto_start.is_some() && config["enabled"] == enabled {
+            return Ok(());
+        }
         transport.0.cancel();
         let stop = self.shutdown.child_token();
         *transport = (stop.clone(), huifa_mcp::web_router(self.app.clone(), stop));
@@ -221,9 +230,11 @@ fn mcp_state(server: &Server) -> HttpResult<Value> {
     connection.as_object_mut().unwrap().remove("stdio");
     // The browser builds the external URL from its origin, including Docker port mapping.
     connection["url"] = json!("/mcp-server");
-    connection["http"] = json!({"mcpServers":{"huifa":{"url":"/mcp-server"}}});
+    connection["http"] = json!({"mcpServers":{"huifa":{"url":"/mcp-server","headers":{"Authorization":"Bearer YOUR_ACCESS_PASSWORD"}}}});
     connection["codex"] = json!("");
-    Ok(json!({"enabled":config["enabled"]==true,"connection":connection}))
+    Ok(
+        json!({"enabled":config["enabled"]==true,"autoStart":config["autoStart"]==true,"connection":connection}),
+    )
 }
 async fn mcp_status(
     State(server): State<Arc<Server>>,
@@ -235,7 +246,10 @@ async fn mcp_status(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct McpToggle {
-    enabled: bool,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default, rename = "autoStart")]
+    auto_start: Option<bool>,
 }
 async fn mcp_configure(
     State(server): State<Arc<Server>>,
@@ -243,7 +257,10 @@ async fn mcp_configure(
     Json(toggle): Json<McpToggle>,
 ) -> HttpResult<Json<Value>> {
     server.auth.authorize(&headers, true)?;
-    server.configure_mcp(toggle.enabled).await.map_err(failed)?;
+    server
+        .configure_mcp(toggle.enabled, toggle.auto_start)
+        .await
+        .map_err(failed)?;
     Ok(Json(mcp_state(&server)?))
 }
 
@@ -280,30 +297,41 @@ async fn login(
     let ip = connection
         .map(|v| v.0.0.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    if !server.auth.check_attempt(ip) {
-        return Err(ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many login attempts; try again later".into(),
-        ));
-    }
     let permit = server
         .auth
         .password_slots
-        .acquire()
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|_| ApiError::from(StatusCode::SERVICE_UNAVAILABLE))?;
-    let auth = server.auth.clone();
-    let valid = tokio::task::spawn_blocking(move || auth.verify(&input.account, &input.password))
-        .await
-        .map_err(|_| ApiError::from(StatusCode::INTERNAL_SERVER_ERROR))?;
-    drop(permit);
+    if !server.app.access.check_attempt(ip) {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed login attempts; try again later".into(),
+        ));
+    }
+    let verifier = server.app.clone();
+    let generation = server.app.access.generation();
+    let valid = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let valid = verifier.access.verify(&input.account, &input.password);
+        if verifier.access.generation() == generation {
+            verifier.access.record_attempt(ip, valid);
+        }
+        valid
+    })
+    .await
+    .map_err(|_| ApiError::from(StatusCode::INTERNAL_SERVER_ERROR))?;
+    if server.app.access.generation() != generation {
+        return Err(StatusCode::UNAUTHORIZED.into());
+    }
     if !valid {
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "invalid account or password".into(),
         ));
     }
-    let (token, session) = server.auth.create_session();
+    let (token, session) = server.auth.create_session(generation);
     let mut response = Json(
         json!({"authenticated":true, "csrfToken":session.csrf, "capabilities":capabilities()}),
     )
@@ -339,6 +367,9 @@ fn allowed_command(command: &str) -> bool {
     matches!(
         command,
         "snapshot"
+            | "access.status"
+            | "access.change_password"
+            | "app.release_status"
             | "tasks.add"
             | "tasks.pause"
             | "tasks.resume"
@@ -348,6 +379,7 @@ fn allowed_command(command: &str) -> bool {
             | "tasks.pauseAll"
             | "tasks.resumeAll"
             | "tasks.convert"
+            | "tasks.convertPreview"
             | "probe.video"
             | "probe.collection"
             | "settings.save"
@@ -355,6 +387,8 @@ fn allowed_command(command: &str) -> bool {
             | "tools.latest"
             | "cookies.import"
             | "cookies.list"
+            | "cookies.status"
+            | "ai.models"
             | "cookies.delete"
             | "cover.preview"
             | "cover.export"
@@ -411,6 +445,15 @@ async fn command(
     }
     if input.command == "settings.save" {
         strip_processing_folder(&mut value);
+    }
+    if input.command == "access.change_password" {
+        server
+            .configure_mcp(
+                Some(server.app.mcp_settings().map_err(failed)?["enabled"] == true),
+                None,
+            )
+            .await
+            .map_err(failed)?;
     }
     Ok(Json(json!({"value":value})))
 }
@@ -492,6 +535,7 @@ async fn file(
         "original" | "originalCover" => "originalCover",
         "cover" => "cover",
         "thumbnail" => "thumbnail",
+        "taskThumbnail" => "taskThumbnail",
         "description" => "description",
         "info" => "info",
         "subtitle" => "subtitle",
@@ -504,8 +548,13 @@ async fn file(
         .await
         .map_err(|_| ApiError::from(StatusCode::NOT_FOUND))?;
     let path = PathBuf::from(value["path"].as_str().ok_or(StatusCode::NOT_FOUND)?);
-    let opened = files::open_owned(&path, &[server.downloads.clone(), server.assets.clone()])
-        .map_err(|_| ApiError::from(StatusCode::NOT_FOUND))?;
+    let roots = if kind == "taskThumbnail" {
+        vec![server.tasks.clone()]
+    } else {
+        vec![server.downloads.clone(), server.assets.clone()]
+    };
+    let opened =
+        files::open_owned(&path, &roots).map_err(|_| ApiError::from(StatusCode::NOT_FOUND))?;
     files::download(
         opened,
         &path,
@@ -719,6 +768,12 @@ mod tests {
     }
 
     #[test]
+    fn cookie_plaintext_is_not_exposed_by_web_commands() {
+        assert!(allowed_command("cookies.list"));
+        assert!(!allowed_command("cookies.read"));
+    }
+
+    #[test]
     fn errors_keep_the_cause_and_remove_signed_urls() {
         let reason = anyhow::anyhow!("HTTP 403 https://example.test/file?token=secret")
             .context("Failed to parse video with yt-dlp");
@@ -768,20 +823,26 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let request = || {
-            Request::builder().method("POST").uri("/mcp-server").header("host","192.168.5.23:11510").header("content-type","application/json").header("accept","application/json, text/event-stream").body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"docker-test","version":"1"}}}"#))
+            Request::builder().method("POST").uri("/mcp-server").header("host","192.168.5.23:11510").header("authorization","Bearer test-password").header("content-type","application/json").header("accept","application/json, text/event-stream").body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"docker-test","version":"1"}}}"#))
         };
         assert_eq!(
             router.clone().oneshot(request()?).await?.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        server.configure_mcp(true).await?;
+        server.configure_mcp(Some(true), None).await?;
+        let mut missing = request()?;
+        missing.headers_mut().remove("authorization");
+        assert_eq!(
+            router.clone().oneshot(missing).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
         let response = router.clone().oneshot(request()?).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let old_session = response.headers()["mcp-session-id"].clone();
         let old_stop = server.mcp_transport.read().await.0.clone();
         let body = String::from_utf8(response.into_body().collect().await?.to_bytes().to_vec())?;
         assert!(body.contains("serverInfo"), "{body}");
-        server.configure_mcp(false).await?;
+        server.configure_mcp(Some(false), None).await?;
         assert!(
             old_stop.is_cancelled(),
             "Disabling must stop existing sessions and queries"
@@ -790,7 +851,7 @@ mod tests {
             router.clone().oneshot(request()?).await?.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        server.configure_mcp(true).await?;
+        server.configure_mcp(Some(true), None).await?;
         let mut old_request = request()?;
         old_request
             .headers_mut()
@@ -822,6 +883,7 @@ mod tests {
                     .uri("/mcp-server")
                     .header("host", "192.168.5.23:11510")
                     .header("origin", "https://evil.example")
+                    .header("authorization", "Bearer test-password")
                     .body(Body::empty())?,
             )
             .await?;
@@ -830,6 +892,318 @@ mod tests {
         assert_eq!(state["connection"]["url"], "/mcp-server");
         assert!(state["connection"].get("token").is_none());
         server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_and_mcp_share_only_failed_password_attempts_from_the_actual_peer() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let server = Server::open(Config {
+            account: "admin".into(),
+            password: "test-password".into(),
+            public_origin: None,
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+            frontend_dir: root.path().join("frontend"),
+            chromium: "missing-chromium".into(),
+        })
+        .await?;
+        server.configure_mcp(Some(true), None).await?;
+        let router = server.router();
+        let peer: SocketAddr = "192.0.2.1:12345".parse()?;
+        let login = |password: &str, peer: SocketAddr| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .extension(ConnectInfo(peer))
+                .header("host", "localhost:19491")
+                .header("origin", "http://localhost:19491")
+                .header("x-forwarded-for", "198.51.100.1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"account":"admin","password":password}).to_string(),
+                ))
+        };
+        let mcp = |password: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/mcp-server")
+                .extension(ConnectInfo(peer))
+                .header("host", "localhost:19491")
+                .header("authorization", format!("Bearer {password}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"limit-test","version":"1"}}}"#))
+        };
+        for _ in 0..6 {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(login("test-password", peer)?)
+                    .await?
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        for _ in 0..4 {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(login("wrong", peer)?)
+                    .await?
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(mcp("test-password")?)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                router.clone().oneshot(mcp("wrong")?).await?.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(login("test-password", peer)?)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(login("wrong", peer)?)
+                    .await?
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                router.clone().oneshot(mcp("wrong")?).await?.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(login("test-password", "192.0.2.1:54321".parse()?)?)
+                .await?
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(mcp("test-password")?)
+                .await?
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(login("test-password", "192.0.2.2:12345".parse()?)?)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        server
+            .app
+            .access
+            .change_password("test-password", "changed-password")?;
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(login("changed-password", peer)?)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        for _ in 0..5 {
+            let request = login("wrong", peer)?;
+            let service = router.clone();
+            let pending = tokio::spawn(async move { service.oneshot(request).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while server.auth.password_slots.available_permits() == 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            pending.abort();
+            let _ = pending.await;
+            let finished = tokio::time::timeout(
+                Duration::from_secs(5),
+                server.auth.password_slots.clone().acquire_many_owned(2),
+            )
+            .await??;
+            drop(finished);
+        }
+        assert!(
+            !server.app.access.check_attempt(peer.ip()),
+            "Disconnecting during password verification must still count the failure"
+        );
+        server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_mcp_preferences_do_not_require_or_change_enabled() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let server = Server::open(Config {
+            account: "admin".into(),
+            password: "test-password".into(),
+            public_origin: None,
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+            frontend_dir: root.path().join("frontend"),
+            chromium: "missing-chromium".into(),
+        })
+        .await?;
+        let router = server.router();
+        let (token, session) = server.auth.create_session(server.app.access.generation());
+        for (body, enabled, automatic) in [
+            (json!({"autoStart":true}), false, true),
+            (json!({"enabled":true}), true, true),
+            (json!({"autoStart":false}), true, false),
+            (json!({"enabled":false}), false, false),
+        ] {
+            let stop = server.mcp_transport.read().await.0.clone();
+            let preference_only = body.get("enabled").is_none();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/mcp")
+                        .header("host", "localhost:19491")
+                        .header("origin", "http://localhost:19491")
+                        .header("cookie", format!("huifa_session={token}"))
+                        .header("x-csrf-token", &session.csrf)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: Value =
+                serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+            assert_eq!(value["enabled"], enabled);
+            assert_eq!(value["autoStart"], automatic);
+            assert_eq!(stop.is_cancelled(), !preference_only);
+        }
+        server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_password_change_revokes_sessions_and_persists() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = || Config {
+            account: "admin".into(),
+            password: "admin".into(),
+            public_origin: None,
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+            frontend_dir: root.path().join("frontend"),
+            chromium: "missing-chromium".into(),
+        };
+        let server = Server::open(config()).await?;
+        let router = server.router();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("host", "localhost:19491")
+                    .header("origin", "http://localhost:19491")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"account":"admin","password":"admin"}"#))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()?
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+        let csrf = body["csrfToken"].as_str().unwrap();
+        server.configure_mcp(Some(true), Some(true)).await?;
+        let initialize = |password: &str| {
+            Request::builder().method("POST").uri("/mcp-server").header("host", "localhost:19491").header("authorization", format!("Bearer {password}")).header("content-type", "application/json").header("accept", "application/json, text/event-stream").body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"password-test","version":"1"}}}"#))
+        };
+        let response = router.clone().oneshot(initialize("admin")?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let old_session = response.headers()["mcp-session-id"].clone();
+        let old_stop = server.mcp_transport.read().await.0.clone();
+        let response = router.clone().oneshot(Request::builder().method("POST").uri("/api/command").header("host", "localhost:19491").header("origin", "http://localhost:19491").header("cookie", &cookie).header("x-csrf-token", csrf).header("content-type", "application/json").body(Body::from(r#"{"command":"access.change_password","args":{"currentPassword":"admin","newPassword":"changed-password"}}"#))?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(old_stop.is_cancelled());
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/session")
+                        .header("cookie", &cookie)
+                        .body(Body::empty())?
+                )
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            router.clone().oneshot(initialize("admin")?).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(initialize("changed-password")?)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        let mut old = initialize("changed-password")?;
+        old.headers_mut().insert("mcp-session-id", old_session);
+        assert_eq!(
+            router.clone().oneshot(old).await?.status(),
+            StatusCode::NOT_FOUND
+        );
+        server.shutdown().await;
+        drop(router);
+        drop(server);
+        let mut changed_environment = config();
+        changed_environment.account = "environment-account".into();
+        changed_environment.password = "environment-password".into();
+        let reopened = Server::open(changed_environment).await?;
+        assert!(reopened.app.access.verify("admin", "changed-password"));
+        assert!(
+            !reopened
+                .app
+                .access
+                .verify("environment-account", "environment-password")
+        );
+        assert_eq!(
+            mcp_state(&reopened).map_err(|error| anyhow::anyhow!(error.1))?["enabled"],
+            true
+        );
+        reopened.shutdown().await;
         Ok(())
     }
 

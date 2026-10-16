@@ -1830,12 +1830,14 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "huifa-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
+ "futures-util",
  "hex",
  "image",
  "libc",
@@ -1843,12 +1845,15 @@ dependencies = [
  "rand_core 0.6.4",
  "reqwest 0.12.28",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tar",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "url",
  "uuid",
@@ -1859,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "huifa-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1868,6 +1873,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "soup3",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -1877,11 +1883,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "webkit2gtk",
+ "webview2-com",
+ "windows",
 ]
 
 [[package]]
 name = "huifa-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1899,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "huifa-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1918,7 +1927,6 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
- "tokio-tungstenite",
  "tokio-util",
  "tower",
  "tower-http",

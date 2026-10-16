@@ -9,12 +9,18 @@ export interface Task {
   title: string;
   status: TaskStatus;
   stage: string;
+  stepIndex?: number | null;
+  stepCount?: number;
   progress: number;
   stageProgress: number | null;
   stageIndeterminate: boolean;
   speed: number | string | null;
   eta: number | string | null;
   error: string | null;
+  warnings?: string[];
+  hasThumbnail?: boolean;
+  kind?: 'media' | 'assets';
+  files?: { filename: string; kind: string; size: number }[];
   createdAt: string;
   options: DownloadOptions;
   outputPath?: string;
@@ -25,13 +31,18 @@ export interface Tool { name: string; available: boolean; version?: string; late
 export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string }
 export interface Snapshot { version: string; tasks: Task[]; media: Media[]; settings: Settings; tools: Tool[] }
 export interface CoreEvent { kind: string; data: Json }
+export interface AddReport { ids: string[]; results: { id: string; status: TaskStatus; action: 'added' | 'existing' | 'restarted' }[] }
+export interface ReleaseStatus { currentVersion: string; latestVersion: string; updateAvailable: boolean; url: string }
 export interface Capabilities { desktop: boolean; browserCookies: boolean; remoteBrowser: boolean; updates: boolean; directoryPicker: boolean }
 export interface Session { authenticated: boolean; csrfToken?: string; capabilities?: Partial<Capabilities> }
-export interface CookieEntry { id: string; name: string; domains?: string[]; count?: number; createdAt?: string }
+export interface CookieEntry { id: string; name: string; domains?: string[]; count?: number; createdAt?: string; updatedAt?: string }
+export type LoginBrowserMode = 'embedded' | 'system';
+export interface LoginBrowserStatus { active: boolean; mode: LoginBrowserMode | null; targetUrl?: string | null; systemBrowser: string | null; cookie?: CookieEntry | null; saveError?: string | null }
+export interface LoginBrowserSaved { cookie: CookieEntry; settings: Settings }
 export interface Format { id?: string; formatId?: string; format_id?: string; ext?: string; width?: number; height?: number; fps?: number; vcodec?: string; acodec?: string; abr?: number; filesize?: number; formatNote?: string; format_note?: string; language?: string }
 export interface VideoProbe { title: string; formats: Format[]; duration?: number; thumbnail?: string }
 export interface CollectionEntry { id?: string; url: string; title: string; index?: number; duration?: number; available?: boolean; error?: string }
-export interface CollectionProbe { title: string; entries: CollectionEntry[] }
+export interface CollectionProbe { kind: 'video' | 'collection'; title: string; entries: CollectionEntry[] }
 export interface CoverResult { assetId?: string; id?: string; url?: string; filename?: string }
 export type Page = 'downloads' | 'completed' | 'settings' | 'mcp' | 'about';
 export type Locale = 'zh-CN' | 'en-US';

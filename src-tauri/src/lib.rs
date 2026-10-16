@@ -16,6 +16,8 @@ use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 
+mod login_browser;
+
 struct Host {
     core: Arc<App>,
     mcp: huifa_mcp::DesktopMcp,
@@ -25,6 +27,7 @@ struct Host {
     closing: AtomicBool,
     shutdown_done: AtomicBool,
     update: Mutex<Option<tauri_plugin_updater::Update>>,
+    login_browser: login_browser::LoginBrowser,
 }
 
 fn error(error: impl std::fmt::Display) -> String {
@@ -32,19 +35,39 @@ fn error(error: impl std::fmt::Display) -> String {
 }
 
 #[tauri::command]
-async fn command(command: String, args: Value, host: State<'_, Host>) -> Result<Value, String> {
+async fn command(
+    app: tauri::AppHandle,
+    command: String,
+    args: Value,
+    host: State<'_, Host>,
+) -> Result<Value, String> {
+    if command.starts_with("browser.login.") {
+        if host.closing.load(Ordering::Acquire) {
+            return Err("Application is shutting down".into());
+        }
+        return host
+            .login_browser
+            .command(&app, &host.core, &command, &args)
+            .await
+            .map_err(error);
+    }
     match command.as_str() {
         "mcp.status" => return host.mcp.status().map_err(error),
         "mcp.configure" => {
+            let saved = host.mcp.status().map_err(error)?;
             return host
                 .mcp
                 .configure(
-                    args["enabled"].as_bool().ok_or("enabled must be boolean")?,
+                    args["enabled"]
+                        .as_bool()
+                        .unwrap_or(saved["enabled"] == true),
                     true,
-                    args["port"]
+                    args.get("port")
+                        .unwrap_or(&saved["port"])
                         .as_u64()
                         .filter(|n| *n > 0 && *n <= 65535)
                         .ok_or("Invalid MCP port")? as u16,
+                    args["autoStart"].as_bool(),
                 )
                 .await
                 .map_err(error);
@@ -69,13 +92,84 @@ async fn command(command: String, args: Value, host: State<'_, Host>) -> Result<
     if command == "media.file" {
         return Err("File paths are internal to the desktop host".into());
     }
+    if matches!(
+        command.as_str(),
+        "tasks.add" | "probe.video" | "probe.collection"
+    ) {
+        host.login_browser
+            .sync(&app, &host.core)
+            .await
+            .map_err(error)?;
+    }
     if command == "host.paths" {
         return Ok(json!({"downloadDir":host.download_dir,"dataDir":host.data_dir}));
     }
     if serde_json::to_vec(&args).map_err(error)?.len() > 3 * 1024 * 1024 {
         return Err("Command arguments are too large".into());
     }
+    if command == "cookies.read" {
+        return host
+            .core
+            .read_cookie(args["id"].as_str().ok_or("A Cookie ID is required")?)
+            .map(Value::String)
+            .map_err(error);
+    }
+    if command == "access.change_password" {
+        let value = host.core.command(&command, args).await.map_err(error)?;
+        host.mcp.shutdown().await;
+        let config = host.mcp.status().map_err(error)?;
+        if config["enabled"] == true {
+            host.mcp
+                .configure(
+                    true,
+                    true,
+                    config["port"].as_u64().unwrap_or(19492) as u16,
+                    None,
+                )
+                .await
+                .map_err(error)?;
+        }
+        return Ok(value);
+    }
     host.core.command(&command, args).await.map_err(error)
+}
+
+#[tauri::command]
+async fn task_copy_value(
+    host: State<'_, Host>,
+    id: String,
+    kind: String,
+) -> Result<String, String> {
+    let value = host.core.task_copy_value(&id, &kind).map_err(error)?;
+    Ok(if kind == "path" {
+        clipboard_path(value)
+    } else {
+        value
+    })
+}
+
+fn clipboard_path(value: String) -> String {
+    if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else {
+        value.strip_prefix(r"\\?\").unwrap_or(&value).to_string()
+    }
+}
+
+#[tauri::command]
+async fn release_status(host: State<'_, Host>) -> Result<Value, String> {
+    host.core
+        .command("app.release_status", json!({}))
+        .await
+        .map_err(error)
+}
+
+#[tauri::command]
+fn open_release(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    if !huifa_core::releases::valid_url(&url) {
+        return Err("Unsupported release URL".into());
+    }
+    app.opener().open_url(url, None::<&str>).map_err(error)
 }
 
 #[tauri::command]
@@ -122,8 +216,8 @@ async fn choose_directory(
 fn file_kind(kind: &str) -> Result<&str> {
     match kind {
         "video" | "media" => Ok("media"),
-        "cover" | "originalCover" | "thumbnail" | "description" | "info" | "subtitle"
-        | "chapter" => Ok(kind),
+        "cover" | "originalCover" | "thumbnail" | "taskThumbnail" | "description" | "info"
+        | "subtitle" | "chapter" => Ok(kind),
         _ => anyhow::bail!("Unsupported media file kind"),
     }
 }
@@ -284,6 +378,7 @@ async fn install_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<
     let update = guard.as_mut().ok_or("Check for an update first")?;
     let bytes = update.download(|_, _| {}, || {}).await.map_err(error)?;
     host.closing.store(true, Ordering::Release);
+    host.login_browser.stop(&app, &host.core).await;
     if let Err(reason) = host.core.shutdown().await {
         host.closing.store(false, Ordering::Release);
         return Err(error(reason));
@@ -306,7 +401,35 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let handle = window.app_handle().clone();
+                let label = window.label().to_owned();
+                if label.starts_with("login-") {
+                    tauri::async_runtime::spawn(async move {
+                        handle
+                            .state::<Host>()
+                            .login_browser
+                            .window_closed(&handle, &label)
+                            .await;
+                    });
+                }
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label().starts_with("login-") {
+                    api.prevent_close();
+                    let handle = window.app_handle().clone();
+                    let label = window.label().to_owned();
+                    tauri::async_runtime::spawn(async move {
+                        let host = handle.state::<Host>();
+                        if let Err(reason) = host.login_browser.close_window(&handle, &host.core, &label).await {
+                            let _ = handle.emit("huifa-host-error", json!({"message":format!("Could not save login cookies: {}. Keep the browser open and try again.", error(reason))}));
+                        }
+                    });
+                    return;
+                }
+                if window.label() != "main" {
+                    return;
+                }
                 let Some(host) = window.try_state::<Host>() else {
                     return;
                 };
@@ -356,16 +479,17 @@ pub fn run() {
             });
             let mcp = huifa_mcp::DesktopMcp::new(core.clone());
             let config = mcp.status()?;
-            if config["enabled"] == true
-                && let Err(reason) = tauri::async_runtime::block_on(mcp.configure(
-                    true,
+            if let Err(reason) = tauri::async_runtime::block_on(mcp.configure(
+                    config["autoStart"] == true,
                     true,
                     config["port"].as_u64().unwrap_or(19492) as u16,
+                    None,
                 ))
             {
                 eprintln!("MCP startup failed: {reason}");
             }
             app.manage(Host {
+                login_browser: login_browser::LoginBrowser::new(base.join("login-browser"))?,
                 mcp,
                 core,
                 data_dir: base,
@@ -374,6 +498,16 @@ pub fn run() {
                 closing: AtomicBool::new(false),
                 shutdown_done: AtomicBool::new(false),
                 update: Mutex::new(None),
+            });
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    let host = handle.state::<Host>();
+                    if host.closing.load(Ordering::Acquire) { break; }
+                    let _ = host.login_browser.sync(&handle, &host.core).await;
+                }
             });
             Ok(())
         })
@@ -421,7 +555,10 @@ pub fn run() {
             upload_asset,
             notify,
             check_update,
-            install_update
+            install_update,
+            task_copy_value,
+            release_status,
+            open_release
         ]);
     let application = builder
         .build(tauri::generate_context!())
@@ -447,6 +584,8 @@ fn begin_shutdown(app: &tauri::AppHandle) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         handle.state::<Host>().mcp.shutdown().await;
+        let host = handle.state::<Host>();
+        host.login_browser.stop(&handle, &host.core).await;
         match core.shutdown().await {
             Ok(()) => {
                 handle
@@ -496,8 +635,24 @@ mod tests {
     fn only_owned_file_kinds_cross_host_boundary() {
         assert_eq!(file_kind("video").unwrap(), "media");
         assert_eq!(file_kind("cover").unwrap(), "cover");
+        assert_eq!(file_kind("taskThumbnail").unwrap(), "taskThumbnail");
         assert!(file_kind("../../secret").is_err());
         assert!(file_kind("file:///etc/passwd").is_err());
+    }
+    #[test]
+    fn copied_paths_use_normal_windows_notation() {
+        assert_eq!(
+            clipboard_path(r"\\?\D:\下载\视频.mkv".into()),
+            r"D:\下载\视频.mkv"
+        );
+        assert_eq!(
+            clipboard_path(r"\\?\UNC\server\share\video.mkv".into()),
+            r"\\server\share\video.mkv"
+        );
+        assert_eq!(
+            clipboard_path("/downloads/video.mkv".into()),
+            "/downloads/video.mkv"
+        );
     }
     #[test]
     fn export_preserves_existing_target_on_failure_and_replaces_on_success() -> Result<()> {

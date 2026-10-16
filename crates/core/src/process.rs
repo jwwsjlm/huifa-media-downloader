@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::{path::Path, process::Stdio, sync::Arc};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
@@ -18,6 +18,56 @@ pub async fn run(
     directory: Option<&Path>,
     cancel: &CancellationToken,
     callback: Option<LineCallback>,
+) -> Result<ProcessOutput> {
+    run_inner(executable, args, directory, cancel, callback, None).await
+}
+
+/// Metadata queries must bound bytes while reading, including a single JSON line.
+pub async fn run_limited(
+    executable: &Path,
+    args: &[String],
+    directory: Option<&Path>,
+    cancel: &CancellationToken,
+    max_stdout: usize,
+    timeout: std::time::Duration,
+) -> Result<ProcessOutput> {
+    run_inner(
+        executable,
+        args,
+        directory,
+        cancel,
+        None,
+        Some((max_stdout, timeout, false)),
+    )
+    .await
+}
+
+/// Only human-readable engine inventories use the tool's legacy Windows code page.
+pub async fn run_limited_text(
+    executable: &Path,
+    args: &[String],
+    cancel: &CancellationToken,
+    max_stdout: usize,
+    timeout: std::time::Duration,
+) -> Result<ProcessOutput> {
+    run_inner(
+        executable,
+        args,
+        None,
+        cancel,
+        None,
+        Some((max_stdout, timeout, true)),
+    )
+    .await
+}
+
+async fn run_inner(
+    executable: &Path,
+    args: &[String],
+    directory: Option<&Path>,
+    cancel: &CancellationToken,
+    callback: Option<LineCallback>,
+    limit: Option<(usize, std::time::Duration, bool)>,
 ) -> Result<ProcessOutput> {
     if cancel.is_cancelled() {
         bail!("Operation interrupted");
@@ -52,11 +102,28 @@ pub async fn run(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let out_callback = callback.clone();
-    let out = tokio::spawn(async move { read_lines(stdout, false, out_callback).await });
-    let err = tokio::spawn(async move { read_lines(stderr, true, callback).await });
+    let overflow = CancellationToken::new();
+    let out_overflow = overflow.clone();
+    let out = tokio::spawn(async move {
+        match limit {
+            Some((max, _, legacy_text)) => {
+                read_limited_output(stdout, max, out_overflow, legacy_text).await
+            }
+            None => read_lines(stdout, false, out_callback).await,
+        }
+    });
+    let err = tokio::spawn(async move {
+        if limit.is_some() {
+            read_diagnostics(stderr).await
+        } else {
+            read_lines(stderr, true, callback).await
+        }
+    });
     let status = tokio::select! {
         status=child.wait()=>status.context("Cannot wait for supervised tool")?,
         _=cancel.cancelled()=> { guard.terminate(); let _=child.kill().await; let _=child.wait().await; out.abort(); err.abort(); bail!("Operation interrupted"); }
+        _=overflow.cancelled()=> { guard.terminate(); let _=child.kill().await; let _=child.wait().await; out.abort(); err.abort(); bail!("Metadata stdout exceeds its byte limit"); }
+        _=tokio::time::sleep(limit.map_or(std::time::Duration::from_secs(86400), |(_, timeout, _)| timeout)), if limit.is_some()=> { guard.terminate(); let _=child.kill().await; let _=child.wait().await; out.abort(); err.abort(); bail!("Metadata query timed out"); }
     };
     // Descendants must be gone before draining pipes or shutdown can hang forever.
     guard.terminate();
@@ -84,6 +151,108 @@ pub async fn run(
         stdout,
         stderr: redact(&stderr),
     })
+}
+
+#[cfg(test)]
+async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    max: usize,
+    overflow: CancellationToken,
+) -> Result<String> {
+    read_limited_output(reader, max, overflow, false).await
+}
+
+async fn read_limited_output<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    max: usize,
+    overflow: CancellationToken,
+    legacy_text: bool,
+) -> Result<String> {
+    let mut captured = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        if count > max.saturating_sub(captured.len()) {
+            overflow.cancel();
+            bail!("Metadata stdout exceeds its byte limit");
+        }
+        captured.extend_from_slice(&chunk[..count]);
+    }
+    match String::from_utf8(captured) {
+        Ok(value) => Ok(value),
+        Err(error) if legacy_text => decode_inventory_text(error.as_bytes()),
+        Err(error) => Err(error).context("Metadata stdout is not UTF-8"),
+    }
+}
+
+fn decode_inventory_text(bytes: &[u8]) -> Result<String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::{
+            CP_ACP, MB_ERR_INVALID_CHARS, MultiByteToWideChar,
+        };
+        let length = i32::try_from(bytes.len())?;
+        let size = unsafe {
+            MultiByteToWideChar(
+                CP_ACP,
+                MB_ERR_INVALID_CHARS,
+                bytes.as_ptr(),
+                length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if size == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Cannot decode the engine inventory's Windows code page");
+        }
+        let mut wide = vec![0u16; size as usize];
+        ensure_decoded(
+            unsafe {
+                MultiByteToWideChar(
+                    CP_ACP,
+                    MB_ERR_INVALID_CHARS,
+                    bytes.as_ptr(),
+                    length,
+                    wide.as_mut_ptr(),
+                    size,
+                )
+            } == size,
+        )?;
+        String::from_utf16(&wide).context("Invalid Windows engine inventory text")
+    }
+    #[cfg(not(windows))]
+    {
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .context("Engine inventory is not UTF-8")
+    }
+}
+
+#[cfg(windows)]
+fn ensure_decoded(success: bool) -> Result<()> {
+    if !success {
+        return Err(std::io::Error::last_os_error())
+            .context("Cannot decode the engine inventory's Windows code page");
+    }
+    Ok(())
+}
+
+async fn read_diagnostics<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Result<String> {
+    let mut captured = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        let take = count.min((1024 * 1024_usize).saturating_sub(captured.len()));
+        captured.extend_from_slice(&chunk[..take]);
+    }
+    Ok(String::from_utf8_lossy(&captured).into_owned())
 }
 
 async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
@@ -180,6 +349,17 @@ impl ProcessTree {
             libc::kill(-(self.pid as i32), libc::SIGKILL);
         }
     }
+    pub fn is_running(&self) -> Result<bool> {
+        if unsafe { libc::kill(-(self.pid as i32), 0) } == 0 {
+            return Ok(true);
+        }
+        let reason = std::io::Error::last_os_error();
+        match reason.raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Ok(true),
+            _ => Err(reason.into()),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -229,6 +409,23 @@ impl ProcessTree {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
         }
     }
+    pub fn is_running(&self) -> Result<bool> {
+        use windows_sys::Win32::System::JobObjects::*;
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe {
+            QueryInformationJobObject(
+                self.job as _,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(info.ActiveProcesses != 0)
+    }
 }
 
 impl Drop for ProcessTree {
@@ -244,6 +441,7 @@ impl Drop for ProcessTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     #[test]
     fn signed_urls_never_reach_errors() {
         let log = redact("failed https://example.com/a?token=secret Authorization cookie=secret");
@@ -338,6 +536,100 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn metadata_limit_rejects_a_single_oversized_line() {
+        let overflow = CancellationToken::new();
+        let bytes = vec![b'x'; 1024 * 1024];
+        assert!(
+            read_limited(bytes.as_slice(), 1024, overflow.clone())
+                .await
+                .is_err()
+        );
+        assert!(overflow.is_cancelled());
+        assert_eq!(
+            read_limited(&b"{}"[..], 2, CancellationToken::new())
+                .await
+                .unwrap(),
+            "{}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_overflow_and_timeout_terminate_supervised_tools() {
+        #[cfg(windows)]
+        let (exe, prefix, loud, slow) = (
+            std::path::PathBuf::from("powershell.exe"),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+            ],
+            "[Console]::OpenStandardOutput().Write([byte[]]::new(1048576),0,1048576); Start-Sleep -Seconds 30",
+            "Start-Sleep -Seconds 30",
+        );
+        #[cfg(unix)]
+        let (exe, prefix, loud, slow) = (
+            std::path::PathBuf::from("sh"),
+            vec!["-c".into()],
+            "head -c 1048576 /dev/zero; sleep 30",
+            "sleep 30 & wait",
+        );
+        for (script, limit, timeout, message) in [
+            (loud, 1024, 3000, "byte limit"),
+            (slow, 1024, 100, "timed out"),
+        ] {
+            let mut args = prefix.clone();
+            args.push(script.into());
+            let error = tokio::time::timeout(
+                Duration::from_secs(6),
+                run_limited(
+                    &exe,
+                    &args,
+                    None,
+                    &CancellationToken::new(),
+                    limit,
+                    Duration::from_millis(timeout),
+                ),
+            )
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_cancellation_remains_prompt() {
+        let cancel = CancellationToken::new();
+        let stopped = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stopped.cancel();
+        });
+        #[cfg(windows)]
+        let (exe, args) = (
+            std::path::PathBuf::from("powershell.exe"),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Start-Sleep -Seconds 30".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (exe, args) = (
+            std::path::PathBuf::from("sh"),
+            vec!["-c".into(), "sleep 30 & wait".into()],
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_limited(&exe, &args, None, &cancel, 1024, Duration::from_secs(120)),
+        )
+        .await
+        .unwrap();
+        assert!(result.err().unwrap().to_string().contains("interrupted"));
     }
     #[tokio::test]
     async fn cancellation_stops_supervised_process() {

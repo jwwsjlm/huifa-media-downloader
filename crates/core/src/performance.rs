@@ -199,9 +199,14 @@ fn measure_database(root: &Path, count: usize, results: &mut Vec<Value>) -> Resu
 
 fn fixture_task(tools: HashMap<String, PathBuf>) -> Task {
     Task {
+        kind: "media".into(),
+        files: vec![],
         id: task_id(0),
         url: "https://example.test/performance-fixture.mp4".into(),
         title: "Performance audit tool fixture".into(),
+        thumbnail: None,
+        steps: vec![],
+        step_index: None,
         status: "paused".into(),
         stage: "queued".into(),
         progress: 0.0,
@@ -210,9 +215,11 @@ fn fixture_task(tools: HashMap<String, PathBuf>) -> Task {
         speed: None,
         eta: None,
         error: None,
+        warnings: vec![],
         created_at: "2026-01-01T00:00:00Z".into(),
         options: DownloadOptions::default(),
         output_path: None,
+        previous_outputs: vec![],
         cookie_snapshot: None,
         proxy_snapshot: None,
         manifest: None,

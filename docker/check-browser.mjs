@@ -159,8 +159,8 @@ try {
   assert.equal((await request('/api/browser')).value.active,false);
   assert.equal(docker(['exec',name,'find','/data/browser','-mindepth','1','-maxdepth','1','-type','d']), '');
   assert.ok(!docker(['logs',name]).includes(cookieCanary));
-  const encrypted = docker(['exec',name,'sh','-c','grep -R -a -l "$1" /data/credentials || true','sh',cookieCanary]);
-  assert.equal(encrypted,'');
+  const stored = docker(['exec',name,'sh','-c','grep -R -a -l "$1" /data/credentials || true','sh',cookieCanary]);
+  assert.ok(stored.endsWith(`/${saved.id}.json`));
   assert.ok(lastFrame && frames >= 1);
   await request('/api/browser/start',{url});
   await request('/api/logout',{});
@@ -168,7 +168,7 @@ try {
   assert.equal(denied.status,401);
   assert.equal(docker(['exec',name,'find','/data/browser','-mindepth','1','-maxdepth','1','-type','d']), '');
   assert.ok(!docker(['top',name,'-eo','pid,comm']).split('\n').some(command=>command.trim().split(/\s+/)[1]==='chromium'));
-  console.log(`Remote browser acceptance passed: ${platform}, authenticated SSE JPEG, mouse/text/key input, encrypted Cookie save, loopback CDP, profile and logout process cleanup`);
+  console.log(`Remote browser acceptance passed: ${platform}, authenticated SSE JPEG, mouse/text/key input, local plaintext Cookie save, loopback CDP, profile and logout process cleanup`);
 } finally {
   streamAbort.abort(); await stream?.catch(()=>{});
   docker(['rm','-f','-v',name],true); docker(['volume','rm',volume],true);

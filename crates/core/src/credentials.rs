@@ -3,12 +3,11 @@ use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
-use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -16,11 +15,11 @@ use std::{
 use uuid::Uuid;
 
 const MAX_COOKIES: usize = 2 * 1024 * 1024;
+const MAX_RECORD: usize = MAX_COOKIES * 6 + 4096;
 const HEADER: &[u8] = b"HUIFA-CREDENTIALS-1\0";
 
 pub struct CredentialStore {
     directory: PathBuf,
-    cipher: ChaCha20Poly1305,
     lock: Mutex<()>,
 }
 
@@ -35,30 +34,12 @@ impl CredentialStore {
         private_directory(data_dir)?;
         let directory = data_dir.join("credentials");
         private_directory(&directory)?;
-        let key_path = data_dir.join(".credentials.key");
-        let mut key = [0u8; 32];
-        match private_file(&key_path).create_new(true).open(&key_path) {
-            Ok(mut file) => {
-                OsRng.fill_bytes(&mut key);
-                file.write_all(&key)?;
-                file.sync_all()?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                ensure_regular(&key_path)?;
-                let bytes = fs::read(&key_path).context("cannot read credential key")?;
-                ensure!(
-                    bytes.len() == key.len(),
-                    "invalid credential key; preserve the data volume and restore its key"
-                );
-                key.copy_from_slice(&bytes);
-            }
-            Err(error) => return Err(error.into()),
-        }
-        Ok(Self {
+        let store = Self {
             directory,
-            cipher: ChaCha20Poly1305::new((&key).into()),
             lock: Mutex::new(()),
-        })
+        };
+        store.migrate_encrypted(data_dir)?;
+        Ok(store)
     }
 
     pub fn put(&self, name: &str, text: &str) -> Result<Value> {
@@ -76,7 +57,119 @@ impl CredentialStore {
                 text: text.into(),
             })?,
         )?;
-        Ok(json!({"id": id, "name": name.trim()}))
+        self.metadata(&id, name.trim(), text)
+    }
+
+    pub fn sync_browser(
+        &self,
+        profile: &str,
+        name: &str,
+        text: Option<&str>,
+    ) -> Result<Option<(Value, bool)>> {
+        ensure!(
+            matches!(profile, "embedded" | "edge" | "chrome" | "chromium"),
+            "Invalid login profile"
+        );
+        validate_name(name)?;
+        if let Some(text) = text {
+            validate_cookies(text)?;
+        }
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("credential store unavailable"))?;
+        // A browser profile updates one record; task identities already have their own snapshots.
+        let hash = Sha256::digest(format!("browser-login:{profile}"));
+        let id = Uuid::from_bytes(hash[..16].try_into().unwrap()).to_string();
+        if let Some(text) = text {
+            let created = !self.path(&id).exists();
+            let cookie = Cookie {
+                name: name.trim().into(),
+                text: text.into(),
+            };
+            let bytes = serde_json::to_vec(&cookie)?;
+            match self.read(&id) {
+                Ok(previous) if previous == bytes => {}
+                Ok(_) => self.write(&id, &bytes)?,
+                Err(reason) if self.path(&id).exists() => return Err(reason),
+                Err(_) => self.write(&id, &bytes)?,
+            }
+            Ok(Some((self.metadata(&id, &cookie.name, text)?, created)))
+        } else {
+            let path = self.path(&id);
+            if path.exists() {
+                ensure_regular(&path)?;
+                fs::remove_file(path)?;
+            }
+            Ok(None)
+        }
+    }
+
+    pub fn matching(&self, url: &str) -> Result<Option<String>> {
+        let parsed = url::Url::parse(url)?;
+        let host = parsed
+            .host_str()
+            .context("Cookie target has no host")?
+            .to_ascii_lowercase();
+        let host = match host.as_str() {
+            "youtu.be" | "www.youtu.be" | "youtube-nocookie.com" | "www.youtube-nocookie.com" => {
+                "www.youtube.com"
+            }
+            "b23.tv" | "www.b23.tv" => "www.bilibili.com",
+            _ => &host,
+        };
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("credential store unavailable"))?;
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            if let Some(id) = filename.to_str().and_then(|s| s.strip_suffix(".json"))
+                && validate_id(id).is_ok()
+            {
+                records.push((entry.metadata()?.modified()?, id.to_owned()));
+            }
+        }
+        records.sort();
+        let now = chrono::Utc::now().timestamp();
+        for (_, id) in records.into_iter().rev() {
+            let cookie: Cookie = serde_json::from_slice(&self.read(&id)?)?;
+            validate_cookies(&cookie.text)?;
+            let mut matching = Vec::new();
+            let mut matched_domain = false;
+            for row in cookie_rows(&cookie.text) {
+                let fields: Vec<_> = row.split('\t').collect();
+                let domain = fields[0]
+                    .strip_prefix("#HttpOnly_")
+                    .unwrap_or(fields[0])
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase();
+                let expires = fields[4].parse::<i64>()?;
+                if host == domain
+                    || fields[1] == "TRUE"
+                        && host
+                            .strip_suffix(&domain)
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                {
+                    matched_domain = true;
+                    if expires == 0 || expires > now {
+                        matching.push(row);
+                    }
+                }
+            }
+            // Keep one complete identity for the site; merging profiles can mix accounts or restore logged-out cookies.
+            if matched_domain {
+                if matching.is_empty() {
+                    return Ok(None);
+                }
+                let text = format!("# Netscape HTTP Cookie File\n{}\n", matching.join("\n"));
+                validate_cookies(&text)?;
+                return Ok(Some(text));
+            }
+        }
+        Ok(None)
     }
 
     pub fn get(&self, id: &str) -> Result<String> {
@@ -86,6 +179,7 @@ impl CredentialStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("credential store unavailable"))?;
         let cookie: Cookie = serde_json::from_slice(&self.read(id)?)?;
+        validate_cookies(&cookie.text)?;
         Ok(cookie.text)
     }
 
@@ -98,14 +192,16 @@ impl CredentialStore {
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
             let filename = entry.file_name();
-            let Some(id) = filename.to_str().and_then(|s| s.strip_suffix(".enc")) else {
+            let Some(id) = filename.to_str().and_then(|s| s.strip_suffix(".json")) else {
                 continue;
             };
             if validate_id(id).is_err() {
                 continue;
             }
             let cookie: Cookie = serde_json::from_slice(&self.read(id)?)?;
-            result.push(json!({"id": id, "name": cookie.name}));
+            validate_name(&cookie.name)?;
+            validate_cookies(&cookie.text)?;
+            result.push(self.metadata(id, &cookie.name, &cookie.text)?);
         }
         result.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(Value::Array(result))
@@ -120,8 +216,8 @@ impl CredentialStore {
         let path = self.path(id);
         ensure_regular(&path)?;
         ensure!(
-            fs::metadata(&path)?.len() <= (MAX_COOKIES + 4096) as u64,
-            "encrypted credential is too large"
+            fs::metadata(&path)?.len() <= MAX_RECORD as u64,
+            "credential is too large"
         );
         fs::remove_file(path)?;
         Ok(())
@@ -145,7 +241,11 @@ impl CredentialStore {
             .map_err(|_| anyhow::anyhow!("credential store unavailable"))?;
         let id = secret_id(name);
         match fs::symlink_metadata(self.path(&id)) {
-            Ok(_) => Ok(Some(String::from_utf8(self.read(&id)?)?)),
+            Ok(_) => {
+                let bytes = self.read(&id)?;
+                ensure!(bytes.len() <= MAX_COOKIES, "secret is too large");
+                Ok(Some(String::from_utf8(bytes)?))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -169,23 +269,25 @@ impl CredentialStore {
         Ok(())
     }
 
+    fn metadata(&self, id: &str, name: &str, text: &str) -> Result<Value> {
+        let mut value = cookie_metadata(id, name, text);
+        let updated: chrono::DateTime<chrono::Utc> =
+            fs::metadata(self.path(id))?.modified()?.into();
+        value["updatedAt"] = json!(updated.to_rfc3339());
+        Ok(value)
+    }
+
     fn path(&self, id: &str) -> PathBuf {
-        self.directory.join(format!("{id}.enc"))
+        let extension = if id.starts_with("secret-") {
+            "txt"
+        } else {
+            "json"
+        };
+        self.directory.join(format!("{id}.{extension}"))
     }
 
     fn write(&self, id: &str, plaintext: &[u8]) -> Result<()> {
-        let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
-        let encrypted = self
-            .cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: id.as_bytes(),
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("credential encryption failed"))?;
+        ensure!(plaintext.len() <= MAX_RECORD, "credential is too large");
         let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)?;
         #[cfg(unix)]
         {
@@ -194,9 +296,7 @@ impl CredentialStore {
                 .as_file()
                 .set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        temporary.write_all(HEADER)?;
-        temporary.write_all(&nonce)?;
-        temporary.write_all(&encrypted)?;
+        temporary.write_all(plaintext)?;
         temporary.as_file().sync_all()?;
         let target = self.path(id);
         if target.exists() {
@@ -211,25 +311,108 @@ impl CredentialStore {
     fn read(&self, id: &str) -> Result<Vec<u8>> {
         let path = self.path(id);
         ensure_regular(&path)?;
-        let bytes = fs::read(path)?;
         ensure!(
-            bytes.len() >= HEADER.len() + 12 + 16 && bytes.starts_with(HEADER),
-            "invalid encrypted credential"
+            fs::metadata(&path)?.len() <= MAX_RECORD as u64,
+            "credential is too large"
         );
-        self.cipher
-            .decrypt(
-                Nonce::from_slice(&bytes[HEADER.len()..HEADER.len() + 12]),
-                Payload {
-                    msg: &bytes[HEADER.len() + 12..],
-                    aad: id.as_bytes(),
-                },
-            )
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "credential authentication failed; the original data-volume key is required"
-                )
-            })
+        Ok(fs::read(path)?)
     }
+
+    fn migrate_encrypted(&self, data_dir: &Path) -> Result<()> {
+        let mut legacy = Vec::new();
+        for entry in fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            if let Some(id) = filename.to_str().and_then(|name| name.strip_suffix(".enc")) {
+                ensure!(
+                    validate_id(id).is_ok()
+                        || id.strip_prefix("secret-").is_some_and(|hash| {
+                            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        }),
+                    "invalid legacy credential ID"
+                );
+                legacy.push((id.to_owned(), entry.path()));
+            }
+        }
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let key_path = data_dir.join(".credentials.key");
+        ensure_regular(&key_path)
+            .context("Restore .credentials.key to migrate legacy credentials")?;
+        ensure!(
+            fs::metadata(&key_path)?.len() == 32,
+            "invalid legacy credential key"
+        );
+        let key = fs::read(&key_path)?;
+        let cipher = ChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| anyhow::anyhow!("invalid legacy credential key"))?;
+        for (id, path) in legacy {
+            ensure_regular(&path)?;
+            ensure!(
+                fs::metadata(&path)?.len() <= MAX_RECORD as u64,
+                "legacy credential is too large"
+            );
+            let bytes = fs::read(&path)?;
+            ensure!(
+                bytes.len() >= HEADER.len() + 28 && bytes.starts_with(HEADER),
+                "invalid legacy credential"
+            );
+            let plaintext = cipher.decrypt(
+                Nonce::from_slice(&bytes[HEADER.len()..HEADER.len() + 12]),
+                Payload { msg: &bytes[HEADER.len() + 12..], aad: id.as_bytes() },
+            ).map_err(|_| anyhow::anyhow!("Legacy credential migration failed; the original .credentials.key is required"))?;
+            if id.starts_with("secret-") {
+                ensure!(plaintext.len() <= MAX_COOKIES, "secret is too large");
+                std::str::from_utf8(&plaintext)?;
+            } else {
+                let cookie: Cookie = serde_json::from_slice(&plaintext)?;
+                validate_name(&cookie.name)?;
+                validate_cookies(&cookie.text)?;
+            }
+            if self.path(&id).exists() {
+                ensure!(
+                    self.read(&id)? == plaintext,
+                    "Plaintext and legacy credentials differ; preserve both files before retrying migration"
+                );
+            } else {
+                self.write(&id, &plaintext)?;
+            }
+            fs::remove_file(path)?;
+        }
+        if !fs::read_dir(&self.directory)?.any(|entry| {
+            entry.map_or(true, |entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "enc")
+            })
+        }) {
+            fs::remove_file(key_path)?;
+        }
+        Ok(())
+    }
+}
+
+fn cookie_rows(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter(|line| {
+        !line.is_empty() && (!line.starts_with('#') || line.starts_with("#HttpOnly_"))
+    })
+}
+
+fn cookie_metadata(id: &str, name: &str, text: &str) -> Value {
+    let mut domains: Vec<_> = cookie_rows(text)
+        .filter_map(|row| row.split('\t').next())
+        .map(|domain| {
+            domain
+                .strip_prefix("#HttpOnly_")
+                .unwrap_or(domain)
+                .trim_start_matches('.')
+        })
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    json!({"id":id,"name":name,"domains":domains,"count":cookie_rows(text).count()})
 }
 
 pub fn validate_cookies(text: &str) -> Result<()> {
@@ -325,35 +508,232 @@ fn ensure_regular(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn private_file(_path: &Path) -> OpenOptions {
-    let mut options = OpenOptions::new();
-    options.write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     const COOKIES: &str =
         "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t0\tsession\ttop-secret\n";
+
     #[test]
-    fn encrypted_persistence_and_redaction() -> Result<()> {
+    fn automatic_matching_is_scoped_and_keeps_profiles_separate() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = CredentialStore::open(root.path())?;
+        let jar = "# Netscape HTTP Cookie File\n#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tyoutube-login\nwww.youtube.com\tFALSE\t/private\tTRUE\t0\thost\thost-login\n.youtube.com\tTRUE\t/\tTRUE\t1\texpired\tignore\n.bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tbilibili-login\n";
+        store.put("Both websites", jar)?;
+        let youtube = store
+            .matching("https://www.youtube.com/watch?v=demo")?
+            .unwrap();
+        assert!(youtube.contains("youtube-login") && youtube.contains("host-login"));
+        assert!(!youtube.contains("bilibili-login") && !youtube.contains("expired"));
+        assert!(
+            store
+                .matching("https://m.youtube.com/")?
+                .unwrap()
+                .contains("youtube-login")
+        );
+        assert!(
+            !store
+                .matching("https://m.youtube.com/")?
+                .unwrap()
+                .contains("host-login")
+        );
+        assert!(
+            store
+                .matching("https://youtu.be/demo")?
+                .unwrap()
+                .contains("youtube-login")
+        );
+        assert!(
+            store
+                .matching("https://b23.tv/demo")?
+                .unwrap()
+                .contains("bilibili-login")
+        );
+        assert!(store.matching("https://notyoutube.com/")?.is_none());
+        assert!(
+            store
+                .matching("https://youtube.com.attacker.invalid/")?
+                .is_none()
+        );
+        let newer =
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tconsent\tnew-profile\n";
+        let entry = store.put("New profile without login", newer)?;
+        std::fs::File::options()
+            .write(true)
+            .open(store.path(entry["id"].as_str().unwrap()))?
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(1))?;
+        assert_eq!(
+            store.matching("https://www.youtube.com/")?.as_deref(),
+            Some(newer)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_sync_reuses_its_record_and_failed_updates_keep_previous_cookies() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = CredentialStore::open(root.path())?;
+        let (first, created) = store
+            .sync_browser("embedded", "Browser", Some(COOKIES))?
+            .unwrap();
+        assert!(created);
+        let id = first["id"].as_str().unwrap();
+        let modified = fs::metadata(store.path(id))?.modified()?;
+        let (same, created) = store
+            .sync_browser("embedded", "Browser", Some(COOKIES))?
+            .unwrap();
+        assert_eq!(first, same);
+        assert!(!created);
+        assert_eq!(fs::metadata(store.path(id))?.modified()?, modified);
+        let updated = COOKIES.replace("top-secret", "new-login");
+        let (second, _) = store
+            .sync_browser("embedded", "Browser", Some(&updated))?
+            .unwrap();
+        assert_eq!(first["id"], second["id"]);
+        assert_eq!(store.list()?.as_array().unwrap().len(), 1);
+        assert!(
+            store
+                .sync_browser("embedded", "Browser", Some("invalid cookies"))
+                .is_err()
+        );
+        assert_eq!(store.get(id)?, updated);
+        assert_eq!(CredentialStore::open(root.path())?.get(id)?, updated);
+        store.sync_browser("embedded", "Browser", None)?;
+        assert!(store.list()?.as_array().unwrap().is_empty());
+        Ok(())
+    }
+
+    fn legacy_record(store: &CredentialStore, id: &str, plaintext: &[u8]) -> Result<PathBuf> {
+        let key = [17u8; 32];
+        let nonce = [9u8; 12];
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: id.as_bytes(),
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("legacy fixture encryption failed"))?;
+        let mut bytes = HEADER.to_vec();
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&ciphertext);
+        let key_path = store.directory.parent().unwrap().join(".credentials.key");
+        let path = store.directory.join(format!("{id}.enc"));
+        fs::write(&key_path, key)?;
+        fs::write(&path, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for file in [&key_path, &path] {
+                fs::set_permissions(file, fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        Ok(path)
+    }
+
+    #[test]
+    fn legacy_migration_preserves_ids_and_snapshots_and_resumes_partial_work() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = CredentialStore::open(root.path())?;
+        let converted = store.put("Already converted", COOKIES)?;
+        let converted_id = converted["id"].as_str().unwrap();
+        legacy_record(&store, converted_id, &store.read(converted_id)?)?;
+        let id = Uuid::new_v4().to_string();
+        legacy_record(
+            &store,
+            &id,
+            &serde_json::to_vec(&Cookie {
+                name: "Legacy login".into(),
+                text: COOKIES.into(),
+            })?,
+        )?;
+        legacy_record(&store, &secret_id("task-cookie:frozen"), COOKIES.as_bytes())?;
+        legacy_record(&store, &secret_id("aiApiKey"), b"old-api-key")?;
+        drop(store);
+
+        let store = CredentialStore::open(root.path())?;
+        assert_eq!(store.get(&id)?, COOKIES);
+        assert_eq!(store.get(converted_id)?, COOKIES);
+        assert_eq!(
+            store.secret("task-cookie:frozen")?.as_deref(),
+            Some(COOKIES)
+        );
+        assert_eq!(store.secret("aiApiKey")?.as_deref(), Some("old-api-key"));
+        assert_eq!(store.list()?.as_array().unwrap().len(), 2);
+        assert!(!root.path().join(".credentials.key").exists());
+        assert!(!fs::read_dir(&store.directory)?.any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "enc")
+        }));
+        assert!(fs::read_to_string(store.path(&id))?.contains("top-secret"));
+        drop(store);
+        assert_eq!(CredentialStore::open(root.path())?.get(&id)?, COOKIES);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_legacy_migration_preserves_original_files_and_key() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = CredentialStore::open(root.path())?;
+        let id = Uuid::new_v4().to_string();
+        let path = legacy_record(
+            &store,
+            &id,
+            &serde_json::to_vec(&Cookie {
+                name: "Legacy".into(),
+                text: COOKIES.into(),
+            })?,
+        )?;
+        let mut bytes = fs::read(&path)?;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&path, &bytes)?;
+        assert!(CredentialStore::open(root.path()).is_err());
+        assert_eq!(fs::read(&path)?, bytes);
+        assert!(root.path().join(".credentials.key").is_file());
+        assert!(!store.path(&id).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_migration_does_not_overwrite_different_plaintext() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = CredentialStore::open(root.path())?;
+        let saved = store.put("Current", COOKIES)?;
+        let id = saved["id"].as_str().unwrap();
+        let path = legacy_record(
+            &store,
+            id,
+            &serde_json::to_vec(&Cookie {
+                name: "Old".into(),
+                text: COOKIES.replace("top-secret", "old-secret"),
+            })?,
+        )?;
+        assert!(CredentialStore::open(root.path()).is_err());
+        assert_eq!(store.get(id)?, COOKIES);
+        assert!(path.is_file());
+        assert!(root.path().join(".credentials.key").is_file());
+        Ok(())
+    }
+    #[test]
+    fn plaintext_persistence_and_metadata_redaction() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = CredentialStore::open(dir.path())?;
         let meta = store.put("Example", COOKIES)?;
         let id = meta["id"].as_str().unwrap();
         store.put_secret("aiApiKey", "key-secret")?;
         assert!(!format!("{}", store.list()?).contains("top-secret"));
-        assert!(
-            !fs::read(store.path(id))?
-                .windows(10)
-                .any(|x| x == b"top-secret")
+        assert!(fs::read_to_string(store.path(id))?.contains("top-secret"));
+        assert_eq!(
+            fs::read_to_string(store.path(&secret_id("aiApiKey")))?,
+            "key-secret"
         );
+        assert!(!dir.path().join(".credentials.key").exists());
         drop(store);
         let store = CredentialStore::open(dir.path())?;
         assert_eq!(store.get(id)?, COOKIES);
@@ -371,16 +751,22 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn rejects_tampering_and_escape() -> Result<()> {
+    fn rejects_invalid_records_and_escape() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = CredentialStore::open(dir.path())?;
         let meta = store.put("Example", COOKIES)?;
         let id = meta["id"].as_str().unwrap();
-        let mut bytes = fs::read(store.path(id))?;
-        let last = bytes.len() - 1;
-        bytes[last] ^= 1;
-        fs::write(store.path(id), bytes)?;
+        fs::write(store.path(id), b"not a cookie record")?;
         assert!(store.get(id).is_err());
+        fs::write(
+            store.path(id),
+            serde_json::to_vec(&Cookie {
+                name: "Example".into(),
+                text: "invalid cookies".into(),
+            })?,
+        )?;
+        assert!(store.get(id).is_err());
+        assert!(store.list().is_err());
         assert!(store.get("../.credentials.key").is_err());
         assert!(store.put("Example", "not cookies").is_err());
         Ok(())

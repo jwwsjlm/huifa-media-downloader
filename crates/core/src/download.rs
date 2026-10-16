@@ -4,6 +4,7 @@ use crate::{
     process::{self, LineCallback},
 };
 use anyhow::{Context, Result, bail, ensure};
+use futures_util::future::join_all;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -107,8 +108,15 @@ pub(crate) async fn probe(
     args.extend([
         "--dump-single-json".into(),
         "--skip-download".into(),
+        "--simulate".into(),
         "--no-playlist".into(),
     ]);
+    if !options.languages().is_empty() {
+        args.push("--write-subs".into());
+        if options.automatic_subtitles {
+            args.push("--write-auto-subs".into());
+        }
+    }
     if options.write_comments {
         args.push("--write-comments".into());
     }
@@ -184,6 +192,9 @@ pub(crate) async fn collection(
         "--flat-playlist".into(),
         "--skip-download".into(),
     ]);
+    if options.collection_mode != "all" {
+        args.push("--no-playlist".into());
+    }
     if options.first_n > 0 {
         args.extend(["--playlist-end".into(), options.first_n.to_string()]);
     }
@@ -211,7 +222,14 @@ pub(crate) async fn collection(
         let url=if url.starts_with("http"){url.to_string()}else if text(entry,"ie_key")=="Youtube" {format!("https://www.youtube.com/watch?v={}",text(entry,"id"))}else{String::new()};
         json!({"id":entry["id"],"url":url,"title":entry["title"],"duration":entry["duration"],"thumbnail":safe_thumbnail(entry),"isLive":entry["is_live"].as_bool().unwrap_or(false)})
     }).filter(|v|!text(v,"url").is_empty()).collect::<Vec<_>>();
-    Ok(json!({"id":info["id"],"title":info["title"],"entries":entries}))
+    let kind = if info["entries"].is_array()
+        || matches!(text(&info, "_type"), "playlist" | "multi_video")
+    {
+        "collection"
+    } else {
+        "video"
+    };
+    Ok(json!({"kind":kind,"id":info["id"],"title":info["title"],"entries":entries}))
 }
 
 fn safe_thumbnail(info: &Value) -> Value {
@@ -370,15 +388,26 @@ pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<
             selected.push(f);
         }
     } else if options.audio_track == "all" {
-        let mut tracks = std::collections::BTreeMap::<String, Value>::new();
-        for format in formats.iter().filter(|f| has_audio(f) && !has_video(f)) {
-            let language = if !text(format, "audio_track_id").is_empty() {
+        let track_key = |format: &Value| {
+            if !text(format, "audio_track_id").is_empty() {
                 text(format, "audio_track_id").to_string()
             } else if !text(format, "language").is_empty() {
                 text(format, "language").to_string()
             } else {
                 "default".into()
-            };
+            }
+        };
+        let included = selected
+            .iter()
+            .filter(|format| has_audio(format))
+            .map(track_key)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut tracks = std::collections::BTreeMap::<String, Value>::new();
+        for format in formats.iter().filter(|f| has_audio(f)) {
+            let language = track_key(format);
+            if included.contains(&language) {
+                continue;
+            }
             if tracks.get(&language).is_none_or(|previous| {
                 compare_audio(format, previous, options) == Ordering::Greater
             }) {
@@ -415,6 +444,49 @@ pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<
     let mut seen = std::collections::HashSet::new();
     selected.retain(|f| seen.insert(text(f, "format_id").to_string()));
     Ok(selected)
+}
+
+async fn collect_transfers<F, T>(
+    transfers: impl IntoIterator<Item = F>,
+    live: bool,
+    cancel: &CancellationToken,
+) -> Result<Vec<T>>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    if live {
+        let failure = Mutex::new(None);
+        let transfers = transfers.into_iter().map(|transfer| {
+            let failure = &failure;
+            async move {
+                match transfer.await {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        let mut failure = failure.lock().unwrap();
+                        if failure.is_none() {
+                            *failure = Some(error);
+                        }
+                        cancel.cancel();
+                        None
+                    }
+                }
+            }
+        });
+        let results = join_all(transfers).await;
+        if let Some(error) = failure.into_inner().unwrap() {
+            return Err(error);
+        }
+        return Ok(results.into_iter().flatten().collect());
+    }
+    let mut results = Vec::new();
+    for transfer in transfers {
+        results.push(transfer.await?);
+    }
+    Ok(results)
+}
+
+fn is_live(info: &Value) -> bool {
+    info["is_live"].as_bool().unwrap_or(false) || text(info, "live_status") == "is_live"
 }
 
 pub(crate) fn chapters(info: &Value) -> Vec<Chapter> {
@@ -469,6 +541,109 @@ fn sanitized_metadata(value: &Value) -> Value {
     }
 }
 
+#[derive(Default)]
+struct TransferProgress {
+    samples: std::collections::VecDeque<(Instant, f64)>,
+    last_received: Option<Instant>,
+    last_emitted: Option<Instant>,
+}
+
+struct TransferUpdate {
+    percent: Option<f64>,
+    speed: Option<f64>,
+    eta: Option<f64>,
+}
+
+impl TransferUpdate {
+    fn apply(self, task: &mut Task) {
+        task.stage_progress = self.percent;
+        task.stage_indeterminate = self.percent.is_none();
+        task.progress = self.percent.unwrap_or(0.0).min(99.0);
+        task.speed = self.speed;
+        task.eta = self.eta;
+    }
+
+    fn live(self, speeds: &mut [Option<f64>], index: usize) -> Self {
+        speeds[index] = self.speed;
+        Self {
+            percent: None,
+            speed: speeds.iter().flatten().copied().reduce(|a, b| a + b),
+            eta: None,
+        }
+    }
+}
+
+impl TransferProgress {
+    fn update(&mut self, line: &str, now: Instant) -> Option<TransferUpdate> {
+        let payload = line.strip_prefix("HU_PROGRESS:")?;
+        let progress = serde_json::from_str::<Value>(payload).ok()?;
+        let finished = text(&progress, "status") == "finished";
+        if !finished && text(&progress, "status") != "downloading" {
+            return None;
+        }
+        let downloaded = progress["downloaded_bytes"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)?;
+        if self.samples.back().is_some_and(|(time, bytes)| {
+            now.saturating_duration_since(*time) >= Duration::from_secs(5) || downloaded < *bytes
+        }) {
+            self.samples.clear();
+        }
+        self.last_received = Some(now);
+        self.samples.push_back((now, downloaded));
+        while self.samples.len() > 2
+            && now.saturating_duration_since(self.samples[1].0) >= Duration::from_secs(5)
+        {
+            self.samples.pop_front();
+        }
+        let total = progress
+            .get("total_bytes")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .or_else(|| {
+                progress["total_bytes_estimate"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v > 0.0)
+            });
+        // Fragment hooks report burst speeds; use actual byte movement over one shared window.
+        let (start, bytes) = self.samples.front().unwrap();
+        let seconds = now.saturating_duration_since(*start).as_secs_f64();
+        let speed = (!finished && seconds >= 1.0).then(|| (downloaded - bytes) / seconds);
+        let eta = total.and_then(|total| {
+            speed
+                .filter(|speed| *speed > 0.0)
+                .map(|speed| ((total - downloaded) / speed).max(0.0))
+        });
+        if finished {
+            self.samples.clear();
+            self.last_received = None;
+        } else if self
+            .last_emitted
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_millis(200))
+        {
+            return None;
+        }
+        self.last_emitted = Some(now);
+        Some(TransferUpdate {
+            percent: total.map(|v| (downloaded / v * 100.0).clamp(0.0, 100.0)),
+            speed,
+            eta,
+        })
+    }
+
+    fn expire(&mut self, now: Instant) -> bool {
+        if self
+            .last_received
+            .is_some_and(|last| now.saturating_duration_since(last) >= Duration::from_secs(5))
+        {
+            self.samples.clear();
+            self.last_received = None;
+            return true;
+        }
+        false
+    }
+}
+
 pub(crate) async fn transfer(
     app: &Arc<App>,
     mut task: Task,
@@ -480,7 +655,11 @@ pub(crate) async fn transfer(
         task.options.matches(&info),
         "Video is excluded by the selected date, duration or live filters"
     );
-    let formats = select_formats(&info, &task.options)?;
+    let formats = if task.kind == "assets" {
+        vec![]
+    } else {
+        select_formats(&info, &task.options)?
+    };
     let directory = app
         .config
         .data_dir
@@ -491,148 +670,175 @@ pub(crate) async fn transfer(
     std::fs::create_dir_all(&directory)?;
     let cookie_text = app.task_cookies(&task)?;
     let cookies = Cookies::new(app, cookie_text.as_deref())?;
-    let live = info["is_live"].as_bool().unwrap_or(false)
-        || formats
-            .iter()
-            .any(|f| matches!(text(f, "protocol"), "rtmp" | "rtsp" | "m3u8"));
-    let mut files = Vec::new();
-    for (index, format) in formats.iter().enumerate() {
-        let kind = if has_video(format) { "video" } else { "audio" };
-        app.set_stage(
-            &task.id,
-            "downloading",
-            &format!("downloading_{kind}_{}", index + 1),
-            None,
-        )?;
-        let output_template = directory.join(format!("source-{index}.%(ext)s"));
-        let mut args = base_args(app, &runtime_options, &cookies, Some(&task)).await?;
-        args.extend([
-            "--no-playlist".into(),
-            "--no-simulate".into(),
-            "--no-progress".into(),
-            "--newline".into(),
-            "--progress".into(),
-            "--progress-template".into(),
-            "download:HU_PROGRESS:%(progress)j".into(),
-            "--print".into(),
-            "after_move:HU_FILE:%(filepath)j".into(),
-            "--fixup".into(),
-            "never".into(),
-            "--no-write-info-json".into(),
-            "--no-write-thumbnail".into(),
-            "--no-mtime".into(),
-            "--concurrent-fragments".into(),
-            task.options.fragment_concurrent.to_string(),
-            "--format".into(),
-            text(format, "format_id").into(),
-            "--output".into(),
-            output_template.to_string_lossy().into(),
-        ]);
-        if live {
-            args.extend([
-                "--downloader".into(),
-                "ffmpeg".into(),
-                "--ffmpeg-location".into(),
-                app.task_tool(&task, "ffmpeg")
-                    .await?
-                    .to_string_lossy()
-                    .into(),
-            ]);
-            if task.options.live_from_start {
-                args.push("--live-from-start".into());
-            }
-        } else {
-            args.extend([
-                "--downloader".into(),
-                "native".into(),
-                "--hls-prefer-native".into(),
-            ]);
-        }
-        if !task.options.rate_limit.is_empty() {
-            args.extend(["--limit-rate".into(), task.options.rate_limit.clone()]);
-        }
-        args.extend(["--".into(), task.url.clone()]);
-        let app_progress = app.clone();
-        let task_id = task.id.clone();
-        let last = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
-        let callback: LineCallback = Arc::new(move |_, line| {
-            if let Some(payload) = line.strip_prefix("HU_PROGRESS:")
-                && let Ok(progress) = serde_json::from_str::<Value>(payload)
-            {
-                let mut last = last.lock().unwrap();
-                if last.elapsed() < Duration::from_millis(200)
-                    && text(&progress, "status") != "finished"
-                {
-                    return;
+    let live = is_live(&info);
+    let capture_cancel = cancel.child_token();
+    let cancel = &capture_cancel;
+    let speeds = Arc::new(Mutex::new(vec![None; formats.len()]));
+    if live {
+        app.set_stage(&task.id, "downloading", "downloading_live", None)?;
+    }
+    let transfers = formats
+        .iter()
+        .enumerate()
+        .map(|(index, format)| {
+            let task = &task;
+            let directory = &directory;
+            let cookies = &cookies;
+            let runtime_options = &runtime_options;
+            let speeds = speeds.clone();
+            async move {
+                let kind = if has_video(format) { "video" } else { "audio" };
+                let stage = if live {
+                    "downloading_live".into()
+                } else {
+                    format!("downloading_{kind}_{}", index + 1)
+                };
+                if !live {
+                    app.set_stage(&task.id, "downloading", &stage, None)?;
                 }
-                *last = Instant::now();
-                if let Ok(mut task) = app_progress.db.task(&task_id) {
-                    if task.status != "downloading" {
+                let output_template = directory.join(format!("source-{index}.%(ext)s"));
+                let mut args = base_args(app, runtime_options, cookies, Some(task)).await?;
+                args.extend([
+                    "--no-playlist".into(),
+                    "--no-simulate".into(),
+                    "--no-progress".into(),
+                    "--newline".into(),
+                    "--progress".into(),
+                    "--progress-template".into(),
+                    "download:HU_PROGRESS:%(progress)j".into(),
+                    "--print".into(),
+                    "after_move:HU_FILE:%(filepath)j".into(),
+                    "--fixup".into(),
+                    "never".into(),
+                    "--no-write-info-json".into(),
+                    "--no-write-thumbnail".into(),
+                    "--no-mtime".into(),
+                    "--concurrent-fragments".into(),
+                    task.options.fragment_concurrent.to_string(),
+                    "--format".into(),
+                    text(format, "format_id").into(),
+                    "--output".into(),
+                    output_template.to_string_lossy().into(),
+                ]);
+                if live || matches!(text(format, "protocol"), "rtmp" | "rtsp" | "m3u8") {
+                    args.extend([
+                        "--downloader".into(),
+                        "ffmpeg".into(),
+                        "--ffmpeg-location".into(),
+                        app.task_tool(task, "ffmpeg")
+                            .await?
+                            .to_string_lossy()
+                            .into(),
+                    ]);
+                    if task.options.live_from_start {
+                        args.push("--live-from-start".into());
+                    }
+                } else {
+                    args.extend([
+                        "--downloader".into(),
+                        "native".into(),
+                        "--hls-prefer-native".into(),
+                    ]);
+                }
+                if !task.options.rate_limit.is_empty() {
+                    args.extend(["--limit-rate".into(), task.options.rate_limit.clone()]);
+                }
+                args.extend(["--".into(), task.url.clone()]);
+                let app_progress = app.clone();
+                let task_id = task.id.clone();
+                let progress_state = Arc::new(Mutex::new(TransferProgress::default()));
+                let callback_state = progress_state.clone();
+                let callback_stage = stage.clone();
+                let callback_speeds = speeds.clone();
+                let callback: LineCallback = Arc::new(move |_, line| {
+                    if !line.starts_with("HU_PROGRESS:") {
                         return;
                     }
-                    let total = progress
-                        .get("total_bytes")
-                        .or(progress.get("total_bytes_estimate"))
-                        .and_then(Value::as_f64)
-                        .filter(|v| *v > 0.0);
-                    let downloaded = progress["downloaded_bytes"].as_f64().unwrap_or(0.0);
-                    task.stage_progress = total.map(|v| (downloaded / v * 100.0).clamp(0.0, 100.0));
-                    task.stage_indeterminate = total.is_none();
-                    task.progress = task.stage_progress.unwrap_or(0.0).min(99.0);
-                    task.speed = progress["speed"].as_f64();
-                    task.eta = progress["eta"].as_f64();
-                    let _ = app_progress.save_task(&task);
+                    let mut state = callback_state.lock().unwrap();
+                    let mut speeds = callback_speeds.lock().unwrap();
+                    if let Some(mut update) = state.update(line, Instant::now())
+                        && let Ok(mut task) = app_progress.db.task(&task_id)
+                        && task.status == "downloading"
+                        && task.stage == callback_stage
+                    {
+                        if live {
+                            update = update.live(&mut speeds, index);
+                        }
+                        update.apply(&mut task);
+                        let _ = app_progress.save_task(&task);
+                    }
+                });
+                let executable = app.task_tool(task, "yt-dlp").await?;
+                let process =
+                    process::run(&executable, &args, Some(directory), cancel, Some(callback));
+                tokio::pin!(process);
+                let mut stale_timer = tokio::time::interval(Duration::from_secs(1));
+                let output = loop {
+                    tokio::select! {
+                        output = &mut process => break output,
+                        _ = stale_timer.tick() => {
+                            let mut state = progress_state.lock().unwrap();
+                            let mut speeds = speeds.lock().unwrap();
+                            if state.expire(Instant::now())
+                                && let Ok(mut current) = app.db.task(&task.id)
+                                && current.status == "downloading" && current.stage == stage
+                            {
+                                if live {
+                                    TransferUpdate { percent: None, speed: None, eta: None }
+                                        .live(&mut speeds, index)
+                                        .apply(&mut current);
+                                } else {
+                                    current.speed = None;
+                                    current.eta = None;
+                                }
+                                app.save_task(&current)?;
+                            }
+                        }
+                    }
                 }
-            }
-        });
-        let output = process::run(
-            &app.task_tool(&task, "yt-dlp").await?,
-            &args,
-            Some(&directory),
-            cancel,
-            Some(callback),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to download {kind} stream (format {}) with yt-dlp",
-                text(format, "format_id")
-            )
-        })?;
-        let path = output
-            .stdout
-            .lines()
-            .filter_map(|s| s.strip_prefix("HU_FILE:"))
-            .filter_map(|s| serde_json::from_str::<String>(s).ok())
-            .map(PathBuf::from)
-            .next_back()
-            .or_else(|| {
-                std::fs::read_dir(&directory)
-                    .ok()?
-                    .filter_map(Result::ok)
-                    .map(|e| e.path())
-                    .find(|p| {
-                        p.file_stem()
-                            .is_some_and(|s| s == format!("source-{index}").as_str())
+                .with_context(|| {
+                    format!(
+                        "Failed to download {kind} stream (format {}) with yt-dlp",
+                        text(format, "format_id")
+                    )
+                })?;
+                let path = output
+                    .stdout
+                    .lines()
+                    .filter_map(|s| s.strip_prefix("HU_FILE:"))
+                    .filter_map(|s| serde_json::from_str::<String>(s).ok())
+                    .map(PathBuf::from)
+                    .next_back()
+                    .or_else(|| {
+                        std::fs::read_dir(directory)
+                            .ok()?
+                            .filter_map(Result::ok)
+                            .map(|e| e.path())
+                            .find(|p| {
+                                p.file_stem()
+                                    .is_some_and(|s| s == format!("source-{index}").as_str())
+                            })
                     })
-            })
-            .context("yt-dlp did not produce the requested stream")?;
-        let canonical = path.canonicalize()?;
-        ensure!(
-            canonical.starts_with(directory.canonicalize()?),
-            "yt-dlp returned an unowned stream path"
-        );
-        let (hash, size) = hash_file(&canonical)?;
-        ensure!(size > 0, "Downloaded stream is empty");
-        files.push(SourceFile {
-            path: canonical,
-            hash,
-            size,
-            kind: kind.into(),
-            format_id: text(format, "format_id").into(),
-            language: format["language"].as_str().map(str::to_string),
-        });
-    }
+                    .context("yt-dlp did not produce the requested stream")?;
+                let canonical = path.canonicalize()?;
+                ensure!(
+                    canonical.starts_with(directory.canonicalize()?),
+                    "yt-dlp returned an unowned stream path"
+                );
+                let (hash, size) = hash_file(&canonical)?;
+                ensure!(size > 0, "Downloaded stream is empty");
+                Ok(SourceFile {
+                    path: canonical,
+                    hash,
+                    size,
+                    kind: kind.into(),
+                    format_id: text(format, "format_id").into(),
+                    language: format["language"].as_str().map(str::to_string),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut files = collect_transfers(transfers, live, cancel).await?;
     task = app.db.task(&task.id)?;
     app.set_stage(&task.id, "downloading", "downloading_assets", None)?;
     download_subtitles(app, &task, &info, &directory, &cookies, cancel, &mut files).await?;
@@ -646,12 +852,25 @@ pub(crate) async fn transfer(
                 || !task.options.embed_thumbnail && !task.options.prepend_cover_enabled,
             "This video has no thumbnail for the requested cover operation"
         );
+        if thumbnail.is_empty() && task.kind == "assets" {
+            let mut current = app.db.task(&task.id)?;
+            let warning = "The media source did not provide the requested thumbnail.".to_string();
+            if !current.warnings.contains(&warning) {
+                current.warnings.push(warning);
+                app.save_task(&current)?;
+            }
+        }
         if !thumbnail.is_empty() {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()?;
-            let bytes = tokio::select! {v=client.get(thumbnail).send()=>v?.error_for_status()?.bytes().await?,_=cancel.cancelled()=>bail!("Operation interrupted")};
-            ensure!(bytes.len() <= 32 * 1024 * 1024, "Thumbnail is too large");
+            let bytes = crate::thumbnail::download(
+                app,
+                &task,
+                &info,
+                32 * 1024 * 1024,
+                Duration::from_secs(60),
+                cancel,
+            )
+            .await?
+            .context("This media source did not provide a thumbnail")?;
             let path = directory.join("thumbnail.source");
             write_sync(&path, &bytes)?;
             let extension = match image::guess_format(&bytes)? {
@@ -719,8 +938,16 @@ pub(crate) async fn transfer(
             language: None,
         });
     }
-    let sponsor_segments = fetch_sponsor(&task.options, &info, cancel).await?;
-    let extension = output_extension(&task.options, &formats);
+    let sponsor_segments = if task.kind == "assets" {
+        vec![]
+    } else {
+        fetch_sponsor(&task.options, &info, cancel).await?
+    };
+    let extension = if formats.is_empty() {
+        String::new()
+    } else {
+        output_extension(&task.options, &formats)
+    };
     Ok(SourceManifest {
         version: 1,
         directory,
@@ -731,6 +958,72 @@ pub(crate) async fn transfer(
         sponsor_segments,
         output_extension: extension,
     })
+}
+
+fn subtitle_selection(
+    info: &Value,
+    requested: &[String],
+    automatic: bool,
+) -> (std::collections::BTreeSet<String>, Vec<String>) {
+    let manual: std::collections::BTreeSet<_> = info["subtitles"]
+        .as_object()
+        .into_iter()
+        .flat_map(|values| values.keys())
+        .cloned()
+        .collect();
+    let mut available = manual.clone();
+    if automatic {
+        available.extend(
+            info["automatic_captions"]
+                .as_object()
+                .into_iter()
+                .flat_map(|values| values.keys())
+                .cloned(),
+        );
+    }
+    let mut selected = std::collections::BTreeSet::new();
+    let mut missing = Vec::new();
+    for language in requested {
+        let aliases = match language.as_str() {
+            "zh-Hans" => vec!["zh-Hans", "zh-CN", "zh"],
+            "zh-Hant" => vec!["zh-Hant", "zh-TW", "zh-HK"],
+            _ => vec![language.as_str()],
+        };
+        let all = matches!(language.as_str(), "all" | "*");
+        let mut matched: Vec<_> = available
+            .iter()
+            .filter(|candidate| {
+                candidate.as_str() != "live_chat"
+                    && (all
+                        || aliases.iter().any(|alias| {
+                            candidate.as_str() == *alias
+                                || candidate
+                                    .starts_with(&format!("{}-", alias.trim_end_matches(".*")))
+                                || alias.ends_with(".*")
+                                    && candidate.starts_with(alias.trim_end_matches(".*"))
+                        }))
+            })
+            .cloned()
+            .collect();
+        if !all {
+            matched.sort_by_key(|candidate| {
+                (
+                    !manual.contains(candidate),
+                    aliases
+                        .iter()
+                        .position(|alias| *alias == candidate)
+                        .unwrap_or(aliases.len()),
+                    candidate.clone(),
+                )
+            });
+            matched.truncate(1);
+        }
+        if matched.is_empty() {
+            missing.push(language.clone());
+        }
+        selected.extend(matched);
+    }
+    (selected, missing)
 }
 
 async fn download_subtitles(
@@ -746,39 +1039,21 @@ async fn download_subtitles(
     if requested.is_empty() {
         return Ok(());
     }
-    let mut available = info["subtitles"]
-        .as_object()
-        .into_iter()
-        .flat_map(|m| m.keys())
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    if task.options.automatic_subtitles {
-        available.extend(
-            info["automatic_captions"]
-                .as_object()
-                .into_iter()
-                .flat_map(|m| m.keys())
-                .cloned(),
+    let (selected, missing) =
+        subtitle_selection(info, &requested, task.options.automatic_subtitles);
+    if !missing.is_empty() {
+        let mut current = app.db.task(&task.id)?;
+        let warning = format!(
+            "Subtitles unavailable for {}. Video download will continue without these subtitles.",
+            missing.join(", ")
         );
+        if !current.warnings.contains(&warning) {
+            current.warnings.push(warning);
+            app.save_task(&current)?;
+        }
     }
-    let mut selected = std::collections::BTreeSet::new();
-    for language in &requested {
-        let matched = available
-            .iter()
-            .filter(|a| {
-                language == "all"
-                    || language == "*"
-                    || *a == language
-                    || a.starts_with(&format!("{}-", language.trim_end_matches(".*")))
-                    || language.ends_with(".*") && a.starts_with(language.trim_end_matches(".*"))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        ensure!(
-            !matched.is_empty(),
-            "Requested subtitles {language} are unavailable"
-        );
-        selected.extend(matched);
+    if selected.is_empty() {
+        return Ok(());
     }
     let runtime_options = app.runtime_options(task)?;
     let mut args = base_args(app, &runtime_options, cookies, Some(task)).await?;
@@ -854,11 +1129,20 @@ async fn fetch_sponsor(
         text(info, "extractor_key").eq_ignore_ascii_case("Youtube"),
         "SponsorBlock supports YouTube video IDs only"
     );
-    let response = tokio::select! {r=reqwest::Client::new().get("https://sponsor.ajay.app/api/skipSegments").query(&[("videoID",text(info,"id")),("categories",&serde_json::to_string(&options.sponsorblock_categories)?)]).send()=>r?,_=cancel.cancelled()=>bail!("Operation interrupted")};
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(vec![]);
-    }
-    let segments: Value = response.error_for_status()?.json().await?;
+    let segments = sponsor_response(
+        reqwest::Client::new()
+            .get("https://sponsor.ajay.app/api/skipSegments")
+            .query(&[
+                ("videoID", text(info, "id")),
+                (
+                    "categories",
+                    &serde_json::to_string(&options.sponsorblock_categories)?,
+                ),
+            ]),
+        cancel,
+        Duration::from_secs(30),
+    )
+    .await?;
     Ok(segments
         .as_array()
         .into_iter()
@@ -875,7 +1159,42 @@ async fn fetch_sponsor(
         .collect())
 }
 
-fn output_extension(options: &DownloadOptions, formats: &[Value]) -> String {
+async fn sponsor_response(
+    request: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<Value> {
+    let fetch = async {
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(json!([]));
+        }
+        let mut response = response.error_for_status()?;
+        const MAX_BYTES: usize = 4 * 1024 * 1024;
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= MAX_BYTES as u64),
+            "SponsorBlock response is too large"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                chunk.len() <= MAX_BYTES.saturating_sub(bytes.len()),
+                "SponsorBlock response is too large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).context("Invalid SponsorBlock response")
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("Operation interrupted"),
+        result = tokio::time::timeout(timeout, fetch) => result.context("SponsorBlock request timed out")?,
+    }
+}
+
+pub(crate) fn output_extension(options: &DownloadOptions, formats: &[Value]) -> String {
     if options.content_mode == "audio"
         && (options.audio_track == "all" || formats.iter().filter(|f| has_audio(f)).count() > 1)
     {
@@ -974,12 +1293,16 @@ impl App {
             .await?;
             task = self.db.task(id)?;
             task.title = text(&info, "title").to_string();
+            crate::workflow::plan(&mut task);
             self.save_task(&task)?;
-            let formats = select_formats(&info, &task.options)?;
-            let special = info["is_live"].as_bool().unwrap_or(false)
-                || formats
-                    .iter()
-                    .any(|f| matches!(text(f, "protocol"), "rtmp" | "rtsp" | "m3u8"));
+            let preview = crate::thumbnail::cache_preview(self, &task, &info, cancel).await;
+            ensure!(!cancel.is_cancelled(), "Operation interrupted");
+            if let Ok(Some(path)) = preview {
+                task = self.db.task(id)?;
+                task.thumbnail = Some(path);
+                self.save_task(&task)?;
+            }
+            let special = task.kind != "assets" && is_live(&info);
             if special {
                 drop(permit);
                 let _capture = tokio::select! {p=self.capture.acquire()=>p?,_=cancel.cancelled()=>bail!("Operation interrupted")};
@@ -992,6 +1315,9 @@ impl App {
             }
         }
         let _processor = tokio::select! {p=self.processor.acquire()=>p?,_=cancel.cancelled()=>bail!("Operation interrupted")};
+        let mut task = self.db.task(id)?;
+        crate::workflow::plan(&mut task);
+        self.save_task(&task)?;
         crate::processing::process_task(self, id, cancel).await
     }
     fn freeze_sources(&self, id: &str, manifest: SourceManifest) -> Result<()> {
@@ -1016,6 +1342,466 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_transfers_start_together_and_preserve_manifest_order() -> Result<()> {
+        let cancel = CancellationToken::new();
+        let ready = Arc::new(tokio::sync::Barrier::new(2));
+        let transfers = (0..2).map(|index| {
+            let ready = ready.clone();
+            async move {
+                ready.wait().await;
+                if index == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(index)
+            }
+        });
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                collect_transfers(transfers, true, &cancel)
+            )
+            .await??,
+            [0, 1]
+        );
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transfers = (0..2).map(|index| {
+            let active = active.clone();
+            async move {
+                assert_eq!(active.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(index)
+            }
+        });
+        assert_eq!(collect_transfers(transfers, false, &cancel).await?, [0, 1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_live_transfer_waits_for_the_other_capture_to_clean_up() {
+        struct Capture(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parent = CancellationToken::new();
+        let cancel = parent.child_token();
+        let transfers = (0..2).map(|index| {
+            let dropped = dropped.clone();
+            let cancel = &cancel;
+            async move {
+                if index == 0 {
+                    let _capture = Capture(dropped);
+                    cancel.cancelled().await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    bail!("Operation interrupted");
+                }
+                bail!("capture failed")
+            }
+        });
+        let result: Result<Vec<()>> = collect_transfers(transfers, true, &cancel).await;
+        assert_eq!(result.unwrap_err().to_string(), "capture failed");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!parent.is_cancelled());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_live_group_waits_for_supervised_parent_and_descendant_exit() -> Result<()> {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        };
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let ready = Mutex::new(Some(ready));
+        let pids = Arc::new(Mutex::new(Vec::new()));
+        let observed = pids.clone();
+        let callback: LineCallback = Arc::new(move |_, line| {
+            if let Some(value) = line.strip_prefix("READY:") {
+                *observed.lock().unwrap() = value
+                    .split(':')
+                    .map(|pid| pid.parse::<u32>().unwrap())
+                    .collect();
+                if let Some(ready) = ready.lock().unwrap().take() {
+                    let _ = ready.send(());
+                }
+            }
+        });
+        let started = Mutex::new(Some(started));
+        let cancel = CancellationToken::new();
+        let exe = PathBuf::from("powershell.exe");
+        let args = vec![
+            "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
+            "$worker = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30'; [Console]::WriteLine('READY:' + $PID + ':' + $worker.Id); Start-Sleep -Seconds 30".into(),
+        ];
+        let transfers = (0..2).map(|index| {
+            let callback = callback.clone();
+            let cancel = &cancel;
+            let exe = &exe;
+            let args = &args;
+            let started = &started;
+            async move {
+                if index == 0 {
+                    process::run(exe, args, None, cancel, Some(callback)).await?;
+                    Ok(())
+                } else {
+                    let started = started.lock().unwrap().take().unwrap();
+                    started.await?;
+                    bail!("capture failed")
+                }
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            collect_transfers(transfers, true, &cancel),
+        )
+        .await?;
+        assert_eq!(result.unwrap_err().to_string(), "capture failed");
+        for pid in pids.lock().unwrap().iter().copied() {
+            let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if !handle.is_null() {
+                let mut code = 259;
+                let queried = unsafe { GetExitCodeProcess(handle, &mut code) };
+                unsafe {
+                    CloseHandle(handle);
+                }
+                assert_ne!(queried, 0);
+                assert_ne!(code, 259, "Supervised process {pid} survived group failure");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_progress_sums_active_streams_without_percent_or_eta() {
+        let mut task = crate::tests::paused_task(Default::default());
+        let mut speeds = [None, None];
+        let update = |speed| TransferUpdate {
+            percent: Some(90.0),
+            speed,
+            eta: Some(1.0),
+        };
+        update(Some(10.0)).live(&mut speeds, 0).apply(&mut task);
+        update(Some(20.0)).live(&mut speeds, 1).apply(&mut task);
+        assert_eq!(task.speed, Some(30.0));
+        assert_eq!(task.stage_progress, None);
+        assert_eq!(task.eta, None);
+        assert!(task.stage_indeterminate);
+        update(None).live(&mut speeds, 0).apply(&mut task);
+        assert_eq!(task.speed, Some(20.0));
+        update(None).live(&mut speeds, 1).apply(&mut task);
+        assert_eq!(task.speed, None);
+    }
+
+    #[test]
+    fn hls_protocol_does_not_make_on_demand_media_live() {
+        assert!(!is_live(
+            &json!({"is_live":false,"live_status":"not_live","formats":[{"protocol":"m3u8"}]})
+        ));
+        assert!(!is_live(
+            &json!({"live_status":"was_live","formats":[{"protocol":"m3u8_native"}]})
+        ));
+        assert!(is_live(
+            &json!({"is_live":true,"formats":[{"protocol":"m3u8_native"}]})
+        ));
+        assert!(is_live(
+            &json!({"live_status":"is_live","formats":[{"protocol":"https"}]})
+        ));
+    }
+
+    #[tokio::test]
+    async fn sponsor_body_reads_obey_cancellation_timeout_and_size_limits() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for cancel_body in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/segments", listener.local_addr()?);
+            let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n[",
+                    )
+                    .await
+                    .unwrap();
+                headers_sent.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let cancel = CancellationToken::new();
+            let control = async {
+                headers_received.await.unwrap();
+                if cancel_body {
+                    cancel.cancel();
+                }
+            };
+            let (_, result) = tokio::join!(
+                control,
+                sponsor_response(
+                    reqwest::Client::new().get(url),
+                    &cancel,
+                    Duration::from_millis(200),
+                )
+            );
+            server.abort();
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(if cancel_body {
+                "interrupted"
+            } else {
+                "timed out"
+            }));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/segments", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4194305\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let error = sponsor_response(
+            reqwest::Client::new().get(url),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("too large"));
+        server.await?;
+        Ok(())
+    }
+
+    #[test]
+    fn fragment_progress_uses_measured_throughput_instead_of_instantaneous_spikes() {
+        let mut task = crate::tests::paused_task(Default::default());
+        task.stage("downloading", "downloading_video_1", None);
+        let now = Instant::now();
+        let mib = 1024.0 * 1024.0;
+        let mut tracker = TransferProgress::default();
+        for (seconds, downloaded, raw_speed, raw_eta) in
+            [(0, 0.0, 5.5, 37), (1, 10.0, 5.5, 37), (2, 20.0, 28.2, 3)]
+        {
+            let line = format!(
+                "HU_PROGRESS:{}",
+                json!({"status":"downloading","downloaded_bytes":downloaded*mib,"total_bytes":100.0*mib,"speed":raw_speed*mib,"eta":raw_eta})
+            );
+            tracker
+                .update(&line, now + Duration::from_secs(seconds))
+                .unwrap()
+                .apply(&mut task);
+        }
+        assert_eq!(task.stage_progress, Some(20.0));
+        assert_eq!(task.speed, Some(10.0 * mib));
+        assert_eq!(task.eta, Some(8.0));
+    }
+
+    #[test]
+    fn transfer_progress_adapts_to_sustained_rate_changes_without_freezing_the_reading() {
+        let now = Instant::now();
+        let mut tracker = TransferProgress::default();
+        for seconds in 0..=6 {
+            let bytes = if seconds <= 1 {
+                seconds * 10
+            } else {
+                10 + (seconds - 1) * 40
+            };
+            let line = format!(
+                "HU_PROGRESS:{}",
+                json!({"status":"downloading","downloaded_bytes":bytes,"total_bytes":1000,"speed":99999,"eta":0})
+            );
+            let update = tracker
+                .update(&line, now + Duration::from_secs(seconds))
+                .unwrap();
+            if seconds == 1 {
+                assert_eq!(update.speed, Some(10.0));
+            }
+            if seconds == 6 {
+                assert_eq!(update.speed, Some(40.0));
+                assert_eq!(update.eta, Some(19.75));
+                assert_eq!(update.percent, Some(21.0));
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_progress_rebases_resumed_bytes_and_expires_stale_measurements() {
+        let now = Instant::now();
+        let mut tracker = TransferProgress::default();
+        let line = |bytes| {
+            format!(
+                "HU_PROGRESS:{}",
+                json!({"status":"downloading","downloaded_bytes":bytes,"total_bytes":1000,"speed":300,"eta":2})
+            )
+        };
+        assert_eq!(tracker.update(&line(500), now).unwrap().speed, None);
+        assert_eq!(
+            tracker
+                .update(&line(510), now + Duration::from_secs(1))
+                .unwrap()
+                .speed,
+            Some(10.0)
+        );
+        let reset = tracker
+            .update(&line(100), now + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(reset.speed, None);
+        assert_eq!(reset.eta, None);
+        assert_eq!(reset.percent, Some(10.0));
+        assert_eq!(
+            tracker
+                .update(&line(120), now + Duration::from_secs(3))
+                .unwrap()
+                .speed,
+            Some(20.0)
+        );
+        assert!(!tracker.expire(now + Duration::from_secs(7)));
+        assert!(tracker.expire(now + Duration::from_secs(8)));
+        assert!(!tracker.expire(now + Duration::from_secs(9)));
+        assert_eq!(
+            tracker
+                .update(&line(130), now + Duration::from_secs(9))
+                .unwrap()
+                .speed,
+            None
+        );
+        assert_eq!(
+            tracker
+                .update(&line(230), now + Duration::from_secs(15))
+                .unwrap()
+                .speed,
+            None
+        );
+        // A new stream has a separate baseline, including when its first bytes came from a partial file.
+        assert_eq!(
+            TransferProgress::default()
+                .update(&line(700), now)
+                .unwrap()
+                .speed,
+            None
+        );
+    }
+
+    #[test]
+    fn transfer_progress_preserves_estimates_unknown_totals_and_finished_events() {
+        let now = Instant::now();
+        let mut tracker = TransferProgress::default();
+        let line = |bytes, total| {
+            format!(
+                "HU_PROGRESS:{}",
+                json!({"status":"downloading","downloaded_bytes":bytes,"total_bytes":null,"total_bytes_estimate":total})
+            )
+        };
+        let first = tracker.update(&line(10, Some(100)), now).unwrap();
+        assert_eq!(first.percent, Some(10.0));
+        assert_eq!(first.speed, None);
+        let unknown = tracker
+            .update(&line(20, None), now + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(unknown.percent, None);
+        assert_eq!(unknown.speed, Some(10.0));
+        assert_eq!(unknown.eta, None);
+        let finished = tracker.update("HU_PROGRESS:{\"status\":\"finished\",\"downloaded_bytes\":100,\"total_bytes\":100,\"speed\":500,\"eta\":0}", now + Duration::from_millis(1050)).unwrap();
+        assert_eq!(finished.percent, Some(100.0));
+        assert_eq!(finished.speed, None);
+        assert_eq!(finished.eta, None);
+        assert!(
+            tracker
+                .update(
+                    "HU_PROGRESS:{\"status\":\"downloading\",\"downloaded_bytes\":-1}",
+                    now
+                )
+                .is_none()
+        );
+        assert!(tracker.update("HU_PROGRESS:{invalid}", now).is_none());
+        assert!(tracker.update("[download] ordinary output", now).is_none());
+    }
+
+    #[test]
+    fn subtitles_prefer_manual_aliases_and_report_missing_languages() {
+        let info = json!({"subtitles":{"zh":[{}],"en":[{}]},"automatic_captions":{"zh-Hans":[{}],"ja":[{}],"en":[{}],"live_chat":[{}]}});
+        let (selected, missing) =
+            subtitle_selection(&info, &["zh-Hans".into(), "ja".into(), "ko".into()], true);
+        assert_eq!(selected.into_iter().collect::<Vec<_>>(), ["ja", "zh"]);
+        assert_eq!(missing, ["ko"]);
+        assert_eq!(subtitle_selection(&info, &["ja".into()], false).1, ["ja"]);
+        let (selected, missing) = subtitle_selection(&info, &["all".into()], true);
+        assert!(!selected.contains("live_chat"));
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_subtitles_preserve_the_download_and_persist_a_warning() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.options.subtitle_language = "ja".into();
+        app.db.insert_task(&task)?;
+        let cookies = Cookies::new(&app, None)?;
+        download_subtitles(
+            &app,
+            &task,
+            &json!({}),
+            root.path(),
+            &cookies,
+            &CancellationToken::new(),
+            &mut vec![],
+        )
+        .await?;
+        let saved = app.db.task(&task.id)?;
+        assert_eq!(saved.warnings.len(), 1);
+        assert_eq!(saved.status, task.status);
+        assert!(
+            saved.public()["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("ja")
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_cookies_reach_ytdlp_only_through_a_temporary_file() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let text =
+            "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t0\tsid\tlogin-secret\n";
+        let imported = app.import_login_cookies("Login", text)?;
+        let options = DownloadOptions::parse(json!({"cookieId":imported["cookie"]["id"]}))?;
+        let snapshot = app.credential_snapshot(&options, "https://www.example.com/video")?;
+        let cookies = Cookies::new(&app, snapshot.as_deref())?;
+        let args = base_args(&app, &options, &cookies, None).await?;
+        let position = args.iter().position(|arg| arg == "--cookies").unwrap();
+        let path = PathBuf::from(&args[position + 1]);
+        assert_eq!(std::fs::read_to_string(&path)?, text);
+        assert!(!args.join(" ").contains("login-secret"));
+        drop(cookies);
+        assert!(!path.exists());
+        app.shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn absent_frozen_deno_disables_default_runtime_and_invalid_snapshot_is_rejected()
@@ -1105,6 +1891,35 @@ mod tests {
         );
         let options = DownloadOptions::parse(json!({"videoFormatId":"missing"})).unwrap();
         assert!(select_formats(&info, &options).is_err());
+    }
+    #[test]
+    fn all_audio_tracks_include_combined_sources_without_repeating_the_main_track() {
+        let info = json!({"formats":[
+            {"format_id":"main","height":1080,"vcodec":"avc1","acodec":"aac","language":"en","audio_track_id":"en-main"},
+            {"format_id":"en-audio","vcodec":"none","acodec":"aac","language":"en","audio_track_id":"en-main","abr":128},
+            {"format_id":"zh-low","height":360,"vcodec":"avc1","acodec":"aac","language":"zh-Hans","abr":64},
+            {"format_id":"zh","height":720,"vcodec":"avc1","acodec":"aac","language":"zh-Hans","abr":128},
+            {"format_id":"commentary","vcodec":"none","acodec":"aac","language":"en","audio_track_id":"en-commentary","abr":128}
+        ]});
+        let options = DownloadOptions::parse(json!({"audioTrack":"all"})).unwrap();
+        let formats = select_formats(&info, &options).unwrap();
+        assert_eq!(
+            formats
+                .iter()
+                .map(|f| text(f, "format_id"))
+                .collect::<Vec<_>>(),
+            ["main", "commentary", "zh"]
+        );
+        let combined_only =
+            json!({"formats":[info["formats"][0].clone(),info["formats"][3].clone()]});
+        assert_eq!(
+            select_formats(&combined_only, &options)
+                .unwrap()
+                .iter()
+                .map(|f| text(f, "format_id"))
+                .collect::<Vec<_>>(),
+            ["main", "zh"]
+        );
     }
     #[test]
     fn automatic_quality_selects_real_video_extremes_and_keeps_audio() {

@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod acceptance;
-mod browser;
+pub mod access;
+mod assets;
+pub mod browser;
 mod cover;
 mod credentials;
 mod db;
@@ -10,12 +12,15 @@ pub(crate) mod model;
 mod performance;
 pub mod process;
 mod processing;
+pub mod releases;
 pub mod research;
+mod thumbnail;
 mod tools;
+mod workflow;
 
 use anyhow::{Context, Result, bail, ensure};
 use db::Database;
-pub use model::{AppConfig, DownloadOptions, Event};
+pub use model::{AppConfig, DownloadOptions, Event, redact_url};
 use model::{Task, text, validate_url};
 use serde_json::{Value, json};
 use std::{
@@ -38,6 +43,7 @@ struct Runtime {
 }
 
 pub struct App {
+    pub access: access::Access,
     pub(crate) config: AppConfig,
     pub(crate) db: Database,
     pub(crate) credentials: credentials::CredentialStore,
@@ -50,7 +56,10 @@ pub struct App {
     pub(crate) capture: Arc<Semaphore>,
     pub(crate) processor: Arc<Semaphore>,
     pub(crate) cover_state: crate::cover::CoverState,
+    pub(crate) research_state: research::ResearchState,
     pub(crate) tool_update_lock: tokio::sync::Mutex<()>,
+    pub(crate) publication_lock: tokio::sync::Mutex<()>,
+    task_add_lock: tokio::sync::Mutex<()>,
     active_commands: AtomicUsize,
     commands_done: Notify,
 }
@@ -68,8 +77,10 @@ impl App {
         std::fs::create_dir_all(config.data_dir.join("assets"))?;
         let db = Database::open(&config.data_dir.join("rust-core.sqlite3"))?;
         let credentials = credentials::CredentialStore::open(&config.data_dir)?;
+        let access = access::Access::open(&config.data_dir)?;
         let (events, _) = broadcast::channel(1024);
         let app = Arc::new(Self {
+            access,
             config,
             db,
             credentials,
@@ -82,7 +93,10 @@ impl App {
             capture: Arc::new(Semaphore::new(1)),
             processor: Arc::new(Semaphore::new(1)),
             cover_state: Default::default(),
+            research_state: Default::default(),
             tool_update_lock: Default::default(),
+            publication_lock: Default::default(),
+            task_add_lock: Default::default(),
             active_commands: AtomicUsize::new(0),
             commands_done: Notify::new(),
         });
@@ -177,11 +191,15 @@ impl App {
         task.stage(status, stage, percent);
         self.save_task(&task)
     }
-    pub(crate) fn credential_snapshot(&self, options: &DownloadOptions) -> Result<Option<String>> {
-        if options.cookie_id.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(self.credentials.get(&options.cookie_id)?))
+    pub(crate) fn credential_snapshot(
+        &self,
+        options: &DownloadOptions,
+        url: &str,
+    ) -> Result<Option<String>> {
+        match options.cookie_id.as_str() {
+            "" => Ok(None),
+            "auto" => self.credentials.matching(url),
+            id => Ok(Some(self.credentials.get(id)?)),
         }
     }
     pub(crate) fn task_cookies(&self, task: &Task) -> Result<Option<String>> {
@@ -249,7 +267,7 @@ impl App {
             let _ = runtime.handle.await;
         }
         let mut task = self.db.task(id)?;
-        if task.status == "completed" {
+        if matches!(task.status.as_str(), "completed" | "retained") {
             return Ok(());
         }
         task.status = status.into();
@@ -295,6 +313,7 @@ impl App {
                 json!({"version":env!("CARGO_PKG_VERSION"),"tasks":self.db.tasks()?.iter().map(Task::public).collect::<Vec<_>>(),"media":self.db.media()?.iter().map(model::Media::public).collect::<Vec<_>>(),"settings":self.public_settings()?,"tools":tools::check(self).await?}),
             ),
             "tasks.add" => {
+                let _adding = self.task_add_lock.lock().await;
                 let urls = args["urls"].as_array().context("urls must be an array")?;
                 ensure!(
                     !urls.is_empty() && urls.len() <= 1000,
@@ -308,8 +327,7 @@ impl App {
                         .secret("downloadProxy")?
                         .unwrap_or_default();
                 }
-                let cookies = self.credential_snapshot(&options)?;
-                let frozen_tools = self.freeze_tools().await?;
+                let mut frozen_tools = None;
                 let mut validated = Vec::new();
                 for url in urls {
                     let url = url.as_str().context("URL must be text")?;
@@ -319,6 +337,7 @@ impl App {
                 if options.collection_mode == "all" {
                     let mut expanded = Vec::new();
                     for url in validated {
+                        let cookies = self.credential_snapshot(&options, &url)?;
                         let collection =
                             download::collection(self, &url, &options, cookies.as_deref()).await?;
                         for entry in collection["entries"]
@@ -336,9 +355,78 @@ impl App {
                     );
                     validated = expanded;
                 }
-                let mut ids = Vec::new();
+                let mut ids: Vec<String> = Vec::new();
+                let mut results = Vec::new();
                 for url in validated {
-                    let id = uuid::Uuid::new_v4().to_string();
+                    let key = download_key(&url)?;
+                    if ids.iter().any(|id| {
+                        self.db
+                            .task(id)
+                            .is_ok_and(|task| download_key(&task.url).ok().as_ref() == Some(&key))
+                    }) {
+                        continue;
+                    }
+                    let matches = self
+                        .db
+                        .tasks_including_retained()?
+                        .into_iter()
+                        .filter(|task| {
+                            task.kind == "media"
+                                && !task.conversion
+                                && download_key(&task.url).ok().as_ref() == Some(&key)
+                        })
+                        .collect::<Vec<_>>();
+                    let previous = matches
+                        .iter()
+                        .find(|task| {
+                            matches!(
+                                task.status.as_str(),
+                                "queued"
+                                    | "probing"
+                                    | "downloading"
+                                    | "waiting_processing"
+                                    | "processing"
+                                    | "paused"
+                            )
+                        })
+                        .or_else(|| matches.first())
+                        .cloned();
+                    if let Some(task) = &previous
+                        && matches!(
+                            task.status.as_str(),
+                            "queued"
+                                | "probing"
+                                | "downloading"
+                                | "waiting_processing"
+                                | "processing"
+                                | "paused"
+                        )
+                    {
+                        ids.push(task.id.clone());
+                        results
+                            .push(json!({"id":task.id,"status":task.status,"action":"existing"}));
+                        continue;
+                    }
+                    if frozen_tools.is_none() {
+                        frozen_tools = Some(self.freeze_tools().await?);
+                    }
+                    if let Some(task) = &previous {
+                        self.stop_task(&task.id, "cancelled").await?;
+                        processing::prepare_redownload(self, task).await?;
+                        remove_task_directory(&self.config.data_dir.join("tasks").join(&task.id))?;
+                        if !task.options.processing_temp_dir.is_empty() {
+                            remove_task_directory(&processing::workspace(self, task))?;
+                        }
+                    }
+                    let cookies = self.credential_snapshot(&options, &url)?;
+                    let id = previous
+                        .as_ref()
+                        .map(|task| task.id.clone())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    self.credentials
+                        .delete_secret(&format!("task-cookie:{id}"))?;
+                    self.credentials
+                        .delete_secret(&format!("task-proxy:{id}"))?;
                     let cookie_snapshot = if let Some(cookie) = &cookies {
                         let key = format!("task-cookie:{id}");
                         self.credentials.put_secret(&key, cookie)?;
@@ -356,36 +444,57 @@ impl App {
                     let mut frozen_options = options.clone();
                     frozen_options.proxy.clear();
                     let task = Task {
+                        kind: "media".into(),
+                        files: vec![],
                         id,
                         url,
                         title: "Waiting for metadata".into(),
+                        thumbnail: None,
                         status: "queued".into(),
                         stage: "queued".into(),
+                        steps: vec![],
+                        step_index: None,
                         progress: 0.0,
                         stage_progress: None,
                         stage_indeterminate: true,
                         speed: None,
                         eta: None,
                         error: None,
+                        warnings: vec![],
                         created_at: chrono::Utc::now().to_rfc3339(),
                         options: frozen_options,
-                        output_path: None,
+                        output_path: previous.as_ref().and_then(|task| task.output_path.clone()),
+                        previous_outputs: vec![],
                         cookie_snapshot,
                         proxy_snapshot,
                         manifest: None,
                         publication: None,
                         conversion: false,
-                        tools: frozen_tools.clone(),
+                        tools: frozen_tools.as_ref().unwrap().clone(),
                     };
-                    self.db.insert_task(&task)?;
+                    if previous.is_some() {
+                        self.db.save_task(&task)?;
+                    } else {
+                        self.db.insert_task(&task)?;
+                    }
                     self.emit("task.upsert", task.public());
                     ids.push(task.id.clone());
+                    results.push(json!({"id":task.id,"status":task.status,"action":if previous.is_some() {"restarted"} else {"added"}}));
                     self.schedule(&task.id)?;
                 }
-                Ok(json!(ids))
+                Ok(if args["report"].as_bool() == Some(true) {
+                    json!({"ids":ids,"results":results})
+                } else {
+                    json!(ids)
+                })
             }
             "tasks.pause" | "tasks.cancel" => {
+                let _adding = self.task_add_lock.lock().await;
                 let id = required_id(&args)?;
+                ensure!(
+                    self.db.task(id)?.status != "retained",
+                    "Task is no longer in the queue"
+                );
                 self.stop_task(
                     id,
                     if command == "tasks.pause" {
@@ -398,10 +507,12 @@ impl App {
                 Ok(self.db.task(id)?.public())
             }
             "tasks.resume" | "tasks.retry" => {
+                let _adding = self.task_add_lock.lock().await;
                 self.resume(required_id(&args)?, command == "tasks.retry")
                     .await
             }
             "tasks.pauseAll" => {
+                let _adding = self.task_add_lock.lock().await;
                 for task in self.db.tasks()? {
                     if matches!(
                         task.status.as_str(),
@@ -413,6 +524,7 @@ impl App {
                 Ok(json!(true))
             }
             "tasks.resumeAll" => {
+                let _adding = self.task_add_lock.lock().await;
                 for task in self.db.tasks()? {
                     if task.status == "paused" {
                         self.resume(&task.id, false).await?;
@@ -421,8 +533,10 @@ impl App {
                 Ok(json!(true))
             }
             "tasks.delete" => {
+                let _adding = self.task_add_lock.lock().await;
                 let id = required_id(&args)?;
                 self.stop_task(id, "cancelled").await?;
+                processing::prepare_task_deletion(self, id).await?;
                 let task = self.db.task(id)?;
                 let delete_files = args["deleteFiles"].as_bool().unwrap_or(false);
                 let media = if delete_files {
@@ -437,6 +551,19 @@ impl App {
                             self.remove_owned(asset)?;
                         }
                     }
+                    if task.kind == "assets"
+                        && let Some(publication) = &task.publication
+                    {
+                        self.remove_owned(&publication.target)?;
+                        for auxiliary in &publication.auxiliary {
+                            self.remove_owned(&auxiliary.target)?;
+                        }
+                    }
+                    if task.kind == "assets" {
+                        for path in &task.previous_outputs {
+                            self.remove_owned(path)?;
+                        }
+                    }
                     if !task.options.processing_temp_dir.is_empty() {
                         remove_task_directory(&processing::workspace(self, &task))?;
                     }
@@ -446,7 +573,7 @@ impl App {
                     .delete_secret(&format!("task-cookie:{id}"))?;
                 self.credentials
                     .delete_secret(&format!("task-proxy:{id}"))?;
-                self.db.remove_task(&task.id, delete_files)?;
+                self.db.remove_task(&task, delete_files)?;
                 if let Some(media) = media {
                     self.emit("media.remove", json!({"id":media.id}));
                 }
@@ -454,8 +581,27 @@ impl App {
                 Ok(json!(true))
             }
             "tasks.convert" => {
-                processing::queue_conversion(self, required_id(&args)?, text(&args, "encoder"))
+                if let Some(options) = args.get("options") {
+                    processing::queue_conversion_options_with_strategy(
+                        self,
+                        required_id(&args)?,
+                        options,
+                        text(&args, "strategy"),
+                    )
                     .await
+                } else {
+                    processing::queue_conversion(self, required_id(&args)?, text(&args, "encoder"))
+                        .await
+                }
+            }
+            "tasks.convertPreview" => {
+                processing::preview_conversion(
+                    self,
+                    required_id(&args)?,
+                    &args["options"],
+                    text(&args, "strategy"),
+                )
+                .await
             }
             "probe.video" | "probe.collection" => {
                 let url = text(&args, "url");
@@ -468,7 +614,7 @@ impl App {
                         .secret("downloadProxy")?
                         .unwrap_or_default();
                 }
-                let cookies = self.credential_snapshot(&options)?;
+                let cookies = self.credential_snapshot(&options, url)?;
                 if command == "probe.video" {
                     download::public_probe(self, url, &options, cookies.as_deref()).await
                 } else {
@@ -476,6 +622,18 @@ impl App {
                 }
             }
             "settings.save" => self.save_settings(args["settings"].clone()),
+            "access.status" => Ok(self.access.status()),
+            "access.change_password" => {
+                let app = self
+                    .myself
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .context("Application is closed")?;
+                let current = text(&args, "currentPassword").to_string();
+                let new = text(&args, "newPassword").to_string();
+                tokio::task::spawn_blocking(move || app.access.change_password(&current, &new))
+                    .await?
+            }
             "tools.check" => {
                 let value = tools::check(self).await?;
                 self.emit("tools.updated", value.clone());
@@ -483,6 +641,7 @@ impl App {
             }
             "tools.update" => tools::update(self, &args).await,
             "tools.latest" => tools::latest(self, &args).await,
+            "app.release_status" => releases::status().await,
             "cookies.import" => {
                 let value = self
                     .credentials
@@ -490,6 +649,8 @@ impl App {
                 Ok(value)
             }
             "cookies.list" => self.credentials.list(),
+            "cookies.status" => self.cookie_status(args.get("url").and_then(Value::as_str)),
+            "ai.models" => cover::models(self, &args).await,
             "cookies.delete" => {
                 self.credentials.delete(required_id(&args)?)?;
                 Ok(json!(true))
@@ -506,8 +667,37 @@ impl App {
                     .collect::<Vec<_>>()
             )),
             "media.file" => {
-                let media = self.db.media_by_id(required_id(&args)?)?;
+                let id = required_id(&args)?;
                 let kind = text(&args, "kind");
+                if kind == "taskThumbnail" {
+                    let task = self.db.task(id)?;
+                    let path = task.thumbnail.context("Task thumbnail is not available")?;
+                    reject_links(&path)?;
+                    let canonical = path.canonicalize()?;
+                    let directory = self
+                        .config
+                        .data_dir
+                        .join("tasks")
+                        .join(id)
+                        .join("preview")
+                        .canonicalize()?;
+                    ensure!(
+                        canonical.starts_with(directory),
+                        "Task thumbnail is outside its preview directory"
+                    );
+                    let mime = tools::mime(&canonical);
+                    ensure!(
+                        matches!(mime, "image/jpeg" | "image/png" | "image/webp"),
+                        "Unsupported task thumbnail type"
+                    );
+                    let metadata = std::fs::metadata(&canonical)?;
+                    ensure!(
+                        metadata.is_file() && metadata.len() <= 8 * 1024 * 1024,
+                        "Task thumbnail is missing or too large"
+                    );
+                    return Ok(json!({"path":canonical,"mimeType":mime}));
+                }
+                let media = self.db.media_by_id(id)?;
                 let path = if kind.is_empty() || kind == "media" {
                     media.path
                 } else {
@@ -555,6 +745,22 @@ impl App {
         ensure!(canonical.is_file(), "Media file does not exist");
         Ok(canonical)
     }
+    pub fn task_copy_value(&self, id: &str, kind: &str) -> Result<String> {
+        let task = self.db.task(id)?;
+        match kind {
+            "title" => Ok(task.title),
+            "source" => Ok(task.url),
+            "path" => {
+                let media = self
+                    .db
+                    .media_for_task(id)?
+                    .context("Result file is not available")?;
+                self.owned_path(&media.path)?;
+                Ok(media.path.to_string_lossy().into_owned())
+            }
+            _ => bail!("Unknown copy action"),
+        }
+    }
     fn remove_owned(&self, path: &std::path::Path) -> Result<()> {
         if path.exists() {
             std::fs::remove_file(self.owned_path(path)?)?;
@@ -591,10 +797,79 @@ impl App {
                 .and_then(Value::as_object_mut)
             {
                 options.remove("proxy");
+                options.insert("cookieId".into(), json!("auto"));
+                if options
+                    .get("fragmentConcurrent")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|value| value > 8)
+                {
+                    options.insert("fragmentConcurrent".into(), json!(8));
+                }
             }
         }
         Ok(value)
     }
+    pub fn import_login_cookies(&self, name: &str, text: &str) -> Result<Value> {
+        let mut settings = self.public_settings()?;
+        let options = settings
+            .as_object_mut()
+            .context("Settings must be an object")?
+            .entry("downloadOptions")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .context("Download settings must be an object")?;
+        let cookie = self.credentials.put(name, text)?;
+        let id = cookie["id"].as_str().context("Missing cookie ID")?;
+        options.insert("cookieId".into(), json!("auto"));
+        if let Err(reason) = self.db.activate_cookie("auto") {
+            let _ = self.credentials.delete(id);
+            return Err(reason);
+        }
+        self.emit("settings.updated", settings.clone());
+        Ok(json!({"cookie":cookie,"settings":settings}))
+    }
+
+    pub fn read_cookie(&self, id: &str) -> Result<String> {
+        self.credentials.get(id)
+    }
+
+    pub fn cookie_status(&self, url: Option<&str>) -> Result<Value> {
+        let records = self.credentials.list()?;
+        let sites: Vec<_> = records.as_array().unwrap().iter().map(|cookie| json!({"domains":cookie["domains"],"count":cookie["count"],"updatedAt":cookie["updatedAt"]})).collect();
+        let matching = url
+            .map(|url| {
+                validate_url(url)?;
+                self.credentials
+                    .matching(url)
+                    .map(|cookie| cookie.is_some())
+            })
+            .transpose()?;
+        Ok(json!({"sites":sites,"hasMatchingCookies":matching}))
+    }
+
+    pub fn sync_login_cookies(
+        &self,
+        profile: &str,
+        name: &str,
+        text: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let Some((cookie, created)) = self.credentials.sync_browser(profile, name, text)? else {
+            return Ok(None);
+        };
+        if created {
+            if let Err(reason) = self.db.activate_cookie("auto") {
+                let _ = self
+                    .credentials
+                    .delete(cookie["id"].as_str().context("Missing cookie ID")?);
+                return Err(reason);
+            }
+            self.emit("settings.updated", self.public_settings()?);
+        }
+        Ok(Some(
+            json!({"cookie":cookie,"settings":self.public_settings()?}),
+        ))
+    }
+
     fn save_settings(&self, mut value: Value) -> Result<Value> {
         // MCP listener state is managed by the desktop host, never by stale settings drafts.
         let mcp = self.db.settings()?["mcp"].clone();
@@ -682,6 +957,34 @@ fn required_id(args: &Value) -> Result<&str> {
     Ok(id)
 }
 
+fn download_key(value: &str) -> Result<String> {
+    let mut url = url::Url::parse(value)?;
+    url.set_fragment(None);
+    let host = url.host_str().unwrap_or("");
+    let video = if matches!(
+        host,
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com"
+    ) {
+        url.query_pairs()
+            .find(|(key, _)| key == "v")
+            .map(|(_, value)| value.into_owned())
+            .or_else(|| {
+                url.path()
+                    .strip_prefix("/shorts/")
+                    .or_else(|| url.path().strip_prefix("/live/"))
+                    .map(|value| value.trim_end_matches('/').to_string())
+            })
+    } else if host == "youtu.be" {
+        Some(url.path().trim_matches('/').to_string())
+    } else {
+        None
+    };
+    if let Some(video) = video.filter(|value| !value.is_empty()) {
+        return Ok(format!("youtube:{video}"));
+    }
+    Ok(url.to_string())
+}
+
 fn remove_task_directory(path: &std::path::Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -766,6 +1069,36 @@ pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn saved_cookie_view_reads_only_the_requested_identity() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let text = "# Netscape HTTP Cookie File\n#HttpOnly_.example.com\tTRUE\t/\tTRUE\t0\tSID\tprivate-value\n";
+        let saved = app.import_login_cookies("Saved login", text)?;
+        let id = saved["cookie"]["id"].as_str().unwrap();
+        let before = app.public_settings()?;
+        assert_eq!(app.read_cookie(id)?, text);
+        assert_eq!(app.public_settings()?, before);
+        assert!(
+            !app.command("cookies.list", json!({}))
+                .await?
+                .to_string()
+                .contains("private-value")
+        );
+        assert!(app.command("cookies.read", json!({"id":id})).await.is_err());
+        assert!(app.read_cookie("../.credentials.key").is_err());
+        assert!(app.read_cookie("secret-aiApiKey").is_err());
+        app.command("cookies.delete", json!({"id":id})).await?;
+        assert!(app.read_cookie(id).is_err());
+        app.shutdown().await?;
+        Ok(())
+    }
 
     #[test]
     fn workspace_cleanup_rejects_other_names() -> Result<()> {
@@ -884,6 +1217,17 @@ mod tests {
             assert_eq!(source.exists(), !delete_files);
             assert_eq!(workspace.exists(), !delete_files);
             assert_eq!(app.db.media_for_task(&task.id)?.is_none(), delete_files);
+            if delete_files {
+                assert!(app.db.task(&task.id).is_err());
+            } else {
+                assert_eq!(app.db.task(&task.id)?.status, "retained");
+                assert!(app.db.tasks()?.iter().all(|item| item.id != task.id));
+                assert!(
+                    app.research_tasks()?
+                        .iter()
+                        .all(|item| item["id"] != task.id)
+                );
+            }
             let mut removed = false;
             while let Ok(event) = events.try_recv() {
                 if event.kind == "media.remove" {
@@ -900,20 +1244,27 @@ mod tests {
 
     pub(super) fn paused_task(tools: HashMap<String, PathBuf>) -> Task {
         Task {
+            kind: "media".into(),
+            files: vec![],
             id: uuid::Uuid::new_v4().to_string(),
             url: "https://example.test/frozen.mp4".into(),
             title: "Frozen runtime".into(),
+            thumbnail: None,
             status: "paused".into(),
             stage: "queued".into(),
+            steps: vec![],
+            step_index: None,
             progress: 0.0,
             stage_progress: None,
             stage_indeterminate: true,
             speed: None,
             eta: None,
             error: None,
+            warnings: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
             options: DownloadOptions::default(),
             output_path: None,
+            previous_outputs: vec![],
             cookie_snapshot: None,
             proxy_snapshot: None,
             manifest: None,
@@ -921,6 +1272,242 @@ mod tests {
             conversion: false,
             tools,
         }
+    }
+
+    #[tokio::test]
+    async fn removed_queue_item_keeps_library_conversion_and_redownload_working() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let bundled = root.path().join("tools");
+        std::fs::create_dir_all(&bundled)?;
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "qjs"] {
+            std::fs::write(
+                bundled.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+                format!("fixture {name}"),
+            )?;
+        }
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: Some(bundled),
+        })
+        .await?;
+        let network = app.network.acquire_many(3).await?;
+        let processor = app.processor.acquire().await?;
+        let mut task = paused_task(app.freeze_tools().await?);
+        task.stage("completed", "completed", Some(100.0));
+        let path = app.config.download_dir.join("original.mp4");
+        std::fs::write(&path, b"original media")?;
+        task.output_path = Some(path.clone());
+        app.db.insert_task(&task)?;
+        app.db.complete(
+            &task,
+            &model::Media {
+                id: "retained-media".into(),
+                task_id: task.id.clone(),
+                title: task.title.clone(),
+                filename: "original.mp4".into(),
+                size: 14,
+                duration: 1.0,
+                path: path.clone(),
+                assets: vec![],
+            },
+        )?;
+        app.command("tasks.delete", json!({"id":task.id,"deleteFiles":false}))
+            .await?;
+        assert_eq!(app.db.task(&task.id)?.status, "retained");
+        assert!(app.db.tasks()?.is_empty());
+        let conversion = app
+            .research_convert_media_options("retained-media", &json!({"container":"mkv"}))
+            .await?;
+        let conversion_id = conversion["id"].as_str().unwrap();
+        assert_ne!(conversion_id, task.id);
+        assert_eq!(
+            app.db.task(conversion_id)?.manifest.unwrap().files[0].path,
+            path
+        );
+        app.command(
+            "tasks.delete",
+            json!({"id":conversion_id,"deleteFiles":true}),
+        )
+        .await?;
+        let added = app
+            .command("tasks.add", json!({"urls":[task.url],"report":true}))
+            .await?;
+        assert_eq!(added["ids"][0], task.id);
+        assert_eq!(added["results"][0]["action"], "restarted");
+        assert_eq!(std::fs::read(&path)?, b"original media");
+        app.command("tasks.delete", json!({"id":task.id,"deleteFiles":false}))
+            .await?;
+        assert_eq!(app.db.task(&task.id)?.status, "retained");
+        app.command("tasks.delete", json!({"id":task.id,"deleteFiles":true}))
+            .await?;
+        assert!(app.db.task(&task.id).is_err());
+        assert!(app.db.media_for_task(&task.id)?.is_none());
+        assert!(!path.exists());
+        drop(processor);
+        drop(network);
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_adds_reuse_active_and_paused_tasks_and_restart_completed_record()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let bundled = root.path().join("tools");
+        std::fs::create_dir_all(&bundled)?;
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "qjs"] {
+            std::fs::write(
+                bundled.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+                format!("fixture {name}"),
+            )?;
+        }
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: Some(bundled),
+        })
+        .await?;
+        let permit = app.network.acquire_many(3).await?;
+        let request = json!({"urls":["https://www.youtube.com/watch?v=abcdef12345&list=one","https://youtu.be/abcdef12345"],"options":{"quality":"best"},"report":true});
+        let (one, two) = tokio::join!(
+            app.command("tasks.add", request.clone()),
+            app.command("tasks.add", request.clone())
+        );
+        let one = one?;
+        let two = two?;
+        let id = one["ids"][0].as_str().unwrap();
+        assert_eq!(one["ids"], two["ids"]);
+        assert_eq!(one["ids"].as_array().unwrap().len(), 1);
+        assert_eq!(two["results"][0]["action"], "existing");
+        assert_eq!(app.db.tasks()?.len(), 1);
+        app.stop_task(id, "paused").await?;
+        let paused=app.command("tasks.add",json!({"urls":["https://youtu.be/abcdef12345"],"options":{"quality":"worst"},"report":true})).await?;
+        assert_eq!(paused["results"][0]["status"], "paused");
+        assert_eq!(app.db.task(id)?.options.quality, "best");
+        let result_path = app.config.download_dir.join("旧标题 [abcdef12345].mkv");
+        std::fs::write(&result_path, b"old valid media")?;
+        let mut task = app.db.task(id)?;
+        task.status = "completed".into();
+        task.output_path = Some(result_path.clone());
+        app.db.save_task(&task)?;
+        let restarted=app.command("tasks.add",json!({"urls":["https://youtu.be/abcdef12345"],"options":{"quality":"worst"},"report":true})).await?;
+        assert_eq!(restarted["ids"][0], id);
+        assert_eq!(restarted["results"][0]["action"], "restarted");
+        assert_eq!(app.db.task(id)?.options.quality, "worst");
+        assert_eq!(app.db.tasks()?.len(), 1);
+        app.stop_task(id, "cancelled").await?;
+        assert_eq!(std::fs::read(result_path)?, b"old valid media");
+        assert_ne!(
+            download_key("https://example.test/play?id=one&token=a")?,
+            download_key("https://example.test/play?id=two&token=a")?
+        );
+        assert_eq!(
+            download_key("https://example.test/play?id=one#fragment")?,
+            download_key("https://example.test/play?id=one")?
+        );
+        drop(permit);
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_copy_preserves_original_source_and_complete_unicode_result_path() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = paused_task(Default::default());
+        task.title = "【视频】中文标题".into();
+        task.url = "https://example.test/play?id=42&signature=private".into();
+        app.db.insert_task(&task)?;
+        assert_eq!(app.task_copy_value(&task.id, "title")?, task.title);
+        assert_eq!(app.task_copy_value(&task.id, "source")?, task.url);
+        assert!(app.task_copy_value(&task.id, "path").is_err());
+        let path = app
+            .config
+            .download_dir
+            .join("中文目录/【视频】中文标题 [42].mkv");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, b"saved result")?;
+        let media = model::Media {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            filename: path.file_name().unwrap().to_string_lossy().into(),
+            size: 12,
+            duration: 1.0,
+            path: path.clone(),
+            assets: vec![],
+        };
+        app.db.complete(&task, &media)?;
+        assert_eq!(
+            app.task_copy_value(&task.id, "path")?,
+            path.to_string_lossy()
+        );
+        assert!(!task.public().to_string().contains("signature"));
+        std::fs::remove_file(path)?;
+        assert!(app.task_copy_value(&task.id, "path").is_err());
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_preview_is_available_before_media_and_confined_to_its_task() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = paused_task(HashMap::new());
+        let mut legacy = serde_json::to_value(&task)?;
+        legacy.as_object_mut().unwrap().remove("thumbnail");
+        assert!(serde_json::from_value::<Task>(legacy)?.thumbnail.is_none());
+        let path = app
+            .config
+            .data_dir
+            .join("tasks")
+            .join(&task.id)
+            .join("preview/thumbnail.jpg");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        image::RgbImage::from_pixel(2, 2, image::Rgb([40, 60, 80])).save(&path)?;
+        task.thumbnail = Some(path.clone());
+        app.db.insert_task(&task)?;
+        assert!(app.db.media_for_task(&task.id)?.is_none());
+        assert_eq!(task.public()["hasThumbnail"], true);
+        assert!(task.public().get("thumbnail").is_none());
+        let value = app
+            .command("media.file", json!({"id":task.id,"kind":"taskThumbnail"}))
+            .await?;
+        assert_eq!(
+            PathBuf::from(value["path"].as_str().unwrap()),
+            path.canonicalize()?
+        );
+        assert_eq!(value["mimeType"], "image/jpeg");
+        for wrong in [
+            app.config.download_dir.join("other.jpg"),
+            app.config
+                .data_dir
+                .join("tasks/other/preview/thumbnail.jpg"),
+            path.with_file_name("secret.txt"),
+        ] {
+            std::fs::create_dir_all(wrong.parent().unwrap())?;
+            std::fs::write(&wrong, b"private")?;
+            task.thumbnail = Some(wrong);
+            app.db.save_task(&task)?;
+            assert!(
+                app.command("media.file", json!({"id":task.id,"kind":"taskThumbnail"}))
+                    .await
+                    .is_err()
+            );
+        }
+        app.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@ services:
     ports:
       - "19491:19491"
     environment:
-      HUIFA_ACCOUNT: ${HUIFA_ACCOUNT:?Set HUIFA_ACCOUNT}
-      HUIFA_PASSWORD: ${HUIFA_PASSWORD:?Set HUIFA_PASSWORD}
+      HUIFA_ACCOUNT: ${HUIFA_ACCOUNT:-admin}
+      HUIFA_PASSWORD: ${HUIFA_PASSWORD:-admin}
       HUIFA_PUBLIC_ORIGIN: ${HUIFA_PUBLIC_ORIGIN:-http://localhost:19491}
     volumes:
       - rust-data:/data
@@ -15,6 +15,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,exec,nosuid,nodev,size=512m
+    shm_size: 256m
     cap_drop:
       - ALL
     security_opt:

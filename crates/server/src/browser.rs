@@ -1,11 +1,13 @@
 use crate::browser_network::{NetworkProxy, public_ip, resolve_public};
 use anyhow::{Context, Result, bail, ensure};
-use futures_util::{SinkExt, StreamExt};
-use huifa_core::{App, process::ProcessTree};
+use huifa_core::{
+    App,
+    browser::{Cdp, netscape},
+    process::ProcessTree,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
     path::PathBuf,
     process::Stdio,
     sync::Arc,
@@ -13,9 +15,8 @@ use std::{
 };
 use tokio::{
     process::{Child, Command},
-    sync::{Mutex, broadcast, mpsc, oneshot},
+    sync::{Mutex, broadcast},
 };
-use tokio_tungstenite::tungstenite::Message;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 800;
@@ -35,18 +36,11 @@ struct Running {
     child: Child,
     guard: ProcessTree,
     profile: PathBuf,
-    channel: mpsc::Sender<Rpc>,
-    driver: tokio::task::JoinHandle<()>,
+    cdp: Cdp,
+    frames: tokio::task::JoinHandle<()>,
     session: String,
     target_url: String,
     touched: Instant,
-}
-
-struct Rpc {
-    method: &'static str,
-    params: Value,
-    session: Option<String>,
-    reply: oneshot::Sender<Result<Value>>,
 }
 
 #[derive(Deserialize)]
@@ -114,7 +108,7 @@ impl Browser {
                 let mut state = browser.running.lock().await;
                 if state
                     .as_ref()
-                    .is_some_and(|r| r.touched.elapsed() >= IDLE_LIMIT || r.driver.is_finished())
+                    .is_some_and(|r| r.touched.elapsed() >= IDLE_LIMIT || r.cdp.is_closed())
                 {
                     if let Some(running) = state.take() {
                         cleanup(running).await;
@@ -237,49 +231,58 @@ impl Browser {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };
-            let (socket, _) = tokio_tungstenite::connect_async(&endpoint).await?;
-            let (channel, receiver) = mpsc::channel(16);
+            let cdp = Cdp::connect(&endpoint).await?;
+            let mut messages = cdp.subscribe();
             let events = self.events.clone();
-            let driver = tokio::spawn(cdp_driver(socket, receiver, events));
-            let target = rpc(
-                &channel,
-                "Target.createTarget",
-                json!({"url":"about:blank"}),
-                None,
-            )
-            .await?;
+            let frames = tokio::spawn(async move {
+                loop {
+                    match messages.recv().await {
+                        Ok(value) if value["method"] == "Page.screencastFrame" => {
+                            if let Some(data) = value["params"]["data"]
+                                .as_str()
+                                .filter(|d| d.len() <= 4 * 1024 * 1024)
+                            {
+                                let _ = events.send(json!({"kind":"browser.frame","data":{"data":data,"mimeType":"image/jpeg","width":WIDTH,"height":HEIGHT}}));
+                            }
+                        }
+                        Ok(value) if value["method"] == "Inspector.detached" => break,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        _ => {}
+                    }
+                }
+                let _ = events.send(json!({"kind":"browser.status","data":{"active":false}}));
+            });
+            let target = cdp
+                .request("Target.createTarget", json!({"url":"about:blank"}), None)
+                .await?;
             let target_id = target["targetId"]
                 .as_str()
                 .context("Chromium did not create a login tab")?;
-            let attached = rpc(
-                &channel,
-                "Target.attachToTarget",
-                json!({"targetId":target_id,"flatten":true}),
-                None,
-            )
-            .await?;
+            let attached = cdp
+                .request(
+                    "Target.attachToTarget",
+                    json!({"targetId":target_id,"flatten":true}),
+                    None,
+                )
+                .await?;
             let session = attached["sessionId"]
                 .as_str()
                 .context("Chromium did not attach a login tab")?
                 .to_owned();
-            rpc(&channel, "Page.enable", json!({}), Some(&session)).await?;
-            rpc(&channel, "Network.enable", json!({}), Some(&session)).await?;
-            rpc(
-                &channel,
+            cdp.request("Page.enable", json!({}), Some(&session))
+                .await?;
+            cdp.request("Network.enable", json!({}), Some(&session))
+                .await?;
+            cdp.request(
                 "Emulation.setDeviceMetricsOverride",
                 json!({"width":WIDTH,"height":HEIGHT,"deviceScaleFactor":1,"mobile":false}),
                 Some(&session),
             )
             .await?;
-            rpc(&channel,"Page.startScreencast",json!({"format":"jpeg","quality":65,"maxWidth":WIDTH,"maxHeight":HEIGHT,"everyNthFrame":1}),Some(&session)).await?;
-            rpc(
-                &channel,
-                "Page.navigate",
-                json!({"url":url}),
-                Some(&session),
-            )
-            .await?;
-            Ok::<_, anyhow::Error>((channel, driver, session))
+            cdp.request("Page.startScreencast",json!({"format":"jpeg","quality":65,"maxWidth":WIDTH,"maxHeight":HEIGHT,"everyNthFrame":1}),Some(&session)).await?;
+            cdp.request("Page.navigate", json!({"url":url}), Some(&session))
+                .await?;
+            Ok::<_, anyhow::Error>((cdp, frames, session))
         };
         let result = tokio::select! {
             result = tokio::time::timeout(Duration::from_secs(30), startup) => result,
@@ -289,13 +292,13 @@ impl Browser {
             }
         };
         match result {
-            Ok(Ok((channel, driver, session))) => Ok(Running {
+            Ok(Ok((cdp, frames, session))) => Ok(Running {
                 _proxy: proxy,
                 child,
                 guard,
                 profile,
-                channel,
-                driver,
+                cdp,
+                frames,
                 session,
                 target_url: url.into(),
                 touched: Instant::now(),
@@ -318,7 +321,10 @@ impl Browser {
             .as_mut()
             .context("start a remote login session first")?;
         for (method, params) in input_commands(input)? {
-            rpc(&running.channel, method, params, Some(&running.session)).await?;
+            running
+                .cdp
+                .request(method, params, Some(&running.session))
+                .await?;
         }
         running.touched = Instant::now();
         Ok(())
@@ -333,13 +339,10 @@ impl Browser {
         let running = state
             .as_mut()
             .context("start a remote login session first")?;
-        let result = rpc(
-            &running.channel,
-            "Network.getAllCookies",
-            json!({}),
-            Some(&running.session),
-        )
-        .await?;
+        let result = running
+            .cdp
+            .request("Network.getAllCookies", json!({}), Some(&running.session))
+            .await?;
         let text = netscape(&result["cookies"])?;
         let meta = self
             .app
@@ -373,7 +376,7 @@ impl Browser {
 async fn cleanup(mut running: Running) {
     let _ = tokio::time::timeout(
         Duration::from_secs(2),
-        rpc(&running.channel, "Browser.close", json!({}), None),
+        running.cdp.request("Browser.close", json!({}), None),
     )
     .await;
     if tokio::time::timeout(Duration::from_secs(3), running.child.wait())
@@ -385,84 +388,9 @@ async fn cleanup(mut running: Running) {
         let _ = running.child.wait().await;
     }
     running.guard.terminate();
-    running.driver.abort();
-    let _ = running.driver.await;
+    running.frames.abort();
+    let _ = running.frames.await;
     let _ = tokio::fs::remove_dir_all(&running.profile).await;
-}
-
-async fn rpc(
-    channel: &mpsc::Sender<Rpc>,
-    method: &'static str,
-    params: Value,
-    session: Option<&str>,
-) -> Result<Value> {
-    let (reply, receiver) = oneshot::channel();
-    let request = Rpc {
-        method,
-        params,
-        session: session.map(str::to_owned),
-        reply,
-    };
-    tokio::time::timeout(Duration::from_secs(10), async {
-        channel
-            .send(request)
-            .await
-            .context("remote login session ended")?;
-        receiver
-            .await
-            .context("remote login session ended")?
-            .with_context(|| format!("Chromium command failed: {method}"))
-    })
-    .await
-    .context("Chromium command timed out")?
-}
-
-async fn cdp_driver(
-    socket: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    mut receiver: mpsc::Receiver<Rpc>,
-    events: broadcast::Sender<Value>,
-) {
-    let (mut writer, mut reader) = socket.split();
-    let mut next_id = 0u64;
-    let mut pending: HashMap<u64, oneshot::Sender<Result<Value>>> = HashMap::new();
-    loop {
-        tokio::select! {
-            request = receiver.recv() => {
-                let Some(request) = request else { break };
-                next_id += 1;
-                let mut message = json!({"id":next_id,"method":request.method,"params":request.params});
-                if let Some(session) = request.session { message["sessionId"] = Value::String(session); }
-                if writer.send(Message::Text(message.to_string().into())).await.is_err() { break; }
-                pending.retain(|_, reply| !reply.is_closed());
-                pending.insert(next_id,request.reply);
-            }
-            message = reader.next() => {
-                let Some(Ok(message)) = message else { break };
-                let Message::Text(text) = message else { continue };
-                let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
-                if let Some(id) = value["id"].as_u64() {
-                    if let Some(reply) = pending.remove(&id) {
-                        let result = if value.get("error").is_some() { Err(anyhow::anyhow!("Chromium rejected the login action")) } else { Ok(value["result"].clone()) };
-                        let _ = reply.send(result);
-                    }
-                } else if value["method"] == "Page.screencastFrame" {
-                    let params = &value["params"];
-                    if let Some(data) = params["data"].as_str().filter(|d| d.len() <= 4 * 1024 * 1024) {
-                        let _ = events.send(json!({"kind":"browser.frame","data":{"data":data,"mimeType":"image/jpeg","width":WIDTH,"height":HEIGHT}}));
-                    }
-                    next_id += 1;
-                    let ack = json!({"id":next_id,"method":"Page.screencastFrameAck","sessionId":value["sessionId"],"params":{"sessionId":params["sessionId"]}});
-                    if writer.send(Message::Text(ack.to_string().into())).await.is_err() { break; }
-                }
-            }
-        }
-    }
-    for (_, reply) in pending {
-        let _ = reply.send(Err(anyhow::anyhow!("remote login session ended")));
-    }
-    let _ = events.send(json!({"kind":"browser.status","data":{"active":false}}));
 }
 
 fn login_url(text: &str) -> Result<String> {
@@ -553,53 +481,6 @@ fn input_commands(input: Input) -> Result<Vec<(&'static str, Value)>> {
             )])
         }
     }
-}
-
-fn netscape(cookies: &Value) -> Result<String> {
-    let cookies = cookies
-        .as_array()
-        .context("Chromium returned invalid cookies")?;
-    ensure!(
-        !cookies.is_empty() && cookies.len() <= 10000,
-        "no cookies to save, or too many cookies"
-    );
-    let mut text = String::from("# Netscape HTTP Cookie File\n# Saved by Huifa Downloader Rust\n");
-    for cookie in cookies {
-        let domain = cookie["domain"].as_str().context("invalid cookie domain")?;
-        let path = cookie["path"].as_str().context("invalid cookie path")?;
-        let name = cookie["name"].as_str().context("invalid cookie name")?;
-        let value = cookie["value"].as_str().context("invalid cookie value")?;
-        ensure!(
-            !domain.is_empty()
-                && !path.is_empty()
-                && !name.is_empty()
-                && ![domain, path, name, value]
-                    .iter()
-                    .any(|s| s.chars().any(char::is_control)),
-            "invalid cookie content"
-        );
-        let prefix = if cookie["httpOnly"].as_bool().unwrap_or(false) {
-            "#HttpOnly_"
-        } else {
-            ""
-        };
-        let subdomains = if domain.starts_with('.') {
-            "TRUE"
-        } else {
-            "FALSE"
-        };
-        let secure = if cookie["secure"].as_bool().unwrap_or(false) {
-            "TRUE"
-        } else {
-            "FALSE"
-        };
-        let expires = cookie["expires"].as_f64().unwrap_or(0.0).max(0.0) as i64;
-        text.push_str(&format!(
-            "{prefix}{domain}\t{subdomains}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n"
-        ));
-        ensure!(text.len() <= 2 * 1024 * 1024, "cookies exceed 2 MiB");
-    }
-    Ok(text)
 }
 
 #[cfg(test)]
