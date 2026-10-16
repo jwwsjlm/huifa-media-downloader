@@ -225,7 +225,8 @@ fn all_formats(info: &Value) -> Vec<Value> {
         .unwrap_or_else(|| vec![info.clone()])
 }
 fn has_video(format: &Value) -> bool {
-    text(format, "vcodec") != "none"
+    !matches!(text(format, "vcodec"), "none" | "images")
+        && text(format, "protocol") != "mhtml"
         && (!text(format, "vcodec").is_empty()
             || text(format, "acodec").is_empty()
             || metric(format, "height") > 0.0)
@@ -266,7 +267,14 @@ fn vr_match(format: &Value, mode: &str) -> bool {
     }
 }
 fn compare_video(a: &Value, b: &Value, options: &DownloadOptions) -> Ordering {
-    let res = metric(a, "height").total_cmp(&metric(b, "height"));
+    let quality_order = |order: Ordering| {
+        if options.quality == "worst" {
+            order.reverse()
+        } else {
+            order
+        }
+    };
+    let res = quality_order(metric(a, "height").total_cmp(&metric(b, "height")));
     if res != Ordering::Equal {
         return res;
     }
@@ -281,7 +289,7 @@ fn compare_video(a: &Value, b: &Value, options: &DownloadOptions) -> Ordering {
             codec_match(text(a, "vcodec"), options.effective_codec())
                 .cmp(&codec_match(text(b, "vcodec"), options.effective_codec())),
         )
-        .then(metric(a, "tbr").total_cmp(&metric(b, "tbr")))
+        .then(quality_order(metric(a, "tbr").total_cmp(&metric(b, "tbr"))))
 }
 fn compare_audio(a: &Value, b: &Value, options: &DownloadOptions) -> Ordering {
     let score = |f: &Value| {
@@ -335,6 +343,9 @@ pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<
             );
             if videos.iter().any(|f| vr_match(f, &options.vr_mode)) {
                 videos.retain(|f| vr_match(f, &options.vr_mode));
+            }
+            if options.quality == "worst" && videos.iter().any(|f| metric(f, "height") > 0.0) {
+                videos.retain(|f| metric(f, "height") > 0.0);
             }
             let best = videos
                 .into_iter()
@@ -1046,6 +1057,40 @@ mod tests {
         );
         let options = DownloadOptions::parse(json!({"videoFormatId":"missing"})).unwrap();
         assert!(select_formats(&info, &options).is_err());
+    }
+    #[test]
+    fn automatic_quality_selects_real_video_extremes_and_keeps_audio() {
+        let info = json!({"formats":[
+            {"format_id":"storyboard","height":45,"vcodec":"images","acodec":"none"},
+            {"format_id":"preview","height":45,"protocol":"mhtml","acodec":"none"},
+            {"format_id":"unknown","vcodec":"avc1","acodec":"none"},
+            {"format_id":"low-large","height":144,"fps":30,"tbr":100,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"low","height":144,"fps":30,"tbr":50,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"medium","height":720,"fps":60,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"high","height":1080,"fps":30,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"audio-low","abr":64,"vcodec":"none","acodec":"aac"},
+            {"format_id":"audio","abr":128,"vcodec":"none","acodec":"aac"}
+        ]});
+        for (quality, expected) in [("best", "high"), ("worst", "low"), ("720p", "medium")] {
+            let options = DownloadOptions::parse(json!({"quality":quality})).unwrap();
+            let formats = select_formats(&info, &options).unwrap();
+            assert_eq!(text(&formats[0], "format_id"), expected);
+            assert_eq!(text(&formats[1], "format_id"), "audio");
+        }
+        let exact =
+            DownloadOptions::parse(json!({"quality":"worst","videoFormatId":"high"})).unwrap();
+        assert_eq!(
+            text(&select_formats(&info, &exact).unwrap()[0], "format_id"),
+            "high"
+        );
+        let previews = json!({"formats":[info["formats"][0].clone(),info["formats"][1].clone()]});
+        assert!(select_formats(&previews, &DownloadOptions::default()).is_err());
+        let unknown = json!({"formats":[info["formats"][2].clone(),info["formats"][8].clone()]});
+        let lowest = DownloadOptions::parse(json!({"quality":"worst"})).unwrap();
+        assert_eq!(
+            text(&select_formats(&unknown, &lowest).unwrap()[0], "format_id"),
+            "unknown"
+        );
     }
     #[test]
     fn durable_metadata_contains_no_signed_urls() {

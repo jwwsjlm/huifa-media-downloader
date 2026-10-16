@@ -56,6 +56,14 @@ waiting_processing, processing, processing_failed, paused, cancelled, failed,
 completed. A completed task is only published after validated output and its
 database transaction. Inputs, plans and publication journal are durable. Retry
 of processing_failed tasks uses saved local inputs without running yt-dlp.
+
+Video quality supports `best` (highest available resolution), `worst` (lowest
+available resolution), and the existing resolution caps. Storyboards are excluded;
+audio is matched automatically. Choosing a quality preset clears exact format IDs
+and exits per-task manual selection, while existing queued plans remain frozen.
+The download-page selector applies to subsequent batches in the current session;
+Quick options and Settings save defaults for future sessions.
+
 Runtime updates apply to newly added tasks; retry retains the original frozen tools
 and credentials. The selected yt-dlp release tag is resolved before downloading;
 GitHub and CDN requests target that same exact tag. SHA-256 checksums are always

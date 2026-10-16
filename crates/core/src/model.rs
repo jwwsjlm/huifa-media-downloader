@@ -197,7 +197,7 @@ impl DownloadOptions {
             (
                 "quality",
                 &self.quality,
-                "best 8k 4k 2k 1k 1080p 720p 480p 360p 240p qcif",
+                "best worst 8k 4k 2k 1k 1080p 720p 480p 360p 240p qcif",
             ),
             (
                 "audioFormat",

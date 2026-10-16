@@ -33,6 +33,16 @@ describe('task delta state', () => {
     state = reducer(state, { type: 'event', event: { kind: 'task.remove', data: { id: 'a' } } });
     expect(state.tasks.a).toBeUndefined(); expect(state.view.taskSelection).toBe(''); expect(state.taskIds).toEqual(['b']);
   });
+  it('keeps batch quality through resync and applies newly saved defaults without changing existing tasks', () => {
+    const snapshot = makeSnapshot(); snapshot.tasks[0].options = { quality: 'best' };
+    let state = reducer(initialState, { type: 'snapshot', snapshot });
+    state = reducer(state, { type: 'view', patch: { quality: 'worst' } });
+    state = reducer(state, { type: 'snapshot', snapshot });
+    expect(state.view.quality).toBe('worst');
+    state = reducer(state, { type: 'saved', settings: { downloadOptions: { quality: '720p' } } });
+    expect(state.view.quality).toBeNull(); expect(state.settings.downloadOptions?.quality).toBe('720p');
+    expect(state.tasks.a.options.quality).toBe('best');
+  });
   it('shows processing progress independently from downloaded input progress', () => {
     expect(taskProgress({ ...makeTask('a'), status: 'processing', progress: 100, stageProgress: 12 })).toEqual({ value: 12, indeterminate: false });
     expect(taskProgress({ ...makeTask('a'), status: 'processing', progress: 100, stageProgress: null }).indeterminate).toBe(true);

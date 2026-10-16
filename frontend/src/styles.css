@@ -97,6 +97,8 @@ input[type=color]{padding:3px!important}
 .batch-plan{display:flex;align-items:center;flex-wrap:wrap;gap:6px 10px;color:var(--muted);font-size:12px}
 .batch-plan small{margin-left:auto;font-size:11px}
 .batch-plan .badge{color:var(--accent);background:transparent;border:1px solid var(--border)}
+.quality-picker{display:inline-flex;align-items:center;gap:6px}
+.quality-picker select{width:auto;max-width:210px;padding:5px 25px 5px 8px;font-size:12px}
 .toolbar{display:flex;align-items:center;gap:8px;flex-shrink:0;border:1px solid var(--border-soft);border-radius:var(--radius);background:var(--surface);padding:8px;box-shadow:var(--panel-shadow)}
 .toolbar input[type=search],.toolbar input[type=url]{flex:1;width:140px}
 .toolbar select{width:auto;max-width:160px}

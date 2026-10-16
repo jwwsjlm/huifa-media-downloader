@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { commandOptions, defaults, optionGroups } from './options';
+import { automaticQuality, commandOptions, defaults, optionGroups } from './options';
 
 describe('download option boundary', () => {
   it('removes a public secret marker while preserving omitted and explicitly cleared proxies', () => {
@@ -15,5 +15,11 @@ describe('download option boundary', () => {
     expect(fields).toContain('prependCoverEnabled'); expect(fields).toContain('automaticSubtitles');
     expect(fields).not.toContain('prependCover'); expect(fields).not.toContain('maxConcurrent');
     expect(commandOptions(defaults).prependCoverFrames).toBe(3);
+  });
+  it('clears exact formats when choosing automatic quality and preserves audio-only mode', () => {
+    const saved = { ...defaults, contentMode: 'manual', formatId: 'old', videoFormatId: 'old-video', audioFormatIds: ['old-audio'] };
+    expect(automaticQuality(saved, 'best')).toEqual({ quality: 'best', contentMode: 'video', formatId: '', videoFormatId: '', audioFormatIds: [] });
+    expect(automaticQuality({ ...saved, contentMode: 'audio' }, 'worst').contentMode).toBe('audio');
+    expect(saved.formatId).toBe('old');
   });
 });

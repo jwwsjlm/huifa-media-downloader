@@ -5,6 +5,23 @@ import type { Translate } from './i18n';
 
 export interface OptionField { key: string; zh: string; en: string; type?: 'number' | 'check' | 'date'; choices?: [string, string, string][]; min?: number; max?: number; hint?: [string, string] }
 const choices = (values: string[]) => values.map(value => [value, value, value] as [string, string, string]);
+const qualityChoices: [string, string, string][] = [['best', '最高画质（自动）', 'Highest quality (automatic)'], ['worst', '最低画质（自动）', 'Lowest quality (automatic)'], ...choices(['8k', '4k', '2k', '1080p', '720p', '480p', '360p', '240p']), ['qcif', '144p', '144p']];
+export function automaticQuality(options: DownloadOptions, quality: string): DownloadOptions {
+  return { quality, contentMode: options.contentMode === 'audio' ? 'audio' : 'video', formatId: '', videoFormatId: '', audioFormatIds: [] };
+}
+function qualityValue(options: DownloadOptions): string {
+  const manual = options.contentMode === 'manual' || options.formatId || options.videoFormatId || Array.isArray(options.audioFormatIds) && options.audioFormatIds.length > 0;
+  return manual ? 'manual' : String(options.quality || 'best');
+}
+export function qualityLabel(options: DownloadOptions, t: Translate): string {
+  const value = qualityValue(options);
+  if (value === 'manual') return t('手动选格式', 'Choose format');
+  const choice = qualityChoices.find(([id]) => id === value);
+  return choice ? t(choice[1], choice[2]) : value;
+}
+export function QualitySelect({ options, change, t }: { options: DownloadOptions; change: (quality: string) => void; t: Translate }) {
+  return <select value={qualityValue(options)} onChange={event => change(event.target.value)}><option value="manual" disabled>{t('手动选格式', 'Choose format')}</option>{qualityChoices.map(([id, zh, en]) => <option key={id} value={id}>{t(zh, en)}</option>)}</select>;
+}
 export const encoders = ['original', 'libx264', 'libx265', 'libsvtav1', 'libaom-av1', 'librav1e', 'h264_nvenc', 'hevc_nvenc', 'av1_nvenc', 'h264_qsv', 'hevc_qsv', 'av1_qsv', 'h264_amf', 'hevc_amf', 'av1_amf'];
 export const defaults: DownloadOptions = {
   contentMode: 'video', quality: 'best', audioFormat: 'best', audioTrack: 'default', container: 'auto', videoFps: 'best', sourceVideoCodec: 'auto', vrMode: 'any', compatibilityTarget: 'auto',
@@ -21,7 +38,7 @@ export function commandOptions(options: DownloadOptions): DownloadOptions {
 export const optionGroups: { key: string; title: [string, string]; fields: OptionField[] }[] = [
   { key: 'media', title: ['媒体格式与处理', 'Media format and processing'], fields: [
     { key: 'contentMode', zh: '内容类型', en: 'Content type', choices: [['video', '视频与音频', 'Video with audio'], ['audio', '仅音频', 'Audio only'], ['manual', '逐任务选择格式', 'Choose format per task']] },
-    { key: 'quality', zh: '清晰度上限', en: 'Quality limit', choices: [['best', '最佳可用画质', 'Best available quality'], ...choices(['8k', '4k', '2k', '1080p', '720p', '480p', '360p', '240p']), ['qcif', '144p', '144p']] },
+    { key: 'quality', zh: '画质选择', en: 'Quality selection', choices: qualityChoices },
     { key: 'audioFormat', zh: '音频输出格式', en: 'Audio output format', choices: choices(['best', 'aac', 'alac', 'flac', 'm4a', 'mp3', 'opus', 'vorbis', 'wav']) },
     { key: 'audioTrack', zh: '音轨偏好', en: 'Audio track preference', choices: [['default', '默认音轨', 'Default audio'], ['original', '原始音轨', 'Original audio'], ['all', '全部音轨', 'All tracks'], ...choices(['zh-Hans', 'zh-Hant', 'en', 'ja', 'ko', 'es', 'fr', 'de', 'ru', 'pt', 'ar', 'hi', 'id', 'vi', 'th', 'tr'])] },
     { key: 'container', zh: '视频容器', en: 'Video container', choices: [['auto', '自动 / 来源格式', 'Automatic / source format'], ...choices(['mp4', 'mkv'])] },
@@ -61,7 +78,7 @@ export const optionGroups: { key: string; title: [string, string]; fields: Optio
 ];
 export const OptionsForm = memo(function OptionsForm({ options, change, t, quick = false }: { options: DownloadOptions; change: (key: string, value: OptionValue) => void; t: Translate; quick?: boolean }) {
   return <>{optionGroups.map(group => <details key={group.key} className="settings-fold panel" open={quick || group.key === 'media'}><summary><strong>{t(...group.title)}</strong></summary><div className="form-grid">
-    {group.fields.filter(field => !quick || ['contentMode', 'quality', 'audioFormat', 'container', 'encoder', 'collectionMode', 'subtitleLanguage', 'prependCoverEnabled'].includes(field.key)).map(field => <OptionControl key={field.key} field={field} value={options[field.key] ?? defaults[field.key]} change={change} t={t} />)}
+    {group.fields.filter(field => !quick || ['contentMode', 'quality', 'audioFormat', 'container', 'encoder', 'collectionMode', 'subtitleLanguage', 'prependCoverEnabled'].includes(field.key)).map(field => field.key === 'quality' ? <Field key={field.key} label={t(field.zh, field.en)}><QualitySelect options={options} change={quality => { for (const [key, value] of Object.entries(automaticQuality(options, quality))) change(key, value); }} t={t} /></Field> : <OptionControl key={field.key} field={field} value={options[field.key] ?? defaults[field.key]} change={change} t={t} />)}
   </div>{group.key === 'sponsor' && !quick && <div className="checkbox-grid">{['sponsor', 'intro', 'outro', 'selfpromo', 'interaction', 'preview', 'music_offtopic', 'filler'].map(category => <Check key={category} label={category} checked={Array.isArray(options.sponsorblockCategories) && options.sponsorblockCategories.includes(category)} onChange={event => { const values = new Set(Array.isArray(options.sponsorblockCategories) ? options.sponsorblockCategories : []); event.target.checked ? values.add(category) : values.delete(category); change('sponsorblockCategories', [...values]); }} />)}</div>}</details>)}</>;
 });
 function OptionControl({ field, value, change, t }: { field: OptionField; value: OptionValue | undefined; change: (key: string, value: OptionValue) => void; t: Translate }) {

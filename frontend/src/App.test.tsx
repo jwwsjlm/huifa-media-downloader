@@ -13,6 +13,41 @@ vi.mock('./transport', () => ({ host: {
 } }));
 beforeEach(() => { transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true); });
 describe('live interface stability', () => {
+  it.each(['best', 'worst'])('adds a batch with %s quality without opening the manual format picker', async quality => {
+    const snapshot = makeSnapshot();
+    snapshot.settings.downloadOptions = { contentMode: 'manual', quality: 'best', formatId: 'old', videoFormatId: 'old-video', audioFormatIds: ['old-audio'] };
+    const entries = [{ url: 'https://example.test/first', title: 'First video' }, { url: 'https://example.test/second', title: 'Second video' }];
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'probe.collection' ? { entries } : true);
+    render(<AppProvider><App /></AppProvider>);
+    const selector = await screen.findByRole('combobox', { name: 'Quality' }) as HTMLSelectElement;
+    expect(selector.value).toBe('manual');
+    fireEvent.change(selector, { target: { value: quality } });
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', progress: 60 } }));
+    expect(selector.value).toBe(quality);
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'https://example.test/collection' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    const confirm = await screen.findByRole('button', { name: 'Download selected items' });
+    await waitFor(() => expect(confirm.hasAttribute('disabled')).toBe(false));
+    fireEvent.click(confirm);
+    await waitFor(() => expect(transport.command.mock.calls.filter(([command]) => command === 'tasks.add')).toHaveLength(2));
+    for (const entry of entries) expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [entry.url], options: expect.objectContaining({ quality, contentMode: 'video', collectionMode: 'single', formatId: '', videoFormatId: '', audioFormatIds: [] }) });
+    expect(transport.command.mock.calls.some(([command]) => command === 'probe.video')).toBe(false);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(selector.value).toBe(quality);
+  });
+  it('saves automatic quality from quick options and keeps audio-only settings', async () => {
+    const snapshot = makeSnapshot();
+    snapshot.settings.downloadOptions = { contentMode: 'audio', quality: 'best', formatId: 'old', videoFormatId: 'old-video', audioFormatIds: ['old-audio'], audioFormat: 'mp3' };
+    transport.command.mockImplementation(async (command, args) => command === 'snapshot' ? snapshot : command === 'settings.save' ? args.settings : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('button', { name: 'Quick options' }));
+    const dialog = screen.getByRole('dialog');
+    fireEvent.change(within(dialog).getByRole('combobox', { name: 'Quality selection' }), { target: { value: 'worst' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save batch plan' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ downloadOptions: expect.objectContaining({ quality: 'worst', contentMode: 'audio', audioFormat: 'mp3', formatId: '', videoFormatId: '', audioFormatIds: [] }) }) });
+    expect((screen.getByRole('combobox', { name: 'Quality' }) as HTMLSelectElement).value).toBe('worst');
+  });
   it('gives recovery guidance for failed downloads while keeping the diagnostic', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'failed', error: 'yt-dlp.exe exited with code 1: Sign in to confirm you are not a bot' } }));
