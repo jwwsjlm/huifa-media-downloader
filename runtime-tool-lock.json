@@ -24,22 +24,22 @@
     },
     "ffmpeg": {
       "repository": "BtbN/FFmpeg-Builds",
-      "version": "autobuild-2026-10-15-13-03",
+      "version": "autobuild-2026-10-16-13-04",
       "assets": {
         "windows-x86_64": {
-          "name": "ffmpeg-N-127564-g3c92f003c7-win64-gpl-shared.zip",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-15-13-03/ffmpeg-N-127564-g3c92f003c7-win64-gpl-shared.zip",
-          "sha256": "354af576d352cdcdbbbed1fc103e4ff80f1c05cccf2cc6847f4a66e59a1e1cea"
+          "name": "ffmpeg-N-127579-g5cb9fcd211-win64-gpl-shared.zip",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-16-13-04/ffmpeg-N-127579-g5cb9fcd211-win64-gpl-shared.zip",
+          "sha256": "345ab5b89c11583c1e309a3d47fce5d44dabe8f7acf81cff3fc974485a500070"
         },
         "linux-x86_64": {
-          "name": "ffmpeg-N-127564-g3c92f003c7-linux64-gpl.tar.xz",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-15-13-03/ffmpeg-N-127564-g3c92f003c7-linux64-gpl.tar.xz",
-          "sha256": "b389df50ad23fc6e03c9e023dc3a28eb61aa480651789f56106f6ca4d169e319"
+          "name": "ffmpeg-N-127579-g5cb9fcd211-linux64-gpl.tar.xz",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-16-13-04/ffmpeg-N-127579-g5cb9fcd211-linux64-gpl.tar.xz",
+          "sha256": "3d994f31aa9ee78ef56eab530a86d50d8307200cb9d1788be36c1ea9410e605c"
         },
         "linux-aarch64": {
-          "name": "ffmpeg-N-127564-g3c92f003c7-linuxarm64-gpl.tar.xz",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-15-13-03/ffmpeg-N-127564-g3c92f003c7-linuxarm64-gpl.tar.xz",
-          "sha256": "0ac1fb49c135d999ada6c0f540716231f7b37b8f1ff0ce433c6aaf98f06c327b"
+          "name": "ffmpeg-N-127579-g5cb9fcd211-linuxarm64-gpl.tar.xz",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-16-13-04/ffmpeg-N-127579-g5cb9fcd211-linuxarm64-gpl.tar.xz",
+          "sha256": "56c9cd900daa38fd07eaab8e144e577fe637293d376a0b33de21364923a90709"
         }
       }
     },
