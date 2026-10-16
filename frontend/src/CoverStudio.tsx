@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button, Empty, Field, Modal } from './components';
 import { host } from './transport';
+import { explainError } from './errors';
 import type { CoverResult, Media } from './types';
 import type { Translate } from './i18n';
 import type { Run } from './App';
@@ -39,6 +40,6 @@ export function CoverStudio({ media, close, run, t }: { media: Media; close: () 
       {(['focusX', 'focusY'] as const).map((key, index) => <Field key={key} label={`${t(index ? '裁切焦点 Y' : '裁切焦点 X', index ? 'Crop focus Y' : 'Crop focus X')} · ${Math.round(edit[key] * 100)}%`}><input type="range" min={0} max={100} value={Math.round(edit[key] * 100)} disabled={busy || edit.fitMode !== 'crop'} onChange={event => change(key, Number(event.target.value) / 100)} /></Field>)}
       <Field label={t('JPEG 质量', 'JPEG quality')}><input type="number" min={1} max={100} value={edit.quality} disabled={busy} onChange={event => change('quality', Number(event.target.value))} /></Field>{edit.fitMode === 'pad' && <Field label={t('留白颜色', 'Padding color')}><input type="color" value={edit.backgroundColor} disabled={busy} onChange={event => change('backgroundColor', event.target.value)} /></Field>}
       <Button tone="primary" icon="download" disabled={busy || !preview || loading} onClick={exportCover}>{t('导出 JPEG', 'Export JPEG')}</Button><hr /><Field label={t('AI 封面提示词', 'AI cover prompt')}><textarea rows={4} value={prompt} maxLength={8000} disabled={busy} onChange={event => setPrompt(event.target.value)} /></Field><Button icon="image" tone="primary" disabled={busy || !prompt.trim() || !preview} onClick={generate}>{t('生成 AI 变体', 'Generate AI variation')}</Button>
-    </div></div>{error && <p className="notice danger" role="alert">{error}</p>}{status && <p className="notice" role="status">{status}</p>}
+    </div></div>{error && <p className="notice danger" role="alert">{explainError(error, t)}</p>}{status && <p className="notice" role="status">{status}</p>}
   </Modal>;
 }

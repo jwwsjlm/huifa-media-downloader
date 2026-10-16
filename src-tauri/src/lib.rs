@@ -27,7 +27,7 @@ struct Host {
 }
 
 fn error(error: impl std::fmt::Display) -> String {
-    error.to_string()
+    huifa_core::process::redact(&format!("{error:#}"))
 }
 
 #[tauri::command]
@@ -422,6 +422,14 @@ fn begin_shutdown(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn command_errors_keep_the_cause_without_signed_urls() {
+        let reason = anyhow::anyhow!("HTTP 403 https://example.test/file?token=secret")
+            .context("Cannot download yt-dlp runtime");
+        let message = error(reason);
+        assert!(message.contains("Cannot download yt-dlp runtime: HTTP 403"));
+        assert!(!message.contains("secret"));
+    }
     #[test]
     fn portable_marker_only_applies_beside_the_executable() -> Result<()> {
         let directory = tempfile::tempdir()?;

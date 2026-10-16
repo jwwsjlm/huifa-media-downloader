@@ -121,7 +121,9 @@ pub(crate) async fn probe(
     } else {
         app.tool("yt-dlp")?
     };
-    let output = process::run(&executable, &args, None, cancel, None).await?;
+    let output = process::run(&executable, &args, None, cancel, None)
+        .await
+        .context("Failed to parse video with yt-dlp")?;
     let info: Value =
         serde_json::from_str(&output.stdout).context("yt-dlp returned invalid video metadata")?;
     ensure!(
@@ -189,8 +191,11 @@ pub(crate) async fn collection(
         args.push("--playlist-random".into());
     }
     args.extend(["--".into(), url.into()]);
-    let output = process::run(&app.tool("yt-dlp")?, &args, None, &app.shutdown_token, None).await?;
-    let info: Value = serde_json::from_str(&output.stdout)?;
+    let output = process::run(&app.tool("yt-dlp")?, &args, None, &app.shutdown_token, None)
+        .await
+        .context("Failed to read collection with yt-dlp")?;
+    let info: Value = serde_json::from_str(&output.stdout)
+        .context("yt-dlp returned invalid collection metadata")?;
     let all = info["entries"]
         .as_array()
         .cloned()
@@ -570,7 +575,13 @@ pub(crate) async fn transfer(
             cancel,
             Some(callback),
         )
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to download {kind} stream (format {}) with yt-dlp",
+                text(format, "format_id")
+            )
+        })?;
         let path = output
             .stdout
             .lines()
@@ -776,7 +787,8 @@ async fn download_subtitles(
         cancel,
         None,
     )
-    .await?;
+    .await
+    .context("Failed to download subtitles with yt-dlp")?;
     for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();
         if path

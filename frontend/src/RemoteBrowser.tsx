@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button, Empty, Field, Modal } from './components';
 import { host } from './transport';
+import { explainError } from './errors';
 import type { Translate } from './i18n';
 import type { Run } from './App';
 
@@ -24,6 +25,6 @@ export function RemoteBrowser({ close, saved, t, run }: { close: () => void; sav
       onKeyDown={event => { if (!active || event.target !== event.currentTarget) return; if (event.key.length === 1 && !event.ctrlKey && !event.metaKey) { event.preventDefault(); run(() => host.browserInput({ type: 'text', text: event.key })); } else if (['Enter', 'Backspace', 'Delete', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); run(() => host.browserInput({ type: 'key', key: event.key })); } }}
       onWheel={event => { if (active) run(() => host.browserInput({ type: 'scroll', deltaY: Math.round(event.deltaY) })); }}>
       {image ? <img src={image} alt={t('远程登录浏览器', 'Remote sign-in browser')} draggable={false} /> : <Empty title={t('打开来源网站开始登录', 'Open a source site to start signing in')} icon="external" />}
-    </div><form className="toolbar remote-text" onSubmit={event => { event.preventDefault(); run(async () => { await host.browserInput({ type: 'text', text }); setText(''); frame.current?.focus(); }); }}><input value={text} autoComplete="off" type="password" aria-label={t('输入并发送到远程浏览器', 'Type and send to the remote browser')} placeholder={t('输入文字，可用于粘贴账号或密码', 'Enter text to paste an account or password')} onChange={event => setText(event.target.value)} /><Button type="submit" disabled={!active || !text}>{t('发送文字', 'Send text')}</Button></form>{error && <p className="notice danger" role="alert">{error}</p>}{status && <p className="notice" role="status">{status}</p>}
+    </div><form className="toolbar remote-text" onSubmit={event => { event.preventDefault(); run(async () => { await host.browserInput({ type: 'text', text }); setText(''); frame.current?.focus(); }); }}><input value={text} autoComplete="off" type="password" aria-label={t('输入并发送到远程浏览器', 'Type and send to the remote browser')} placeholder={t('输入文字，可用于粘贴账号或密码', 'Enter text to paste an account or password')} onChange={event => setText(event.target.value)} /><Button type="submit" disabled={!active || !text}>{t('发送文字', 'Send text')}</Button></form>{error && <p className="notice danger" role="alert">{explainError(error, t)}</p>}{status && <p className="notice" role="status">{status}</p>}
   </Modal>;
 }

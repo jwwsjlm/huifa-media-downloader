@@ -178,29 +178,101 @@ fn managed_path(directory: &Path, name: &str) -> Result<Option<PathBuf>> {
     Ok(Some(canonical))
 }
 
-pub(crate) async fn update(app: &App, name: &str) -> Result<Value> {
+fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static str, String)> {
+    let channel = if channel.is_empty() {
+        "stable"
+    } else {
+        channel
+    };
+    let version = version.trim();
+    anyhow::ensure!(
+        version.len() <= 64
+            && (version.is_empty()
+                || version.starts_with(|c: char| c.is_ascii_alphanumeric())
+                    && version
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                    && !version.contains("..")),
+        "Invalid runtime version; enter an official release tag, not a URL"
+    );
+    let repository = match (name, channel) {
+        ("yt-dlp", "stable") => "yt-dlp/yt-dlp",
+        ("yt-dlp", "nightly") => "yt-dlp/yt-dlp-nightly-builds",
+        ("yt-dlp", _) => bail!("Unknown yt-dlp channel; choose stable or nightly"),
+        ("ffmpeg" | "ffprobe", "stable") if version.is_empty() => "yt-dlp/FFmpeg-Builds",
+        ("deno", "stable") if version.is_empty() => "denoland/deno",
+        ("ffmpeg" | "ffprobe" | "deno", _) => {
+            bail!("Channel and version selection is only supported for yt-dlp")
+        }
+        _ => bail!("Unknown runtime tool"),
+    };
+    let (origin, release) = if name == "yt-dlp" {
+        (
+            "https://github.com",
+            if version.is_empty() {
+                "latest/download".into()
+            } else {
+                format!("download/{version}")
+            },
+        )
+    } else {
+        ("https://api.github.com/repos", "latest".into())
+    };
+    Ok((
+        repository,
+        format!("{origin}/{repository}/releases/{release}"),
+    ))
+}
+
+pub(crate) async fn update(app: &App, args: &Value) -> Result<Value> {
+    let name = args["name"]
+        .as_str()
+        .context("Runtime tool name must be text")?;
+    let channel = args
+        .get("channel")
+        .map(|v| v.as_str().context("Runtime channel must be text"))
+        .transpose()?
+        .unwrap_or("stable");
+    let version = args
+        .get("version")
+        .map(|v| v.as_str().context("Runtime version must be text"))
+        .transpose()?
+        .unwrap_or("");
+    let (repository, release_url) = release_source(name, channel, version)?;
     let _guard = tokio::select! {
         guard=app.tool_update_lock.lock()=>guard,
         _=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted"),
     };
     tokio::select! {
-        result=update_inner(app,name)=>result,
+        result=update_inner(app,name,repository,&release_url)=>result,
         _=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted"),
     }
 }
 
-async fn update_inner(app: &App, name: &str) -> Result<Value> {
+fn checksum_for(sums: &str, filename: &str) -> Result<String> {
+    let mut digest = None;
+    for line in sums.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(hash), Some(name)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if name.trim_start_matches('*') == filename {
+            anyhow::ensure!(digest.is_none(), "Duplicate official runtime checksum");
+            anyhow::ensure!(
+                fields.next().is_none()
+                    && hash.len() == 64
+                    && hash.chars().all(|c| c.is_ascii_hexdigit()),
+                "Invalid official runtime checksum"
+            );
+            digest = Some(hash.to_ascii_lowercase());
+        }
+    }
+    digest.context("Official runtime checksum is missing for this platform; installation refused")
+}
+
+async fn update_inner(app: &App, name: &str, repository: &str, release_url: &str) -> Result<Value> {
     use anyhow::{Context, ensure};
     use std::io::Write;
-    ensure!(
-        matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe" | "deno"),
-        "Unknown runtime tool"
-    );
-    let repository = match name {
-        "yt-dlp" => "yt-dlp/yt-dlp",
-        "ffmpeg" | "ffprobe" => "yt-dlp/FFmpeg-Builds",
-        _ => "denoland/deno",
-    };
     let platform = target()?;
     let asset_name = match (name, platform.as_str()) {
         ("yt-dlp", "windows-x86_64") => "yt-dlp.exe",
@@ -219,20 +291,41 @@ async fn update_inner(app: &App, name: &str) -> Result<Value> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
-    let response = client
-        .get(format!(
-            "https://api.github.com/repos/{repository}/releases/latest"
-        ))
-        .send()
-        .await
-        .map_err(|e| e.without_url())?;
-    ensure!(
-        response.status().is_success(),
-        "Cannot query runtime release: HTTP {}",
-        response.status().as_u16()
-    );
-    let release: Value =
-        serde_json::from_slice(&bounded_response(response, 2 * 1024 * 1024).await?)?;
+    let release: Value = if name == "yt-dlp" {
+        // Official release checksum assets avoid the unauthenticated GitHub API quota.
+        let base = release_url;
+        let response = client
+            .get(format!("{base}/SHA2-256SUMS"))
+            .send()
+            .await
+            .map_err(|e| e.without_url())
+            .context("Cannot download official yt-dlp checksums from GitHub")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("Runtime release not found for yt-dlp; check the channel and exact release tag");
+        }
+        ensure!(
+            response.status().is_success(),
+            "Cannot download official yt-dlp runtime checksums from GitHub: HTTP {}",
+            response.status().as_u16()
+        );
+        let sums = String::from_utf8(bounded_response(response, 256 * 1024).await?)
+            .context("Invalid official runtime checksum file")?;
+        let digest = checksum_for(&sums, asset_name)?;
+        json!({"assets":[{"name":asset_name,"digest":format!("sha256:{digest}"),"browser_download_url":format!("{base}/{asset_name}")}]})
+    } else {
+        let response = client
+            .get(release_url)
+            .send()
+            .await
+            .map_err(|e| e.without_url())
+            .with_context(|| format!("Cannot connect to GitHub to query {name} release"))?;
+        ensure!(
+            response.status().is_success(),
+            "Cannot query {name} runtime release from GitHub: HTTP {}",
+            response.status().as_u16()
+        );
+        serde_json::from_slice(&bounded_response(response, 2 * 1024 * 1024).await?)?
+    };
     let asset = release["assets"]
         .as_array()
         .context("Malformed runtime release")?
@@ -255,15 +348,23 @@ async fn update_inner(app: &App, name: &str) -> Result<Value> {
     ensure!(
         url.scheme() == "https"
             && url.host_str() == Some("github.com")
-            && url
+            && (url
                 .path()
-                .starts_with(&format!("/{repository}/releases/download/")),
+                .starts_with(&format!("/{repository}/releases/download/"))
+                || name == "yt-dlp"
+                    && url.path()
+                        == format!("/{repository}/releases/latest/download/{asset_name}")),
         "Unexpected runtime download origin"
     );
-    let response = client.get(url).send().await.map_err(|e| e.without_url())?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.without_url())
+        .with_context(|| format!("Cannot download {name} runtime from GitHub"))?;
     ensure!(
         response.status().is_success(),
-        "Runtime download failed: HTTP {}",
+        "Runtime download failed for {name}: HTTP {}",
         response.status().as_u16()
     );
     let archive = bounded_response(response, 512 * 1024 * 1024).await?;
@@ -320,6 +421,17 @@ async fn update_inner(app: &App, name: &str) -> Result<Value> {
             None,
         )
         .await?;
+        if tool == "yt-dlp" {
+            let fixture = temporary.path().join("compatibility.json");
+            std::fs::write(&fixture, br#"{"id":"compatibility","title":"Compatibility","extractor":"generic","webpage_url":"https://example.invalid/compatibility.mp4","url":"https://example.invalid/compatibility.mp4","ext":"mp4","format_id":"compatibility","protocol":"https","vcodec":"avc1","acodec":"mp4a.40.2"}"#)?;
+            crate::process::run(&path, &[
+                "--ignore-config".into(), "--no-plugin-dirs".into(), "--no-cache-dir".into(),
+                "--no-js-runtimes".into(), "--encoding".into(), "utf-8".into(),
+                "--simulate".into(), "--skip-download".into(), "--progress-template".into(), "download:%(progress)j".into(),
+                "--print".into(), "after_move:%(filepath)j".into(), "--load-info-json".into(), fixture.to_string_lossy().into_owned(),
+            ], Some(temporary.path()), &app.shutdown_token, None).await.context("This yt-dlp version is incompatible with required application options; choose a newer release")?;
+            std::fs::remove_file(fixture)?;
+        }
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)?
@@ -478,10 +590,10 @@ pub(crate) async fn check(app: &App) -> Result<Value> {
                 let result =
                     crate::process::run(&path, &[flag.into()], None, &app.shutdown_token, None)
                         .await;
-                tools.push(match result {Ok(output)=>json!({"name":name,"available":true,"version":output.stdout.lines().next().unwrap_or("")}),Err(error)=>json!({"name":name,"available":false,"error":error.to_string()})});
+                tools.push(match result {Ok(output)=>json!({"name":name,"available":true,"version":output.stdout.lines().next().unwrap_or("")}),Err(error)=>json!({"name":name,"available":false,"error":crate::process::redact(&format!("{error:#}"))})});
             }
             Err(error) => {
-                tools.push(json!({"name":name,"available":false,"error":error.to_string()}))
+                tools.push(json!({"name":name,"available":false,"error":crate::process::redact(&format!("{error:#}"))}))
             }
         }
     }
@@ -517,6 +629,81 @@ pub(crate) fn mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn invalid_update_arguments_do_not_change_the_installed_tools() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: directory.path().join("data"),
+            download_dir: directory.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let tools = app.config.data_dir.join("tools");
+        std::fs::create_dir_all(&tools)?;
+        let pointer = tools.join("current.json");
+        std::fs::write(&pointer, b"{}")?;
+        for args in [
+            json!({"name":"yt-dlp","channel":1}),
+            json!({"name":"yt-dlp","version":[]}),
+            json!({"name":"yt-dlp","channel":"other/repo"}),
+            json!({"name":"yt-dlp","version":"../latest"}),
+        ] {
+            assert!(update(&app, &args).await.is_err());
+            assert_eq!(std::fs::read(&pointer)?, b"{}");
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
+    #[test]
+    fn official_checksums_require_one_exact_valid_entry() -> Result<()> {
+        let digest = "ab".repeat(32);
+        let sums = format!("{}  yt-dlp_linux\n{digest} *yt-dlp.exe\n", "cd".repeat(32));
+        assert_eq!(checksum_for(&sums, "yt-dlp.exe")?, digest);
+        assert!(checksum_for(&sums, "yt-dlp").is_err());
+        assert!(checksum_for(&format!("{sums}{digest} yt-dlp.exe\n"), "yt-dlp.exe").is_err());
+        assert!(checksum_for("not-a-digest yt-dlp.exe", "yt-dlp.exe").is_err());
+        assert!(checksum_for(&format!("{digest} yt-dlp.exe extra"), "yt-dlp.exe").is_err());
+        Ok(())
+    }
+    #[test]
+    fn runtime_selection_stays_in_official_repositories() -> Result<()> {
+        assert_eq!(
+            release_source("yt-dlp", "", "")?.1,
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
+        );
+        assert_eq!(
+            release_source("yt-dlp", "nightly", "")?.1,
+            "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download"
+        );
+        assert_eq!(
+            release_source("yt-dlp", "stable", " 2026.08.19 ")?.1,
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19"
+        );
+        assert!(
+            release_source("yt-dlp", "nightly", "2026.10.10.233141")?
+                .1
+                .ends_with("/download/2026.10.10.233141")
+        );
+        for version in [
+            "../latest",
+            "https://example.com/tool",
+            "a/b",
+            "a?x=b",
+            "a#x",
+            "a%2fb",
+            "--exec",
+            "a b",
+        ] {
+            assert!(
+                release_source("yt-dlp", "stable", version).is_err(),
+                "{version}"
+            );
+        }
+        assert!(release_source("yt-dlp", "other/repository", "").is_err());
+        assert!(release_source("ffmpeg", "nightly", "").is_err());
+        assert!(release_source("deno", "stable", "2.9.7").is_err());
+        Ok(())
+    }
     #[test]
     fn managed_tool_references_cannot_escape_storage() -> Result<()> {
         let directory = tempfile::tempdir()?;

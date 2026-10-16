@@ -480,7 +480,7 @@ impl App {
                 self.emit("tools.updated", value.clone());
                 Ok(value)
             }
-            "tools.update" => tools::update(self, text(&args, "name")).await,
+            "tools.update" => tools::update(self, &args).await,
             "cookies.import" => {
                 let value = self
                     .credentials

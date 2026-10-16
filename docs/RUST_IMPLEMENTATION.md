@@ -40,7 +40,7 @@ Core commands:
 - `probe.video` `{url, options}` -> metadata and formats;
   `probe.collection` `{url, options}` -> entries for client selection.
 - `settings.save` `{settings}` -> sanitized settings.
-- `tools.check`; `tools.update` `{name}` is desktop-only. Docker tools update with the image.
+- `tools.check`; `tools.update` `{name, channel?, version?}` is desktop-only. Only yt-dlp accepts `channel: stable | nightly` (default stable) and an optional exact official release tag; blank means latest. Docker tools update with the image.
 - `cookies.import` `{text, name}`, `cookies.list`, `cookies.delete` `{id}`;
   `cookies.browser` `{browser, profile?}` for desktop browser reading.
 - `cover.preview`, `cover.export` `{mediaId, ...editOptions}`;
@@ -54,9 +54,15 @@ waiting_processing, processing, processing_failed, paused, cancelled, failed,
 completed. A completed task is only published after validated output and its
 database transaction. Inputs, plans and publication journal are durable. Retry
 of processing_failed tasks uses saved local inputs without running yt-dlp.
+Runtime updates apply to newly added tasks; retry retains the original frozen tools
+and credentials. yt-dlp downloads and SHA-256 checksums come from its selected
+official GitHub release without depending on the unauthenticated GitHub API quota.
+Native execution and required CLI options are checked before switching the current
+tool pointer. Failed installation leaves that pointer unchanged.
 
 The media DTO uses `{id, taskId, title, filename, size, duration}`; snapshots
-never expose Cookie text, AI keys or signed media URLs. Desktop settings retain
+never expose Cookie text, AI keys or signed media URLs. Public YouTube watch URLs
+retain only a validated public video ID; other query parameters are removed. Desktop settings retain
 the chosen `processingTempDir`; web responses and events remove it, and web
 requests cannot set it. Task DTOs hide it on both hosts.
 `media.file` is a host-internal command: web rejects it from public command

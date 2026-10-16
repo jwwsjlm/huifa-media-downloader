@@ -67,7 +67,10 @@ impl From<StatusCode> for ApiError {
     }
 }
 fn failed(error: anyhow::Error) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, error.to_string())
+    ApiError(
+        StatusCode::BAD_REQUEST,
+        huifa_core::process::redact(&format!("{error:#}")),
+    )
 }
 
 impl Server {
@@ -619,6 +622,15 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[test]
+    fn errors_keep_the_cause_and_remove_signed_urls() {
+        let reason = anyhow::anyhow!("HTTP 403 https://example.test/file?token=secret")
+            .context("Failed to parse video with yt-dlp");
+        let message = failed(reason).1;
+        assert!(message.contains("Failed to parse video with yt-dlp: HTTP 403"));
+        assert!(!message.contains("secret"));
+    }
 
     #[tokio::test]
     async fn protected_real_core_command_flow() -> Result<()> {

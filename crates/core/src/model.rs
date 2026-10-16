@@ -622,10 +622,31 @@ pub(crate) fn text<'a>(value: &'a Value, key: &str) -> &'a str {
 
 pub fn redact_url(value: &str) -> String {
     if let Ok(mut url) = url::Url::parse(value) {
+        // A public YouTube video ID is needed to identify and re-add failed tasks.
+        let video_id = if matches!(
+            url.host_str(),
+            Some("youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com")
+        ) && url.path() == "/watch"
+        {
+            url.query_pairs()
+                .find(|(key, value)| {
+                    key == "v"
+                        && value.len() == 11
+                        && value
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                })
+                .map(|(_, value)| value.into_owned())
+        } else {
+            None
+        };
         let _ = url.set_username("");
         let _ = url.set_password(None);
         url.set_query(None);
         url.set_fragment(None);
+        if let Some(video_id) = video_id {
+            url.query_pairs_mut().append_pair("v", &video_id);
+        }
         url.to_string()
     } else {
         "[redacted URL]".into()
@@ -648,6 +669,23 @@ pub(crate) fn validate_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn public_youtube_links_keep_only_the_video_id() {
+        assert_eq!(
+            redact_url(
+                "https://user:secret@www.youtube.com/watch?v=jNQXAC9IVRw&token=secret#secret"
+            ),
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+        );
+        assert_eq!(
+            redact_url("https://www.youtube.com.evil.test/watch?v=jNQXAC9IVRw&token=secret"),
+            "https://www.youtube.com.evil.test/watch"
+        );
+        assert_eq!(
+            redact_url("https://www.youtube.com/watch?v=secret&token=secret"),
+            "https://www.youtube.com/watch"
+        );
+    }
     #[test]
     fn options_are_frozen_strict_and_compatible() {
         let options=DownloadOptions::parse(json!({"content_mode":"audio","audio_track":"all","audio_format":"flac","section_start":"1:02.5","section_end":"1:10"})).unwrap();

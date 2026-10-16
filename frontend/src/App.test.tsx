@@ -13,6 +13,12 @@ vi.mock('./transport', () => ({ host: {
 } }));
 beforeEach(() => { transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true); });
 describe('live interface stability', () => {
+  it('gives recovery guidance for failed downloads while keeping the diagnostic', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'failed', error: 'yt-dlp.exe exited with code 1: Sign in to confirm you are not a bot' } }));
+    expect(screen.getByRole('alert').textContent).toContain('Import or read signed-in cookies');
+    expect(screen.getByRole('alert').textContent).toContain('yt-dlp.exe exited with code 1');
+  });
   it('keeps URL drafts, caret, filter, selected hidden task and virtual viewport during progress updates', async () => {
     render(<AppProvider><App /></AppProvider>);
     await screen.findByRole('listbox', { name: 'Download task list' });

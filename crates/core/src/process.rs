@@ -70,9 +70,14 @@ pub async fn run(
         .context("Cannot read tool stderr")?;
     if !status.success() {
         bail!(
-            "Tool exited with {}: {}",
+            "{} exited with code {}: {}",
+            executable.file_name().unwrap_or_default().to_string_lossy(),
             status.code().unwrap_or(-1),
-            redact(&stderr)
+            if stderr.trim().is_empty() {
+                "No diagnostic output was returned".into()
+            } else {
+                redact(&stderr)
+            }
         );
     }
     Ok(ProcessOutput {
@@ -114,28 +119,51 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
     Ok(captured)
 }
 
-pub(crate) fn redact(message: &str) -> String {
-    message
-        .split_whitespace()
-        .map(|word| {
-            if word.contains("://") {
-                let trimmed =
-                    word.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | ','));
-                crate::model::redact_url(trimmed)
-            } else if word.to_ascii_lowercase().contains("cookie")
-                || word.to_ascii_lowercase().contains("authorization")
-                || word.to_ascii_lowercase().contains("token=")
-            {
-                "[redacted]".into()
-            } else {
-                word.to_string()
-            }
+pub fn redact(message: &str) -> String {
+    let sanitized = message
+        .lines()
+        .flat_map(|line| {
+            let mut sensitive_header = false;
+            line.split_whitespace().map(move |word| {
+                let option = word
+                    .trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | ',' | '.' | '`'));
+                let lower = option.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "authorization:" | "proxy-authorization:" | "cookie:" | "set-cookie:"
+                ) {
+                    sensitive_header = true;
+                }
+                if sensitive_header {
+                    "[redacted]".into()
+                } else if matches!(
+                    lower.as_str(),
+                    "--cookies" | "--cookies-from-browser" | "cookie" | "cookies"
+                ) {
+                    word.to_string()
+                } else if word.contains("://") {
+                    let trimmed =
+                        word.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | ','));
+                    crate::model::redact_url(trimmed)
+                } else if lower.contains("cookie")
+                    || lower.contains("authorization")
+                    || lower.contains("token=")
+                {
+                    "[redacted]".into()
+                } else {
+                    word.to_string()
+                }
+            })
         })
         .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(2000)
-        .collect()
+        .join(" ");
+    if sanitized.chars().nth(2000).is_none() {
+        return sanitized;
+    }
+    // Tool banners can be long; keep both the operation context and final diagnostic.
+    let head: String = sanitized.chars().take(900).collect();
+    let tail: String = sanitized.chars().rev().take(1097).collect();
+    format!("{head} … {}", tail.chars().rev().collect::<String>())
 }
 
 #[cfg(unix)]
@@ -221,6 +249,26 @@ mod tests {
         let log = redact("failed https://example.com/a?token=secret Authorization cookie=secret");
         assert!(!log.contains("secret"));
     }
+    #[test]
+    fn cookie_advice_is_readable_but_credentials_stay_redacted() {
+        let log = redact(
+            "Sign in with --cookies or `--cookies-from-browser`. cookie=secret C:/data/.cookie-secret https://user:secret@example.com/a?token=secret",
+        );
+        assert!(log.contains("--cookies or `--cookies-from-browser`."));
+        assert!(!log.contains("secret"));
+    }
+    #[test]
+    fn long_diagnostics_keep_the_failure_tail_after_redacting_secrets() {
+        let message = format!(
+            "Failed to encode: {}\nAuthorization: Bearer auth-secret\nCookie: SID=cookie-secret; OTHER=other-secret\nInvalid argument https://example.test/media?token=query-secret",
+            "编码信息 ".repeat(1000)
+        );
+        let log = redact(&message);
+        assert!(log.starts_with("Failed to encode:"));
+        assert!(log.ends_with("Invalid argument https://example.test/media"));
+        assert!(!log.contains("secret"));
+        assert_eq!(log.chars().count(), 2000);
+    }
     #[tokio::test]
     async fn legacy_encoded_stderr_does_not_discard_valid_metadata() {
         #[cfg(windows)]
@@ -277,7 +325,11 @@ mod tests {
             .await
             .err()
             .expect("A failed tool must remain a failure despite non-UTF-8 stderr");
-        assert!(error.to_string().starts_with("Tool exited with 7: warn: "));
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("{} exited with code 7: warn: ", exe.display()))
+        );
     }
     #[tokio::test]
     async fn invalid_utf8_metadata_is_still_rejected() {
