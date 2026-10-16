@@ -358,6 +358,12 @@ async fn real_split_streams_queue_offline_restart_and_publication_recovery() -> 
     );
     let expected_hash = download::hash_file(&media.path)?;
     let mut journal = first.clone();
+    // Replay the crash after file installation but before the atomic task/media commit.
+    journal
+        .publication
+        .as_mut()
+        .context("No publication journal")?
+        .committed = false;
     journal.stage("processing", "publishing", None);
     journal
         .tools
