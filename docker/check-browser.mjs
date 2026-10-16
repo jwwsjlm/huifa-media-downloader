@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { createServer } from 'node:http';
+import { spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 
 const image = process.env.HUIFA_IMAGE ?? 'huifa-rust:local';
@@ -10,7 +10,6 @@ const volume = name + '-data';
 const account = 'browser-acceptance';
 const password = randomUUID() + randomUUID();
 const cookieCanary = randomUUID();
-let fixture;
 let origin;
 let cookie;
 let csrf;
@@ -45,21 +44,62 @@ async function request(path, body, extra = {}) {
   return {response,value};
 }
 
-try {
-  fixture = createServer((_request,response) => {
-    response.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
-    response.end(`<!doctype html><title>Remote login acceptance</title><body style="margin:0;font:24px sans-serif;background:#fff;color:#111">
+async function installLoginFixture() {
+  const port = docker(['exec',name,'sh','-c','cat /data/browser/*/DevToolsActivePort']).split(/\r?\n/)[0];
+  assert.match(port,/^\d+$/);
+  const sockets = new Set();
+  // Reach CDP through docker exec; keep its container port bound to loopback.
+  const relay = createServer(socket => {
+    sockets.add(socket);
+    const pipe = spawn('docker',['exec','-i',name,'bash','-c','exec 3<>"/dev/tcp/127.0.0.1/$1"; cat <&3 & cat >&3','bash',port],{stdio:['pipe','pipe','ignore'],windowsHide:true});
+    socket.pipe(pipe.stdin); pipe.stdout.pipe(socket);
+    pipe.on('error',()=>socket.destroy()); pipe.on('exit',()=>socket.destroy());
+    pipe.stdin.on('error',()=>{});
+    socket.on('error',()=>{});
+    socket.on('close',()=>{ sockets.delete(socket); pipe.kill(); });
+  });
+  await new Promise(resolve=>relay.listen(0,'127.0.0.1',resolve));
+  let cdp;
+  try {
+    const base = `http://127.0.0.1:${relay.address().port}`;
+    let target;
+    await waitFor(async()=>{
+      const targets = await (await fetch(base+'/json/list',{signal:AbortSignal.timeout(5000)})).json();
+      target=targets.find(target=>target.type==='page' && target.url.startsWith('https://example.com'));
+      return Boolean(target);
+    },30_000);
+    cdp = new WebSocket(base.replace('http:','ws:')+new URL(target.webSocketDebuggerUrl).pathname);
+    await new Promise((resolve,reject)=>{
+      const timeout=setTimeout(()=>reject(new Error('CDP fixture connection timed out')),5000);
+      cdp.onopen=()=>{clearTimeout(timeout);resolve();};
+      cdp.onerror=error=>{clearTimeout(timeout);reject(error);};
+    });
+    let nextId=0;
+    const rpc = (method,params={}) => new Promise((resolve,reject)=>{
+      const id=++nextId;
+      const timeout=setTimeout(()=>{cdp.removeEventListener('message',receive);reject(new Error('CDP fixture timed out'));},5000);
+      const receive = event=>{const value=JSON.parse(event.data);if(value.id!==id)return;clearTimeout(timeout);cdp.removeEventListener('message',receive);value.error?reject(new Error(value.error.message)):resolve(value.result);};
+      cdp.addEventListener('message',receive);cdp.send(JSON.stringify({id,method,params}));
+    });
+    await rpc('Page.stopLoading');
+    await rpc('Page.setBypassCSP',{enabled:true});
+    const {frameTree}=await rpc('Page.getFrameTree');
+    await rpc('Page.setDocumentContent',{frameId:frameTree.frame.id,html:`<!doctype html><title>Remote login acceptance</title><body style="margin:0;font:24px sans-serif;background:#fff;color:#111">
       <h1 style="margin:20px">Remote login acceptance</h1>
       <input id="account" aria-label="Account" style="position:absolute;left:30px;top:100px;width:300px;height:40px;font:24px sans-serif">
       <button style="position:absolute;left:30px;top:180px;width:300px;height:50px;font:24px sans-serif"
-        onclick="if(document.getElementById('account').value==='accepted'){document.cookie='remoteSession=${cookieCanary}; Path=/; SameSite=Lax';this.textContent='Saved'}">Sign in</button></body>`);
-  });
-  await new Promise(resolve => fixture.listen(0,'0.0.0.0',resolve));
+        onclick="if(document.getElementById('account').value==='accepted'){document.cookie='remoteSession=${cookieCanary}; Path=/; SameSite=Lax';this.textContent='Saved'}">Sign in</button></body>`});
+  } finally {
+    cdp?.close(); for(const socket of sockets)socket.destroy();
+    await new Promise(resolve=>relay.close(resolve));
+  }
+}
+
+try {
   docker(['volume','create',volume]);
   const options = ['run','-d','--name',name,'--platform',platform,'--read-only','--tmpfs','/tmp:rw,exec,nosuid,nodev,size=536870912',
     '--cap-drop','ALL','--security-opt','no-new-privileges:true','-p','127.0.0.1::19491','-v',`${volume}:/data`,
     '-e',`HUIFA_ACCOUNT=${account}`,'-e',`HUIFA_PASSWORD=${password}`];
-  if (process.platform !== 'win32') options.push('--add-host','host.docker.internal:host-gateway');
   docker([...options,image]);
   origin = 'http://'+docker(['port',name,'19491/tcp']).split(/\r?\n/)[0];
   await waitFor(async () => (await fetch(origin+'/api/session',{signal:AbortSignal.timeout(2000)})).status === 401);
@@ -96,13 +136,18 @@ try {
       }
     } catch(error) { if (!streamAbort.signal.aborted) throw error; }
   })();
-  const url = `http://host.docker.internal:${fixture.address().port}/login`;
+  for(const url of ['http://127.0.0.1:19491','http://[::ffff:127.0.0.1]:19491']) {
+    const response=await fetch(origin+'/api/browser/start',{method:'POST',headers:{Origin:origin,Cookie:cookie,'X-CSRF-Token':csrf,'Content-Type':'application/json'},body:JSON.stringify({url}),signal:AbortSignal.timeout(5000)});
+    assert.equal(response.status,400,'local login URL must be rejected');
+  }
+  const url = 'https://example.com';
   await request('/api/browser/start',{url});
+  await installLoginFixture();
   await waitFor(()=>frames > 0);
   const sockets = docker(['exec',name,'cat','/proc/net/tcp']);
   const listeners = sockets.split('\n').slice(1).map(row=>row.trim().split(/\s+/)).filter(row=>row[3] === '0A');
   assert.ok(listeners.some(row=>row[1].startsWith('0100007F:')), 'CDP must listen on loopback');
-  assert.ok(!listeners.some(row=>row[1].startsWith('00000000:') && row[1] !== '00000000:4C23'), 'Only web port 19491 may listen publicly');
+  assert.ok(!listeners.some(row=>!row[1].startsWith('0100007F:') && row[1] !== '00000000:4C23'), 'Only web port 19491 may listen beyond loopback');
   await request('/api/browser/input',{type:'click',x:120,y:120});
   await request('/api/browser/input',{type:'text',text:'accepted'});
   await request('/api/browser/input',{type:'key',key:'Tab'});
@@ -127,5 +172,4 @@ try {
 } finally {
   streamAbort.abort(); await stream?.catch(()=>{});
   docker(['rm','-f','-v',name],true); docker(['volume','rm',volume],true);
-  if (fixture) await new Promise(resolve=>fixture.close(resolve));
 }

@@ -151,6 +151,24 @@ impl CredentialStore {
         }
     }
 
+    pub fn delete_secret(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("credential store unavailable"))?;
+        let path = self.path(&secret_id(name));
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                ensure_regular(&path)?;
+                fs::remove_file(path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     fn path(&self, id: &str) -> PathBuf {
         self.directory.join(format!("{id}.enc"))
     }

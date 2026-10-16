@@ -42,6 +42,14 @@ export function reducer(state: AppState, action: Action): AppState {
     mediaByTask[next.taskId] = id;
     return { ...state, media: { ...state.media, [id]: next }, mediaIds: state.media[id] ? state.mediaIds : [...state.mediaIds, id], mediaByTask, view: state.view.mediaSelection ? state.view : { ...state.view, mediaSelection: id } };
   }
+  if (kind === 'media.remove') {
+    const id = String((data as { id: string }).id); const item = state.media[id];
+    if (!item) return state;
+    const media = { ...state.media }; delete media[id];
+    const mediaByTask = { ...state.mediaByTask };
+    if (mediaByTask[item.taskId] === id) delete mediaByTask[item.taskId];
+    return { ...state, media, mediaIds: state.mediaIds.filter(value => value !== id), mediaByTask, view: state.view.mediaSelection === id ? { ...state.view, mediaSelection: '' } : state.view };
+  }
   if (kind === 'settings.updated') return { ...state, settings: data as Settings };
   if (kind === 'tools.updated') return { ...state, tools: Array.isArray(data) ? data as unknown as Tool[] : state.tools };
   return state;

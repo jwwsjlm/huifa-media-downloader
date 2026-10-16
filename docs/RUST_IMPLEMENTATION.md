@@ -26,8 +26,9 @@ Commands use `{command, args}`. Web `POST /api/command` returns `{value}` or a
 non-success status with `{error}`. Tauri's `command` invoke returns the same
 value, with failures returned as a string. `snapshot` returns
 `{version, tasks, media, settings, tools}`. Core events use
-`{kind, data}`: `task.upsert`, `task.remove`, `media.upsert`, `settings.updated`,
-`tools.updated`. SSE uses the default message event; Tauri emits `huifa-event`.
+`{kind, data}`: `task.upsert`, `task.remove`, `media.upsert`, `media.remove`, `settings.updated`,
+`tools.updated`. Removal events carry `{id}`. Deleting a task without deleting its
+files retains its media record. SSE uses the default message event; Tauri emits `huifa-event`.
 DTO fields use camelCase. View state and unsaved form inputs stay in React.
 
 Core commands:
@@ -39,7 +40,7 @@ Core commands:
 - `probe.video` `{url, options}` -> metadata and formats;
   `probe.collection` `{url, options}` -> entries for client selection.
 - `settings.save` `{settings}` -> sanitized settings.
-- `tools.check`, `tools.update` `{name}`.
+- `tools.check`; `tools.update` `{name}` is desktop-only. Docker tools update with the image.
 - `cookies.import` `{text, name}`, `cookies.list`, `cookies.delete` `{id}`;
   `cookies.browser` `{browser, profile?}` for desktop browser reading.
 - `cover.preview`, `cover.export` `{mediaId, ...editOptions}`;
@@ -55,7 +56,9 @@ database transaction. Inputs, plans and publication journal are durable. Retry
 of processing_failed tasks uses saved local inputs without running yt-dlp.
 
 The media DTO uses `{id, taskId, title, filename, size, duration}`; snapshots
-never expose Cookie text, AI keys, signed media URLs or arbitrary file paths.
+never expose Cookie text, AI keys or signed media URLs. Desktop settings retain
+the chosen `processingTempDir`; web responses and events remove it, and web
+requests cannot set it. Task DTOs hide it on both hosts.
 `media.file` is a host-internal command: web rejects it from public command
 requests and resolves `/api/files/:id` through it after authentication.
 Hosts may define `capabilities`, upload, download and remote login endpoints;

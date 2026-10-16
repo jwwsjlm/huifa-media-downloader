@@ -30,6 +30,16 @@ disabled; container isolation and the non-root user are its containment boundary
 Some websites reject headless login or require device verification; a Netscape
 Cookie file remains available as an import option.
 
+Remote login accepts public websites only. Chromium's TCP traffic goes through a
+loopback SOCKS5 proxy that rejects local, private and special-use addresses after
+DNS resolution, then connects to the checked IPs. Redirects, child pages and
+subresources use the same proxy. Chromium's implicit loopback bypass and direct
+hostname resolution are disabled; QUIC and non-proxied WebRTC UDP are disabled.
+The proxy stops with the disposable browser session. See
+[Chromium's proxy documentation](https://chromium.googlesource.com/chromium/src/+/HEAD/net/docs/proxy.md).
+Runtime components are updated by updating the Docker image and recreating the
+container; the web interface offers component checks only.
+
 `runtime-tool-lock.json` pins the official yt-dlp and Deno assets and SHA-256
 checksums for both architectures. Build both architectures with
 `docker buildx build --platform linux/amd64,linux/arm64`.

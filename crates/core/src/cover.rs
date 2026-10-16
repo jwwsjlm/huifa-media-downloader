@@ -99,7 +99,7 @@ pub(crate) async fn command(app: &App, command: &str, args: Value) -> Result<Val
         return Ok(json!(true));
     }
     let dimensions = request.validate()?;
-    let mut media = app.db.media_by_id(&request.media_id)?;
+    let media = app.db.media_by_id(&request.media_id)?;
     let source = source_path(app, &media, &request)?;
     let bytes = read_image(&source)?;
     if command == "cover.generate" {
@@ -126,7 +126,7 @@ pub(crate) async fn command(app: &App, command: &str, args: Value) -> Result<Val
         ensure!(!token.is_cancelled(), "Cover generation cancelled");
         let generated_image = decode(&generated)?;
         let png = png_bytes(&generated_image)?;
-        let asset_id = save_asset(app, &mut media, "png", &png)?;
+        let asset_id = save_asset(app, &media.id, "png", &png)?;
         return Ok(
             json!({"assetId":asset_id,"previewUrl":format!("data:image/png;base64,{}",STANDARD.encode(png)),"filename":"generated-cover.png"}),
         );
@@ -143,7 +143,7 @@ pub(crate) async fn command(app: &App, command: &str, args: Value) -> Result<Val
             json!({"previewUrl":format!("data:image/jpeg;base64,{}",STANDARD.encode(&jpeg)),"width":dimensions.0,"height":dimensions.1}),
         ),
         "cover.export" => {
-            let asset_id = save_asset(app, &mut media, "jpg", &jpeg)?;
+            let asset_id = save_asset(app, &media.id, "jpg", &jpeg)?;
             Ok(
                 json!({"assetId":asset_id,"filename":format!("cover-{}.jpg",request.preset),"previewUrl":format!("data:image/jpeg;base64,{}",STANDARD.encode(&jpeg))}),
             )
@@ -301,7 +301,7 @@ fn png_bytes(image: &DynamicImage) -> Result<Vec<u8>> {
     image.write_to(&mut bytes, image::ImageFormat::Png)?;
     Ok(bytes.into_inner())
 }
-fn save_asset(app: &App, media: &mut Media, extension: &str, bytes: &[u8]) -> Result<String> {
+fn save_asset(app: &App, media_id: &str, extension: &str, bytes: &[u8]) -> Result<String> {
     let directory = app.config.data_dir.join("assets");
     fs::create_dir_all(&directory)?;
     ensure!(
@@ -318,8 +318,13 @@ fn save_asset(app: &App, media: &mut Media, extension: &str, bytes: &[u8]) -> Re
         .map_err(|error| error.error)?;
     #[cfg(unix)]
     fs::File::open(&directory)?.sync_all()?;
-    media.assets.push(target);
-    app.db.save_media(media)?;
+    let media = match app.db.append_media_asset(media_id, target.clone()) {
+        Ok(media) => media,
+        Err(error) => {
+            fs::remove_file(target)?;
+            return Err(error);
+        }
+    };
     app.emit("media.upsert", media.public());
     Ok(id)
 }
@@ -463,6 +468,105 @@ async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn audit_ai_completion_preserves_concurrent_export_and_publication() -> Result<()> {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            sync::oneshot,
+        };
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let task = crate::tests::paused_task(HashMap::new());
+        app.db.insert_task(&task)?;
+        let png = png_bytes(&DynamicImage::new_rgb8(2, 2))?;
+        let original = app.config.download_dir.join("original.png");
+        fs::write(&original, &png)?;
+        let media = Media {
+            id: Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            title: "Audit".into(),
+            filename: "video.mp4".into(),
+            size: 1,
+            duration: 1.0,
+            path: app.config.download_dir.join("video.mp4"),
+            assets: vec![original],
+        };
+        app.db.complete(&task, &media)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (started_tx, started) = oneshot::channel();
+        let (release_tx, release) = oneshot::channel();
+        let encoded = STANDARD.encode(&png);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                ensure!(socket.read_buf(&mut request).await? > 0, "request ended");
+            }
+            let header_end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let length: usize = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().to_owned())
+                })
+                .context("missing request size")?
+                .parse()?;
+            while request.len() < header_end + length {
+                ensure!(
+                    socket.read_buf(&mut request).await? > 0,
+                    "request body ended"
+                );
+            }
+            let _ = started_tx.send(());
+            release.await?;
+            let body = json!({"data":[{"b64_json":encoded}]}).to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        app.command("settings.save",json!({"settings":{"aiApiKey":"fake audit key","aiBaseUrl":format!("http://{address}/v1")}})).await?;
+        let generating = app.clone();
+        let media_id = media.id.clone();
+        let generation = tokio::spawn(async move {
+            generating
+                .command(
+                    "cover.generate",
+                    json!({"mediaId":media_id,"original":true,"prompt":"Audit"}),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), started).await??;
+        let export = app
+            .command("cover.export", json!({"mediaId":media.id,"original":true}))
+            .await?;
+        let mut published = app.db.media_by_id(&media.id)?;
+        published.size = 999;
+        app.db.complete(&task, &published)?;
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(10), generation).await???;
+        server.await??;
+        let result = app.db.media_by_id(&media.id)?;
+        assert_eq!(result.assets.len(), 3);
+        assert_eq!(result.size, 999);
+        assert!(
+            result
+                .assets
+                .iter()
+                .any(|path| path.file_stem().unwrap() == export["assetId"].as_str().unwrap())
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
     #[test]
     fn crops_focus_and_preserves_padding_background() -> Result<()> {
         let source = DynamicImage::ImageRgb8(image::RgbImage::from_fn(200, 100, |x, _| {

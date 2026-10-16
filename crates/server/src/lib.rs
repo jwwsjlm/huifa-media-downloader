@@ -1,5 +1,6 @@
 mod auth;
 mod browser;
+mod browser_network;
 mod files;
 
 use anyhow::Result;
@@ -308,12 +309,28 @@ async fn command(
     {
         return Err(StatusCode::PAYLOAD_TOO_LARGE.into());
     }
-    let value = server
+    let mut value = server
         .app
         .command(&input.command, input.args)
         .await
         .map_err(failed)?;
+    if input.command == "snapshot" {
+        strip_processing_folder(&mut value["settings"]);
+    }
+    if input.command == "settings.save" {
+        strip_processing_folder(&mut value);
+    }
     Ok(Json(json!({"value":value})))
+}
+
+fn strip_processing_folder(settings: &mut Value) {
+    if let Some(options) = settings
+        .get_mut("downloadOptions")
+        .and_then(Value::as_object_mut)
+    {
+        options.remove("processingTempDir");
+        options.remove("processing_temp_dir");
+    }
 }
 
 async fn events(
@@ -339,7 +356,10 @@ async fn events(
                     }
                 };
                 match item {
-                    Ok(value) => {
+                    Ok(mut value) => {
+                        if value.kind == "settings.updated" {
+                            strip_processing_folder(&mut value.data);
+                        }
                         auth.session(&headers)?;
                         return Some((
                             Ok(Event::default()
@@ -733,6 +753,15 @@ mod tests {
             .is_err()
         );
         assert!(validate_host_args(&json!({"options":{"processingTempDir":""}})).is_ok());
+        let mut settings =
+            json!({"downloadOptions":{"processingTempDir":"C:/private-folder","quality":"best"}});
+        strip_processing_folder(&mut settings);
+        assert!(
+            settings["downloadOptions"]
+                .get("processingTempDir")
+                .is_none()
+        );
+        assert_eq!(settings["downloadOptions"]["quality"], "best");
         server.shutdown().await;
         Ok(())
     }

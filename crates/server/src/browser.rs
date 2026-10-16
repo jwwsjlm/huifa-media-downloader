@@ -1,3 +1,4 @@
+use crate::browser_network::{NetworkProxy, public_ip, resolve_public};
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use huifa_core::{App, process::ProcessTree};
@@ -30,6 +31,7 @@ pub struct Browser {
 }
 
 struct Running {
+    _proxy: NetworkProxy,
     child: Child,
     guard: ProcessTree,
     profile: PathBuf,
@@ -143,6 +145,12 @@ impl Browser {
     pub async fn start(&self, input: Start) -> Result<Value> {
         ensure!(!self.shutdown.is_cancelled(), "server is shutting down");
         let url = login_url(&input.url)?;
+        let parsed = reqwest::Url::parse(&url)?;
+        resolve_public(
+            parsed.host_str().unwrap(),
+            parsed.port_or_known_default().unwrap(),
+        )
+        .await?;
         let mut state = self.running.lock().await;
         ensure!(state.is_none(), "a remote login session is already active");
         let profile = self.directory.join(uuid::Uuid::new_v4().to_string());
@@ -167,6 +175,7 @@ impl Browser {
     }
 
     async fn launch(&self, profile: PathBuf, url: &str) -> Result<Running> {
+        let proxy = NetworkProxy::start()?;
         let mut command = Command::new(&self.executable);
         command
             .args([
@@ -180,7 +189,12 @@ impl Browser {
                 "--disable-dev-shm-usage",
                 "--disable-background-networking",
                 "--disable-sync",
+                "--proxy-bypass-list=<-loopback>",
+                "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+                "--disable-quic",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             ])
+            .arg(format!("--proxy-server=socks5://{}", proxy.address))
             .arg(format!("--user-data-dir={}", profile.display()))
             .arg("about:blank")
             .stdin(Stdio::null())
@@ -276,6 +290,7 @@ impl Browser {
         };
         match result {
             Ok(Ok((channel, driver, session))) => Ok(Running {
+                _proxy: proxy,
                 child,
                 guard,
                 profile,
@@ -466,24 +481,7 @@ fn login_url(text: &str) -> Result<String> {
         "local login URLs are unavailable"
     );
     if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-        let public = match ip {
-            std::net::IpAddr::V4(ip) => {
-                !ip.is_private()
-                    && !ip.is_loopback()
-                    && !ip.is_link_local()
-                    && !ip.is_unspecified()
-                    && !ip.is_multicast()
-                    && !ip.is_broadcast()
-            }
-            std::net::IpAddr::V6(ip) => {
-                !ip.is_loopback()
-                    && !ip.is_unspecified()
-                    && !ip.is_multicast()
-                    && (ip.segments()[0] & 0xfe00 != 0xfc00)
-                    && (ip.segments()[0] & 0xffc0 != 0xfe80)
-            }
-        };
-        ensure!(public, "local login URLs are unavailable");
+        ensure!(public_ip(ip), "local login URLs are unavailable");
     }
     Ok(url.to_string())
 }
@@ -612,6 +610,8 @@ mod tests {
         assert!(login_url("file:///etc/passwd").is_err());
         assert!(login_url("http://127.0.0.1").is_err());
         assert!(login_url("http://[::1]").is_err());
+        assert!(login_url("http://[::ffff:127.0.0.1]").is_err());
+        assert!(login_url("http://[::ffff:192.168.1.1]").is_err());
         assert!(login_url("https://www.youtube.com").is_ok());
         assert!(input_commands(Input::Click { x: -1.0, y: 0.0 }).is_err());
         assert_eq!(

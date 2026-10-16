@@ -974,9 +974,13 @@ impl App {
             .join("source-manifest.json");
         write_sync(&file, &serde_json::to_vec_pretty(&manifest)?)?;
         task.manifest = Some(manifest);
-        task.cookie_snapshot = None;
+        let cookie_snapshot = task.cookie_snapshot.take();
         task.stage("waiting_processing", "waiting_processing", None);
-        self.save_task(&task)
+        self.save_task(&task)?;
+        if let Some(key) = cookie_snapshot {
+            self.credentials.delete_secret(&key)?;
+        }
+        Ok(())
     }
 }
 

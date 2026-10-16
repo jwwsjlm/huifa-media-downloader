@@ -24,6 +24,18 @@ struct Input {
     probe: Value,
 }
 
+pub(crate) fn workspace(app: &App, task: &Task) -> PathBuf {
+    if task.options.processing_temp_dir.is_empty() {
+        app.config
+            .data_dir
+            .join("tasks")
+            .join(&task.id)
+            .join("processing")
+    } else {
+        PathBuf::from(&task.options.processing_temp_dir).join(format!("HuifaRust-{}", task.id))
+    }
+}
+
 pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Result<Value> {
     let mut task = app.db.task(id)?;
     ensure!(
@@ -137,15 +149,7 @@ pub(crate) async fn process_task(
                 .to_string_lossy()
         );
     }
-    let workspace = if task.options.processing_temp_dir.is_empty() {
-        app.config
-            .data_dir
-            .join("tasks")
-            .join(id)
-            .join("processing")
-    } else {
-        PathBuf::from(&task.options.processing_temp_dir).join(format!("HuifaRust-{id}"))
-    };
+    let workspace = workspace(app, &task);
     crate::reject_links(&workspace)?;
     std::fs::create_dir_all(&workspace)?;
     let mut inputs = Vec::new();
@@ -1199,7 +1203,7 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
     task.output_path = Some(publication.target.clone());
     task.error = None;
     task.stage("completed", "completed", Some(100.0));
-    app.db.complete(&task, &media)?;
+    let media = app.db.complete(&task, &media)?;
     app.emit("task.upsert", task.public());
     app.emit("media.upsert", media.public());
     if let Some(backup) = publication.backup

@@ -424,19 +424,31 @@ impl App {
                 self.stop_task(id, "cancelled").await?;
                 let task = self.db.task(id)?;
                 let delete_files = args["deleteFiles"].as_bool().unwrap_or(false);
+                let media = if delete_files {
+                    self.db.media_for_task(id)?
+                } else {
+                    None
+                };
                 if delete_files {
-                    if let Some(media) = self.db.media_for_task(id)? {
+                    if let Some(media) = &media {
                         self.remove_owned(&media.path)?;
-                        for asset in media.assets {
-                            self.remove_owned(&asset)?;
+                        for asset in &media.assets {
+                            self.remove_owned(asset)?;
                         }
                     }
-                    let workspace = self.config.data_dir.join("tasks").join(id);
-                    if workspace.exists() {
-                        std::fs::remove_dir_all(workspace)?;
+                    if !task.options.processing_temp_dir.is_empty() {
+                        remove_task_directory(&processing::workspace(self, &task))?;
                     }
+                    remove_task_directory(&self.config.data_dir.join("tasks").join(id))?;
                 }
+                self.credentials
+                    .delete_secret(&format!("task-cookie:{id}"))?;
+                self.credentials
+                    .delete_secret(&format!("task-proxy:{id}"))?;
                 self.db.remove_task(&task.id, delete_files)?;
+                if let Some(media) = media {
+                    self.emit("media.remove", json!({"id":media.id}));
+                }
                 self.emit("task.remove", json!({"id":id}));
                 Ok(json!(true))
             }
@@ -577,7 +589,6 @@ impl App {
                 .and_then(Value::as_object_mut)
             {
                 options.remove("proxy");
-                options.remove("processingTempDir");
             }
         }
         Ok(value)
@@ -663,6 +674,36 @@ fn required_id(args: &Value) -> Result<&str> {
     Ok(id)
 }
 
+fn remove_task_directory(path: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        metadata => {
+            ensure!(metadata?.is_dir(), "Task workspace is not a directory");
+        }
+    }
+    reject_links(path)?;
+    let parent = path
+        .parent()
+        .context("Task workspace has no parent")?
+        .canonicalize()?;
+    let canonical = path.canonicalize()?;
+    ensure!(
+        canonical.parent() == Some(parent.as_path()),
+        "Task workspace resolved outside its parent"
+    );
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Invalid task workspace")?;
+    let id = name.strip_prefix("HuifaRust-").unwrap_or(name);
+    ensure!(
+        uuid::Uuid::parse_str(id)?.to_string() == id,
+        "Invalid task workspace ID"
+    );
+    std::fs::remove_dir_all(canonical)?;
+    Ok(())
+}
+
 struct CommandGuard<'a>(&'a App);
 impl<'a> CommandGuard<'a> {
     fn begin(app: &'a App) -> Result<Self> {
@@ -717,6 +758,137 @@ pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_cleanup_rejects_other_names() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let keep = root.path().join("keep");
+        std::fs::create_dir(&keep)?;
+        std::fs::write(keep.join("keep.txt"), b"unrelated")?;
+        assert!(remove_task_directory(&keep).is_err());
+        assert!(keep.join("keep.txt").is_file());
+        #[cfg(unix)]
+        {
+            let link = root.path().join(uuid::Uuid::new_v4().to_string());
+            std::os::unix::fs::symlink(&keep, &link)?;
+            assert!(remove_task_directory(&link).is_err());
+            assert!(keep.join("keep.txt").is_file());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_processing_folder_survives_settings_round_trip() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let folder = root.path().join("processing");
+        let saved = app
+            .command(
+                "settings.save",
+                json!({"settings":{"downloadOptions":{"processingTempDir":folder}}}),
+            )
+            .await?;
+        assert_eq!(saved["downloadOptions"]["processingTempDir"], json!(folder));
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let options = DownloadOptions::parse(app.public_settings()?["downloadOptions"].clone())?;
+        assert_eq!(PathBuf::from(options.processing_temp_dir), folder);
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_task_deletion_cleans_only_its_files_and_secrets_and_emits_media_removal()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let processing = root.path().join("custom");
+        std::fs::create_dir_all(&processing)?;
+        let sentinel = processing.join("keep.txt");
+        std::fs::write(&sentinel, b"unrelated")?;
+        for delete_files in [false, true] {
+            let mut task = paused_task(HashMap::new());
+            task.options.processing_temp_dir = processing.to_string_lossy().into();
+            task.proxy_snapshot = Some(format!("task-proxy:{}", task.id));
+            // A saved source manifest has already cleared the cookie reference.
+            app.credentials
+                .put_secret(&format!("task-cookie:{}", task.id), "cookie snapshot")?;
+            app.credentials
+                .put_secret(task.proxy_snapshot.as_ref().unwrap(), "proxy snapshot")?;
+            app.credentials.put_secret("aiApiKey", "keep this key")?;
+            app.db.insert_task(&task)?;
+            let source = app.config.data_dir.join("tasks").join(&task.id);
+            let workspace = processing.join(format!("HuifaRust-{}", task.id));
+            std::fs::create_dir_all(&source)?;
+            std::fs::create_dir_all(&workspace)?;
+            std::fs::write(source.join("source.bin"), b"source")?;
+            std::fs::write(workspace.join("prepared.bin"), b"working media")?;
+            let path = app.config.download_dir.join(format!("{}.mp4", task.id));
+            std::fs::write(&path, b"output")?;
+            let media = model::Media {
+                id: uuid::Uuid::new_v4().to_string(),
+                task_id: task.id.clone(),
+                title: "Audit".into(),
+                filename: "output.mp4".into(),
+                size: 6,
+                duration: 1.0,
+                path: path.clone(),
+                assets: vec![],
+            };
+            app.db.complete(&task, &media)?;
+            let mut events = app.subscribe();
+            app.command(
+                "tasks.delete",
+                json!({"id":task.id,"deleteFiles":delete_files}),
+            )
+            .await?;
+            assert!(
+                app.credentials
+                    .secret(&format!("task-cookie:{}", task.id))?
+                    .is_none()
+            );
+            assert!(
+                app.credentials
+                    .secret(task.proxy_snapshot.as_ref().unwrap())?
+                    .is_none()
+            );
+            assert_eq!(
+                app.credentials.secret("aiApiKey")?.as_deref(),
+                Some("keep this key")
+            );
+            assert_eq!(path.exists(), !delete_files);
+            assert_eq!(source.exists(), !delete_files);
+            assert_eq!(workspace.exists(), !delete_files);
+            assert_eq!(app.db.media_for_task(&task.id)?.is_none(), delete_files);
+            let mut removed = false;
+            while let Ok(event) = events.try_recv() {
+                if event.kind == "media.remove" {
+                    assert_eq!(event.data["id"], media.id);
+                    removed = true;
+                }
+            }
+            assert_eq!(removed, delete_files);
+            assert!(sentinel.is_file());
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
 
     pub(super) fn paused_task(tools: HashMap<String, PathBuf>) -> Task {
         Task {

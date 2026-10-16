@@ -3,6 +3,17 @@ import { initialState, reducer } from './state';
 import { taskProgress } from './task';
 import { makeTask, makeSnapshot } from './test-fixtures';
 describe('task delta state', () => {
+  it('removes media in another client without removing retained results on task removal', () => {
+    const snapshot = makeSnapshot();
+    snapshot.media = [{ id: 'm', taskId: 'a', title: 'Media', filename: 'a.mp4', size: 12, duration: 1 }];
+    let state = reducer(initialState, { type: 'snapshot', snapshot });
+    state = reducer(state, { type: 'view', patch: { mediaSelection: 'm', mediaSearch: 'draft' } });
+    state = reducer(state, { type: 'event', event: { kind: 'task.remove', data: { id: 'a' } } });
+    expect(state.media.m).toBeDefined();
+    state = reducer(state, { type: 'event', event: { kind: 'media.remove', data: { id: 'm' } } });
+    expect(state.media.m).toBeUndefined(); expect(state.mediaIds).toEqual([]); expect(state.mediaByTask.a).toBeUndefined();
+    expect(state.view.mediaSelection).toBe(''); expect(state.view.mediaSearch).toBe('draft');
+  });
   it('preserves untouched row references and all view drafts across progress events', () => {
     let state = reducer(initialState, { type: 'snapshot', snapshot: makeSnapshot() });
     state = reducer(state, { type: 'view', patch: { urls: 'a draft URL', taskSearch: 'Beta', taskStatus: 'paused', taskSelection: 'a', settingsDraft: { uiLanguage: 'zh-CN' }, optionsDraft: { quality: '720p' } } });

@@ -2,7 +2,10 @@ use crate::model::{Media, Task};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::{path::Path, sync::Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 pub(crate) struct Database {
     connection: Mutex<Connection>,
@@ -88,13 +91,22 @@ impl Database {
             .optional()?;
         serde_json::from_str(&record.context("Media does not exist")?).map_err(Into::into)
     }
-    pub fn save_media(&self, media: &Media) -> Result<()> {
-        let changed = self.connection.lock().unwrap().execute(
+    pub fn append_media_asset(&self, id: &str, asset: PathBuf) -> Result<Media> {
+        let mut db = self.connection.lock().unwrap();
+        let transaction = db.transaction()?;
+        let record: Option<String> = transaction
+            .query_row("SELECT record FROM media WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let mut media: Media = serde_json::from_str(&record.context("Media does not exist")?)?;
+        media.assets.push(asset);
+        transaction.execute(
             "UPDATE media SET record=?2 WHERE id=?1",
-            params![media.id, serde_json::to_string(media)?],
+            params![id, serde_json::to_string(&media)?],
         )?;
-        ensure!(changed == 1, "Media does not exist");
-        Ok(())
+        transaction.commit()?;
+        Ok(media)
     }
     pub fn media_for_task(&self, id: &str) -> Result<Option<Media>> {
         let record: Option<String> = self
@@ -110,16 +122,35 @@ impl Database {
             .transpose()
             .map_err(Into::into)
     }
-    pub fn complete(&self, task: &Task, media: &Media) -> Result<()> {
+    pub fn complete(&self, task: &Task, media: &Media) -> Result<Media> {
         let mut db = self.connection.lock().unwrap();
         let transaction = db.transaction()?;
-        transaction.execute("INSERT INTO media VALUES(?1,?2,?3) ON CONFLICT(task_id) DO UPDATE SET record=excluded.record",params![media.id,media.task_id,serde_json::to_string(media)?])?;
+        let mut media = media.clone();
+        if task.conversion {
+            let record: Option<String> = transaction
+                .query_row(
+                    "SELECT record FROM media WHERE task_id=?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(record) = record {
+                let latest: Media = serde_json::from_str(&record)?;
+                media.id = latest.id;
+                for asset in latest.assets {
+                    if !media.assets.contains(&asset) {
+                        media.assets.push(asset);
+                    }
+                }
+            }
+        }
+        transaction.execute("INSERT INTO media VALUES(?1,?2,?3) ON CONFLICT(task_id) DO UPDATE SET record=excluded.record",params![media.id,media.task_id,serde_json::to_string(&media)?])?;
         transaction.execute(
             "UPDATE tasks SET state=?2 WHERE id=?1",
             params![task.id, serde_json::to_string(task)?],
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(media)
     }
     pub fn settings(&self) -> Result<Value> {
         let db = self.connection.lock().unwrap();
@@ -150,6 +181,34 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conversion_publication_keeps_assets_added_after_its_read() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
+        let mut task = crate::tests::paused_task(Default::default());
+        db.insert_task(&task)?;
+        let media = Media {
+            id: "m".into(),
+            task_id: task.id.clone(),
+            title: "Audit".into(),
+            filename: "output.mp4".into(),
+            size: 1,
+            duration: 1.0,
+            path: temp.path().join("output.mp4"),
+            assets: vec![],
+        };
+        db.complete(&task, &media)?;
+        let mut stale = db.media_by_id("m")?;
+        let asset = temp.path().join("new-cover.jpg");
+        db.append_media_asset("m", asset.clone())?;
+        stale.size = 99;
+        task.conversion = true;
+        let published = db.complete(&task, &stale)?;
+        assert_eq!(published.size, 99);
+        assert_eq!(published.assets, vec![asset]);
+        assert_eq!(db.media_by_id("m")?.assets, published.assets);
+        Ok(())
+    }
     #[test]
     fn single_media_queries_preserve_results_and_ignore_unrelated_corrupt_records() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -190,10 +249,9 @@ mod tests {
         assert!(db.media_for_task("missing")?.is_none());
         assert!(db.media_by_id("broken-media").is_err());
         assert!(db.media_for_task("broken-task").is_err());
-        let mut edited = media;
-        edited.title = "Edited".into();
-        db.save_media(&edited)?;
-        assert_eq!(db.media_for_task("task-1")?.unwrap().title, "Edited");
+        let edited = db.append_media_asset(&media.id, temp.path().join("edited.jpg"))?;
+        assert_eq!(edited.assets.len(), 2);
+        assert_eq!(db.media_for_task("task-1")?.unwrap().assets, edited.assets);
         Ok(())
     }
     #[test]
