@@ -21,7 +21,8 @@ export interface Task {
   size?: string;
 }
 export interface Media { id: string; taskId: string; title: string; filename: string; size: number; duration: number; hasCover?: boolean }
-export interface Tool { name: string; available: boolean; version?: string; latest?: string; error?: string; path?: string }
+export interface Tool { name: string; available: boolean; version?: string; latest?: string; error?: string; path?: string; platform?: string; asset?: string }
+export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string }
 export interface Snapshot { version: string; tasks: Task[]; media: Media[]; settings: Settings; tools: Tool[] }
 export interface CoreEvent { kind: string; data: Json }
 export interface Capabilities { desktop: boolean; browserCookies: boolean; remoteBrowser: boolean; updates: boolean; directoryPicker: boolean }

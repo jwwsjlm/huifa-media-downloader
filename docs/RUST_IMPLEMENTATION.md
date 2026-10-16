@@ -40,7 +40,9 @@ Core commands:
 - `probe.video` `{url, options}` -> metadata and formats;
   `probe.collection` `{url, options}` -> entries for client selection.
 - `settings.save` `{settings}` -> sanitized settings.
-- `tools.check`; `tools.update` `{name, channel?, version?}` is desktop-only. Only yt-dlp accepts `channel: stable | nightly` (default stable) and an optional exact official release tag; blank means latest. Docker tools update with the image.
+- `tools.check` returns local component versions and the yt-dlp package selected for the host platform/architecture. It never contacts release servers.
+- `tools.latest` `{name:"yt-dlp", channel?:"stable"|"nightly"}` checks the official GitHub release redirect and returns `{name, channel, current, latest, updateAvailable, platform, asset}` without installing. Available on both hosts; it does not use the GitHub API quota.
+- `tools.update` `{name, channel?, version?, downloadSource?}` is desktop-only. Only yt-dlp accepts `channel: stable | nightly` (default stable), an optional exact official release tag (blank means latest), and `downloadSource: auto | github | cdn` (default auto). Auto tries GitHub, then the fixed third-party CDN `ghfast.top`. Other components keep their official download path. Docker tools update with the image.
 - `cookies.import` `{text, name}`, `cookies.list`, `cookies.delete` `{id}`;
   `cookies.browser` `{browser, profile?}` for desktop browser reading.
 - `cover.preview`, `cover.export` `{mediaId, ...editOptions}`;
@@ -55,8 +57,11 @@ completed. A completed task is only published after validated output and its
 database transaction. Inputs, plans and publication journal are durable. Retry
 of processing_failed tasks uses saved local inputs without running yt-dlp.
 Runtime updates apply to newly added tasks; retry retains the original frozen tools
-and credentials. yt-dlp downloads and SHA-256 checksums come from its selected
-official GitHub release without depending on the unauthenticated GitHub API quota.
+and credentials. The selected yt-dlp release tag is resolved before downloading;
+GitHub and CDN requests target that same exact tag. SHA-256 checksums are always
+fetched from the official GitHub release, independently of the CDN. If trusted
+checksums cannot be retrieved, installation stops. Remote checks and yt-dlp
+checksum downloads do not depend on the unauthenticated GitHub API quota.
 Native execution and required CLI options are checked before switching the current
 tool pointer. Failed installation leaves that pointer unchanged.
 

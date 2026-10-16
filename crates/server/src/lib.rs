@@ -264,6 +264,7 @@ fn allowed_command(command: &str) -> bool {
             | "probe.collection"
             | "settings.save"
             | "tools.check"
+            | "tools.latest"
             | "cookies.import"
             | "cookies.list"
             | "cookies.delete"
@@ -622,6 +623,12 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[test]
+    fn remote_version_checks_are_read_only_in_the_web_host() {
+        assert!(allowed_command("tools.latest"));
+        assert!(!allowed_command("tools.update"));
+    }
 
     #[test]
     fn errors_keep_the_cause_and_remove_signed_urls() {

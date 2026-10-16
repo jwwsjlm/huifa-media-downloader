@@ -481,6 +481,7 @@ impl App {
                 Ok(value)
             }
             "tools.update" => tools::update(self, &args).await,
+            "tools.latest" => tools::latest(self, &args).await,
             "cookies.import" => {
                 let value = self
                     .credentials
