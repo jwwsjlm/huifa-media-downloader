@@ -16,13 +16,13 @@ beforeEach(() => {
 });
 const show = (errors?: unknown[]) => render(<McpSettings run={operation => { const result = operation(); if (errors) void result.catch(reason => errors.push(reason)); }} t={(_zh, en) => en} />);
 
-it('organizes all 28 tools by capability and expands parameters only on demand', async () => {
+it('organizes all 29 tools by capability and expands parameters only on demand', async () => {
   show();
   await screen.findByText('Engine status');
-  expect(tools).toHaveLength(28);
-  expect(new Set(tools.map(tool => tool.name)).size).toBe(28);
+  expect(tools).toHaveLength(29);
+  expect(new Set(tools.map(tool => tool.name)).size).toBe(29);
   expect(screen.getByRole('heading', { name: 'AI media service (MCP)' })).toBeTruthy();
-  expect(screen.getByText('Available tools（28）')).toBeTruthy();
+  expect(screen.getByText('Available tools（29）')).toBeTruthy();
   const group = screen.getByText('Engine & sites').closest('details')!;
   expect(group.open).toBe(true);
   const row = screen.getByText('Engine status').closest('article')!;

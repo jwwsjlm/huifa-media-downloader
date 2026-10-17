@@ -538,6 +538,10 @@ pub(crate) struct Task {
     #[serde(default)]
     pub media_info: Option<MediaInfo>,
     pub status: String,
+    #[serde(default)]
+    pub priority: u64,
+    #[serde(default)]
+    pub live: bool,
     pub stage: String,
     #[serde(default)]
     pub steps: Vec<String>,
@@ -567,6 +571,8 @@ pub(crate) struct Task {
     #[serde(default)]
     pub publication: Option<Publication>,
     #[serde(default)]
+    pub destination: Option<crate::destination::Destination>,
+    #[serde(default)]
     pub conversion: bool,
     #[serde(default)]
     // Private immutable runtime references. Missing snapshots must fail when used, never resolve current tools.
@@ -589,7 +595,7 @@ impl Task {
                     .try_fold(0u64, |sum, item| sum.checked_add(item.total?))
             })
             .flatten();
-        json!({"id":self.id,"kind":self.kind,"files":self.files,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,
+        json!({"id":self.id,"kind":self.kind,"files":self.files,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,"priority":self.priority,"live":self.live,"conversion":self.conversion,"destinationConflict":self.destination.as_ref().and_then(|d| d.public_conflict()),
             "progress":self.progress,"stageProgress":self.stage_progress,"stageIndeterminate":self.stage_indeterminate,"stepIndex":self.step_index,"stepCount":self.steps.len(),
             "speed":self.speed,"eta":self.eta,"size":self.size,"downloadedBytes":downloaded_bytes,"totalBytes":total_bytes,"totalBytesEstimated":total_bytes.is_some() && self.transfer_bytes.iter().any(|item| item.estimated),"sourceInfo":self.source_info,"mediaInfo":self.media_info,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
             "outputPath":self.output_path.as_ref().and_then(|p|p.file_name()).map(|p|p.to_string_lossy())})

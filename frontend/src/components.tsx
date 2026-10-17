@@ -10,6 +10,7 @@ const paths: Record<string, string> = {
   copy: 'M9 9h12v12H9V9ZM5 15H3V3h12v2', image: 'M3 3h18v18H3V3Zm0 14 5-5 4 4 4-4 5 5M9 7h.01',
   trash: 'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7', external: 'M14 3h7v7m0-7L10 14M10 3H3v18h18v-7',
   video: 'M3 5h12v14H3V5Zm12 5 6-4v12l-6-4', search: 'm21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
+  up: 'M12 20V7m-5 5 5-5 5 5M5 3h14',
 };
 export function Icon({ name }: { name: string }) { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name] || paths.info} /></svg>; }
 export function Button({ icon, tone = '', size = 'default', className = '', children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { icon?: string; tone?: string; size?: 'default' | 'small' }) { return <button type="button" className={`button ${size === 'small' ? 'small' : ''} ${tone} ${className}`} {...props}>{icon && <Icon name={icon} />}{children}</button>; }

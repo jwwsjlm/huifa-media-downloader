@@ -10,6 +10,10 @@ export interface Task {
   title: string;
   status: TaskStatus;
   stage: string;
+  priority?: number;
+  live?: boolean;
+  conversion?: boolean;
+  destinationConflict?: { filename: string; files: string[] } | null;
   stepIndex?: number | null;
   stepCount?: number;
   progress: number;
@@ -38,7 +42,7 @@ export interface Tool { name: string; available: boolean; version?: string; late
 export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string }
 export interface Snapshot { version: string; tasks: Task[]; media: Media[]; settings: Settings; tools?: Tool[] }
 export interface CoreEvent { kind: string; data: Json }
-export interface AddReport { ids: string[]; results: { id: string; status: TaskStatus; action: 'added' | 'existing' | 'restarted' }[] }
+export interface AddReport { ids: string[]; results: { id: string; status: TaskStatus; action: 'added' | 'existing' | 'restarted' }[]; issues?: { url: string; error: string }[]; cancelled?: boolean }
 export interface ReleaseStatus { currentVersion: string; latestVersion: string; updateAvailable: boolean; url: string }
 export interface Capabilities { desktop: boolean; browserCookies: boolean; remoteBrowser: boolean; updates: boolean; directoryPicker: boolean }
 export interface Session { authenticated: boolean; csrfToken?: string; capabilities?: Partial<Capabilities> }

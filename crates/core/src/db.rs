@@ -269,7 +269,70 @@ impl Database {
                 }
             }
         }
+        if let Some(destination) = task.destination.as_ref().filter(|value| value.confirmed) {
+            let mut replaced = destination.replaced_tasks();
+            replaced.sort();
+            replaced.dedup();
+            for id in replaced.into_iter().filter(|id| id != &task.id) {
+                let state: Option<String> = transaction
+                    .query_row("SELECT state FROM tasks WHERE id=?1", [&id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                if let Some(state) = state {
+                    let mut previous: Task = serde_json::from_str(&state)?;
+                    ensure!(
+                        matches!(
+                            previous.status.as_str(),
+                            "completed" | "retained" | "failed" | "processing_failed" | "cancelled"
+                        ),
+                        "Another task started using the destination; original results were preserved"
+                    );
+                    previous.output_path = None;
+                    previous.publication = None;
+                    previous.destination = None;
+                    previous.size = None;
+                    previous.stage("failed", "result_replaced", None);
+                    previous.error = Some("This result was replaced by another source after confirmation. Download again to restore it.".into());
+                    transaction.execute("DELETE FROM media WHERE task_id=?1", [&id])?;
+                    transaction.execute(
+                        "UPDATE tasks SET state=?2 WHERE id=?1",
+                        params![id, serde_json::to_string(&previous)?],
+                    )?;
+                    crate::task_logs::record_changes(
+                        &transaction,
+                        Some(&serde_json::from_str::<Task>(&state)?),
+                        &previous,
+                    )?;
+                }
+            }
+        }
         transaction.execute("INSERT INTO media VALUES(?1,?2,?3) ON CONFLICT(task_id) DO UPDATE SET record=excluded.record",params![media.id,media.task_id,serde_json::to_string(&media)?])?;
+        if task
+            .destination
+            .as_ref()
+            .is_some_and(|value| value.confirmed)
+        {
+            let states = {
+                let mut query = transaction.prepare("SELECT state FROM tasks WHERE id<>?1")?;
+                query
+                    .query_map([&task.id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for state in states {
+                let mut other: Task = serde_json::from_str(&state)?;
+                let count = other.previous_outputs.len();
+                other
+                    .previous_outputs
+                    .retain(|path| *path != media.path && !media.assets.contains(path));
+                if other.previous_outputs.len() != count {
+                    transaction.execute(
+                        "UPDATE tasks SET state=?2 WHERE id=?1",
+                        params![other.id, serde_json::to_string(&other)?],
+                    )?;
+                }
+            }
+        }
         transaction.execute(
             "UPDATE tasks SET state=?2 WHERE id=?1",
             params![task.id, serde_json::to_string(task)?],

@@ -230,6 +230,9 @@ fn fixture_task(tools: HashMap<String, PathBuf>) -> Task {
         proxy_snapshot: None,
         manifest: None,
         publication: None,
+        destination: None,
+        priority: 0,
+        live: false,
         conversion: false,
         tools,
     }

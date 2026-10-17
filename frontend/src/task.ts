@@ -3,9 +3,14 @@ import type { Translate } from './i18n';
 
 export function taskActions(task: Task, t: Translate): { action: string; label: string; icon: string }[] {
   const actions = [];
+  if (task.destinationConflict) actions.push({ action: 'destination', label: t('解决同名冲突', 'Resolve filename conflict'), icon: 'settings' });
+  if (task.live && task.status === 'downloading') actions.push({ action: 'finishLive', label: t('结束直播并保存', 'Stop live capture and save'), icon: 'check' });
   if (task.status === 'paused') actions.push({ action: 'resume', label: t('继续', 'Resume'), icon: 'play' });
   else if (['failed', 'processing_failed', 'cancelled'].includes(task.status)) actions.push({ action: 'retry', label: task.status === 'processing_failed' ? t('重试处理', 'Retry processing') : t('重试下载', 'Retry download'), icon: 'refresh' });
   else if (['queued', 'probing', 'downloading', 'processing', 'waiting_processing'].includes(task.status)) actions.push({ action: 'pause', label: t('暂停', 'Pause'), icon: 'pause' });
+  if (['failed', 'cancelled', 'paused', 'processing_failed'].includes(task.status) && task.kind !== 'assets' && !task.conversion) actions.push({ action: 'retryCurrent', label: t('使用当前设置重试', 'Retry with current settings'), icon: 'refresh' });
+  if (['failed', 'processing_failed'].includes(task.status) && task.error?.includes('Requirements unmet:')) actions.push({ action: 'configure', label: t('调整要求重试', 'Adjust requirements and retry'), icon: 'settings' });
+  if (['queued', 'waiting_processing', 'paused'].includes(task.status) || task.stage === 'waiting_live') actions.push({ action: 'prioritize', label: t('优先执行', 'Move to front of queue'), icon: 'up' });
   if (['queued', 'probing', 'downloading', 'processing', 'waiting_processing', 'paused'].includes(task.status)) actions.push({ action: 'cancel', label: t('取消', 'Cancel'), icon: 'close' });
   return actions;
 }

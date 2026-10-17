@@ -72,14 +72,17 @@ MCP **继承软件已保存的 Cookie、代理和下载配置**。仅将地址�
 | | `retry_processing` | 失败任务 `id`；仍有来源清单时复用本地文件重试 |
 | 任务与媒体管理 | `list_downloads` | `offset`、`limit`；任务状态，默认 20、最多 100 条 |
 | | `get_download` | `id`；状态、进度、警告与错误 |
-| | `control_download` | `id`、`action: pause/resume/cancel/retry`，不允许删除文件 |
+| | `control_download` | `id`、`action: pause/resume/cancel/retry/retryCurrent/prioritize/finishLive`；`retry` 保留原快照，`retryCurrent` 使用当前已保存设置、Cookie、代理与工具；不允许删除文件 |
+| | `resolve_download_filename` | 冲突任务 `id`、`choice: rename/skip`；改名时传 `filename`，仅接受文件名。跨来源覆盖须回应用界面二次确认 |
 | | `list_media` | `query`、`offset`、`limit`；分页搜索媒体库 |
 | | `get_media` | `id`；媒体元数据，不返回本地路径 |
 | | `get_cookie_status` | 可选 `url` 或 `sourceRef`；域名、数量、同步时间和匹配情况，不返回 Cookie 原文或验证网站登录 |
 
-共 **28 个工具**：下载管理权限关闭时提供 **21 个只读工具**；开启后增加 7 个写工具。下载加入应用持久队列，使用 `get_download` 查询；断开 AI 连接不会取消已入队任务。写操作沿用现有权限，不允许删除文件、更新运行时、导出凭据或传递任意命令行。解析、下载和查询按网站自动匹配 Cookie，已有任务保持创建时的身份。
+共 **29 个工具**：下载管理权限关闭时提供 **21 个只读工具**；开启后增加 8 个写工具。下载加入应用持久队列，使用 `get_download` 查询；断开 AI 连接不会取消已入队任务。写操作沿用现有权限，不允许删除文件、更新运行时、导出凭据或传递任意命令行。解析、下载和查询按网站自动匹配 Cookie，已有任务保持创建时的身份。
 
 除标明无来源或使用媒体 ID 的工具外，来源查询、预览、下载均接受 **`url` 或 `sourceRef`，恰好一个**。搜索/合集结果返回的 `url` 用于展示，必要查询参数和私有签名保留后端；继续查询或下载应优先传 `sourceRef`。引用只在当前应用内短期有效，过期或重启后需重新查询。
+
+同一来源重复加入复用任务记录；活动任务不重启，暂停任务等待继续。同名的不同来源在传输前产生 `destinationConflict`，只含文件名，不返回绝对路径。批量逐项返回结果，单项失败不会阻止其余链接。优先级保存到队列，只调整等待顺序；`finishLive` 结束正在录制的直播并验证保存已录制部分，普通 `cancel` 不发布结果。
 
 ### 结构化下载选项
 
@@ -95,7 +98,7 @@ MCP **继承软件已保存的 Cookie、代理和下载配置**。仅将地址�
 | 速度与文件 | `fragmentConcurrent`（1–8）、`rateLimit`、`requestDelay`、`filenameTemplate`、`organizeTaskFolder`、`convertCoverJpeg`、`coverJpegQuality` |
 | SponsorBlock | `sponsorblockMode`、`sponsorblockCategories`，仅 YouTube |
 
-单条和批量始终只处理明确的视频；不会继承「整个频道/合集」行为。合集下载先固定来源的 `offset/limit` 窗口，再在这个窗口内应用筛选、源序号交集及排序（`selectionScope: range-local`）；过滤后不足本次数量也不向后补抓，`nextOffset` 仍按来源窗口继续。`waitForLive` 默认关闭，只有本次显式设为 `true` 才等待开播。字幕默认关闭；选定语言后人工优先，缺少人工轨道时按设置回退自动字幕。没有目标字幕可继续视频下载并产生警告。字幕正文查询没有字幕时则明确报错，不进行语音识别。
+单条和批量始终只处理明确的视频；不会继承「整个频道/合集」行为。合集下载先固定来源的 `offset/limit` 窗口，再在这个窗口内应用筛选、源序号交集及排序（`selectionScope: range-local`）；过滤后不足本次数量也不向后补抓，`nextOffset` 仍按来源窗口继续。`waitForLive` 默认关闭，只有本次显式设为 `true` 才等待开播。字幕默认关闭；选定语言后人工优先，缺少人工轨道时按设置回退自动字幕。明确选择的画质、帧率、音轨或字幕缺失时停止该项，保留原要求，由用户调整后重试；不会静默降级。字幕正文查询没有字幕时则明确报错，不进行语音识别。
 
 ### 分页、评论与边界
 

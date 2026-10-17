@@ -19,7 +19,16 @@ pub async fn run(
     cancel: &CancellationToken,
     callback: Option<LineCallback>,
 ) -> Result<ProcessOutput> {
-    run_inner(executable, args, directory, cancel, callback, None, None).await
+    run_inner(
+        executable,
+        args,
+        directory,
+        (cancel, None),
+        callback,
+        None,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn run_logged(
@@ -34,7 +43,28 @@ pub(crate) async fn run_logged(
         executable,
         args,
         directory,
-        cancel,
+        (cancel, None),
+        callback,
+        None,
+        Some(log),
+    )
+    .await
+}
+
+pub(crate) async fn run_capture(
+    executable: &Path,
+    args: &[String],
+    directory: &Path,
+    cancel: &CancellationToken,
+    finish: &CancellationToken,
+    callback: Option<LineCallback>,
+    log: crate::task_logs::RawLog,
+) -> Result<ProcessOutput> {
+    run_inner(
+        executable,
+        args,
+        Some(directory),
+        (cancel, Some(finish)),
         callback,
         None,
         Some(log),
@@ -55,7 +85,7 @@ pub async fn run_limited(
         executable,
         args,
         directory,
-        cancel,
+        (cancel, None),
         None,
         Some((max_stdout, timeout, false)),
         None,
@@ -75,7 +105,7 @@ pub async fn run_limited_text(
         executable,
         args,
         None,
-        cancel,
+        (cancel, None),
         None,
         Some((max_stdout, timeout, true)),
         None,
@@ -87,11 +117,12 @@ async fn run_inner(
     executable: &Path,
     args: &[String],
     directory: Option<&Path>,
-    cancel: &CancellationToken,
+    control: (&CancellationToken, Option<&CancellationToken>),
     callback: Option<LineCallback>,
     limit: Option<(usize, std::time::Duration, bool)>,
     log: Option<crate::task_logs::RawLog>,
 ) -> Result<ProcessOutput> {
+    let (cancel, finish) = control;
     if cancel.is_cancelled() {
         bail!("Operation interrupted");
     }
@@ -153,9 +184,17 @@ async fn run_inner(
             read_lines(stderr, true, callback, err_log).await
         }
     });
+    let mut stopped_capture = false;
     let status = tokio::select! {
-        status=child.wait()=>status.context("Cannot wait for supervised tool"),
+        biased;
         _=cancel.cancelled()=> Err(anyhow::anyhow!("Operation interrupted")),
+        _=async { match finish { Some(token) => token.cancelled().await, None => std::future::pending::<()>().await } }=> {
+            stopped_capture = true;
+            // Live captures use MPEG-TS; the normal media validator decides whether the saved part is usable.
+            guard.terminate();
+            child.wait().await.context("Cannot wait for stopped live capture")
+        },
+        status=child.wait()=>status.context("Cannot wait for supervised tool"),
         _=overflow.cancelled()=> Err(anyhow::anyhow!("Metadata stdout exceeds its byte limit")),
         _=tokio::time::sleep(limit.map_or(std::time::Duration::from_secs(86400), |(_, timeout, _)| timeout)), if limit.is_some()=> Err(anyhow::anyhow!("Metadata query timed out")),
     };
@@ -184,7 +223,7 @@ async fn run_inner(
         )?;
     }
     let status = status?;
-    if !status.success() {
+    if !status.success() && !stopped_capture {
         bail!(
             "{} exited with code {}: {}",
             executable.file_name().unwrap_or_default().to_string_lossy(),

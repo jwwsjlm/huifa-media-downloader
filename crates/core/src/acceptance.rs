@@ -119,6 +119,166 @@ fn config(root: &Path) -> AppConfig {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires native FFmpeg and FFprobe; uses only a local generated live fixture"]
+async fn real_live_stop_save_publishes_valid_recording_and_cancel_does_not() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let app = App::open(config(root.path())).await?;
+    for save in [true, false] {
+        let mut task = crate::tests::paused_task(app.freeze_tools().await?);
+        task.title = if save {
+            "Recorded live"
+        } else {
+            "Cancelled live"
+        }
+        .into();
+        task.live = true;
+        task.stage("downloading", "downloading_live", None);
+        app.db.insert_task(&task)?;
+        let directory = app
+            .config
+            .data_dir
+            .join("tasks")
+            .join(&task.id)
+            .join("sources/live-fixture");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("recording.ts.part");
+        let args = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=12",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=44100",
+            "-threads",
+            "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .chain([path.to_string_lossy().into_owned()])
+        .collect::<Vec<_>>();
+        let cancel = CancellationToken::new();
+        let finish_capture = CancellationToken::new();
+        let runner_cancel = cancel.clone();
+        let runner_finish = finish_capture.clone();
+        let runner_app = app.clone();
+        let mut runner_task = task.clone();
+        let runner_path = path.clone();
+        let handle = tokio::spawn(async move {
+            let captured = crate::process::run_capture(
+                &runner_app.task_tool(&runner_task, "ffmpeg").await?,
+                &args,
+                &directory,
+                &runner_cancel,
+                &runner_finish,
+                None,
+                runner_app.raw_task_log(&runner_task.id)?,
+            )
+            .await;
+            if runner_cancel.is_cancelled() {
+                ensure!(
+                    captured.is_err(),
+                    "Ordinary cancel was treated as a successful recording"
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+            captured?;
+            let (hash, size) = download::hash_file(&runner_path)?;
+            runner_task.manifest = Some(SourceManifest {
+                version: 1,
+                directory,
+                files: vec![SourceFile {
+                    path: runner_path,
+                    hash,
+                    size,
+                    kind: "video".into(),
+                    format_id: "fixture".into(),
+                    language: None,
+                }],
+                metadata: json!({"id":"local-live","title":runner_task.title,"is_live":true}),
+                duration: None,
+                chapters: vec![],
+                sponsor_segments: vec![],
+                output_extension: "mp4".into(),
+            });
+            runner_task.stage("waiting_processing", "waiting_processing", None);
+            runner_app.save_task(&runner_task)?;
+            crate::processing::process_task(&runner_app, &runner_task.id, &runner_cancel).await
+        });
+        // Runtime owns the real capture future, matching the public task action's cancellation boundary.
+        let completion = Arc::new(Mutex::new(None));
+        let result_slot = completion.clone();
+        let supervisor = tokio::spawn(async move {
+            *result_slot.lock().unwrap() = Some(handle.await);
+        });
+        app.runners.lock().unwrap().insert(
+            task.id.clone(),
+            crate::Runtime {
+                cancel,
+                finish_capture,
+                handle: supervisor,
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while std::fs::metadata(&path).map_or(0, |m| m.len()) < 64 * 1024 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("Local live fixture did not start")?;
+        if save {
+            app.command("tasks.finishLive", json!({"id":task.id}))
+                .await?;
+            let saved = wait_for(&app, &[task.id.clone()], &["completed"]).await?;
+            let media = app
+                .db
+                .media_for_task(&task.id)?
+                .context("Stopped recording was not published")?;
+            ensure!(
+                media.duration > 0.0
+                    && media.size > 0
+                    && media.path.extension().is_some_and(|ext| ext == "mp4"),
+                "Stopped recording did not become a valid MP4"
+            );
+            ensure!(saved[0].live, "Live marker was lost");
+            app.stop_task(&task.id, "paused").await?;
+        } else {
+            app.command("tasks.cancel", json!({"id":task.id})).await?;
+            ensure!(
+                app.db.media_for_task(&task.id)?.is_none(),
+                "Cancelled capture published media"
+            );
+            ensure!(
+                path.is_file(),
+                "Cancelled capture lost its recoverable source"
+            );
+        }
+        let result = completion
+            .lock()
+            .unwrap()
+            .take()
+            .context("Capture supervisor did not return")?;
+        result??;
+    }
+    app.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires HUIFA_TEST_DOUYIN=1, native tools and public Douyin access"]
 async fn real_douyin_short_link_identification_and_download() -> Result<()> {
@@ -233,6 +393,148 @@ async fn wait_for(app: &App, ids: &[String], states: &[&str]) -> Result<Vec<Task
                 .collect::<Vec<_>>()
         )
     })?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires native yt-dlp, FFmpeg and FFprobe; local fixture only"]
+async fn real_filename_conflict_confirmation_rename_and_successful_cache_cleanup() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let fixtures = root.path().join("fixtures");
+    std::fs::create_dir_all(&fixtures)?;
+    let app = App::open(config(root.path())).await?;
+    let source = fixtures.join("clip.mp4");
+    let args = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=160x90:rate=12",
+        "-t",
+        "1",
+        "-threads",
+        "1",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .chain([source.to_string_lossy().into_owned()])
+    .collect::<Vec<_>>();
+    crate::process::run(
+        &app.tool("ffmpeg")?,
+        &args,
+        None,
+        &CancellationToken::new(),
+        None,
+    )
+    .await?;
+    let server = LocalServer::start(fixtures).await?;
+    let options = json!({"container":"mp4","encoder":"copy","writeThumbnail":false,"writeInfoJson":false,"subtitleLanguage":"none","organizeTaskFolder":false});
+    let first: Vec<String> = serde_json::from_value(
+        app.command(
+            "tasks.add",
+            json!({"urls":[format!("{}/clip.mp4?source=one",server.url)],"options":options}),
+        )
+        .await?,
+    )?;
+    wait_for(&app, &first, &["completed"]).await?;
+    let original = app
+        .db
+        .media_for_task(&first[0])?
+        .context("First result missing")?;
+    let old_hash = download::hash_file(&original.path)?;
+    ensure!(
+        !app.config
+            .data_dir
+            .join("tasks")
+            .join(&first[0])
+            .join("sources")
+            .exists(),
+        "Successful task kept its source cache"
+    );
+    let second: Vec<String> = serde_json::from_value(
+        app.command(
+            "tasks.add",
+            json!({"urls":[format!("{}/clip.mp4?source=two",server.url)],"options":options}),
+        )
+        .await?,
+    )?;
+    let conflict = wait_for(&app, &second, &["failed"]).await?.remove(0);
+    ensure!(
+        conflict
+            .destination
+            .as_ref()
+            .and_then(|value| value.public_conflict())
+            .is_some(),
+        "Same-name source did not ask before transfer"
+    );
+    ensure!(
+        download::hash_file(&original.path)? == old_hash,
+        "Unconfirmed conflict changed the original"
+    );
+    ensure!(
+        !app.config
+            .data_dir
+            .join("tasks")
+            .join(&second[0])
+            .join("sources")
+            .exists(),
+        "Conflict downloaded media before confirmation"
+    );
+    app.command(
+        "tasks.destination",
+        json!({"id":second[0],"choice":"overwrite","confirmed":true}),
+    )
+    .await?;
+    wait_for(&app, &second, &["completed"]).await?;
+    ensure!(
+        app.db.media_for_task(&first[0])?.is_none()
+            && app.db.task(&first[0])?.output_path.is_none(),
+        "Old owner still claims the replacement"
+    );
+    ensure!(
+        app.db.media_for_task(&second[0])?.unwrap().path == original.path,
+        "Replacement changed the chosen filename"
+    );
+    let third: Vec<String> = serde_json::from_value(
+        app.command(
+            "tasks.add",
+            json!({"urls":[format!("{}/clip.mp4?source=three",server.url)],"options":options}),
+        )
+        .await?,
+    )?;
+    wait_for(&app, &third, &["failed"]).await?;
+    app.command(
+        "tasks.destination",
+        json!({"id":third[0],"choice":"rename","filename":"clip (2).mp4"}),
+    )
+    .await?;
+    wait_for(&app, &third, &["completed"]).await?;
+    ensure!(
+        app.db.media()?.len() == 2
+            && original.path.exists()
+            && app.db.media_for_task(&third[0])?.unwrap().filename == "clip (2).mp4",
+        "Rename failed to preserve both results"
+    );
+    app.command("tasks.delete", json!({"id":first[0],"deleteFiles":true}))
+        .await?;
+    ensure!(
+        original.path.exists(),
+        "Deleting replaced owner removed the new result"
+    );
+    ensure!(
+        crate::storage::status(&app)?["completedCacheBytes"] == 0,
+        "Completed caches were not cleaned"
+    );
+    app.shutdown().await?;
+    server.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -589,6 +891,13 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         }],
         output_extension: "mkv".into(),
     };
+    let source_seed = tempfile::tempdir_in(root.path())?;
+    for source in &manifest.files {
+        std::fs::copy(
+            &source.path,
+            source_seed.path().join(source.path.file_name().unwrap()),
+        )?;
+    }
     let task = Task {
         kind: "media".into(),
         files: vec![],
@@ -620,6 +929,9 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         proxy_snapshot: None,
         manifest: Some(manifest),
         publication: None,
+        destination: None,
+        priority: 0,
+        live: false,
         conversion: false,
         tools: app.freeze_tools().await?,
     };
@@ -629,6 +941,10 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         .await?
         .remove(0);
     let media = app.db.media_for_task(&id)?.unwrap();
+    ensure!(
+        !task.manifest.as_ref().unwrap().directory.exists(),
+        "Completed media kept its download source cache"
+    );
     let output = crate::process::run(
         &app.tool("ffprobe")?,
         &[
@@ -773,7 +1089,10 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
     std::fs::create_dir_all(&manifest.directory)?;
     for source in &mut manifest.files {
         let destination = manifest.directory.join(source.path.file_name().unwrap());
-        std::fs::copy(&source.path, &destination)?;
+        std::fs::copy(
+            source_seed.path().join(source.path.file_name().unwrap()),
+            &destination,
+        )?;
         source.path = destination;
     }
     manifest.metadata["title"] = json!(marked.title);
@@ -887,9 +1206,15 @@ async fn real_generic_http_mp4_and_audio_extraction() -> Result<()> {
     let server = LocalServer::start(fixtures).await?;
     let url = format!("{}/generic.mp4", server.url);
     ensure!(
-        download::public_probe(&app, &url, &DownloadOptions::default(), None)
-            .await
-            .is_err(),
+        download::public_probe(
+            &app,
+            &url,
+            &DownloadOptions::default(),
+            None,
+            &app.shutdown_token
+        )
+        .await
+        .is_err(),
         "Cookie-protected media was available without login"
     );
     let cookies = crate::browser::netscape(

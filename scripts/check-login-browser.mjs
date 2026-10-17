@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 if (process.platform !== 'win32') throw new Error('This smoke test requires Windows WebView2 and Edge or Chrome');
@@ -17,4 +18,14 @@ writeFileSync(`${artifact.executable}.manifest`, `<?xml version="1.0" encoding="
   <dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" /></dependentAssembly></dependency>
 </assembly>
 `);
-execFileSync(artifact.executable, ['real_login_cookie_export_persistence_popups_and_ipc_isolation', '--ignored', '--test-threads=1', '--nocapture'], { cwd, stdio: 'inherit' });
+let manifestTool;
+try { manifestTool = execFileSync('where.exe', ['mt.exe'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\r?\n/)[0]; } catch {}
+if (!manifestTool) {
+  const sdk = path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Windows Kits', '10', 'bin');
+  manifestTool = readdirSync(sdk).filter(name => /^\d+\.\d+\.\d+\.\d+$/.test(name))
+    .sort((a, b) => b.localeCompare(a, 'en', { numeric: true }))
+    .map(version => path.join(sdk, version, 'x64', 'mt.exe')).find(existsSync);
+}
+if (!manifestTool) throw new Error('Windows SDK mt.exe is required to prepare the WebView2 test executable');
+execFileSync(manifestTool, ['-nologo', '-manifest', `${artifact.executable}.manifest`, `-outputresource:${artifact.executable};#1`], { cwd, stdio: 'inherit' });
+execFileSync(artifact.executable, ['real_login_cookie_export_persistence_popups_and_ipc_isolation', '--ignored', '--test-threads=1', '--nocapture'], { cwd, stdio: 'inherit', timeout: 180_000 });

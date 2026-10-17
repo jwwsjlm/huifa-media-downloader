@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { bytes, dimensions, frameRate, mediaQuality, mediaQualityWithFps, taskSize } from './task';
+import { bytes, dimensions, frameRate, mediaQuality, mediaQualityWithFps, taskSize, taskActions } from './task';
 import { makeTask } from './test-fixtures';
 
 it.each([
@@ -34,4 +34,15 @@ it('shows actual downloaded bytes with known, estimated and unknown totals, pres
   expect(taskSize({ ...task, status: 'paused' }, en).value).toBe('1.0 MiB');
   expect(taskSize({ ...task, status: 'completed', size: 3145728 }, en)).toEqual({ value: '3.0 MiB' });
   expect(taskSize({ ...task, status: 'retained', size: undefined, mediaInfo: { size: 4194304 } }, en)).toEqual({ value: '4.0 MiB' });
+});
+it('offers live save separately from cancel, current settings retry and real queue priority only where applicable', () => {
+  const actions = (patch: Partial<ReturnType<typeof makeTask>>) => taskActions({ ...makeTask('a'), ...patch }, (_zh, en) => en).map(item => item.action);
+  expect(actions({ status: 'downloading', live: true })).toContain('finishLive');
+  expect(actions({ status: 'downloading', live: false })).not.toContain('finishLive');
+  expect(actions({ status: 'queued' })).toContain('prioritize');
+  expect(actions({ status: 'downloading' })).not.toContain('prioritize');
+  expect(actions({ status: 'failed' })).toContain('retryCurrent');
+  expect(actions({ status: 'failed', conversion: true })).not.toContain('retryCurrent');
+  expect(actions({ status: 'failed', kind: 'assets' })).not.toContain('retryCurrent');
+  expect(actions({ status: 'failed', error: 'Requirements unmet: missing subtitles' })).toContain('configure');
 });

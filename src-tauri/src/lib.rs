@@ -400,7 +400,19 @@ async fn check_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<Va
     if host.portable {
         return Err("Download and extract the latest portable ZIP to update this edition".into());
     }
-    let update = app.updater().map_err(error)?.check().await.map_err(error)?;
+    let mut builder = app.updater_builder();
+    let proxy = host.core.download_proxy().map_err(error)?;
+    if !proxy.is_empty() {
+        builder = builder.proxy(proxy.parse().map_err(error)?);
+    } else {
+        builder = builder.no_proxy();
+    }
+    let update = builder
+        .build()
+        .map_err(error)?
+        .check()
+        .await
+        .map_err(error)?;
     let value = update
         .as_ref()
         .map(|update| json!({"version":update.version,"body":update.body}))
@@ -416,6 +428,13 @@ async fn install_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<
     }
     let mut guard = host.update.lock().await;
     let update = guard.as_mut().ok_or("Check for an update first")?;
+    let proxy = host.core.download_proxy().map_err(error)?;
+    update.proxy = if proxy.is_empty() {
+        None
+    } else {
+        Some(proxy.parse().map_err(error)?)
+    };
+    update.no_proxy = proxy.is_empty();
     let bytes = update.download(|_, _| {}, || {}).await.map_err(error)?;
     host.closing.store(true, Ordering::Release);
     host.login_browser.stop(&app, &host.core).await;
@@ -424,6 +443,11 @@ async fn install_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<
         return Err(error(reason));
     }
     host.shutdown_done.store(true, Ordering::Release);
+    if let Err(reason) = huifa_core::backup::create(&host.data_dir, "before-update") {
+        return Err(error(format!(
+            "Update was not installed because the configuration backup failed: {reason:#}. Tasks were saved; restart the application before retrying."
+        )));
+    }
     if let Err(reason) = update.install(bytes) {
         let message = format!(
             "Update installation failed after tasks were saved: {reason}. Restart the application to resume work."

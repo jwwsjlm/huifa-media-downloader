@@ -158,21 +158,9 @@ pub(crate) async fn probe(
     } else {
         app.tool("yt-dlp")?
     };
-    let output = match task {
-        Some(task) => {
-            process::run_logged(
-                &executable,
-                &args,
-                None,
-                cancel,
-                None,
-                app.raw_task_log(&task.id)?,
-            )
-            .await
-        }
-        None => process::run(&executable, &args, None, cancel, None).await,
-    }
-    .context("Failed to parse video with yt-dlp")?;
+    let output = metadata_process(app, &executable, &args, cancel, task)
+        .await
+        .context("Failed to parse video with yt-dlp")?;
     let info: Value =
         serde_json::from_str(&output.stdout).context("yt-dlp returned invalid video metadata")?;
     ensure!(
@@ -191,9 +179,10 @@ pub(crate) async fn public_probe(
     url: &str,
     options: &DownloadOptions,
     cookies: Option<&str>,
+    cancel: &CancellationToken,
 ) -> Result<Value> {
-    let permit = app.network.acquire().await?;
-    let info = probe(app, url, options, cookies, &app.shutdown_token, None).await?;
+    let permit = tokio::select! { permit=app.network.acquire()=>permit?, _=cancel.cancelled()=>bail!("Operation interrupted") };
+    let info = probe(app, url, options, cookies, cancel, None).await?;
     drop(permit);
     let formats=all_formats(&info).iter().map(|f|json!({"formatId":f["format_id"],"ext":f["ext"],"width":f["width"],"height":f["height"],"fps":f["fps"],"vcodec":f["vcodec"],"acodec":f["acodec"],"language":f["language"],"filesize":f.get("filesize").or(f.get("filesize_approx")),"formatNote":f["format_note"]})).collect::<Vec<_>>();
     let subtitles = info["subtitles"]
@@ -218,8 +207,9 @@ pub(crate) async fn collection(
     url: &str,
     options: &DownloadOptions,
     cookie_text: Option<&str>,
+    cancel: &CancellationToken,
 ) -> Result<Value> {
-    let _permit = app.network.acquire().await?;
+    let _permit = tokio::select! { permit=app.network.acquire()=>permit?, _=cancel.cancelled()=>bail!("Operation interrupted") };
     let cookies = Cookies::new(app, cookie_text)?;
     let mut args = base_args(app, options, &cookies, None).await?;
     args.extend([
@@ -243,7 +233,7 @@ pub(crate) async fn collection(
         args.push("--playlist-random".into());
     }
     args.extend(["--".into(), url.into()]);
-    let output = process::run(&app.tool("yt-dlp")?, &args, None, &app.shutdown_token, None)
+    let output = metadata_process(app, &app.tool("yt-dlp")?, &args, cancel, None)
         .await
         .context("Failed to identify media or collection with yt-dlp")?;
     let info: Value = serde_json::from_str(&output.stdout)
@@ -265,6 +255,92 @@ pub(crate) async fn collection(
         "video"
     };
     Ok(json!({"kind":kind,"id":info["id"],"title":info["title"],"entries":entries}))
+}
+
+fn transient_metadata_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if [
+        "http error 403",
+        "http error 404",
+        "sign in",
+        "sign-in",
+        "fresh cookies",
+        "unsupported url",
+        "not available",
+        "private video",
+        "requirements unmet",
+    ]
+    .iter()
+    .any(|value| error.contains(value))
+    {
+        return false;
+    }
+    [
+        "http error 429",
+        "http error 500",
+        "http error 502",
+        "http error 503",
+        "http error 504",
+        "too many requests",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "temporary failure",
+        "network is unreachable",
+        "remote end closed",
+        "getaddrinfo failed",
+        "name or service not known",
+    ]
+    .iter()
+    .any(|value| error.contains(value))
+}
+
+async fn metadata_process(
+    app: &App,
+    executable: &Path,
+    args: &[String],
+    cancel: &CancellationToken,
+    task: Option<&Task>,
+) -> Result<process::ProcessOutput> {
+    for attempt in 0..3 {
+        let result = match task {
+            Some(task) => {
+                process::run_logged(
+                    executable,
+                    args,
+                    None,
+                    cancel,
+                    None,
+                    app.raw_task_log(&task.id)?,
+                )
+                .await
+            }
+            None => process::run(executable, args, None, cancel, None).await,
+        };
+        match result {
+            Err(error)
+                if attempt < 2
+                    && !cancel.is_cancelled()
+                    && transient_metadata_error(&format!("{error:#}")) =>
+            {
+                let seconds = if attempt == 0 { 1 } else { 3 };
+                if let Some(task) = task {
+                    app.log_task(
+                        &task.id,
+                        "warning",
+                        &format!(
+                            "Temporary metadata request failure; retry {}/2 in {seconds}s",
+                            attempt + 1
+                        ),
+                    )?;
+                }
+                tokio::select! { _=tokio::time::sleep(Duration::from_secs(seconds))=>{}, _=cancel.cancelled()=>bail!("Operation interrupted") }
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
 }
 
 fn safe_thumbnail(info: &Value) -> Value {
@@ -350,16 +426,49 @@ fn compare_video(a: &Value, b: &Value, options: &DownloadOptions) -> Ordering {
         )
         .then(quality_order(metric(a, "tbr").total_cmp(&metric(b, "tbr"))))
 }
+pub(crate) fn resolution_tier(format: &Value) -> f64 {
+    let height = metric(format, "height");
+    let width = metric(format, "width");
+    let shorter = if width > 0.0 {
+        height.min(width)
+    } else {
+        height
+    };
+    let longer = height.max(width);
+    // Match the displayed quality tiers, including cinematic and portrait media.
+    if longer >= 7680.0 && shorter >= 3200.0 {
+        return 4320.0;
+    }
+    if longer >= 3840.0 && shorter >= 1600.0 {
+        return 2160.0;
+    }
+    [2160.0, 1440.0, 1080.0, 720.0, 480.0, 360.0, 240.0, 144.0]
+        .into_iter()
+        .find(|tier| shorter >= *tier)
+        .unwrap_or(shorter)
+}
+fn audio_matches(format: &Value, track: &str) -> bool {
+    if track == "original" {
+        return text(format, "format_note")
+            .to_ascii_lowercase()
+            .contains("original");
+    }
+    let language = text(format, "language");
+    let aliases: &[&str] = match track {
+        "zh-Hans" => &["zh-Hans", "zh-CN", "zh"],
+        "zh-Hant" => &["zh-Hant", "zh-TW", "zh-HK"],
+        _ => &[track],
+    };
+    aliases
+        .iter()
+        .any(|alias| language == *alias || language.starts_with(&format!("{alias}-")))
+}
 fn compare_audio(a: &Value, b: &Value, options: &DownloadOptions) -> Ordering {
     let score = |f: &Value| {
-        let language = text(f, "language");
-        let note = text(f, "format_note").to_ascii_lowercase();
-        if options.audio_track == "original" {
-            note.contains("original")
-        } else if !matches!(options.audio_track.as_str(), "default" | "all") {
-            language.starts_with(&options.audio_track)
-        } else {
+        if matches!(options.audio_track.as_str(), "default" | "all") {
             metric(f, "language_preference") > 0.0
+        } else {
+            audio_matches(f, &options.audio_track)
         }
     };
     score(a)
@@ -372,6 +481,27 @@ fn compare_audio(a: &Value, b: &Value, options: &DownloadOptions) -> Ordering {
 pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<Vec<Value>> {
     let formats = all_formats(info);
     let mut selected = Vec::new();
+    let explicit_audio = options.audio_format_ids.is_empty()
+        && options.format_id.is_empty()
+        && !matches!(options.audio_track.as_str(), "default" | "all");
+    if explicit_audio {
+        ensure!(
+            formats
+                .iter()
+                .any(|f| has_audio(f) && audio_matches(f, &options.audio_track)),
+            "Requirements unmet: audioTrack={}; available: {}. Adjust the requirements before retrying",
+            options.audio_track,
+            formats
+                .iter()
+                .filter(|f| has_audio(f))
+                .map(|f| text(f, "language"))
+                .filter(|s| !s.is_empty())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let exact = |id: &str| -> Result<Value> {
         formats
             .iter()
@@ -393,12 +523,38 @@ pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<
                     has_video(f)
                         && options
                             .max_height()
-                            .is_none_or(|h| metric(f, "height") <= h as f64)
+                            .is_none_or(|h| resolution_tier(f) == h as f64)
+                        && options
+                            .video_fps
+                            .parse::<f64>()
+                            .ok()
+                            .is_none_or(|fps| metric(f, "fps").round() == fps)
+                        && (!explicit_audio
+                            || !has_audio(f)
+                            || audio_matches(f, &options.audio_track))
                 })
                 .collect::<Vec<_>>();
             ensure!(
                 !videos.is_empty(),
-                "No video format satisfies the selected resolution"
+                "Requirements unmet: video={} / {} fps; available: {}. Adjust the requirements before retrying",
+                options.quality,
+                options.video_fps,
+                formats
+                    .iter()
+                    .filter(|f| has_video(f))
+                    .map(|f| format!(
+                        "{}p{}",
+                        metric(f, "height"),
+                        if metric(f, "fps") > 0.0 {
+                            format!(" / {} fps", metric(f, "fps"))
+                        } else {
+                            String::new()
+                        }
+                    ))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             if videos.iter().any(|f| vr_match(f, &options.vr_mode)) {
                 videos.retain(|f| vr_match(f, &options.vr_mode));
@@ -451,19 +607,26 @@ pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<
         }
         selected.extend(tracks.into_values());
     } else if selected.is_empty()
-        || !selected.iter().any(has_audio)
-        || !matches!(options.audio_track.as_str(), "default")
+        || !selected
+            .iter()
+            .any(|f| has_audio(f) && (!explicit_audio || audio_matches(f, &options.audio_track)))
     {
         let audio = formats
             .iter()
-            .filter(|f| has_audio(f) && !has_video(f))
+            .filter(|f| {
+                has_audio(f)
+                    && !has_video(f)
+                    && (!explicit_audio || audio_matches(f, &options.audio_track))
+            })
             .max_by(|a, b| compare_audio(a, b, options));
         if let Some(audio) = audio {
             selected.push(audio.clone());
         } else if selected.is_empty()
             && let Some(combined) = formats
                 .iter()
-                .filter(|f| has_audio(f))
+                .filter(|f| {
+                    has_audio(f) && (!explicit_audio || audio_matches(f, &options.audio_track))
+                })
                 .max_by(|a, b| compare_audio(a, b, options))
         {
             selected.push(combined.clone());
@@ -476,6 +639,20 @@ pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<
         );
     }
     ensure!(!selected.is_empty(), "No stream can be downloaded");
+    ensure!(
+        !explicit_audio
+            || selected
+                .iter()
+                .any(|f| has_audio(f) && audio_matches(f, &options.audio_track)),
+        "Requirements unmet: audioTrack={}. Choose a compatible video or audio track before retrying",
+        options.audio_track
+    );
+    let (_, missing) = subtitle_selection(info, &options.languages(), options.automatic_subtitles);
+    ensure!(
+        missing.is_empty(),
+        "Requirements unmet: subtitles={}. Adjust the subtitle languages or disable subtitles before retrying",
+        missing.join(", ")
+    );
     let mut seen = std::collections::HashSet::new();
     selected.retain(|f| seen.insert(text(f, "format_id").to_string()));
     Ok(selected)
@@ -520,7 +697,7 @@ where
     Ok(results)
 }
 
-fn is_live(info: &Value) -> bool {
+pub(crate) fn is_live(info: &Value) -> bool {
     info["is_live"].as_bool().unwrap_or(false) || text(info, "live_status") == "is_live"
 }
 
@@ -712,6 +889,14 @@ impl TransferProgress {
     }
 }
 
+fn transfer_identity(info: &Value, formats: &[Value]) -> Result<String> {
+    let formats = formats.iter().map(|format| {
+        json!({"id":format["format_id"],"url":format["url"],"fragments":format["fragments"],"size":format["filesize"],"width":format["width"],"height":format["height"],"fps":format["fps"],"video":format["vcodec"],"audio":format["acodec"]})
+    }).collect::<Vec<_>>();
+    let identity = json!({"extractor":info["extractor_key"],"id":info["id"],"duration":info["duration"],"modified":info["modified_timestamp"],"formats":formats});
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&identity)?)))
+}
+
 pub(crate) async fn transfer(
     app: &Arc<App>,
     mut task: Task,
@@ -732,6 +917,15 @@ pub(crate) async fn transfer(
             &formats,
             info["duration"].as_f64(),
         ));
+        let extension = output_extension(&task.options, &formats);
+        crate::destination::reserve(app, &mut task, &extension, &info).await?;
+        let expected = formats
+            .iter()
+            .filter_map(|format| {
+                byte_count(&format["filesize"]).or_else(|| byte_count(&format["filesize_approx"]))
+            })
+            .fold(0u64, u64::saturating_add);
+        crate::storage::before_download(app, &task, expected)?;
     }
     task.transfer_bytes = formats
         .iter()
@@ -760,17 +954,34 @@ pub(crate) async fn transfer(
         })
         .collect();
     app.save_task(&task)?;
+    let live = is_live(&info);
     let directory = app
         .config
         .data_dir
         .join("tasks")
         .join(&task.id)
-        .join("sources");
+        .join("sources")
+        .join(if live {
+            format!("live-{}", uuid::Uuid::new_v4())
+        } else {
+            transfer_identity(&info, &formats)?
+        });
     crate::reject_links(&directory)?;
+    if !directory.try_exists()? && task.transfer_bytes.iter().any(|bytes| bytes.downloaded > 0) {
+        for bytes in &mut task.transfer_bytes {
+            bytes.downloaded = 0;
+        }
+        task.warnings.push("The source or format changed; this attempt starts a new transfer and preserves the previous partial files.".into());
+        app.save_task(&task)?;
+    }
     std::fs::create_dir_all(&directory)?;
     let cookie_text = app.task_cookies(&task)?;
     let cookies = Cookies::new(app, cookie_text.as_deref())?;
-    let live = is_live(&info);
+    let finish_capture = if live {
+        Some(app.finish_capture_token(&task.id)?)
+    } else {
+        None
+    };
     let capture_cancel = cancel.child_token();
     let cancel = &capture_cancel;
     let speeds = Arc::new(Mutex::new(vec![None; formats.len()]));
@@ -786,6 +997,7 @@ pub(crate) async fn transfer(
             let cookies = &cookies;
             let runtime_options = &runtime_options;
             let speeds = speeds.clone();
+            let finish_capture = &finish_capture;
             async move {
                 let kind = if has_video(format) { "video" } else { "audio" };
                 let stage = if live {
@@ -796,7 +1008,7 @@ pub(crate) async fn transfer(
                 if !live {
                     app.set_stage(&task.id, "downloading", &stage, None)?;
                 }
-                let output_template = directory.join(format!("source-{index}.%(ext)s"));
+                let output_template = directory.join(if live { format!("source-{index}.ts") } else { format!("source-{index}.%(ext)s") });
                 let mut args = base_args(app, runtime_options, cookies, Some(task)).await?;
                 args.extend([
                     "--no-playlist".into(),
@@ -832,6 +1044,9 @@ pub(crate) async fn transfer(
                     ]);
                     if task.options.live_from_start {
                         args.push("--live-from-start".into());
+                    }
+                    if live {
+                        args.extend(["--downloader-args".into(), "ffmpeg_o:-f mpegts".into()]);
                     }
                 } else {
                     args.extend([
@@ -869,14 +1084,13 @@ pub(crate) async fn transfer(
                     }
                 });
                 let executable = app.task_tool(task, "yt-dlp").await?;
-                let process = process::run_logged(
-                    &executable,
-                    &args,
-                    Some(directory),
-                    cancel,
-                    Some(callback),
-                    app.raw_task_log(&task.id)?,
-                );
+                let process = async {
+                    if let Some(finish) = &finish_capture {
+                        process::run_capture(&executable, &args, directory, cancel, finish, Some(callback), app.raw_task_log(&task.id)?).await
+                    } else {
+                        process::run_logged(&executable, &args, Some(directory), cancel, Some(callback), app.raw_task_log(&task.id)?).await
+                    }
+                };
                 tokio::pin!(process);
                 let mut stale_timer = tokio::time::interval(Duration::from_secs(1));
                 let output = loop {
@@ -908,6 +1122,7 @@ pub(crate) async fn transfer(
                         text(format, "format_id")
                     )
                 })?;
+                ensure!(!cancel.is_cancelled(), "Operation interrupted");
                 let path = output
                     .stdout
                     .lines()
@@ -916,6 +1131,9 @@ pub(crate) async fn transfer(
                     .map(PathBuf::from)
                     .next_back()
                     .or_else(|| {
+                        if live {
+                            return [format!("source-{index}.ts"), format!("source-{index}.ts.part")].into_iter().map(|name| directory.join(name)).find(|path| path.is_file());
+                        }
                         std::fs::read_dir(directory)
                             .ok()?
                             .filter_map(Result::ok)
@@ -1068,7 +1286,11 @@ pub(crate) async fn transfer(
         directory,
         files,
         metadata,
-        duration: info["duration"].as_f64(),
+        duration: if live {
+            None
+        } else {
+            info["duration"].as_f64()
+        },
         chapters: chapters(&info),
         sponsor_segments,
         output_extension: extension,
@@ -1156,17 +1378,11 @@ async fn download_subtitles(
     }
     let (selected, missing) =
         subtitle_selection(info, &requested, task.options.automatic_subtitles);
-    if !missing.is_empty() {
-        let mut current = app.db.task(&task.id)?;
-        let warning = format!(
-            "Subtitles unavailable for {}. Video download will continue without these subtitles.",
-            missing.join(", ")
-        );
-        if !current.warnings.contains(&warning) {
-            current.warnings.push(warning);
-            app.save_task(&current)?;
-        }
-    }
+    ensure!(
+        missing.is_empty(),
+        "Requirements unmet: subtitles={}. Adjust the subtitle languages or disable subtitles before retrying",
+        missing.join(", ")
+    );
     if selected.is_empty() {
         return Ok(());
     }
@@ -1394,7 +1610,9 @@ impl App {
     ) -> Result<()> {
         let mut task = self.db.task(id)?;
         if task.manifest.is_none() {
-            let permit = tokio::select! {p=self.network.clone().acquire_owned()=>p?,_=cancel.cancelled()=>bail!("Operation interrupted")};
+            let permit = self
+                .task_permit(id, "network", &self.network, cancel)
+                .await?;
             self.set_stage(id, "probing", "probing", None)?;
             let cookies = self.task_cookies(&task)?;
             let runtime_options = self.runtime_options(&task)?;
@@ -1419,9 +1637,14 @@ impl App {
                 self.save_task(&task)?;
             }
             let special = task.kind != "assets" && is_live(&info);
+            task.live = special;
+            self.save_task(&task)?;
             if special {
                 drop(permit);
-                let _capture = tokio::select! {p=self.capture.acquire()=>p?,_=cancel.cancelled()=>bail!("Operation interrupted")};
+                self.set_stage(id, "queued", "waiting_live", None)?;
+                let _capture = self
+                    .task_permit(id, "capture", &self.capture, cancel)
+                    .await?;
                 let manifest = transfer(self, task.clone(), info, cancel).await?;
                 self.freeze_sources(id, manifest)?;
             } else {
@@ -1430,7 +1653,9 @@ impl App {
                 drop(permit);
             }
         }
-        let _processor = tokio::select! {p=self.processor.acquire()=>p?,_=cancel.cancelled()=>bail!("Operation interrupted")};
+        let _processor = self
+            .task_permit(id, "processor", &self.processor, cancel)
+            .await?;
         let mut task = self.db.task(id)?;
         crate::workflow::plan(&mut task);
         self.save_task(&task)?;
@@ -1438,10 +1663,11 @@ impl App {
     }
     fn freeze_sources(&self, id: &str, manifest: SourceManifest) -> Result<()> {
         let mut task = self.db.task(id)?;
-        let file = manifest
-            .directory
-            .parent()
-            .unwrap()
+        let file = self
+            .config
+            .data_dir
+            .join("tasks")
+            .join(id)
             .join("source-manifest.json");
         write_sync(&file, &serde_json::to_vec_pretty(&manifest)?)?;
         task.manifest = Some(manifest);
@@ -1458,6 +1684,37 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_transfer_identity_reuses_only_the_same_source_and_format() -> Result<()> {
+        let info =
+            json!({"extractor_key":"Local","id":"same","duration":10,"modified_timestamp":1});
+        let format = json!({"format_id":"video","url":"https://example.test/video?signature=one","vcodec":"h264","acodec":"none","width":1920,"height":1080,"fps":30,"filesize":1000});
+        let original = transfer_identity(&info, std::slice::from_ref(&format))?;
+        assert_eq!(
+            original,
+            transfer_identity(&info, std::slice::from_ref(&format))?
+        );
+        for (key, value) in [
+            ("url", json!("https://example.test/video?signature=two")),
+            ("format_id", json!("other")),
+            ("filesize", json!(1001)),
+            ("fps", json!(60)),
+        ] {
+            let mut changed = format.clone();
+            changed[key] = value;
+            assert_ne!(
+                original,
+                transfer_identity(&info, &[changed])?,
+                "{key} changed without invalidating partial bytes"
+            );
+        }
+        let mut changed_source = info.clone();
+        changed_source["id"] = json!("new");
+        assert_ne!(original, transfer_identity(&changed_source, &[format])?);
+        assert!(!original.contains("signature"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn live_transfers_start_together_and_preserve_manifest_order() -> Result<()> {
@@ -1998,7 +2255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_subtitles_preserve_the_download_and_persist_a_warning() -> Result<()> {
+    async fn missing_subtitles_require_a_decision_without_changing_the_task() -> Result<()> {
         let root = tempfile::tempdir()?;
         let app = App::open(crate::AppConfig {
             data_dir: root.path().join("data"),
@@ -2010,7 +2267,7 @@ mod tests {
         task.options.subtitle_language = "ja".into();
         app.db.insert_task(&task)?;
         let cookies = Cookies::new(&app, None)?;
-        download_subtitles(
+        let error = download_subtitles(
             &app,
             &task,
             &json!({}),
@@ -2019,16 +2276,16 @@ mod tests {
             &CancellationToken::new(),
             &mut vec![],
         )
-        .await?;
-        let saved = app.db.task(&task.id)?;
-        assert_eq!(saved.warnings.len(), 1);
-        assert_eq!(saved.status, task.status);
+        .await
+        .unwrap_err();
         assert!(
-            saved.public()["warnings"][0]
-                .as_str()
-                .unwrap()
-                .contains("ja")
+            error
+                .to_string()
+                .contains("Requirements unmet: subtitles=ja")
         );
+        let saved = app.db.task(&task.id)?;
+        assert!(saved.warnings.is_empty());
+        assert_eq!(saved.status, task.status);
         app.shutdown().await?;
         Ok(())
     }
@@ -2142,7 +2399,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn exact_plan_retains_all_audio_languages_and_prefers_resolution() {
+    fn exact_plan_retains_all_audio_languages_and_requested_frame_rate() {
         let info = json!({"formats":[{"format_id":"v","height":1080,"fps":30,"vcodec":"avc1","acodec":"none"},{"format_id":"v-low","height":720,"fps":60,"vcodec":"avc1","acodec":"none"},{"format_id":"en-low","language":"en","abr":64,"vcodec":"none","acodec":"aac"},{"format_id":"en","language":"en","abr":128,"vcodec":"none","acodec":"aac"},{"format_id":"zh","language":"zh-Hans","abr":128,"vcodec":"none","acodec":"aac"}]});
         let options = DownloadOptions::parse(json!({"audioTrack":"all","videoFps":"60"})).unwrap();
         let formats = select_formats(&info, &options).unwrap();
@@ -2151,10 +2408,152 @@ mod tests {
                 .iter()
                 .map(|f| text(f, "format_id"))
                 .collect::<Vec<_>>(),
-            vec!["v", "en", "zh"]
+            vec!["v-low", "en", "zh"]
         );
         let options = DownloadOptions::parse(json!({"videoFormatId":"missing"})).unwrap();
         assert!(select_formats(&info, &options).is_err());
+    }
+    #[test]
+    fn explicit_requirements_do_not_silently_fall_back() -> Result<()> {
+        let info = json!({"formats":[
+            {"format_id":"video","height":1080,"width":1920,"fps":30,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"audio","language":"en","vcodec":"none","acodec":"aac"}
+        ]});
+        for options in [
+            json!({"quality":"4k"}),
+            json!({"videoFps":"60"}),
+            json!({"audioTrack":"ja"}),
+            json!({"subtitleLanguage":"ja"}),
+        ] {
+            let options = DownloadOptions::parse(options)?;
+            assert!(
+                select_formats(&info, &options)
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("Requirements unmet:")
+            );
+        }
+        assert_eq!(select_formats(&info, &DownloadOptions::default())?.len(), 2);
+        let portrait = json!({"formats":[
+            {"format_id":"video","height":1920,"width":1080,"fps":59.94,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"audio","language":"zh-CN","vcodec":"none","acodec":"aac"}
+        ], "subtitles":{"zh-Hans":[{}]}});
+        let options = DownloadOptions::parse(
+            json!({"quality":"1080p","videoFps":"60","audioTrack":"zh-Hans","subtitleLanguage":"zh-Hans"}),
+        )?;
+        let selected = select_formats(&portrait, &options)?;
+        assert_eq!(text(&selected[0], "format_id"), "video");
+        assert_eq!(text(&selected[1], "language"), "zh-CN");
+        Ok(())
+    }
+    #[test]
+    fn explicit_quality_matches_displayed_cinematic_and_portrait_tiers() -> Result<()> {
+        for (width, height, expected) in [
+            (3840, 1600, "4k"),
+            (1600, 3840, "4k"),
+            (7680, 3200, "8k"),
+            (1920, 1080, "1080p"),
+        ] {
+            let info = json!({"formats":[{"format_id":"video","width":width,"height":height,"fps":30,"vcodec":"h264","acodec":"aac"}]});
+            let options = DownloadOptions::parse(json!({"quality":expected}))?;
+            assert_eq!(select_formats(&info, &options)?.len(), 1);
+            if expected != "4k" {
+                assert!(
+                    select_formats(&info, &DownloadOptions::parse(json!({"quality":"4k"}))?)
+                        .is_err()
+                );
+            }
+        }
+        let too_narrow = json!({"formats":[{"format_id":"video","width":3840,"height":1599,"vcodec":"h264","acodec":"aac"}]});
+        assert!(
+            select_formats(
+                &too_narrow,
+                &DownloadOptions::parse(json!({"quality":"4k"}))?
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn metadata_retries_only_temporary_failures() {
+        for message in [
+            "HTTP Error 429: Too Many Requests",
+            "HTTP Error 503: Service Unavailable",
+            "Connection timed out",
+            "Connection reset by peer",
+            "getaddrinfo failed",
+        ] {
+            assert!(transient_metadata_error(message), "{message}");
+        }
+        for message in [
+            "HTTP Error 403: Forbidden",
+            "HTTP Error 404",
+            "Fresh cookies are needed",
+            "Requirements unmet: timeout subtitles",
+            "Private video. Sign in",
+            "Unsupported URL",
+        ] {
+            assert!(!transient_metadata_error(message), "{message}");
+        }
+    }
+    #[tokio::test]
+    async fn metadata_process_retries_once_then_succeeds_and_obeys_cancellation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let counter = root.path().join("attempts");
+        #[cfg(windows)]
+        let (executable, args) = {
+            let script = root.path().join("metadata.ps1");
+            std::fs::write(
+                &script,
+                "$count = if (Test-Path -LiteralPath $args[0]) { [int](Get-Content -LiteralPath $args[0]) } else { 0 }; $count++; [IO.File]::WriteAllText($args[0], [string]$count); if ($count -eq 1) { [Console]::Error.WriteLine('ERROR: HTTP Error 429'); exit 1 }; Write-Output '{\"ok\":true}'",
+            )?;
+            (
+                PathBuf::from("powershell.exe"),
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    script.to_string_lossy().into(),
+                    counter.to_string_lossy().into(),
+                ],
+            )
+        };
+        #[cfg(not(windows))]
+        let (executable, args) = {
+            let script = root.path().join("metadata.sh");
+            std::fs::write(
+                &script,
+                "count=0; if [ -f \"$1\" ]; then count=$(cat \"$1\"); fi; count=$((count + 1)); printf %s \"$count\" > \"$1\"; if [ \"$count\" -eq 1 ]; then echo 'ERROR: HTTP Error 429' >&2; exit 1; fi; echo '{\"ok\":true}'",
+            )?;
+            (
+                PathBuf::from("/bin/sh"),
+                vec![
+                    script.to_string_lossy().into(),
+                    counter.to_string_lossy().into(),
+                ],
+            )
+        };
+        let cancel = CancellationToken::new();
+        let output = metadata_process(&app, &executable, &args, &cancel, None).await?;
+        assert!(output.stdout.contains("\"ok\":true"));
+        assert_eq!(std::fs::read_to_string(&counter)?, "2");
+        cancel.cancel();
+        assert!(
+            metadata_process(&app, &executable, &args, &cancel, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(counter)?, "2");
+        app.shutdown().await?;
+        Ok(())
     }
     #[test]
     fn all_audio_tracks_include_combined_sources_without_repeating_the_main_track() {

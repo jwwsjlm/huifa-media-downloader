@@ -38,6 +38,88 @@ fn payload_name(name: &str) -> String {
     }
 }
 
+pub(crate) fn unused_cache(app: &App) -> Result<Vec<PathBuf>> {
+    let root = app.config.data_dir.join("tools");
+    if !root.exists() {
+        return Ok(vec![]);
+    }
+    crate::reject_links(&root)?;
+    let mut kept = std::collections::HashSet::new();
+    for task in app.db.tasks_including_retained()? {
+        kept.extend(
+            task.tools
+                .values()
+                .filter_map(|path| path.parent().map(Path::to_path_buf)),
+        );
+    }
+    let pointer = root.join("current.json");
+    if pointer.exists() {
+        crate::reject_links(&pointer)?;
+        let current: HashMap<String, String> = serde_json::from_slice(&std::fs::read(pointer)?)?;
+        for value in current.values() {
+            let path = root.join(value);
+            crate::reject_links(&path)?;
+            if let Some(parent) = path.parent() {
+                kept.insert(parent.canonicalize()?);
+            }
+        }
+    }
+    let mut removable = Vec::new();
+    let mut objects = std::collections::HashSet::new();
+    let frozen = root.join("frozen");
+    if frozen.exists() {
+        for entry in std::fs::read_dir(&frozen)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type()?.is_dir()
+                || name.len() != 64
+                || !name.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            crate::reject_links(&path)?;
+            if kept.contains(&path.canonicalize()?) {
+                let manifest: BTreeMap<String, String> =
+                    serde_json::from_slice(&std::fs::read(path.join("manifest.json"))?)?;
+                objects.extend(manifest.into_values());
+            } else {
+                removable.push(path);
+            }
+        }
+    }
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let version = ["yt-dlp-", "ffmpeg-", "deno-", "qjs-"]
+            .iter()
+            .find_map(|prefix| name.strip_prefix(prefix));
+        if entry.file_type()?.is_dir()
+            && version.is_some_and(|value| {
+                value.len() == 16 && value.chars().all(|c| c.is_ascii_hexdigit())
+            })
+            && !kept.contains(&entry.path().canonicalize()?)
+        {
+            removable.push(entry.path());
+        }
+    }
+    let object_dir = root.join("objects");
+    if object_dir.exists() {
+        for entry in std::fs::read_dir(object_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type()?.is_dir()
+                && name.len() == 64
+                && name.chars().all(|c| c.is_ascii_hexdigit())
+                && !objects.contains(&name)
+            {
+                removable.push(entry.path());
+            }
+        }
+    }
+    Ok(removable)
+}
+
 fn file_digest(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
@@ -347,13 +429,17 @@ pub(crate) async fn update(app: &App, args: &Value) -> Result<Value> {
     }
 }
 
-fn runtime_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+fn runtime_client(proxy: &str) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .user_agent(concat!("HuifaDownloader/", env!("CARGO_PKG_VERSION")))
         .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?)
+        .timeout(std::time::Duration::from_secs(300));
+    if !proxy.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    }
+    Ok(builder.build()?)
 }
 
 fn asset_name(name: &str, platform: &str) -> Result<&'static str> {
@@ -447,7 +533,7 @@ pub(crate) async fn latest(app: &App, args: &Value) -> Result<Value> {
     let (repository, _) = release_source(name, channel, "")?;
     let platform = target()?;
     let asset = asset_name(name, &platform)?;
-    let client = runtime_client()?;
+    let client = runtime_client(&app.download_proxy()?)?;
     let version = tokio::select! {
         result=latest_version(&client,repository)=>result?,
         _=app.shutdown_token.cancelled()=>bail!("Runtime update check interrupted"),
@@ -556,7 +642,7 @@ async fn update_inner(
     use std::io::Write;
     let platform = target()?;
     let asset_name = asset_name(name, &platform)?;
-    let client = runtime_client()?;
+    let client = runtime_client(&app.download_proxy()?)?;
     let release: Value = if name == "yt-dlp" {
         // Official release checksum assets avoid the unauthenticated GitHub API quota.
         let base = if release_url.ends_with("/latest/download") {
@@ -944,6 +1030,35 @@ pub(crate) fn mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_downloads_use_configured_proxy_connect() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy = format!("http://{}", listener.local_addr()?);
+        let fixture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut bytes = [0; 8192];
+            let size = socket.read(&mut bytes).await?;
+            let request = String::from_utf8_lossy(&bytes[..size]).to_string();
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(request)
+        });
+        assert!(
+            runtime_client(&proxy)?
+                .get("https://runtime-proxy.invalid/tool")
+                .send()
+                .await
+                .is_err()
+        );
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), fixture).await???;
+        assert!(request.starts_with("CONNECT runtime-proxy.invalid:443 HTTP/1.1"));
+        Ok(())
+    }
     #[tokio::test]
     async fn component_cache_reuses_unchanged_bytes_and_freezes_dlls() -> Result<()> {
         let root = tempfile::tempdir()?;

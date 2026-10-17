@@ -348,6 +348,8 @@ impl CredentialStore {
         let key = fs::read(&key_path)?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key)
             .map_err(|_| anyhow::anyhow!("invalid legacy credential key"))?;
+        crate::backup::create(data_dir, "credentials-migration")
+            .context("Could not back up legacy credentials; migration was not started")?;
         for (id, path) in legacy {
             ensure_regular(&path)?;
             ensure!(
@@ -716,6 +718,37 @@ mod tests {
                 .is_some_and(|extension| extension == "enc")
         }));
         assert!(fs::read_to_string(store.path(&id))?.contains("top-secret"));
+        let backup = fs::read_dir(root.path().join("backups"))?
+            .next()
+            .unwrap()?
+            .path();
+        assert_eq!(fs::read(backup.join(".credentials.key"))?, [17u8; 32]);
+        assert!(
+            backup
+                .join("credentials")
+                .join(format!("{id}.enc"))
+                .is_file()
+        );
+        assert!(
+            !backup
+                .join("credentials")
+                .join(format!("{id}.json"))
+                .exists()
+        );
+        let restored = tempfile::tempdir()?;
+        fs::create_dir(restored.path().join("credentials"))?;
+        fs::copy(
+            backup.join(".credentials.key"),
+            restored.path().join(".credentials.key"),
+        )?;
+        fs::copy(
+            backup.join("credentials").join(format!("{id}.enc")),
+            restored
+                .path()
+                .join("credentials")
+                .join(format!("{id}.enc")),
+        )?;
+        assert_eq!(CredentialStore::open(restored.path())?.get(&id)?, COOKIES);
         drop(store);
         assert_eq!(CredentialStore::open(root.path())?.get(&id)?, COOKIES);
         Ok(())

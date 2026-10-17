@@ -74,6 +74,8 @@ pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Resu
     options.content_mode = "video".into();
     task.options = options;
     task.conversion = true;
+    task.destination = None;
+    task.live = false;
     task.source_info = task.media_info.take();
     task.size = None;
     task.transfer_bytes.clear();
@@ -390,6 +392,8 @@ async fn queue_conversion_prepared(
     task.created_at = chrono::Utc::now().to_rfc3339();
     task.options = options;
     task.conversion = true;
+    task.destination = None;
+    task.live = false;
     task.previous_outputs.clear();
     task.steps.clear();
     task.step_index = None;
@@ -524,6 +528,13 @@ pub(crate) async fn process_task(
         .filter(|s| s.kind == "video" || s.kind == "audio")
     {
         let probe = probe_file(app, &task, &source.path, cancel).await?;
+        if task.kind == "media"
+            && !task.live
+            && !crate::download::is_live(&manifest.metadata)
+            && let (Some(expected), Some(actual)) = (manifest.duration, probe_duration(&probe))
+        {
+            verify_duration(actual, expected, "Saved source")?;
+        }
         inputs.push(Input {
             path: source.path.clone(),
             kind: source.kind.clone(),
@@ -532,6 +543,17 @@ pub(crate) async fn process_task(
         });
     }
     ensure!(!inputs.is_empty(), "Source manifest has no media inputs");
+    if !task.conversion
+        && task.options.format_id.is_empty()
+        && task.options.video_format_id.is_empty()
+        && task.options.content_mode != "audio"
+        && let Some(video) = inputs
+            .iter()
+            .flat_map(|input| streams(&input.probe))
+            .find(|stream| text(stream, "codec_type") == "video")
+    {
+        verify_video_requirements(video, &task.options)?;
+    }
     let source_size = manifest
         .files
         .iter()
@@ -1164,6 +1186,13 @@ pub(crate) async fn process_task(
             (final_duration - covered - cover_duration).abs() < 1.5,
             "Processed duration differs from the requested cut"
         );
+    } else {
+        let expected = inputs
+            .iter()
+            .filter_map(|input| probe_duration(&input.probe))
+            .reduce(f64::max)
+            .context("Saved source duration is unavailable")?;
+        verify_duration(final_duration, expected, "Processed output")?;
     }
     let root = app.task_download_directory(&task)?;
     let directory = if task.options.organize_task_folder {
@@ -1178,7 +1207,10 @@ pub(crate) async fn process_task(
             .clone()
             .context("Conversion task has no output path")?
     } else {
-        directory.join(output_filename(&task, extension))
+        task.destination
+            .as_ref()
+            .map(|destination| destination.target.clone())
+            .unwrap_or_else(|| directory.join(output_filename(&task, extension)))
     };
     let mut auxiliary = Vec::new();
     if !task.conversion {
@@ -1563,6 +1595,7 @@ fn make_auxiliary(source: &Path, target: PathBuf, task_id: &str) -> Result<Auxil
         .parent()
         .context("Publication target has no directory")?;
     std::fs::create_dir_all(directory)?;
+    crate::storage::before_publication(&target, std::fs::metadata(source)?.len())?;
     let mut staged = tempfile::Builder::new()
         .prefix(&format!(".huifa-{task_id}-"))
         .suffix(".publish")
@@ -1807,16 +1840,25 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
             destinations.insert(destination),
             "Two generated files have the same publication filename"
         );
+        let approved = if backup.exists() {
+            task.destination
+                .as_ref()
+                .is_some_and(|destination| destination.approves(&entry.target))
+        } else {
+            crate::destination::validate_approval(&task, &entry.target)?
+        };
         ensure!(
             !all_media.iter().any(|media| media.task_id != task.id
-                && (media.path == entry.target || media.assets.contains(&entry.target))),
+                && (media.path == entry.target || media.assets.contains(&entry.target)))
+                || approved,
             "Publication filename belongs to another task"
         );
         let matches =
             entry.target.exists() && hash_file(&entry.target)? == (entry.hash.clone(), entry.size);
         let owned = previous.as_ref().is_some_and(|media| {
             media.path == entry.target || media.assets.contains(&entry.target)
-        }) || task.kind == "assets" && task.previous_outputs.contains(&entry.target);
+        }) || task.kind == "assets" && task.previous_outputs.contains(&entry.target)
+            || approved;
         if matches {
             ensure!(
                 owned || !entry.temporary.exists() || task.status == "completed",
@@ -1862,16 +1904,63 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
             if entry.target.exists()
                 && hash_file(&entry.target)? == (entry.hash.clone(), entry.size)
             {
+                let owned = previous.as_ref().is_some_and(|media| {
+                    media.path == entry.target || media.assets.contains(&entry.target)
+                }) || task.kind == "assets"
+                    && task.previous_outputs.contains(&entry.target)
+                    || crate::destination::validate_approval(&task, &entry.target).unwrap_or(false);
+                ensure!(
+                    owned || !entry.temporary.exists(),
+                    "Publication filename became occupied before installation"
+                );
                 continue;
             }
             if entry.target.exists() {
-                std::fs::rename(&entry.target, backup)?;
+                let approved = crate::destination::validate_approval(&task, &entry.target)?;
+                let owned = previous.as_ref().is_some_and(|media| {
+                    media.path == entry.target || media.assets.contains(&entry.target)
+                }) || task.kind == "assets"
+                    && task.previous_outputs.contains(&entry.target)
+                    || task.conversion
+                        && task.manifest.as_ref().is_some_and(|manifest| {
+                            manifest.files.iter().any(|source| {
+                                source.path == entry.target
+                                    && hash_file(&entry.target).is_ok_and(|value| {
+                                        value == (source.hash.clone(), source.size)
+                                    })
+                            })
+                        });
+                ensure!(
+                    approved || owned,
+                    "Publication filename is already occupied by an unmanaged file"
+                );
+                move_without_replacing(&entry.target, backup)?;
+                if !installed.contains(&index) {
+                    installed.push(index);
+                }
+                if let Some(approval) = task
+                    .destination
+                    .as_ref()
+                    .filter(|destination| destination.confirmed)
+                    .and_then(|destination| {
+                        destination
+                            .occupied
+                            .iter()
+                            .find(|approval| approval.path == entry.target)
+                    })
+                {
+                    ensure!(
+                        approval.hash.as_ref().is_some_and(|hash| hash_file(backup)
+                            .is_ok_and(|(actual, size)| actual == *hash && size == approval.size)),
+                        "Destination changed during replacement; original files were preserved"
+                    );
+                }
             }
             // Record before rename so a failed installation also restores the old file.
             if !installed.contains(&index) {
                 installed.push(index);
             }
-            std::fs::rename(&entry.temporary, &entry.target)?;
+            move_without_replacing(&entry.temporary, &entry.target)?;
         }
         sync_directory(publication.target.parent().unwrap())?;
         app.set_stage(&task.id, "processing", "validating_publication", None)?;
@@ -1967,6 +2056,16 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
         }
     };
     app.emit("media.upsert", media.public());
+    if let Some(destination) = &task.destination {
+        for old in &all_media {
+            if destination.replaced_tasks().contains(&old.task_id) && old.task_id != task.id {
+                app.emit("media.remove", json!({"id":old.id}));
+                if let Ok(previous) = app.db.task(&old.task_id) {
+                    app.emit("task.upsert", previous.public());
+                }
+            }
+        }
+    }
     finish_publication(app, task, &all_media)
 }
 
@@ -1996,6 +2095,18 @@ fn finish_publication(app: &App, mut task: Task, all_media: &[Media]) -> Result<
         }
     }
     let backups_cleaned = cleanup_backups(&backups);
+    let mut staged_cleaned = true;
+    for entry in &entries {
+        if entry.temporary.exists() {
+            if hash_file(&entry.temporary)
+                .is_ok_and(|value| value == (entry.hash.clone(), entry.size))
+            {
+                staged_cleaned &= std::fs::remove_file(&entry.temporary).is_ok();
+            } else {
+                staged_cleaned = false;
+            }
+        }
+    }
     let current = if task.kind == "assets" {
         entries
             .iter()
@@ -2013,11 +2124,37 @@ fn finish_publication(app: &App, mut task: Task, all_media: &[Media]) -> Result<
     let warning =
         "Some previous output files could not be removed; they were preserved for a later cleanup.";
     task.warnings.retain(|value| value != warning);
-    if !backups_cleaned || !task.previous_outputs.is_empty() {
+    if !backups_cleaned || !staged_cleaned || !task.previous_outputs.is_empty() {
         task.warnings.push(warning.into());
     }
     task.stage("completed", "completed", Some(100.0));
+    if let Err(error) = crate::destination::finish_replacement(app, &task, &current) {
+        task.warnings.push(format!(
+            "Previous result cleanup did not finish: {}",
+            crate::process::redact(&format!("{error:#}"))
+        ));
+    }
+    if let Err(error) = crate::storage::clean_completed(app, &task) {
+        task.warnings.push(format!(
+            "Completed cache cleanup did not finish: {}",
+            crate::process::redact(&format!("{error:#}"))
+        ));
+    }
     app.save_task(&task)
+}
+
+fn move_without_replacing(source: &Path, target: &Path) -> Result<()> {
+    if let Err(error) =
+        tempfile::TempPath::try_from_path(source.to_path_buf())?.persist_noclobber(target)
+    {
+        let cause = error.error;
+        error
+            .path
+            .keep()
+            .context("Cannot preserve the prepared publication file")?;
+        return Err(cause.into());
+    }
+    Ok(())
 }
 
 fn rollback_publication(
@@ -2025,23 +2162,31 @@ fn rollback_publication(
     backups: &[PathBuf],
     installed: &[usize],
 ) -> Result<()> {
+    let mut failures = Vec::new();
     for index in installed.iter().rev().copied() {
         let entry = &entries[index];
-        if entry.target.exists() {
-            ensure!(
-                hash_file(&entry.target)? == (entry.hash.clone(), entry.size),
-                "Published file changed; original backup was preserved"
-            );
-            if entry.temporary.exists() {
-                std::fs::remove_file(&entry.target)?;
-            } else {
-                std::fs::rename(&entry.target, &entry.temporary)?;
+        let result = (|| -> Result<()> {
+            if entry.target.exists() {
+                ensure!(
+                    !entry.temporary.exists(),
+                    "Publication destination appeared before installation; target, prepared file and backup were preserved"
+                );
+                ensure!(
+                    hash_file(&entry.target)? == (entry.hash.clone(), entry.size),
+                    "Published file changed; original backup was preserved"
+                );
+                move_without_replacing(&entry.target, &entry.temporary)?;
             }
-        }
-        if backups[index].exists() {
-            std::fs::rename(&backups[index], &entry.target)?;
+            if backups[index].exists() {
+                move_without_replacing(&backups[index], &entry.target)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            failures.push(error.to_string());
         }
     }
+    ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
@@ -2097,6 +2242,42 @@ fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         let _ = path;
+    }
+    Ok(())
+}
+
+fn verify_duration(actual: f64, expected: f64, label: &str) -> Result<()> {
+    ensure!(
+        actual.is_finite() && actual > 0.0 && expected.is_finite() && expected > 0.0,
+        "{label} has no valid duration"
+    );
+    let tolerance = (expected * 0.01).clamp(1.5, 10.0);
+    ensure!(
+        (actual - expected).abs() <= tolerance,
+        "{label} duration differs from the expected media ({actual:.2}s versus {expected:.2}s); saved sources were preserved for retry"
+    );
+    Ok(())
+}
+
+fn verify_video_requirements(video: &Value, options: &DownloadOptions) -> Result<()> {
+    if let Some(height) = options.max_height() {
+        let width = video["width"].as_u64().unwrap_or(0);
+        let actual_height = video["height"].as_u64().unwrap_or(0);
+        ensure!(
+            width > 0
+                && actual_height > 0
+                && crate::download::resolution_tier(video) == height as f64,
+            "Requirements unmet: actual saved resolution does not match {}; saved sources were preserved",
+            options.quality
+        );
+    }
+    if let Ok(fps) = options.video_fps.parse::<f64>() {
+        let actual = parse_fraction(text(video, "avg_frame_rate"))
+            .or_else(|| parse_fraction(text(video, "r_frame_rate")));
+        ensure!(
+            actual.is_some_and(|actual| actual.round() == fps),
+            "Requirements unmet: actual saved frame rate does not match {fps}; saved sources were preserved"
+        );
     }
     Ok(())
 }
@@ -2651,17 +2832,21 @@ fn bounded_filename(value: &str) -> String {
     value
 }
 
-fn output_filename(task: &Task, extension: &str) -> String {
-    let title = sanitize_filename(&task.title)
-        .chars()
-        .take(80)
-        .collect::<String>();
+pub(crate) fn output_filename(task: &Task, extension: &str) -> String {
     let source_id = task
         .manifest
         .as_ref()
         .map(|m| text(&m.metadata, "id"))
         .filter(|v| !v.is_empty())
         .unwrap_or("video");
+    filename_with_id(task, extension, source_id)
+}
+
+pub(crate) fn filename_with_id(task: &Task, extension: &str, source_id: &str) -> String {
+    let title = sanitize_filename(&task.title)
+        .chars()
+        .take(80)
+        .collect::<String>();
     let suffix_bytes = task
         .options
         .filename_template
@@ -2765,6 +2950,114 @@ fn srt_time(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_never_replaces_a_concurrent_file_even_with_identical_bytes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("video.mp4");
+        let temporary = root.path().join(".video.publish");
+        let backup = root.path().join(".video.backup");
+        std::fs::write(&target, b"new output")?;
+        std::fs::write(&temporary, b"new output")?;
+        std::fs::write(&backup, b"old output")?;
+        let (hash, size) = hash_file(&temporary)?;
+        let entry = AuxiliaryPublication {
+            target: target.clone(),
+            temporary: temporary.clone(),
+            hash,
+            size,
+        };
+        assert!(move_without_replacing(&temporary, &target).is_err());
+        assert!(
+            rollback_publication(
+                std::slice::from_ref(&entry),
+                std::slice::from_ref(&backup),
+                &[0]
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&target)?, b"new output");
+        assert_eq!(std::fs::read(&temporary)?, b"new output");
+        assert_eq!(std::fs::read(&backup)?, b"old output");
+        assert!(move_without_replacing(&backup, &target).is_err());
+        assert_eq!(std::fs::read(&backup)?, b"old output");
+
+        let installed = AuxiliaryPublication {
+            target: root.path().join("subtitle.srt"),
+            temporary: root.path().join(".subtitle.publish"),
+            hash: entry.hash.clone(),
+            size: entry.size,
+        };
+        let old_subtitle = root.path().join(".subtitle.backup");
+        std::fs::write(&installed.target, b"new output")?;
+        std::fs::write(&old_subtitle, b"old subtitle")?;
+        assert!(
+            rollback_publication(
+                &[installed.clone(), entry],
+                &[old_subtitle.clone(), backup],
+                &[0, 1]
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&installed.target)?, b"old subtitle");
+        assert_eq!(std::fs::read(&installed.temporary)?, b"new output");
+        Ok(())
+    }
+
+    #[test]
+    fn saved_stream_properties_must_match_explicit_requirements() -> Result<()> {
+        let options = DownloadOptions::parse(json!({"quality":"1080p","videoFps":"60"}))?;
+        assert!(
+            verify_video_requirements(
+                &json!({"width":1920,"height":1080,"avg_frame_rate":"60000/1001"}),
+                &options
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_video_requirements(
+                &json!({"width":1920,"height":1080,"avg_frame_rate":"30/1"}),
+                &options
+            )
+            .is_err()
+        );
+        assert!(
+            verify_video_requirements(
+                &json!({"width":1280,"height":720,"avg_frame_rate":"60/1"}),
+                &options
+            )
+            .is_err()
+        );
+        let cinematic = DownloadOptions::parse(json!({"quality":"4k","videoFps":"60"}))?;
+        for (width, height) in [(3840, 1600), (1600, 3840), (3840, 2160)] {
+            assert!(
+                verify_video_requirements(
+                    &json!({"width":width,"height":height,"avg_frame_rate":"60000/1001"}),
+                    &cinematic
+                )
+                .is_ok()
+            );
+        }
+        for (width, height) in [(1920, 1080), (3840, 1599), (0, 2160), (7680, 3200)] {
+            assert!(
+                verify_video_requirements(
+                    &json!({"width":width,"height":height,"avg_frame_rate":"60/1"}),
+                    &cinematic
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_outputs_reject_truncation_with_bounded_timestamp_tolerance() {
+        assert!(verify_duration(59.94, 60.0, "fixture").is_ok());
+        assert!(verify_duration(3595.0, 3600.0, "fixture").is_ok());
+        assert!(verify_duration(20.0, 60.0, "fixture").is_err());
+        assert!(verify_duration(3500.0, 3600.0, "fixture").is_err());
+        assert!(verify_duration(f64::NAN, 60.0, "fixture").is_err());
+    }
 
     #[test]
     fn legacy_publication_backup_names_remain_unchanged() {

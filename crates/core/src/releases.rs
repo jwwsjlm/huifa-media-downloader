@@ -2,16 +2,24 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-pub(crate) async fn status() -> Result<Value> {
-    status_for(env!("CARGO_PKG_VERSION")).await
+pub(crate) async fn status(app: &crate::App) -> Result<Value> {
+    status_for(env!("CARGO_PKG_VERSION"), &app.download_proxy()?).await
 }
 
-async fn status_for(current: &str) -> Result<Value> {
-    let client = reqwest::Client::builder()
+fn client(proxy: &str) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(12))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("HuifaDownloader/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+        .user_agent(concat!("HuifaDownloader/", env!("CARGO_PKG_VERSION")));
+    if !proxy.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    }
+    Ok(builder.build()?)
+}
+
+async fn status_for(current: &str, proxy: &str) -> Result<Value> {
+    let client = client(proxy)?;
     check(
         &client,
         current,
@@ -116,6 +124,41 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn release_check_uses_the_configured_proxy() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy = format!("http://{}", listener.local_addr()?);
+        let fixture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buffer = [0u8; 8192];
+            let count = socket.read(&mut buffer).await?;
+            let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+            let body = r#"{"tag_name":"v99.0.0","html_url":"https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v99.0.0"}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(request)
+        });
+        let value = check(
+            &client(&proxy)?,
+            "0.4.2",
+            "http://release-proxy.invalid/api",
+            "http://release-proxy.invalid/latest",
+        )
+        .await?;
+        assert_eq!(value["latestVersion"], "99.0.0");
+        let request = tokio::time::timeout(Duration::from_secs(5), fixture).await???;
+        assert!(request.starts_with("GET http://release-proxy.invalid/api HTTP/1.1"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rate_limited_api_uses_official_release_redirect() -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -201,13 +244,13 @@ mod tests {
         if std::env::var("HUIFA_TEST_RELEASE").as_deref() != Ok("1") {
             return Ok(());
         }
-        let previous = status_for("0.4.0").await?;
+        let previous = status_for("0.4.0", "").await?;
         println!("Previous version check: {previous}");
         ensure!(
             previous["updateAvailable"] == true,
             "Previous release did not detect the update"
         );
-        let current = status().await?;
+        let current = status_for(env!("CARGO_PKG_VERSION"), "").await?;
         println!("Current version check: {current}");
         ensure!(
             current["latestVersion"] == previous["latestVersion"],

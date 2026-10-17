@@ -2,10 +2,12 @@
 mod acceptance;
 pub mod access;
 mod assets;
+pub mod backup;
 pub mod browser;
 mod cover;
 mod credentials;
 mod db;
+mod destination;
 mod download;
 mod download_directory;
 pub(crate) mod model;
@@ -15,6 +17,7 @@ pub mod process;
 mod processing;
 pub mod releases;
 pub mod research;
+mod storage;
 mod task_logs;
 mod thumbnail;
 mod tools;
@@ -41,7 +44,22 @@ use tokio_util::sync::CancellationToken;
 
 struct Runtime {
     cancel: CancellationToken,
+    finish_capture: CancellationToken,
     handle: JoinHandle<()>,
+}
+
+struct ProbeQuery<'a> {
+    app: &'a App,
+    id: Option<String>,
+    token: CancellationToken,
+}
+impl Drop for ProbeQuery<'_> {
+    fn drop(&mut self) {
+        self.token.cancel();
+        if let Some(id) = &self.id {
+            self.app.request_queries.lock().unwrap().remove(id);
+        }
+    }
 }
 
 pub struct App {
@@ -67,12 +85,16 @@ pub struct App {
     task_log_lock: Arc<Mutex<()>>,
     active_commands: AtomicUsize,
     commands_done: Notify,
+    queue_changed: Notify,
+    queued_slots: Mutex<HashMap<&'static str, Vec<String>>>,
+    request_queries: Mutex<HashMap<String, CancellationToken>>,
 }
 
 impl App {
     pub async fn open(mut config: AppConfig) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&config.data_dir)?;
         config.data_dir = config.data_dir.canonicalize()?;
+        backup::before_upgrade(&config.data_dir)?;
         let saved_download_directory = config
             .data_dir
             .join(download_directory::FILE_NAME)
@@ -119,6 +141,9 @@ impl App {
             task_log_lock: Default::default(),
             active_commands: AtomicUsize::new(0),
             commands_done: Notify::new(),
+            queue_changed: Notify::new(),
+            queued_slots: Default::default(),
+            request_queries: Default::default(),
         });
         app.myself.set(Arc::downgrade(&app)).unwrap();
         let mut settings = app.db.settings()?;
@@ -126,7 +151,14 @@ impl App {
             settings["downloadOptions"]["filenameTemplate"] = json!("%(title)s.%(ext)s");
             app.db.save_settings(&settings)?;
         }
-        for mut task in app.db.tasks_including_retained()? {
+        let mut restored_tasks = app.db.tasks_including_retained()?;
+        restored_tasks.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+        });
+        for mut task in restored_tasks {
             let mut changed = false;
             if task.download_dir.is_none() {
                 task.download_dir = Some(app.config.download_dir.clone());
@@ -259,6 +291,95 @@ impl App {
         }
         Ok(options)
     }
+    fn probe_query(&self, args: &Value) -> Result<ProbeQuery<'_>> {
+        let token = self.shutdown_token.child_token();
+        let id = match args.get("requestId") {
+            Some(value) => {
+                let id = value.as_str().context("requestId must be a string")?;
+                ensure!(!id.is_empty() && id.len() <= 128, "Invalid requestId");
+                let mut queries = self.request_queries.lock().unwrap();
+                ensure!(queries.len() < 64, "Too many active metadata requests");
+                ensure!(
+                    !queries.contains_key(id),
+                    "Metadata requestId is already active"
+                );
+                queries.insert(id.into(), token.clone());
+                Some(id.into())
+            }
+            None => None,
+        };
+        Ok(ProbeQuery {
+            app: self,
+            id,
+            token,
+        })
+    }
+    pub(crate) async fn task_permit(
+        &self,
+        id: &str,
+        slot: &'static str,
+        semaphore: &Arc<Semaphore>,
+        cancel: &CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.queued_slots
+            .lock()
+            .unwrap()
+            .entry(slot)
+            .or_default()
+            .push(id.into());
+        self.queue_changed.notify_waiters();
+        let result = loop {
+            let changed = self.queue_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let first = self
+                .queued_slots
+                .lock()
+                .unwrap()
+                .get(slot)
+                .and_then(|queue| {
+                    queue
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(index, id)| {
+                            (
+                                self.db.task(id).map_or(0, |task| task.priority),
+                                std::cmp::Reverse(*index),
+                            )
+                        })
+                        .map(|(_, id)| id.clone())
+                });
+            if first.as_deref() == Some(id) {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break Err(anyhow::anyhow!("Operation interrupted")),
+                    _ = &mut changed => {},
+                    permit = semaphore.clone().acquire_owned() => break permit.map_err(Into::into),
+                }
+            } else {
+                tokio::select! {
+                    _ = cancel.cancelled() => break Err(anyhow::anyhow!("Operation interrupted")),
+                    _ = &mut changed => {},
+                }
+            }
+        };
+        self.queued_slots
+            .lock()
+            .unwrap()
+            .entry(slot)
+            .or_default()
+            .retain(|queued| queued != id);
+        self.queue_changed.notify_waiters();
+        result
+    }
+    pub(crate) fn finish_capture_token(&self, id: &str) -> Result<CancellationToken> {
+        self.runners
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|runtime| runtime.finish_capture.clone())
+            .context("Live capture is no longer running")
+    }
     fn schedule(&self, id: &str) -> Result<()> {
         ensure!(
             !self.closing.load(Ordering::Acquire),
@@ -274,6 +395,7 @@ impl App {
             .and_then(Weak::upgrade)
             .context("Application is closed")?;
         let cancel = self.shutdown_token.child_token();
+        let finish_capture = CancellationToken::new();
         let running_cancel = cancel.clone();
         let task_id = id.to_string();
         let handle = tokio::spawn(async move {
@@ -295,7 +417,14 @@ impl App {
                 let _ = app.save_task(&task);
             }
         });
-        runners.insert(id.into(), Runtime { cancel, handle });
+        runners.insert(
+            id.into(),
+            Runtime {
+                cancel,
+                finish_capture,
+                handle,
+            },
+        );
         Ok(())
     }
     async fn stop_task(&self, id: &str, status: &str) -> Result<()> {
@@ -316,6 +445,7 @@ impl App {
     async fn delete_task(&self, id: &str, delete_files: bool) -> Result<()> {
         self.stop_task(id, "cancelled").await?;
         processing::prepare_task_deletion(self, id).await?;
+        let _publication = self.publication_lock.lock().await;
         let task = self.db.task(id)?;
         let media = if delete_files {
             self.db.media_for_task(id)?
@@ -338,7 +468,11 @@ impl App {
                 }
             }
             for path in &task.previous_outputs {
-                self.remove_owned(path)?;
+                if !self.db.media()?.iter().any(|media| {
+                    media.task_id != id && (media.path == *path || media.assets.contains(path))
+                }) {
+                    self.remove_owned(path)?;
+                }
             }
             if !task.options.processing_temp_dir.is_empty() {
                 remove_task_directory(&processing::workspace(self, &task))?;
@@ -390,11 +524,79 @@ impl App {
         self.schedule(id)?;
         Ok(task.public())
     }
+    async fn retry_current(&self, id: &str, overrides: Option<&Value>) -> Result<Value> {
+        let mut task = self.db.task(id)?;
+        ensure!(
+            matches!(
+                task.status.as_str(),
+                "failed" | "processing_failed" | "paused" | "cancelled"
+            ),
+            "Only stopped tasks can use current settings"
+        );
+        ensure!(
+            task.kind == "media" && !task.conversion,
+            "Use the original processing plan for local conversions and asset tasks"
+        );
+        let settings = self.public_settings()?;
+        let mut options = DownloadOptions::parse(overrides.cloned().unwrap_or_else(|| {
+            settings["downloadOptions"]
+                .as_object()
+                .map(|v| Value::Object(v.clone()))
+                .unwrap_or(json!({}))
+        }))?;
+        options.proxy = self
+            .credentials
+            .secret("downloadProxy")?
+            .unwrap_or_default();
+        let cookies = self.credential_snapshot(&options, &task.url)?;
+        let tools = self.freeze_tools().await?;
+        self.stop_task(id, "cancelled").await?;
+        processing::prepare_redownload(self, &task).await?;
+        task = self.db.task(id)?;
+        for key in [&task.cookie_snapshot, &task.proxy_snapshot]
+            .into_iter()
+            .flatten()
+        {
+            self.credentials.delete_secret(key)?;
+        }
+        task.cookie_snapshot = if let Some(cookie) = cookies {
+            let key = format!("task-cookie:{id}");
+            self.credentials.put_secret(&key, &cookie)?;
+            Some(key)
+        } else {
+            None
+        };
+        task.proxy_snapshot = if options.proxy.is_empty() {
+            None
+        } else {
+            let key = format!("task-proxy:{id}");
+            self.credentials.put_secret(&key, &options.proxy)?;
+            Some(key)
+        };
+        options.proxy.clear();
+        task.options = options;
+        task.download_dir = Some(self.download_directory());
+        task.tools = tools;
+        task.manifest = None;
+        task.publication = None;
+        task.destination = None;
+        task.steps.clear();
+        task.step_index = None;
+        task.error = None;
+        task.warnings.clear();
+        task.stage("queued", "queued", None);
+        self.save_task(&task)?;
+        self.schedule(id)?;
+        Ok(task.public())
+    }
     pub async fn command(&self, command: &str, args: Value) -> Result<Value> {
         let _active = CommandGuard::begin(self)?;
         match command {
             "tasks.get" => Ok(self.db.task(required_id(&args)?)?.public()),
             "tasks.logs" => self.task_logs(required_id(&args)?, &args),
+            "tasks.destination" => destination::resolve(self, required_id(&args)?, &args).await,
+            "storage.status" => storage::status(self),
+            "storage.cleanup" => storage::cleanup(self).await,
             "tasks.info" => processing::task_info(self, required_id(&args)?)
                 .await
                 .map_err(|reason| anyhow::anyhow!(self.research_error(&format!("{reason:#}")))),
@@ -435,8 +637,14 @@ impl App {
                     let mut expanded = Vec::new();
                     for url in validated {
                         let cookies = self.credential_snapshot(&options, &url)?;
-                        let collection =
-                            download::collection(self, &url, &options, cookies.as_deref()).await?;
+                        let collection = download::collection(
+                            self,
+                            &url,
+                            &options,
+                            cookies.as_deref(),
+                            &self.shutdown_token,
+                        )
+                        .await?;
                         for entry in collection["entries"]
                             .as_array()
                             .context("Collection has no entries")?
@@ -574,6 +782,9 @@ impl App {
                         proxy_snapshot,
                         manifest: None,
                         publication: None,
+                        destination: None,
+                        priority: 0,
+                        live: false,
                         conversion: false,
                         tools: frozen_tools.as_ref().unwrap().clone(),
                     };
@@ -615,6 +826,43 @@ impl App {
                 let _adding = self.task_add_lock.lock().await;
                 self.resume(required_id(&args)?, command == "tasks.retry")
                     .await
+            }
+            "tasks.retryCurrent" => {
+                let _adding = self.task_add_lock.lock().await;
+                self.retry_current(required_id(&args)?, args.get("options"))
+                    .await
+            }
+            "tasks.prioritize" => {
+                let _adding = self.task_add_lock.lock().await;
+                let mut task = self.db.task(required_id(&args)?)?;
+                ensure!(
+                    matches!(
+                        task.status.as_str(),
+                        "queued" | "waiting_processing" | "paused"
+                    ) || task.stage == "waiting_live",
+                    "Only waiting tasks can be prioritized"
+                );
+                task.priority = self
+                    .db
+                    .tasks()?
+                    .iter()
+                    .map(|task| task.priority)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .context("Queue priority limit reached")?;
+                self.save_task(&task)?;
+                self.queue_changed.notify_waiters();
+                Ok(task.public())
+            }
+            "tasks.finishLive" => {
+                let task = self.db.task(required_id(&args)?)?;
+                ensure!(
+                    task.live && task.status == "downloading",
+                    "Only an active live capture can be stopped and saved"
+                );
+                self.finish_capture_token(&task.id)?.cancel();
+                Ok(task.public())
             }
             "tasks.pauseAll" => {
                 let _adding = self.task_add_lock.lock().await;
@@ -721,11 +969,21 @@ impl App {
                         .unwrap_or_default();
                 }
                 let cookies = self.credential_snapshot(&options, url)?;
+                let query = self.probe_query(&args)?;
                 if command == "probe.video" {
-                    download::public_probe(self, url, &options, cookies.as_deref()).await
+                    download::public_probe(self, url, &options, cookies.as_deref(), &query.token)
+                        .await
                 } else {
-                    download::collection(self, url, &options, cookies.as_deref()).await
+                    download::collection(self, url, &options, cookies.as_deref(), &query.token)
+                        .await
                 }
+            }
+            "probe.cancel" => {
+                let id = required_id(&args)?;
+                if let Some(token) = self.request_queries.lock().unwrap().get(id) {
+                    token.cancel();
+                }
+                Ok(json!(true))
             }
             "settings.save" => self.save_settings(args["settings"].clone()),
             "settings.preferences" => {
@@ -764,7 +1022,7 @@ impl App {
             }
             "tools.update" => tools::update(self, &args).await,
             "tools.latest" => tools::latest(self, &args).await,
-            "app.release_status" => releases::status().await,
+            "app.release_status" => releases::status(self).await,
             "cookies.import" => {
                 let value = self
                     .credentials
@@ -1687,10 +1945,14 @@ mod tests {
                 running_cancel.cancelled().await;
                 did_stop.store(true, Ordering::Release);
             });
-            app.runners
-                .lock()
-                .unwrap()
-                .insert(active.id.clone(), Runtime { cancel, handle });
+            app.runners.lock().unwrap().insert(
+                active.id.clone(),
+                Runtime {
+                    cancel,
+                    finish_capture: CancellationToken::new(),
+                    handle,
+                },
+            );
 
             let mut completed = paused_task(HashMap::new());
             completed.stage("completed", "completed", Some(100.0));
@@ -1795,9 +2057,85 @@ mod tests {
             proxy_snapshot: None,
             manifest: None,
             publication: None,
+            destination: None,
+            priority: 0,
+            live: false,
             conversion: false,
             tools,
         }
+    }
+
+    #[tokio::test]
+    async fn deleting_old_task_waits_for_publication_and_preserves_replacement() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let target = app.download_directory().join("same.mp4");
+        std::fs::write(&target, b"original")?;
+        let mut old = paused_task(Default::default());
+        old.stage("completed", "completed", Some(100.0));
+        old.output_path = Some(target.clone());
+        app.db.insert_task(&old)?;
+        let media = model::Media {
+            id: "original-media".into(),
+            task_id: old.id.clone(),
+            title: old.title.clone(),
+            filename: "same.mp4".into(),
+            size: 8,
+            duration: 1.0,
+            path: target.clone(),
+            assets: vec![],
+            media_info: None,
+        };
+        app.db.complete(&old, &media)?;
+        let mut next = paused_task(Default::default());
+        next.stage("completed", "completed", Some(100.0));
+        next.output_path = Some(target.clone());
+        next.destination = Some(destination::Destination {
+            target: target.clone(),
+            confirmed: true,
+            occupied: vec![destination::Occupied {
+                path: target.clone(),
+                hash: Some(download::hash_file(&target)?.0),
+                size: 8,
+                owners: vec![old.id.clone()],
+            }],
+        });
+        app.db.insert_task(&next)?;
+        let gate = app.publication_lock.lock().await;
+        let deleting = app.delete_task(&old.id, true);
+        tokio::pin!(deleting);
+        assert!(futures_util::poll!(&mut deleting).is_pending());
+        let replacing = async {
+            let _publication = app.publication_lock.lock().await;
+            assert!(app.db.task(&old.id).is_ok());
+            std::fs::write(&target, b"replacement")?;
+            app.db.complete(
+                &next,
+                &model::Media {
+                    id: "replacement-media".into(),
+                    task_id: next.id.clone(),
+                    size: 11,
+                    ..media.clone()
+                },
+            )?;
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::pin!(replacing);
+        assert!(futures_util::poll!(&mut replacing).is_pending());
+        drop(gate);
+        let (deleted, replaced) = tokio::join!(deleting, replacing);
+        deleted?;
+        replaced?;
+        assert!(app.db.task(&old.id).is_err());
+        assert!(app.db.media_for_task(&next.id)?.is_some());
+        assert_eq!(std::fs::read(&target)?, b"replacement");
+        app.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2217,6 +2555,211 @@ mod tests {
             }
         })
         .await??;
+        app.shutdown().await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn priority_changes_real_wait_order_and_survives_restart() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let mut first = tests::paused_task(Default::default());
+        let mut second = tests::paused_task(Default::default());
+        first.status = "queued".into();
+        second.status = "queued".into();
+        app.db.insert_task(&first)?;
+        app.db.insert_task(&second)?;
+        let slots = Arc::new(Semaphore::new(0));
+        let cancel = CancellationToken::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let mut handles = vec![];
+        for task in [&first, &second] {
+            let (runner_app, slots, cancel, sender, id) = (
+                app.clone(),
+                slots.clone(),
+                cancel.clone(),
+                sender.clone(),
+                task.id.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                if let Ok(permit) = runner_app.task_permit(&id, "test", &slots, &cancel).await {
+                    let _ = sender.send((id, permit)).await;
+                }
+            }));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while app
+                    .queued_slots
+                    .lock()
+                    .unwrap()
+                    .get("test")
+                    .map_or(0, Vec::len)
+                    < handles.len()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        }
+        app.command("tasks.prioritize", json!({"id":second.id}))
+            .await?;
+        slots.add_permits(1);
+        let (id, permit) = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await?
+            .context("No queued task started")?;
+        assert_eq!(id, second.id);
+        cancel.cancel();
+        drop(permit);
+        for handle in handles {
+            handle.await?;
+        }
+        first.status = "paused".into();
+        second = app.db.task(&second.id)?;
+        second.status = "paused".into();
+        app.db.save_task(&first)?;
+        app.db.save_task(&second)?;
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        assert!(app.db.task(&second.id)?.priority > app.db.task(&first.id)?.priority);
+        let mut legacy = serde_json::to_value(&first)?;
+        for field in ["priority", "live", "destination"] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let legacy: Task = serde_json::from_value(legacy)?;
+        assert_eq!(legacy.priority, 0);
+        assert!(!legacy.live);
+        assert!(legacy.destination.is_none());
+        first.status = "queued".into();
+        second.status = "queued".into();
+        app.db.save_task(&first)?;
+        app.db.save_task(&second)?;
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut events = app.subscribe();
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await?;
+                if event.kind == "task.upsert" && event.data["status"] == "probing" {
+                    return Ok::<_, anyhow::Error>(event.data["id"].clone());
+                }
+            }
+        })
+        .await??;
+        assert_eq!(
+            started, second.id,
+            "Restart did not restore queue priority before starting tasks"
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_retry_refreshes_snapshots_and_retains_partial_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let tools = root.path().join("tools");
+        std::fs::create_dir(&tools)?;
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "qjs"] {
+            std::fs::write(
+                tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+                name,
+            )?;
+        }
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: Some(tools),
+        })
+        .await?;
+        let _blocked = app.network.clone().acquire_many_owned(3).await?;
+        let mut task = tests::paused_task(app.freeze_tools().await?);
+        task.url = "https://example.test/video?p=2&signature=keep-original".into();
+        task.cookie_snapshot = Some(format!("task-cookie:{}", task.id));
+        task.proxy_snapshot = Some(format!("task-proxy:{}", task.id));
+        app.credentials
+            .put_secret(task.cookie_snapshot.as_ref().unwrap(), "old cookie")?;
+        app.credentials
+            .put_secret(task.proxy_snapshot.as_ref().unwrap(), "http://127.0.0.1:1")?;
+        app.db.insert_task(&task)?;
+        let partial = app
+            .config
+            .data_dir
+            .join("tasks")
+            .join(&task.id)
+            .join("sources/previous/source-0.mp4.part");
+        std::fs::create_dir_all(partial.parent().unwrap())?;
+        std::fs::write(&partial, b"resume bytes")?;
+        app.save_settings(json!({"downloadOptions":{"quality":"720p","proxy":"http://127.0.0.1:8123","cookieId":"none"}}))?;
+        app.command("tasks.retryCurrent", json!({"id":task.id}))
+            .await?;
+        let current = app.db.task(&task.id)?;
+        assert_eq!(current.options.quality, "720p");
+        assert!(current.cookie_snapshot.is_none());
+        assert_eq!(
+            app.runtime_options(&current)?.proxy,
+            "http://127.0.0.1:8123"
+        );
+        assert_eq!(std::fs::read(&partial)?, b"resume bytes");
+        assert!(current.tools.contains_key("yt-dlp"));
+        app.stop_task(&task.id, "paused").await?;
+        let previous_directory = app.download_directory();
+        let next_directory = root.path().join("next-downloads");
+        std::fs::create_dir(&next_directory)?;
+        app.set_download_directory(&next_directory)?;
+        app.command(
+            "tasks.retryCurrent",
+            json!({"id":task.id,"options":{"quality":"1080p"}}),
+        )
+        .await?;
+        let overridden = app.db.task(&task.id)?;
+        assert_eq!(overridden.url, task.url);
+        assert_eq!(overridden.options.quality, "1080p");
+        assert_ne!(previous_directory, app.download_directory());
+        assert_eq!(overridden.download_dir, Some(app.download_directory()));
+        assert_eq!(
+            app.runtime_options(&overridden)?.proxy,
+            "http://127.0.0.1:8123"
+        );
+        assert_eq!(std::fs::read(&partial)?, b"resume bytes");
+        app.stop_task(&task.id, "paused").await?;
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_query_cancel_is_scoped_and_releases_registration() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let first = app.probe_query(&json!({"requestId":"first"}))?;
+        let second = app.probe_query(&json!({"requestId":"second"}))?;
+        assert!(app.probe_query(&json!({"requestId":"first"})).is_err());
+        app.command("probe.cancel", json!({"id":"first"})).await?;
+        assert!(first.token.is_cancelled());
+        assert!(!second.token.is_cancelled());
+        drop(first);
+        assert!(app.probe_query(&json!({"requestId":"first"})).is_ok());
+        drop(second);
         app.shutdown().await?;
         Ok(())
     }

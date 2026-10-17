@@ -279,6 +279,7 @@ fn writes(name: &str) -> bool {
         "start_download"
             | "start_batch_download"
             | "control_download"
+            | "resolve_download_filename"
             | "convert_media"
             | "retry_processing"
             | "start_collection_download"
@@ -287,7 +288,17 @@ fn writes(name: &str) -> bool {
 }
 fn classify_error(message: &str) -> (&'static str, &'static str) {
     let lower = message.to_lowercase();
-    if lower.contains("429") || lower.contains("rate limit") {
+    if lower.contains("requirements unmet:") {
+        (
+            "requirements_unmet",
+            "The selected quality, frame rate, audio or subtitles are unavailable. Ask the user whether to adjust the requirements before restarting.",
+        )
+    } else if lower.contains("destination conflict:") {
+        (
+            "filename_conflict",
+            "Ask the user to choose another filename or skip using resolve_download_filename. Replacing files requires confirmation in the desktop or authenticated web interface.",
+        )
+    } else if lower.contains("429") || lower.contains("rate limit") {
         (
             "rate_limited",
             "The site is rate limiting requests. Wait before retrying.",
@@ -490,6 +501,14 @@ impl Handler {
                 )
                 .await
                 .map(|_| json!({"id":args["id"],"action":args["action"],"accepted":true})),
+            "resolve_download_filename" => self
+                .app
+                .command(
+                    "tasks.destination",
+                    json!({"id":args["id"],"choice":args["choice"],"filename":args["filename"]}),
+                )
+                .await
+                .map(|_| json!({"id":args["id"],"choice":args["choice"],"accepted":true})),
             "get_download" => self
                 .app
                 .research_tasks()?
@@ -701,7 +720,7 @@ fn feature_groups() -> Value {
         {"id":"runtime","label":"Runtime and supported sites","tools":["get_ytdlp_status","list_extractors","list_search_providers"],"support":"Installed yt-dlp; listed extractors do not guarantee every feature"},
         {"id":"research","label":"Source research","tools":["inspect_url","search_videos","get_video_info","list_video_formats","list_collection_items","get_video_transcript","get_video_comments","get_video_chapters","list_subtitle_languages","get_channel_info","list_video_thumbnails"],"support":"Depends on site and extractor"},
         {"id":"download","label":"Downloads and processing","tools":["get_download_options","preview_download","start_download","start_batch_download","start_collection_download","download_assets","convert_media","retry_processing"],"support":"Structured app options; SponsorBlock is YouTube only"},
-        {"id":"management","label":"Tasks and library","tools":["list_downloads","get_download","control_download","list_media","get_media","get_cookie_status"],"support":"Application-owned tasks, media and cookie metadata"}
+        {"id":"management","label":"Tasks and library","tools":["list_downloads","get_download","control_download","resolve_download_filename","list_media","get_media","get_cookie_status"],"support":"Application-owned tasks, media and cookie metadata"}
     ])
 }
 fn definitions() -> Vec<Value> {
@@ -874,9 +893,15 @@ fn definitions() -> Vec<Value> {
         ),
         (
             "control_download",
-            "Pause, resume, cancel or retry a desktop task. Does not delete files.",
-            json!({"id":string(36),"action":{"type":"string","enum":["pause","resume","cancel","retry"]}}),
+            "Pause, resume, cancel, retry, prioritize, or finish a live recording and save it. Resume/retry keep the original settings and login snapshot; retryCurrent explicitly restarts using current saved settings, login and tools. Does not delete files.",
+            json!({"id":string(36),"action":{"type":"string","enum":["pause","resume","cancel","retry","retryCurrent","prioritize","finishLive"]}}),
             vec!["id", "action"],
+        ),
+        (
+            "resolve_download_filename",
+            "Resolve a filename conflict by choosing rename with a new filename (including the existing extension, no directory), or skip. Replacing existing files requires explicit confirmation in the desktop or authenticated web interface and is not available through this tool.",
+            json!({"id":string(36),"choice":{"type":"string","enum":["rename","skip"]},"filename":string(220)}),
+            vec!["id", "choice"],
         ),
     ];
     specs.into_iter().map(|(name,description,mut properties,mut required)| {
@@ -988,6 +1013,14 @@ fn validate(name: &str, args: &Value) -> Result<()> {
     }
     if let Some(id) = args["id"].as_str() {
         uuid::Uuid::parse_str(id).context("Invalid task ID")?;
+    }
+    if name == "resolve_download_filename" && args["choice"] == "rename" {
+        ensure!(
+            args["filename"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty()),
+            "New filename is required"
+        );
     }
     if let Some(id) = args["sourceRef"].as_str() {
         uuid::Uuid::parse_str(id).context("Invalid source reference")?;
@@ -1263,6 +1296,44 @@ mod tests {
             serde_json::from_value::<Tool>(definition).unwrap();
         }
     }
+    #[test]
+    fn recovery_controls_and_filename_resolution_are_bounded() {
+        let id = uuid::Uuid::new_v4().to_string();
+        for action in ["retryCurrent", "prioritize", "finishLive"] {
+            assert!(validate("control_download", &json!({"id":id,"action":action})).is_ok());
+        }
+        assert!(writes("resolve_download_filename"));
+        assert_eq!(
+            classify_error("Requirements unmet: subtitles=ja").0,
+            "requirements_unmet"
+        );
+        assert_eq!(
+            classify_error("Destination conflict: choose a name").0,
+            "filename_conflict"
+        );
+        assert!(
+            validate(
+                "resolve_download_filename",
+                &json!({"id":id,"choice":"rename","filename":"Another title.mp4"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                "resolve_download_filename",
+                &json!({"id":id,"choice":"skip"})
+            )
+            .is_ok()
+        );
+        for args in [
+            json!({"id":id,"choice":"overwrite","confirmed":true}),
+            json!({"id":id,"choice":"rename"}),
+            json!({"id":id,"choice":"rename","filename":"x".repeat(221)}),
+            json!({"id":id,"choice":"skip","path":"C:/private"}),
+        ] {
+            assert!(validate("resolve_download_filename", &args).is_err());
+        }
+    }
 
     #[test]
     fn structured_options_sources_and_precedence_are_bounded() -> Result<()> {
@@ -1333,7 +1404,7 @@ mod tests {
             download_options(saved, &json!({"options":{"waitForLive":true}}))?["waitForLive"],
             true
         );
-        assert_eq!(definitions().len(), 28);
+        assert_eq!(definitions().len(), 29);
         assert_eq!(
             definitions()
                 .iter()
@@ -1426,7 +1497,7 @@ mod tests {
             json!({"mcpServers":{"huifa":{"url":url,"headers":{"Authorization":"Bearer YOUR_ACCESS_PASSWORD"}}}})
         );
         assert!(connection.get("token").is_none());
-        assert_eq!(connection["tools"].as_array().unwrap().len(), 28);
+        assert_eq!(connection["tools"].as_array().unwrap().len(), 29);
         assert!(!connection.to_string().contains("test-password"));
         assert_eq!(
             http.post(&url).send().await?.status(),
@@ -1453,7 +1524,7 @@ mod tests {
                 StreamableHttpClientTransportConfig::with_uri(url).auth_header("changed-password"),
             ))
             .await?;
-        assert_eq!(client.list_tools(None).await?.tools.len(), 28);
+        assert_eq!(client.list_tools(None).await?.tools.len(), 29);
         client.cancel().await?;
         host.shutdown().await;
         app.shutdown().await?;

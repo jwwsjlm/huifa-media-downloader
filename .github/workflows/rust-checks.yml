@@ -54,6 +54,23 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo test --locked --release -p huifa-core -p huifa-mcp -p huifa-server -- --include-ignored --test-threads=1
       - run: cargo clippy --locked -p huifa-core -p huifa-mcp -p huifa-server --all-targets -- -D warnings
+  windows-login:
+    needs: frontend
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --prefix frontend
+      - run: node scripts/acquire-rust-tools.mjs windows-x86_64
+      - name: Verify native login, cookie sync, IPC isolation and proxy
+        run: node scripts/check-login-browser.mjs
   containers:
     needs: frontend
     strategy:

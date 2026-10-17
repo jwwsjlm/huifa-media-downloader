@@ -117,6 +117,8 @@ jobs:
       - run: node scripts/acquire-rust-tools.mjs windows-x86_64
       - run: node scripts/prepare-mcp-bridge.mjs
       - run: cargo test --locked --release -p huifa-desktop
+      - name: Verify native Windows login, cookie sync and proxy
+        run: node scripts/check-login-browser.mjs
       - name: Build, verify and sign portable ZIP
         shell: pwsh
         run: |
@@ -220,6 +222,9 @@ jobs:
         run: node scripts/prepare-mcp-bridge.mjs
       - name: Test shared core and native file boundaries
         run: cargo test --locked --release -p huifa-core -p huifa-mcp -p huifa-server -p huifa-desktop -- --include-ignored --test-threads=1
+      - name: Verify native Windows login, cookie sync and proxy
+        if: runner.os == 'Windows'
+        run: node scripts/check-login-browser.mjs
       - name: Build signed desktop from shared frontend
         shell: bash
         run: |

@@ -169,6 +169,9 @@ impl App {
             proxy_snapshot,
             manifest: None,
             publication: None,
+            destination: None,
+            priority: 0,
+            live: false,
             conversion: false,
             tools,
         };

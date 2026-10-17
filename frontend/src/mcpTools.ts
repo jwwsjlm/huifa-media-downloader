@@ -40,7 +40,8 @@ export const mcpGroups: { title: Copy; tools: ToolHelp[] }[] = [
     { name: 'get_media', title: ['媒体记录', 'Saved media record'], description: ['查看已保存媒体的信息，不返回内部目录。', 'Read saved media metadata without internal paths.'], example: { id: 'media-id' } },
     { name: 'list_downloads', title: ['任务列表', 'Download tasks'], description: ['分页查看任务和附件保存状态。', 'Read a page of download and attachment task statuses.'], example: { limit: 20 } },
     { name: 'get_download', title: ['任务详情', 'Task details'], description: ['查看进度、警告、错误和生成文件。', 'Inspect progress, warnings, errors and generated files.'], example: { id: 'task-id' } },
-    { name: 'control_download', title: ['控制任务', 'Control a task'], description: ['暂停、继续、取消或重试任务，不删除文件。', 'Pause, resume, cancel or retry a task without deleting files.'], example: { id: 'task-id', action: 'pause' } },
+    { name: 'control_download', title: ['控制任务', 'Control a task'], description: ['暂停、继续、取消、重试、优先下载或结束直播保存。继续沿用原方案；retryCurrent 使用当前设置和登录。', 'Pause, resume, cancel, retry, prioritize or finish and save live capture. Resume keeps the original plan; retryCurrent uses current settings and sign-in.'], example: { id: 'task-id', action: 'retryCurrent' } },
+    { name: 'resolve_download_filename', title: ['解决同名冲突', 'Resolve filename conflict'], description: ['选择新文件名或跳过。覆盖文件须在桌面或登录后的网页明确确认。', 'Choose a new filename or skip. Replacing files requires confirmation in the desktop or authenticated web interface.'], example: { id: 'task-id', choice: 'rename', filename: 'Video (2).mp4' } },
     { name: 'get_cookie_status', title: ['登录状态资料', 'Saved sign-in metadata'], description: ['查看 Cookie 网站、数量和同步时间，不读取明文或验证登录。', 'Read cookie sites, counts and sync times without exposing values or verifying sign-in.'], example: { url: 'https://example.com/' } },
   ] },
 ];

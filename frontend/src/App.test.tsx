@@ -593,12 +593,13 @@ describe('live interface stability', () => {
   it('queues clipboard links once and preserves remaining links after a partial failure', async () => {
     let release!: (value: string) => void; const readText = vi.fn(() => new Promise<string>(resolve => { release = resolve; }));
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText } });
-    let calls = 0; transport.command.mockImplementation(async name => { if (name === 'snapshot') return makeSnapshot(); if (name === 'tasks.add' && ++calls === 2) throw new Error('Queue fixture failed'); return true; });
+    let calls = 0; transport.command.mockImplementation(async name => { if (name === 'snapshot') return makeSnapshot(); if (name === 'tasks.add') { if (++calls === 2) throw new Error('Queue fixture failed'); return { ids: ['new'], results: [{ id: 'new', status: 'queued', action: 'added' }] }; } return true; });
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     const button = screen.getByRole('button', { name: 'Download clipboard' }); fireEvent.click(button); fireEvent.click(button);
     expect(readText).toHaveBeenCalledTimes(1);
     await act(async () => release('https://youtu.be/abcdefghijk\nhttps://youtu.be/abcdefghijk\nhttps://youtu.be/zyxwvutsrqp'));
-    expect((await screen.findByRole('alert')).textContent).toContain('Added 1 tasks');
+    expect(await screen.findByRole('heading', { name: 'Batch results' })).toBeTruthy();
+    expect(screen.getByText('1 tasks added or located, 1 issues or decisions needed.')).toBeTruthy();
     expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('https://youtu.be/zyxwvutsrqp');
     expect((button as HTMLButtonElement).disabled).toBe(false);
   });
@@ -607,6 +608,69 @@ describe('live interface stability', () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox'); fireEvent.click(screen.getByRole('button', { name: 'Download clipboard' }));
     expect((await screen.findByRole('alert')).textContent).toContain('Paste the links manually');
     expect(transport.command.mock.calls.some(([name]) => name === 'tasks.add')).toBe(false);
+  });
+  it('continues a mixed batch after identification fails and summarizes the failed link', async () => {
+    const urls = ['https://example.test/one', 'https://example.test/bad', 'https://example.test/three'];
+    transport.command.mockImplementation(async (name, args) => {
+      if (name === 'snapshot') return makeSnapshot();
+      if (name === 'probe.collection') { if (args.url === urls[1]) throw new Error('Unreadable source'); return { kind: 'video', entries: [{ url: args.url, title: args.url }] }; }
+      if (name === 'tasks.add') return { ids: [args.urls[0]], results: [{ id: args.urls[0], status: 'queued', action: 'added' }] };
+      return true;
+    });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: urls.join('\n') } }); fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    expect(await screen.findByRole('heading', { name: 'Batch results' })).toBeTruthy();
+    expect(screen.getByText('2 tasks added or located, 1 issues or decisions needed.')).toBeTruthy(); expect(screen.getByText(/Unreadable source/)).toBeTruthy();
+    expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.add').map(([, args]) => args.urls[0])).toEqual([urls[0], urls[2]]);
+    expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe(urls[1]);
+  });
+  it('cancels in-flight batch checks without adding the identified or remaining links', async () => {
+    let fail!: (error: Error) => void;
+    transport.command.mockImplementation(async name => {
+      if (name === 'snapshot') return makeSnapshot();
+      if (name === 'probe.collection') return new Promise((_resolve, reject) => { fail = reject; });
+      if (name === 'probe.cancel') { fail(new Error('Operation interrupted')); return true; }
+      return true;
+    });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'https://example.test/slow\nhttps://example.test/next' } }); fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel checks' }));
+    expect(await screen.findByRole('heading', { name: 'Batch results' })).toBeTruthy();
+    expect(screen.getByText('Remaining checks and additions were cancelled. Created tasks keep running.')).toBeTruthy();
+    expect(transport.command).toHaveBeenCalledWith('probe.cancel', { id: expect.any(String) });
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.add')).toBe(false);
+  });
+  it('requires the user to adjust unmet requirements before restarting the same source', async () => {
+    const snapshot = makeSnapshot(); Object.assign(snapshot.tasks[0], { url: 'https://example.test/watch', status: 'failed', error: 'Requirements unmet: video=4k / 60 fps; available: 1080p / 30 fps', options: { quality: '4k', videoFps: '60' } });
+    transport.command.mockImplementation(async name => name === 'snapshot' ? snapshot : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox'); fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Adjust requirements and retry' }));
+    const dialog = within(await screen.findByRole('dialog')); expect(dialog.getAllByText(/source does not meet/i)).toHaveLength(2);
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.add')).toBe(false);
+    fireEvent.change(dialog.getByRole('combobox', { name: 'Quality selection' }), { target: { value: '1080p' } });
+    fireEvent.change(dialog.getByRole('combobox', { name: 'Frame rate requirement' }), { target: { value: '30' } });
+    fireEvent.click(dialog.getByRole('button', { name: 'Retry with these requirements' }));
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.retryCurrent', { id: 'a', options: expect.objectContaining({ quality: '1080p', videoFps: '30', cookieId: 'auto', collectionMode: 'single' }) }));
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.add')).toBe(false);
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  });
+  it('waits for the other batch tasks before reporting download failures once', async () => {
+    const snapshot = makeSnapshot();
+    transport.command.mockImplementation(async (name, args) => {
+      if (name === 'snapshot') return snapshot;
+      if (name === 'tasks.add') { const task = args.urls[0].includes('abcdefghijk') ? snapshot.tasks[0] : snapshot.tasks[1]; return { ids: [task.id], results: [{ id: task.id, status: 'queued', action: 'added' }] }; }
+      return true;
+    });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'https://youtu.be/abcdefghijk\nhttps://youtu.be/zyxwvutsrqp' } }); fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
+    await waitFor(() => expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.add')).toHaveLength(2));
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'failed', error: 'Requirements unmet: subtitles=ja' } }));
+    expect(screen.queryByRole('heading', { name: 'Batch results' })).toBeNull();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', status: 'completed', stage: 'completed' } }));
+    const report = within(await screen.findByRole('dialog')); expect(report.getByText(/Requirements unmet: subtitles=ja/)).toBeTruthy();
+    fireEvent.click(report.getByRole('button', { name: 'Close' }));
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', progress: 100 } }));
+    expect(screen.queryByRole('heading', { name: 'Batch results' })).toBeNull();
   });
   it.each(['best', 'worst'])('adds a batch with %s quality without opening the manual format picker', async quality => {
     const snapshot = makeSnapshot();

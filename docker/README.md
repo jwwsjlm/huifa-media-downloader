@@ -104,3 +104,22 @@ React build in `frontend/dist`. A normal local build runs `npm ci` and builds it
 restart; `docker/check-browser.mjs` checks the actual remote login flow. Both take
 `HUIFA_IMAGE` and `HUIFA_PLATFORM` environment variables and clean up their own
 containers and test volumes.
+
+## Download recovery and upgrades
+
+The web host shares the desktop download workflow: explicit quality, frame rate,
+audio and subtitle requirements must be met; a failed item does not stop the rest
+of a batch. Different sources with the same output filename prompt before
+transfer, with a second confirmation before replacement. Queue priority persists;
+live capture offers **Stop live capture and save** separately from cancellation.
+
+Settings reports free space and recoverable caches. Successful downloads clean
+their intermediate sources; paused and failed downloads retain recovery files.
+Version and component checks use the saved download proxy. Container runtime
+updates still require recreating the image as described above.
+
+Before an application upgrade or credential migration, `/data/backups` receives
+a consistent database and configuration backup, checksums and `RESTORE.txt`.
+Restore with the container stopped. These backups exclude downloads, runtimes,
+processing workspaces and browser profiles; continue backing up both host mounts.
+Do not delete the data mount when pulling `latest` and recreating the container.

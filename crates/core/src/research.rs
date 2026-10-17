@@ -201,6 +201,8 @@ impl App {
                         "title",
                         "status",
                         "stage",
+                        "live",
+                        "priority",
                         "progress",
                         "speed",
                         "eta",
@@ -217,6 +219,7 @@ impl App {
                 }
                 value["warnings"] = json!(task.warnings);
                 value["files"] = public["files"].clone();
+                value["destinationConflict"] = public["destinationConflict"].clone();
                 value
             })
             .collect())
@@ -1150,6 +1153,49 @@ fn parse_vtt(source: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn task_recovery_projection_keeps_conflicts_public_without_paths_or_source_urls()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.url = "https://example.test/watch?token=private-source".into();
+        task.priority = 42;
+        task.live = true;
+        let target = app.config.download_dir.join("Video.mp4");
+        task.destination = Some(crate::destination::Destination {
+            target: target.clone(),
+            occupied: vec![crate::destination::Occupied {
+                path: target,
+                hash: None,
+                size: 10,
+                owners: vec![],
+            }],
+            confirmed: false,
+        });
+        app.db.insert_task(&task)?;
+        let tasks = app.research_tasks()?;
+        assert_eq!(tasks[0]["priority"], 42);
+        assert_eq!(tasks[0]["live"], true);
+        assert_eq!(
+            tasks[0]["destinationConflict"],
+            json!({"filename":"Video.mp4","files":["Video.mp4"]})
+        );
+        let output = serde_json::to_string(&tasks)?;
+        assert!(
+            !output.contains("private-source")
+                && !output.contains("https://example.test")
+                && !output.contains("downloads")
+                && !output.contains("outputPath")
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
     #[test]
     fn preview_uses_the_real_selector_without_exporting_stream_urls_or_private_options()
     -> Result<()> {

@@ -4,6 +4,7 @@ export function explainError(message: string, t: Translate): string {
   const missing = message.match(/^Subtitles unavailable for (.+)\. Video download will continue without these subtitles\.$/);
   if (missing) return t(`没有 ${missing[1]} 字幕，视频将继续下载。`, `Subtitles are unavailable for ${missing[1]}. The video will continue downloading.`);
   const hints: [RegExp, string, string][] = [
+    [/Requirements unmet:/i, '来源不满足明确的画质、帧率、音轨或字幕要求，已停止此任务。选择“调整要求重试”，由你决定是否放宽。', 'The source does not meet the explicit quality, frame-rate, audio-track, or subtitle requirements. This task stopped. Choose Adjust requirements and retry to decide what to relax.'],
     [/liveFilter is set to videos/i, '当前方案仅下载非直播视频，这个来源正在直播或等待开播。请在“快速选项 → 直播筛选”选择“全部内容”，再重新添加链接。', 'This plan excludes live and upcoming streams. Under Quick options → Live stream filter, select All content and add the link again.'],
     [/liveFilter is set to live/i, '当前方案仅下载直播，这个来源是普通视频或已结束的直播回放。请将“直播筛选”改为“全部内容”，再重新添加链接。', 'This plan only includes live streams. The source is a regular video or finished recording. Select All content under Live stream filter and add the link again.'],
     [/Source duration is (?:shorter than durationMin|longer than durationMax)/i, '视频时长不符合当前方案的最小或最大时长限制。请在“快速选项 → 合集与筛选”调整时长后重新添加链接。', 'The video duration is outside this plan’s minimum or maximum. Adjust the duration under Quick options → Collections and filters and add the link again.'],
