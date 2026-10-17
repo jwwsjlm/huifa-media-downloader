@@ -36,6 +36,7 @@ fn task_id(index: usize) -> String {
 
 fn fixture_media(root: &Path, index: usize) -> Media {
     Media {
+        media_info: None,
         id: media_id(index),
         task_id: task_id(index),
         title: format!("Performance audit synthetic media {index:05}"),
@@ -205,6 +206,9 @@ fn fixture_task(tools: HashMap<String, PathBuf>) -> Task {
         url: "https://example.test/performance-fixture.mp4".into(),
         title: "Performance audit tool fixture".into(),
         thumbnail: None,
+        size: None,
+        source_info: None,
+        media_info: None,
         steps: vec![],
         step_index: None,
         status: "paused".into(),

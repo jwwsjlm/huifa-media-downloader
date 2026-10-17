@@ -170,6 +170,7 @@ input[type=color]{padding:3px!important}
 .facts{margin:16px 0;display:grid;gap:6px}
 .facts dt{font-size:11px;color:var(--muted);margin-top:8px}
 .facts dd{font-size:12px;line-height:1.6;margin:0}
+.media-information{margin:16px 0}.media-information>.facts{margin:6px 0 16px}.media-information>.hint{margin-top:6px}
 .detail details{border-top:1px solid var(--border-soft);border-bottom:1px solid var(--border-soft);padding:12px 0}
 summary{cursor:pointer;color:var(--muted);font-size:12px}
 .detail details[open]>.actions{padding-top:12px}

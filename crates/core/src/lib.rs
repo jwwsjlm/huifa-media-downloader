@@ -59,6 +59,7 @@ pub struct App {
     pub(crate) research_state: research::ResearchState,
     pub(crate) tool_update_lock: tokio::sync::Mutex<()>,
     pub(crate) publication_lock: tokio::sync::Mutex<()>,
+    pub(crate) media_info_lock: tokio::sync::Mutex<()>,
     task_add_lock: tokio::sync::Mutex<()>,
     active_commands: AtomicUsize,
     commands_done: Notify,
@@ -96,6 +97,7 @@ impl App {
             research_state: Default::default(),
             tool_update_lock: Default::default(),
             publication_lock: Default::default(),
+            media_info_lock: Default::default(),
             task_add_lock: Default::default(),
             active_commands: AtomicUsize::new(0),
             commands_done: Notify::new(),
@@ -309,6 +311,9 @@ impl App {
     pub async fn command(&self, command: &str, args: Value) -> Result<Value> {
         let _active = CommandGuard::begin(self)?;
         match command {
+            "tasks.info" => processing::task_info(self, required_id(&args)?)
+                .await
+                .map_err(|reason| anyhow::anyhow!(self.research_error(&format!("{reason:#}")))),
             "snapshot" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"tasks":self.db.tasks()?.iter().map(Task::public).collect::<Vec<_>>(),"media":self.db.media()?.iter().map(model::Media::public).collect::<Vec<_>>(),"settings":self.public_settings()?,"tools":tools::check(self).await?}),
             ),
@@ -450,6 +455,9 @@ impl App {
                         url,
                         title: "Waiting for metadata".into(),
                         thumbnail: None,
+                        size: None,
+                        source_info: None,
+                        media_info: None,
                         status: "queued".into(),
                         stage: "queued".into(),
                         steps: vec![],
@@ -1081,6 +1089,39 @@ pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn saved_media_info_errors_hide_storage_paths_and_preserve_task_state() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = paused_task(Default::default());
+        task.stage("completed", "completed", Some(100.0));
+        task.size = Some(123);
+        task.output_path = Some(app.config.download_dir.join("missing.mp4"));
+        app.db.insert_task(&task)?;
+        let error = app
+            .command("tasks.info", json!({"id":task.id}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains(&app.config.download_dir.to_string_lossy().to_string()),
+            "{error}"
+        );
+        assert_eq!(app.db.task(&task.id)?.size, Some(123));
+        assert_eq!(app.db.task(&task.id)?.status, "completed");
+        assert!(
+            app.command("tasks.info", json!({"path":"/unowned/file"}))
+                .await
+                .is_err()
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn saved_cookie_view_reads_only_the_requested_identity() -> Result<()> {
@@ -1385,6 +1426,7 @@ mod tests {
             let path = app.config.download_dir.join(format!("{}.mp4", task.id));
             std::fs::write(&path, b"output")?;
             let media = model::Media {
+                media_info: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 task_id: task.id.clone(),
                 title: "Audit".into(),
@@ -1452,6 +1494,9 @@ mod tests {
             url: "https://example.test/frozen.mp4".into(),
             title: "Frozen runtime".into(),
             thumbnail: None,
+            size: None,
+            source_info: None,
+            media_info: None,
             status: "paused".into(),
             stage: "queued".into(),
             steps: vec![],
@@ -1507,6 +1552,7 @@ mod tests {
         app.db.complete(
             &task,
             &model::Media {
+                media_info: None,
                 id: "retained-media".into(),
                 task_id: task.id.clone(),
                 title: task.title.clone(),
@@ -1644,6 +1690,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::write(&path, b"saved result")?;
         let media = model::Media {
+            media_info: None,
             id: uuid::Uuid::new_v4().to_string(),
             task_id: task.id.clone(),
             title: task.title.clone(),

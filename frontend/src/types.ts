@@ -3,6 +3,7 @@ export type OptionValue = string | number | boolean | string[];
 export type DownloadOptions = Record<string, OptionValue>;
 export type Settings = Record<string, Json> & { downloadOptions?: DownloadOptions; uiPreferences?: { deleteMediaOnTaskDelete?: boolean } };
 export type TaskStatus = 'queued' | 'probing' | 'downloading' | 'waiting_processing' | 'processing' | 'processing_failed' | 'paused' | 'cancelled' | 'failed' | 'completed';
+export type MediaInfo = { width?: number | null; height?: number | null; fps?: number | null; videoCodec?: string | null; audioCodec?: string | null; container?: string | null; size?: number | null; duration?: number | null };
 export interface Task {
   id: string;
   url: string;
@@ -24,9 +25,11 @@ export interface Task {
   createdAt: string;
   options: DownloadOptions;
   outputPath?: string;
-  size?: string;
+  size?: number | string | null;
+  sourceInfo?: MediaInfo | null;
+  mediaInfo?: MediaInfo | null;
 }
-export interface Media { id: string; taskId: string; title: string; filename: string; size: number; duration: number; hasCover?: boolean }
+export interface Media { id: string; taskId: string; title: string; filename: string; size: number; duration: number; hasCover?: boolean; mediaInfo?: MediaInfo | null }
 export interface Tool { name: string; available: boolean; version?: string; latest?: string; error?: string; path?: string; platform?: string; asset?: string }
 export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string }
 export interface Snapshot { version: string; tasks: Task[]; media: Media[]; settings: Settings; tools: Tool[] }

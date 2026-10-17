@@ -74,6 +74,8 @@ pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Resu
     options.content_mode = "video".into();
     task.options = options;
     task.conversion = true;
+    task.source_info = task.media_info.take();
+    task.size = None;
     task.steps.clear();
     task.step_index = None;
     task.publication = None;
@@ -380,6 +382,8 @@ async fn queue_conversion_prepared(
     let mut task = original;
     task.id = uuid::Uuid::new_v4().to_string();
     task.thumbnail = None;
+    task.source_info = task.media_info.take();
+    task.size = None;
     task.created_at = chrono::Utc::now().to_rfc3339();
     task.options = options;
     task.conversion = true;
@@ -490,6 +494,26 @@ pub(crate) async fn process_task(
         });
     }
     ensure!(!inputs.is_empty(), "Source manifest has no media inputs");
+    let source_size = manifest
+        .files
+        .iter()
+        .filter(|s| matches!(s.kind.as_str(), "video" | "audio"))
+        .map(|s| s.size)
+        .sum();
+    let source_probe = json!({"streams": inputs.iter().flat_map(|input| input.probe["streams"].as_array().into_iter().flatten().cloned()).collect::<Vec<_>>(),"format":{"duration":manifest.duration.map(|d|d.to_string())}});
+    let mut current = app.db.task(id)?;
+    current.source_info = Some(crate::model::MediaInfo::from_probe(
+        &source_probe,
+        Some(source_size),
+        None,
+    ));
+    if let Some(info) = current.source_info.as_mut() {
+        info.container = task
+            .source_info
+            .as_ref()
+            .and_then(|source| source.container.clone());
+    }
+    app.save_task(&current)?;
     let audio_mode = task.options.content_mode == "audio";
     let video = if audio_mode {
         None
@@ -1072,6 +1096,14 @@ pub(crate) async fn process_task(
     }
     app.set_stage(id, "processing", "verifying_output", None)?;
     let probe = probe_file(app, &task, &output, cancel).await?;
+    let result_info = crate::model::MediaInfo::from_probe(
+        &probe,
+        Some(std::fs::metadata(&output)?.len()),
+        Some(extension),
+    );
+    let mut current = app.db.task(id)?;
+    current.media_info = Some(result_info);
+    app.save_task(&current)?;
     ensure!(
         count_streams(&probe, "video") == usize::from(video.is_some()),
         "Processed output has an unexpected number of video streams"
@@ -1831,6 +1863,8 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
             }
         };
         task.output_path = Some(publication.target);
+        task.size =
+            Some(publication.size + publication.auxiliary.iter().map(|a| a.size).sum::<u64>());
         task.error = None;
         task.publication.as_mut().unwrap().committed = true;
         task.stage("processing", "saving_results", None);
@@ -1850,6 +1884,7 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
     };
     assets.extend(publication.auxiliary.iter().map(|a| a.target.clone()));
     let media = Media {
+        media_info: None,
         id: previous
             .as_ref()
             .map(|m| m.id.clone())
@@ -1875,6 +1910,10 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
         }
     };
     task.output_path = Some(publication.target.clone());
+    task.size = Some(publication.size);
+    if let Some(info) = task.media_info.as_mut() {
+        info.size = Some(publication.size);
+    }
     task.error = None;
     if let Some(previous) = previous {
         task.previous_outputs.push(previous.path);
@@ -2024,6 +2063,101 @@ fn sync_directory(path: &Path) -> Result<()> {
         let _ = path;
     }
     Ok(())
+}
+
+pub(crate) async fn task_info(app: &App, id: &str) -> Result<Value> {
+    let cancel = app.shutdown_token.child_token();
+    let mut operation = Box::pin(task_info_inner(app, id, &cancel));
+    tokio::select! {
+        result = &mut operation => result,
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            cancel.cancel();
+            let _ = operation.await;
+            bail!("Reading saved media information timed out; retry when the file is available")
+        }
+    }
+}
+
+async fn task_info_inner(app: &App, id: &str, cancel: &CancellationToken) -> Result<Value> {
+    let _info_guard = tokio::select! { guard = app.media_info_lock.lock() => guard, _ = cancel.cancelled() => bail!("Media information query cancelled") };
+    let task = app.db.task(id)?;
+    if task.kind != "media"
+        || !matches!(task.status.as_str(), "completed" | "retained")
+        || task.media_info.is_some()
+    {
+        return Ok(task.public());
+    }
+    let _publication_guard = tokio::select! { guard = app.publication_lock.lock() => guard, _ = cancel.cancelled() => bail!("Media information query cancelled") };
+    let task = app.db.task(id)?;
+    if task.kind != "media"
+        || !matches!(task.status.as_str(), "completed" | "retained")
+        || task.media_info.is_some()
+    {
+        return Ok(task.public());
+    }
+    let path = app.owned_path(
+        task.output_path
+            .as_ref()
+            .context("Task has no saved media file")?,
+    )?;
+    let probe = probe_file(app, &task, &path, cancel).await?;
+    let size = task.size.or_else(|| {
+        probe["format"]["size"]
+            .as_str()
+            .and_then(|size| size.parse().ok())
+    });
+    let info = crate::model::MediaInfo::from_probe(
+        &probe,
+        size,
+        path.extension().and_then(|s| s.to_str()),
+    );
+    let mut source_info = task.source_info.clone();
+    if source_info.is_none()
+        && let Some(manifest) = &task.manifest
+    {
+        let mut probes = Vec::new();
+        let mut source_size = 0;
+        for source in manifest
+            .files
+            .iter()
+            .filter(|s| matches!(s.kind.as_str(), "video" | "audio"))
+            .take(32)
+        {
+            let owned = source
+                .path
+                .canonicalize()
+                .is_ok_and(|path| path.starts_with(app.config.data_dir.join("tasks").join(id)))
+                || task.conversion && app.owned_path(&source.path).is_ok();
+            if owned && let Ok(probe) = probe_file(app, &task, &source.path, cancel).await {
+                probes.extend(probe["streams"].as_array().into_iter().flatten().cloned());
+                source_size += source.size;
+            }
+        }
+        if !probes.is_empty() {
+            source_info = Some(crate::model::MediaInfo::from_probe(
+                &json!({"streams":probes,"format":{"duration":manifest.duration.map(|d|d.to_string())}}),
+                Some(source_size),
+                None,
+            ));
+        }
+    }
+    let mut current = app.db.task(id)?;
+    if matches!(current.status.as_str(), "completed" | "retained")
+        && current.output_path == task.output_path
+    {
+        current.media_info = Some(info.clone());
+        current.source_info = source_info;
+        current.size = size;
+        app.db.save_media_info(id, &path, &info)?;
+        app.db.save_task(&current)?;
+        if current.status != "retained" {
+            app.emit("task.upsert", current.public());
+        }
+        if let Some(media) = app.db.media_for_task(id)? {
+            app.emit("media.upsert", media.public());
+        }
+    }
+    Ok(current.public())
 }
 
 async fn probe_file(
@@ -2770,6 +2904,7 @@ mod tests {
         app.db.complete(
             &task,
             &Media {
+                media_info: None,
                 id: "old-media".into(),
                 task_id: task.id.clone(),
                 title: "视频".into(),
@@ -3074,6 +3209,7 @@ mod tests {
         app.db.complete(
             &task,
             &Media {
+                media_info: None,
                 id: "committed-media".into(),
                 task_id: task.id.clone(),
                 title: "Committed".into(),
@@ -3440,6 +3576,7 @@ mod tests {
         app.db.complete(
             &task,
             &Media {
+                media_info: None,
                 id: "media".into(),
                 task_id: task.id.clone(),
                 title: "Source".into(),
@@ -3671,6 +3808,7 @@ mod tests {
         app.db.complete(
             &task,
             &Media {
+                media_info: None,
                 id: "original-media".into(),
                 task_id: task.id.clone(),
                 title: task.title.clone(),
@@ -3681,6 +3819,19 @@ mod tests {
                 assets: vec![subtitle, thumbnail],
             },
         )?;
+        let original_info = task_info(&app, &task.id).await?;
+        assert_eq!(original_info["mediaInfo"]["width"], 160);
+        assert_eq!(original_info["mediaInfo"]["height"], 90);
+        assert_eq!(original_info["size"], size);
+        assert!(
+            app.db
+                .media_for_task(&task.id)?
+                .unwrap()
+                .media_info
+                .is_some()
+        );
+        // Persisted summaries do not depend on re-reading a file for every detail refresh.
+        assert_eq!(task_info(&app, &task.id).await?, original_info);
         for options in [
             json!({"contentMode":"audio","audioFormat":"mp3"}),
             json!({"container":"mkv","encoder":"libx264","embedSubtitles":true,"embedThumbnail":true,"embedMetadata":true,"embedChapters":true,"subtitleFormat":"ass"}),
@@ -3705,6 +3856,9 @@ mod tests {
             })
             .await??;
             assert_ne!(completed.id, task.id);
+            assert!(completed.source_info.is_some());
+            assert!(completed.media_info.is_some());
+            assert!(completed.size.is_some_and(|size| size > 0));
             let probe = probe_file(
                 &app,
                 &completed,
@@ -3802,6 +3956,7 @@ mod tests {
         app.db.complete(
             &task,
             &Media {
+                media_info: None,
                 path: old_path.clone(),
                 assets: vec![old_subtitle.clone()],
                 ..previous

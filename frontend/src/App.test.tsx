@@ -17,6 +17,87 @@ beforeEach(() => {
   transport.openRelease.mockReset().mockResolvedValue(undefined);
 });
 describe('live interface stability', () => {
+  it('shows actual completed quality and bytes with separate source and result details', async () => {
+    const snapshot = makeSnapshot();
+    Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed', size: 10485760, sourceInfo: { width: 3840, height: 2160, fps: 59.94, videoCodec: 'vp9', audioCodec: 'opus', size: 20971520, duration: 60, container: 'webm' }, mediaInfo: { width: 1920, height: 1080, fps: 29.97, videoCodec: 'h264', audioCodec: 'aac', size: 10485760, duration: 60, container: 'mp4' } });
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const row = within(screen.getByRole('option', { name: /Alpha/ }));
+    expect(row.getByText('Completed · 1080p')).toBeTruthy();
+    expect(row.getByText('10.0 MiB')).toBeTruthy();
+    expect(row.queryByText(/4K/)).toBeNull();
+    const source = within(screen.getByRole('region', { name: 'Source video information' }));
+    const result = within(screen.getByRole('region', { name: 'Result file information' }));
+    expect(source.getByText('4K · 3840 × 2160')).toBeTruthy();
+    expect(source.getByText('59.94 fps')).toBeTruthy(); expect(source.getByText('vp9 / opus')).toBeTruthy();
+    expect(result.getByText('1080p · 1920 × 1080')).toBeTruthy();
+    expect(result.getByText('29.97 fps')).toBeTruthy(); expect(result.getByText('h264 / aac')).toBeTruthy();
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.info')).toBe(false);
+  });
+  it('reads legacy completed file information once and updates the row without using its quality preset', async () => {
+    const snapshot = makeSnapshot();
+    Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed', size: 1048576, options: { quality: 'best' } });
+    let finish!: (value: unknown) => void;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tasks.info' ? new Promise(resolve => { finish = resolve; }) : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const row = within(screen.getByRole('option', { name: /Alpha/ }));
+    expect(row.getByText('1.0 MiB')).toBeTruthy(); expect(row.queryByText(/4K/)).toBeNull();
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.info', { id: 'a' }));
+    expect(screen.getByText('Reading local file information…')).toBeTruthy();
+    await act(async () => finish({ ...snapshot.tasks[0], mediaInfo: { width: 720, height: 1280, fps: 30, size: 1048576 } }));
+    expect(row.getByText('Completed · 720p')).toBeTruthy();
+    expect(screen.queryByText('Reading local file information…')).toBeNull();
+    expect(screen.getByText('No information available')).toBeTruthy();
+    expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.info')).toHaveLength(1);
+  });
+  it('keeps failed local metadata reads unobtrusive and offers retry', async () => {
+    const snapshot = makeSnapshot(); Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed' });
+    transport.command.mockImplementation(async command => { if (command === 'snapshot') return snapshot; if (command === 'tasks.info') throw new Error('fixture probe failed'); return true; });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    expect(await screen.findByText(/Result information could not be read/)).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.info')).toHaveLength(2));
+  });
+  it('shows the actual resolution in the completed media library', async () => {
+    const snapshot = makeSnapshot();
+    snapshot.media = [{ id: 'media-a', taskId: 'a', title: 'Alpha', filename: 'alpha.mp4', size: 10485760, duration: 60, mediaInfo: { width: 2160, height: 3840, fps: 30, videoCodec: 'hevc', audioCodec: 'aac', container: 'mp4' } }];
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Completed' })[0]);
+    expect(await screen.findByText('Completed · 4K')).toBeTruthy();
+    expect(screen.getByText('4K · 2160 × 3840')).toBeTruthy();
+    expect(screen.getByText('hevc / aac')).toBeTruthy();
+  });
+  it('fills legacy media information when opening completed media without selecting its task', async () => {
+    const snapshot = makeSnapshot();
+    snapshot.media = [{ id: 'retained-media', taskId: 'retained-task', title: 'Retained video', filename: 'video.mp4', size: 10485760, duration: 60 }];
+    let finish!: (value: unknown) => void;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tasks.info' ? new Promise(resolve => { finish = resolve; }) : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Completed' })[0]);
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.info', { id: 'retained-task' }));
+    expect(screen.getByText('Reading local file information…')).toBeTruthy();
+    await act(async () => finish({ id: 'retained-task', status: 'retained', mediaInfo: { width: 1920, height: 1080, fps: 60, videoCodec: 'h264', audioCodec: 'aac' } }));
+    expect(await screen.findByText('Completed · 1080p')).toBeTruthy();
+    expect(screen.getByText('1080p · 1920 × 1080')).toBeTruthy();
+    expect(screen.queryByText('Reading local file information…')).toBeNull();
+    expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.info')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Downloads' }));
+    expect(screen.queryByRole('option', { name: /Retained video/ })).toBeNull();
+  });
+  it('offers retry and a concrete error tooltip for legacy media information', async () => {
+    const snapshot = makeSnapshot();
+    snapshot.media = [{ id: 'old-media', taskId: 'old-task', title: 'Old video', filename: 'old.mp4', size: 10485760, duration: 60 }];
+    transport.command.mockImplementation(async command => { if (command === 'snapshot') return snapshot; if (command === 'tasks.info') throw new Error('fixture local file is missing'); return true; });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Completed' })[0]);
+    const error = await screen.findByText(/Result information could not be read/);
+    expect(error.getAttribute('title')).toContain('fixture local file is missing');
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.info')).toHaveLength(2));
+  });
   it('shows a task cover during download before a completed media record exists', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     const detail = screen.getByRole('complementary', { name: 'Task details' });

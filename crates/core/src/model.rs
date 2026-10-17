@@ -511,6 +511,12 @@ pub(crate) struct Task {
     pub title: String,
     #[serde(default)]
     pub thumbnail: Option<PathBuf>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub source_info: Option<MediaInfo>,
+    #[serde(default)]
+    pub media_info: Option<MediaInfo>,
     pub status: String,
     pub stage: String,
     #[serde(default)]
@@ -549,7 +555,7 @@ impl Task {
     pub fn public(&self) -> Value {
         json!({"id":self.id,"kind":self.kind,"files":self.files,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,
             "progress":self.progress,"stageProgress":self.stage_progress,"stageIndeterminate":self.stage_indeterminate,"stepIndex":self.step_index,"stepCount":self.steps.len(),
-            "speed":self.speed,"eta":self.eta,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
+            "speed":self.speed,"eta":self.eta,"size":self.size,"sourceInfo":self.source_info,"mediaInfo":self.media_info,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
             "outputPath":self.output_path.as_ref().and_then(|p|p.file_name()).map(|p|p.to_string_lossy())})
     }
     pub fn stage(&mut self, status: &str, stage: &str, percent: Option<f64>) {
@@ -644,11 +650,100 @@ pub(crate) struct Media {
     pub path: PathBuf,
     #[serde(default)]
     pub assets: Vec<PathBuf>,
+    #[serde(default)]
+    pub media_info: Option<MediaInfo>,
 }
 impl Media {
     pub fn public(&self) -> Value {
-        json!({"id":self.id,"taskId":self.task_id,"title":self.title,"filename":self.filename,"size":self.size,"duration":self.duration})
+        let mut info = self.media_info.clone();
+        if let Some(info) = info.as_mut() {
+            info.size = Some(self.size);
+        }
+        json!({"id":self.id,"taskId":self.task_id,"title":self.title,"filename":self.filename,"size":self.size,"duration":self.duration,"mediaInfo":info})
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MediaInfo {
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub fps: Option<f64>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub container: Option<String>,
+    pub size: Option<u64>,
+    pub duration: Option<f64>,
+}
+
+impl MediaInfo {
+    pub fn from_probe(probe: &Value, size: Option<u64>, container: Option<&str>) -> Self {
+        let streams = probe["streams"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let video = streams
+            .iter()
+            .find(|s| text(s, "codec_type") == "video" && s["disposition"]["attached_pic"] != 1)
+            .unwrap_or(&Value::Null);
+        let audio = streams
+            .iter()
+            .find(|s| text(s, "codec_type") == "audio")
+            .unwrap_or(&Value::Null);
+        Self {
+            width: video["width"].as_u64().filter(|v| *v > 0),
+            height: video["height"].as_u64().filter(|v| *v > 0),
+            fps: rate(text(video, "avg_frame_rate")).or_else(|| rate(text(video, "r_frame_rate"))),
+            video_codec: codec(text(video, "codec_name")),
+            audio_codec: codec(text(audio, "codec_name")),
+            container: container.and_then(codec),
+            size,
+            duration: text(&probe["format"], "duration")
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0),
+        }
+    }
+
+    pub fn from_formats(formats: &[Value], duration: Option<f64>) -> Self {
+        let video = formats
+            .iter()
+            .find(|f| codec(text(f, "vcodec")).is_some())
+            .unwrap_or(&Value::Null);
+        let audio = formats
+            .iter()
+            .find(|f| codec(text(f, "acodec")).is_some())
+            .unwrap_or(&Value::Null);
+        Self {
+            width: video["width"].as_u64().filter(|v| *v > 0),
+            height: video["height"].as_u64().filter(|v| *v > 0),
+            fps: video["fps"].as_f64().filter(|v| v.is_finite() && *v > 0.0),
+            video_codec: codec(text(video, "vcodec")),
+            audio_codec: codec(text(audio, "acodec")),
+            container: codec(text(if video.is_null() { audio } else { video }, "ext")),
+            size: None,
+            duration: duration.filter(|v| v.is_finite() && *v > 0.0),
+        }
+    }
+}
+
+fn codec(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value != "none"
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._,-".contains(c)))
+    .then(|| value.into())
+}
+
+fn rate(value: &str) -> Option<f64> {
+    let value = if let Some((a, b)) = value.split_once('/') {
+        a.parse::<f64>().ok()? / b.parse::<f64>().ok()?
+    } else {
+        value.parse().ok()?
+    };
+    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 pub(crate) fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -704,6 +799,29 @@ pub(crate) fn validate_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn media_summaries_only_expose_selected_technical_fields() {
+        let info = MediaInfo::from_formats(
+            &[
+                json!({"width":1080,"height":1920,"fps":60,"vcodec":"avc1.640028","acodec":"none","ext":"mp4","url":"https://secret.invalid/?token=secret","http_headers":{"Cookie":"secret"}}),
+                json!({"vcodec":"none","acodec":"aac"}),
+            ],
+            Some(12.0),
+        );
+        assert_eq!(info.width, Some(1080));
+        assert_eq!(info.height, Some(1920));
+        assert_eq!(info.audio_codec.as_deref(), Some("aac"));
+        assert!(!serde_json::to_string(&info).unwrap().contains("secret"));
+        let probe = json!({"streams":[{"codec_type":"video","codec_name":"mjpeg","width":16,"height":16,"disposition":{"attached_pic":1}},{"codec_type":"audio","codec_name":"aac"}],"format":{"filename":"/private/media","duration":"NaN"}});
+        let audio = MediaInfo::from_probe(&probe, Some(123), Some("m4a"));
+        assert_eq!(audio.height, None);
+        assert_eq!(audio.video_codec, None);
+        assert_eq!(audio.duration, None);
+        assert_eq!(audio.size, Some(123));
+        assert!(!serde_json::to_string(&audio).unwrap().contains("private"));
+        assert!(rate("0/0").is_none());
+        assert_eq!(rate("30000/1001"), Some(30000.0 / 1001.0));
+    }
     #[test]
     fn legacy_publication_journals_start_uncommitted() {
         let journal: Publication = serde_json::from_value(json!({

@@ -10,6 +10,23 @@ use std::{
 pub(crate) struct Database {
     connection: Mutex<Connection>,
 }
+
+fn task_record(state: &str, media: Option<&str>) -> Result<Task> {
+    let mut task: Task = serde_json::from_str(state)?;
+    if matches!(task.status.as_str(), "completed" | "retained") {
+        if let Some(record) = media {
+            let media: Media = serde_json::from_str(record)?;
+            task.size = Some(media.size);
+            task.media_info = media.media_info.or(task.media_info);
+        } else if let Some(publication) = task.publication.as_ref().filter(|p| p.committed) {
+            task.size = Some(publication.size);
+        }
+        if let Some(info) = task.media_info.as_mut() {
+            info.size = task.size;
+        }
+    }
+    Ok(task)
+}
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)?;
@@ -42,19 +59,24 @@ impl Database {
     }
     pub fn tasks_including_retained(&self) -> Result<Vec<Task>> {
         let db = self.connection.lock().unwrap();
-        let mut query = db.prepare("SELECT state FROM tasks ORDER BY rowid DESC")?;
+        let mut query = db.prepare("SELECT tasks.state,media.record FROM tasks LEFT JOIN media ON media.task_id=tasks.id ORDER BY tasks.rowid DESC")?;
         query
-            .query_map([], |r| r.get::<_, String>(0))?
-            .map(|r| Ok(serde_json::from_str(&r?)?))
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .map(|r| {
+                let (state, media) = r?;
+                task_record(&state, media.as_deref())
+            })
             .collect()
     }
     pub fn task(&self, id: &str) -> Result<Task> {
         let db = self.connection.lock().unwrap();
-        let state: String = db
-            .query_row("SELECT state FROM tasks WHERE id=?1", [id], |r| r.get(0))
+        let (state, media): (String, Option<String>) = db
+            .query_row("SELECT tasks.state,media.record FROM tasks LEFT JOIN media ON media.task_id=tasks.id WHERE tasks.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?)))
             .optional()?
             .context("Task does not exist")?;
-        Ok(serde_json::from_str(&state)?)
+        task_record(&state, media.as_deref())
     }
     pub fn insert_task(&self, task: &Task) -> Result<()> {
         self.connection.lock().unwrap().execute(
@@ -148,10 +170,41 @@ impl Database {
             .transpose()
             .map_err(Into::into)
     }
+    pub fn save_media_info(
+        &self,
+        id: &str,
+        path: &Path,
+        info: &crate::model::MediaInfo,
+    ) -> Result<()> {
+        let mut db = self.connection.lock().unwrap();
+        let transaction = db.transaction()?;
+        let record: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT id,record FROM media WHERE task_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((media_id, record)) = record {
+            let mut media: Media = serde_json::from_str(&record)?;
+            if media.path == path {
+                media.media_info = Some(info.clone());
+                transaction.execute(
+                    "UPDATE media SET record=?2 WHERE id=?1",
+                    params![media_id, serde_json::to_string(&media)?],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn complete(&self, task: &Task, media: &Media) -> Result<Media> {
         let mut db = self.connection.lock().unwrap();
         let transaction = db.transaction()?;
         let mut media = media.clone();
+        if task.media_info.is_some() {
+            media.media_info = task.media_info.clone();
+        }
         if task.conversion {
             let record: Option<String> = transaction
                 .query_row(
@@ -258,12 +311,49 @@ impl Database {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_completed_task_sizes_follow_media_without_reading_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.stage("completed", "completed", Some(100.0));
+        task.size = Some(1);
+        db.insert_task(&task)?;
+        let media = Media {
+            media_info: Some(crate::model::MediaInfo {
+                height: Some(2160),
+                size: Some(1),
+                ..Default::default()
+            }),
+            id: "legacy-media".into(),
+            task_id: task.id.clone(),
+            title: "Video".into(),
+            filename: "missing.mp4".into(),
+            size: 654321,
+            duration: 10.0,
+            path: temp.path().join("missing.mp4"),
+            assets: vec![],
+        };
+        db.complete(&task, &media)?;
+        let loaded = db.task(&task.id)?;
+        assert_eq!(loaded.public()["size"], 654321);
+        assert_eq!(loaded.public()["mediaInfo"]["size"], 654321);
+        assert_eq!(loaded.public()["mediaInfo"]["height"], 2160);
+        assert_eq!(db.tasks()?[0].size, Some(654321));
+        assert!(loaded.source_info.is_none());
+        assert!(
+            !serde_json::to_string(&loaded.public())?
+                .contains(&temp.path().to_string_lossy().to_string())
+        );
+        Ok(())
+    }
+    #[test]
     fn conversion_publication_keeps_assets_added_after_its_read() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
         let mut task = crate::tests::paused_task(Default::default());
         db.insert_task(&task)?;
         let media = Media {
+            media_info: None,
             id: "m".into(),
             task_id: task.id.clone(),
             title: "Audit".into(),
@@ -290,6 +380,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
         let media = Media {
+            media_info: None,
             id: "media-1".into(),
             task_id: "task-1".into(),
             title: "Original".into(),

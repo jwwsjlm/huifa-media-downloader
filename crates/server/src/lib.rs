@@ -371,6 +371,7 @@ fn allowed_command(command: &str) -> bool {
             | "access.change_password"
             | "app.release_status"
             | "tasks.add"
+            | "tasks.info"
             | "tasks.pause"
             | "tasks.resume"
             | "tasks.cancel"
@@ -775,6 +776,13 @@ mod tests {
     fn cookie_plaintext_is_not_exposed_by_web_commands() {
         assert!(allowed_command("cookies.list"));
         assert!(!allowed_command("cookies.read"));
+    }
+
+    #[test]
+    fn media_info_only_uses_the_id_scoped_core_command() {
+        assert!(allowed_command("tasks.info"));
+        assert!(!allowed_command("media.file"));
+        assert!(!allowed_command("host.paths"));
     }
 
     #[test]

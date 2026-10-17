@@ -1,4 +1,4 @@
-import type { Task } from './types';
+import type { MediaInfo, Task } from './types';
 import type { Translate } from './i18n';
 
 export function taskActions(task: Task, t: Translate): { action: string; label: string; icon: string }[] {
@@ -31,6 +31,18 @@ export function stageLabel(stage: string, status: string, t: Translate): string 
   return labels[stage] ? t(...labels[stage]) : statusLabel(stage in { queued: 1, probing: 1, downloading: 1, waiting_processing: 1, processing: 1, processing_failed: 1, paused: 1, cancelled: 1, failed: 1, completed: 1 } ? stage : status, t);
 }
 export function stepLabel(task: Task): string { return task.stepIndex && task.stepCount ? `${task.stepIndex}/${task.stepCount} ` : ''; }
+export function dimensions(info?: MediaInfo | null): string {
+  return info?.width && info.height ? `${info.width} × ${info.height}` : '—';
+}
+export function mediaQuality(info?: MediaInfo | null): string {
+  if (!info?.width || !info.height) return '—';
+  const shorter = Math.min(info.width, info.height), longer = Math.max(info.width, info.height);
+  if (longer >= 7680 && shorter >= 3200) return '8K';
+  if (longer >= 3840 && shorter >= 1600) return '4K';
+  for (const height of [2160, 1440, 1080, 720, 480, 360, 240, 144]) if (shorter >= height) return `${height}p`;
+  return `${shorter}p`;
+}
+export function frameRate(value?: number | null): string { return value && Number.isFinite(value) ? `${Number(value.toFixed(2))} fps` : '—'; }
 export function bytes(value: number | string | undefined | null): string {
   if (typeof value === 'string') return value || '—';
   if (!value) return '—';

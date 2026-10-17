@@ -676,6 +676,13 @@ pub(crate) async fn transfer(
     } else {
         select_formats(&info, &task.options)?
     };
+    if task.kind != "assets" {
+        task.source_info = Some(crate::model::MediaInfo::from_formats(
+            &formats,
+            info["duration"].as_f64(),
+        ));
+        app.save_task(&task)?;
+    }
     let directory = app
         .config
         .data_dir

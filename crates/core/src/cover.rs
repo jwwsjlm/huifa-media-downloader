@@ -663,6 +663,7 @@ mod tests {
         let original = app.config.download_dir.join("original.png");
         fs::write(&original, &png)?;
         let media = Media {
+            media_info: None,
             id: Uuid::new_v4().to_string(),
             task_id: task.id.clone(),
             title: "Audit".into(),
