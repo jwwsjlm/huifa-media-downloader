@@ -76,7 +76,6 @@ pub(crate) async fn base_args(
         "--encoding".into(),
         "utf-8".into(),
         "--no-js-runtimes".into(),
-        "--no-warnings".into(),
         "--no-cache-dir".into(),
         "--socket-timeout".into(),
         "30".into(),
@@ -87,6 +86,14 @@ pub(crate) async fn base_args(
         "--extractor-retries".into(),
         "3".into(),
     ];
+    args.push(
+        if task.is_some() {
+            "--verbose"
+        } else {
+            "--no-warnings"
+        }
+        .into(),
+    );
     cookies.apply(&mut args);
     if !options.proxy.is_empty() {
         args.extend(["--proxy".into(), options.proxy.clone()]);
@@ -151,9 +158,21 @@ pub(crate) async fn probe(
     } else {
         app.tool("yt-dlp")?
     };
-    let output = process::run(&executable, &args, None, cancel, None)
-        .await
-        .context("Failed to parse video with yt-dlp")?;
+    let output = match task {
+        Some(task) => {
+            process::run_logged(
+                &executable,
+                &args,
+                None,
+                cancel,
+                None,
+                app.raw_task_log(&task.id)?,
+            )
+            .await
+        }
+        None => process::run(&executable, &args, None, cancel, None).await,
+    }
+    .context("Failed to parse video with yt-dlp")?;
     let info: Value =
         serde_json::from_str(&output.stdout).context("yt-dlp returned invalid video metadata")?;
     ensure!(
@@ -667,10 +686,9 @@ pub(crate) async fn transfer(
     cancel: &CancellationToken,
 ) -> Result<SourceManifest> {
     let runtime_options = app.runtime_options(&task)?;
-    ensure!(
-        task.options.matches(&info),
-        "Video is excluded by the selected date, duration or live filters"
-    );
+    if let Some(reason) = task.options.exclusion_reason(&info) {
+        bail!(reason);
+    }
     let formats = if task.kind == "assets" {
         vec![]
     } else {
@@ -792,8 +810,14 @@ pub(crate) async fn transfer(
                     }
                 });
                 let executable = app.task_tool(task, "yt-dlp").await?;
-                let process =
-                    process::run(&executable, &args, Some(directory), cancel, Some(callback));
+                let process = process::run_logged(
+                    &executable,
+                    &args,
+                    Some(directory),
+                    cancel,
+                    Some(callback),
+                    app.raw_task_log(&task.id)?,
+                );
                 tokio::pin!(process);
                 let mut stale_timer = tokio::time::interval(Duration::from_secs(1));
                 let output = loop {
@@ -1095,12 +1119,13 @@ async fn download_subtitles(
         args.push("--write-auto-subs".into());
     }
     args.extend(["--".into(), task.url.clone()]);
-    process::run(
+    process::run_logged(
         &app.task_tool(task, "yt-dlp").await?,
         &args,
         Some(directory),
         cancel,
         None,
+        app.raw_task_log(&task.id)?,
     )
     .await
     .context("Failed to download subtitles with yt-dlp")?;

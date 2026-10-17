@@ -445,24 +445,39 @@ impl DownloadOptions {
         value
     }
     pub fn matches(&self, info: &Value) -> bool {
+        self.exclusion_reason(info).is_none()
+    }
+    pub(crate) fn exclusion_reason(&self, info: &Value) -> Option<&'static str> {
         let live = info["is_live"].as_bool().unwrap_or(false)
-            || matches!(
-                text(info, "live_status"),
-                "is_live" | "is_upcoming" | "post_live" | "was_live"
+            || matches!(text(info, "live_status"), "is_live" | "is_upcoming");
+        if self.live_filter == "videos" && live {
+            return Some(
+                "Source is live or upcoming, but liveFilter is set to videos. Choose All content to download live streams.",
             );
-        if self.live_filter == "videos" && live || self.live_filter == "live" && !live {
-            return false;
         }
-        if let Some(d) = info["duration"].as_f64()
-            && (d < self.duration_min || self.duration_max > 0.0 && d > self.duration_max)
-        {
-            return false;
+        if self.live_filter == "live" && !live {
+            return Some(
+                "Source is not live or upcoming, but liveFilter is set to live. Choose All content to download recordings.",
+            );
+        }
+        if let Some(d) = info["duration"].as_f64() {
+            if d < self.duration_min {
+                return Some("Source duration is shorter than durationMin.");
+            }
+            if self.duration_max > 0.0 && d > self.duration_max {
+                return Some("Source duration is longer than durationMax.");
+            }
         }
         let date = text(info, "upload_date").replace('-', "");
-        (date.is_empty() || self.date_after.is_empty() || date >= self.date_after.replace('-', ""))
-            && (date.is_empty()
-                || self.date_before.is_empty()
-                || date <= self.date_before.replace('-', ""))
+        if !date.is_empty() {
+            if !self.date_after.is_empty() && date < self.date_after.replace('-', "") {
+                return Some("Source upload date is earlier than dateAfter.");
+            }
+            if !self.date_before.is_empty() && date > self.date_before.replace('-', "") {
+                return Some("Source upload date is later than dateBefore.");
+            }
+        }
+        None
     }
 }
 
@@ -533,6 +548,8 @@ pub(crate) struct Task {
     pub warnings: Vec<String>,
     pub created_at: String,
     pub options: DownloadOptions,
+    #[serde(default)]
+    pub download_dir: Option<PathBuf>,
     pub output_path: Option<PathBuf>,
     #[serde(default)]
     pub previous_outputs: Vec<PathBuf>,
@@ -799,6 +816,48 @@ pub(crate) fn validate_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finished_live_recordings_are_downloadable_as_regular_videos() {
+        let options = DownloadOptions::parse(json!({"liveFilter":"videos"})).unwrap();
+        for status in ["was_live", "post_live", "not_live"] {
+            assert!(
+                options.matches(&json!({"is_live":false,"was_live":true,"live_status":status})),
+                "A finished recording must not be excluded by the non-live filter: {status}"
+            );
+        }
+        for status in ["is_live", "is_upcoming"] {
+            assert!(!options.matches(&json!({"live_status":status})));
+        }
+        let live_only = DownloadOptions::parse(json!({"liveFilter":"live"})).unwrap();
+        assert!(!live_only.matches(&json!({"live_status":"was_live"})));
+        assert!(live_only.matches(&json!({"live_status":"is_live"})));
+        let all = DownloadOptions::parse(json!({"liveFilter":"all"})).unwrap();
+        assert!(all.matches(&json!({"live_status":"is_live"})));
+    }
+    #[test]
+    fn filters_report_the_specific_exclusion_without_changing_date_or_duration_bounds() {
+        let options = DownloadOptions::parse(json!({"durationMin":10,"durationMax":20,"dateAfter":"2026-10-01","dateBefore":"2026-10-17"})).unwrap();
+        assert!(
+            options
+                .exclusion_reason(&json!({"live_status":"is_live"}))
+                .unwrap()
+                .contains("liveFilter")
+        );
+        for (info, field) in [
+            (json!({"duration":9}), "durationMin"),
+            (json!({"duration":21}), "durationMax"),
+            (json!({"upload_date":"20260930"}), "dateAfter"),
+            (json!({"upload_date":"20261018"}), "dateBefore"),
+        ] {
+            assert!(options.exclusion_reason(&info).unwrap().contains(field));
+            assert!(!options.matches(&info));
+        }
+        for duration in [10, 20] {
+            for date in ["20261001", "20261017"] {
+                assert!(options.matches(&json!({"duration":duration,"upload_date":date})));
+            }
+        }
+    }
     #[test]
     fn media_summaries_only_expose_selected_technical_fields() {
         let info = MediaInfo::from_formats(

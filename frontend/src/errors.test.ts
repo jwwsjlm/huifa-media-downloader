@@ -3,6 +3,10 @@ import { explainError } from './errors';
 
 const en = (_zh: string, english: string) => english;
 it.each([
+  ['Source is live or upcoming, but liveFilter is set to videos. Choose All content to download live streams.', 'Quick options → Live stream filter'],
+  ['Source is not live or upcoming, but liveFilter is set to live. Choose All content to download recordings.', 'regular video or finished recording'],
+  ['Source duration is longer than durationMax.', 'minimum or maximum'],
+  ['Source upload date is earlier than dateAfter.', 'date range'],
   ['yt-dlp.exe exited with code 1: Sign in to confirm you are not a bot', 'existing tasks keep their original credentials'],
   ['The web client only works when logged-in', 'Open browser sign-in'],
   ['HTTP Error 429: Too Many Requests', 'request delay'],

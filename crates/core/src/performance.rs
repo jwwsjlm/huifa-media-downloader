@@ -222,6 +222,7 @@ fn fixture_task(tools: HashMap<String, PathBuf>) -> Task {
         warnings: vec![],
         created_at: "2026-01-01T00:00:00Z".into(),
         options: DownloadOptions::default(),
+        download_dir: None,
         output_path: None,
         previous_outputs: vec![],
         cookie_snapshot: None,

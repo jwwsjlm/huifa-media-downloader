@@ -6,18 +6,31 @@ import { makeSnapshot } from './test-fixtures';
 import type { CoreEvent } from './types';
 import { version as buildVersion } from '../package.json';
 
-const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn() }));
+const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), copyTask: vi.fn(), result: vi.fn() }));
 vi.mock('./transport', () => ({ host: {
   desktop: false, capabilities: () => ({ browserCookies: false, remoteBrowser: false, updates: false }),
   session: async () => ({ authenticated: true }), subscribe: async (listener: (event: CoreEvent) => void, connection: (value: boolean) => void) => { transport.listener = listener; connection(true); return () => { transport.listener = null; }; },
-  command: transport.command, assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: async () => {}, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, copyTask: async () => {},
+  command: transport.command, assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: async () => {}, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, copyTask: transport.copyTask, result: transport.result,
 } }));
 beforeEach(() => {
   transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true);
   transport.releaseStatus.mockReset().mockResolvedValue({ currentVersion:'0.3.0', latestVersion:'0.3.0', updateAvailable:false, url:'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.0' });
   transport.openRelease.mockReset().mockResolvedValue(undefined);
+  transport.copyTask.mockReset().mockResolvedValue(undefined); transport.result.mockReset().mockResolvedValue(undefined);
 });
 describe('live interface stability', () => {
+  it('updates total download speed independently of the visible task filter', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const total = screen.getByLabelText('Total download speed');
+    expect(total.textContent).toContain('2.0 KiB/s');
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: 'Alpha' } });
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', speed: 3072 } }));
+    expect(total.textContent).toContain('4.0 KiB/s');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', status: 'paused' } }));
+    expect(total.textContent).toContain('1.0 KiB/s');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'completed' } }));
+    expect(total.textContent).toContain('0 B/s');
+  });
   it('loads tasks before slow runtime and release checks and keeps tools through fast refreshes', async () => {
     const snapshot = makeSnapshot(); delete snapshot.tools;
     let finishTools!: (value: unknown) => void; let finishRelease!: (value: unknown) => void;
@@ -68,7 +81,7 @@ describe('live interface stability', () => {
   });
   it('shows actual completed quality and bytes with separate source and result details', async () => {
     const snapshot = makeSnapshot();
-    Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed', size: 10485760, sourceInfo: { width: 3840, height: 2160, fps: 59.94, videoCodec: 'vp9', audioCodec: 'opus', size: 20971520, duration: 60, container: 'webm' }, mediaInfo: { width: 1920, height: 1080, fps: 29.97, videoCodec: 'h264', audioCodec: 'aac', size: 10485760, duration: 60, container: 'mp4' } });
+    Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed', stepIndex: 6, stepCount: 6, size: 10485760, sourceInfo: { width: 3840, height: 2160, fps: 59.94, videoCodec: 'vp9', audioCodec: 'opus', size: 20971520, duration: 60, container: 'webm' }, mediaInfo: { width: 1920, height: 1080, fps: 29.97, videoCodec: 'h264', audioCodec: 'aac', size: 10485760, duration: 60, container: 'mp4' } });
     transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     const row = within(screen.getByRole('option', { name: /Alpha/ }));
@@ -82,6 +95,19 @@ describe('live interface stability', () => {
     expect(result.getByText('1080p · 1920 × 1080')).toBeTruthy();
     expect(result.getByText('29.97 fps')).toBeTruthy(); expect(result.getByText('h264 / aac')).toBeTruthy();
     expect(transport.command.mock.calls.some(([name]) => name === 'tasks.info')).toBe(false);
+  });
+  it('uses the completed result frame rate in both task and library badges', async () => {
+    const snapshot = makeSnapshot(); const mediaInfo = { width: 1920, height: 1080, fps: 59.94, size: 1048576 };
+    Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed', options: { quality: 'best' }, mediaInfo, sourceInfo: { width: 3840, height: 2160, fps: 120 } });
+    snapshot.media = [{ id: 'media-a', taskId: 'a', title: 'Alpha', filename: 'alpha.mp4', size: 1048576, duration: 60, mediaInfo }];
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const row = within(screen.getByRole('option', { name: /Alpha/ }));
+    expect(row.getByText('Completed · 1080p60')).toBeTruthy(); expect(row.queryByText(/4K120/)).toBeNull();
+    const result = within(screen.getByRole('region', { name: 'Result file information' }));
+    expect(result.getByText('1080p · 1920 × 1080')).toBeTruthy(); expect(result.getByText('59.94 fps')).toBeTruthy();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Completed' })[0]);
+    expect(await screen.findByText('Completed · 1080p60')).toBeTruthy();
   });
   it('reads legacy completed file information once and updates the row without using its quality preset', async () => {
     const snapshot = makeSnapshot();
@@ -128,7 +154,7 @@ describe('live interface stability', () => {
     await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.info', { id: 'retained-task' }));
     expect(screen.getByText('Reading local file information…')).toBeTruthy();
     await act(async () => finish({ id: 'retained-task', status: 'retained', mediaInfo: { width: 1920, height: 1080, fps: 60, videoCodec: 'h264', audioCodec: 'aac' } }));
-    expect(await screen.findByText('Completed · 1080p')).toBeTruthy();
+    expect(await screen.findByText('Completed · 1080p60')).toBeTruthy();
     expect(screen.getByText('1080p · 1920 × 1080')).toBeTruthy();
     expect(screen.queryByText('Reading local file information…')).toBeNull();
     expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.info')).toHaveLength(1);
@@ -154,6 +180,82 @@ describe('live interface stability', () => {
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'downloading', hasThumbnail: true } }));
     await waitFor(() => expect(detail.querySelector('.thumbnail img')?.getAttribute('src')).toBe('/api/files/a?kind=taskThumbnail'));
   });
+  it('prefers task covers in compact rows, falls back to media covers, and keeps an image failure inside its 56px row', async () => {
+    const snapshot = makeSnapshot(); snapshot.tasks[0].hasThumbnail = true;
+    snapshot.media = [
+      { id: 'media-a', taskId: 'a', title: 'Alpha', filename: 'a.mp4', size: 1024, duration: 60 },
+      { id: 'media-b', taskId: 'b', title: 'Beta', filename: 'b.mp4', size: 1024, duration: 60 },
+    ];
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const alpha = screen.getByRole('option', { name: /Alpha/ }); const beta = screen.getByRole('option', { name: /Beta/ });
+    expect(alpha.querySelector('.thumbnail img')?.getAttribute('src')).toBe('/api/files/a?kind=taskThumbnail');
+    expect(beta.querySelector('.thumbnail img')?.getAttribute('src')).toBe('/api/files/media-b?kind=thumbnail');
+    expect(alpha.style.height).toBe('56px'); expect(beta.style.height).toBe('56px');
+    fireEvent.error(alpha.querySelector('.thumbnail img')!);
+    expect(alpha.querySelector('.thumbnail img')).toBeNull(); expect(alpha.querySelector('.thumbnail svg')).toBeTruthy(); expect(alpha.style.height).toBe('56px');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', hasThumbnail: false } }));
+    await waitFor(() => expect(alpha.querySelector('.thumbnail img')?.getAttribute('src')).toBe('/api/files/media-a?kind=thumbnail'));
+  });
+  it('uses the same context actions on completed media and supports keyboard dismissal and focus', async () => {
+    const snapshot = makeSnapshot(); const mediaInfo = { width: 1920, height: 1080, fps: 60 };
+    for (const task of snapshot.tasks) Object.assign(task, { status: 'completed', stage: 'completed', mediaInfo });
+    snapshot.media = snapshot.tasks.map(task => ({ id: `media-${task.id}`, taskId: task.id, title: task.title, filename: `${task.id}.mp4`, size: 1024, duration: 60, mediaInfo }));
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tasks.logs' ? { text: 'Raw log for Alpha', start: 0, end: 17, total: 17, hasMore: false, raw: true, legacy: false } : command === 'tasks.convertPreview' ? { strategy: 'remux', encoder: 'copy', audioEncoder: 'copy', reason: 'compatible codecs' } : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Completed' })[0]);
+    const list = await screen.findByRole('listbox', { name: 'Completed media list' });
+    const alpha = within(list).getByRole('option', { name: /Alpha/ });
+    const menu = () => { expect(fireEvent.contextMenu(alpha)).toBe(false); return within(screen.getByRole('menu', { name: 'Task actions' })); };
+    let actions = menu();
+    expect(alpha.getAttribute('aria-selected')).toBe('true');
+    expect(actions.getByRole('menuitem', { name: 'Convert format' })).toBeTruthy(); expect(actions.getByRole('menuitem', { name: 'Delete task' })).toBeTruthy();
+    fireEvent.click(actions.getByRole('menuitem', { name: 'Copy video title' }));
+    await waitFor(() => expect(transport.copyTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'a' }), 'title'));
+    actions = menu(); fireEvent.click(actions.getByRole('menuitem', { name: 'Copy source' }));
+    await waitFor(() => expect(transport.copyTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'a' }), 'source'));
+    actions = menu(); fireEvent.click(actions.getByRole('menuitem', { name: 'Download result file' }));
+    await waitFor(() => expect(transport.result).toHaveBeenCalledWith('media-a', 'download'));
+    actions = menu(); fireEvent.click(actions.getByRole('menuitem', { name: 'View logs' }));
+    let dialog = within(await screen.findByRole('dialog', { name: 'Task logs' }));
+    expect(await dialog.findByText('Raw log for Alpha')).toBeTruthy(); expect(transport.command).toHaveBeenCalledWith('tasks.logs', { id: 'a', limit: 65536 });
+    fireEvent.click(dialog.getByRole('button', { name: 'Close' }));
+    actions = menu(); fireEvent.click(actions.getByRole('menuitem', { name: 'Convert format' }));
+    dialog = within(await screen.findByRole('dialog', { name: 'Convert video format' }));
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.convertPreview', expect.objectContaining({ id: 'a' })));
+    fireEvent.click(dialog.getByRole('button', { name: 'Close dialog' }));
+    actions = menu(); fireEvent.click(actions.getByRole('menuitem', { name: 'Delete task' }));
+    dialog = within(await screen.findByRole('dialog', { name: 'Delete task' }));
+    expect(dialog.getByText(/Delete “Alpha”/)).toBeTruthy(); fireEvent.click(dialog.getByRole('button', { name: 'Cancel' }));
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.delete')).toBe(false);
+    list.focus(); fireEvent.keyDown(list, { key: 'F10', shiftKey: true });
+    const keyboardMenu = screen.getByRole('menu', { name: 'Task actions' });
+    fireEvent.keyDown(keyboardMenu, { key: 'End' }); expect(document.activeElement).toBe(within(keyboardMenu).getByRole('menuitem', { name: 'Delete task' }));
+    fireEvent.keyDown(keyboardMenu, { key: 'Escape' }); expect(screen.queryByRole('menu')).toBeNull(); expect(document.activeElement).toBe(list);
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.get')).toBe(false);
+  });
+  it('loads a retained media task on demand for its menu without restoring its deleted task row', async () => {
+    const snapshot = makeSnapshot(); const mediaInfo = { width: 1920, height: 1080, fps: 60 };
+    snapshot.media = [{ id: 'retained-media', taskId: 'retained-task', title: 'Retained video', filename: 'retained.mp4', size: 1024, duration: 60, mediaInfo }];
+    let finish!: (value: unknown) => void;
+    const retained = { ...snapshot.tasks[0], id: 'retained-task', title: 'Retained video', status: 'retained', stage: 'completed', mediaInfo };
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tasks.get' ? new Promise(resolve => { finish = resolve; }) : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Completed' })[0]);
+    const list = await screen.findByRole('listbox', { name: 'Completed media list' });
+    fireEvent.contextMenu(within(list).getByRole('option', { name: /Retained video/ }));
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.get', { id: 'retained-task' }));
+    expect(screen.queryByRole('menu')).toBeNull();
+    await act(async () => finish(retained));
+    const menu = within(await screen.findByRole('menu', { name: 'Task actions' }));
+    expect(menu.getByRole('menuitem', { name: 'Convert format' })).toBeTruthy(); expect(menu.getByRole('menuitem', { name: 'View logs' })).toBeTruthy();
+    fireEvent.click(menu.getByRole('menuitem', { name: 'Copy source' }));
+    await waitFor(() => expect(transport.copyTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'retained-task' }), 'source'));
+    fireEvent.click(screen.getByRole('button', { name: 'Downloads' }));
+    expect(screen.getByRole('listbox', { name: 'Download task list' })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: /Retained video/ })).toBeNull(); expect(within(screen.getByRole('listbox', { name: 'Download task list' })).getAllByRole('option')).toHaveLength(2);
+    expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.get')).toHaveLength(1);
+  });
   it('opens task actions with right click and acts on that task rather than the previous selection', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     const row = screen.getByRole('option', { name: /Beta/ });
@@ -165,6 +267,20 @@ describe('live interface stability', () => {
     fireEvent.click(within(menu).getByRole('menuitem', { name: 'Pause' }));
     await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.pause', { id: 'b' }));
     expect(screen.queryByRole('menu')).toBeNull();
+  });
+  it('opens logs for the right-clicked task and retains a details entry after closing', async () => {
+    transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'tasks.logs' ? { text: 'Fixture warning for Beta', start: 0, end: 24, total: 24, hasMore: false, raw: true, legacy: false } : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.contextMenu(screen.getByRole('option', { name: /Beta/ }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'View logs' }));
+    const dialog = within(await screen.findByRole('dialog', { name: 'Task logs' }));
+    expect(await dialog.findByText(/Fixture warning for Beta/)).toBeTruthy();
+    expect(transport.command).toHaveBeenCalledWith('tasks.logs', { id: 'b', limit: 65536 });
+    expect(screen.queryByRole('menu')).toBeNull();
+    fireEvent.click(dialog.getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    fireEvent.click(within(screen.getByRole('complementary', { name: 'Task details' })).getByRole('button', { name: 'View logs' }));
+    expect(await screen.findByRole('dialog', { name: 'Task logs' })).toBeTruthy();
   });
   it('supports keyboard context menus, status-specific actions and dismissing stale virtual rows', async () => {
     render(<AppProvider><App /></AppProvider>); const list = await screen.findByRole('listbox');
@@ -268,7 +384,7 @@ describe('live interface stability', () => {
       await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.resume', { id: 'b' }));
     } else expect(detail.getByRole('button', { name: 'Pause' })).toBeTruthy();
   });
-  it('updates processing step counts in both the task row and selected task details', async () => {
+  it('retains paused positions and replaces stale stages with terminal status in both the row and details', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'processing', stage: 'muxing', stepIndex: 2, stepCount: 4, stageProgress: 35 } }));
     const row = within(screen.getByRole('option', { name: /Alpha/ }));
@@ -279,6 +395,21 @@ describe('live interface stability', () => {
     expect(row.getByText('3/4 Validating result file')).toBeTruthy();
     expect(detail.getByText('3/4 Validating result file')).toBeTruthy();
     expect(row.queryByText('2/4 Merging video and audio')).toBeNull();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'paused' } }));
+    expect(row.getByText('3/4 Validating result file')).toBeTruthy();
+    expect(detail.getByText('3/4 Validating result file')).toBeTruthy();
+    for (const [status, stage, label] of [['failed', 'probing', 'Download failed'], ['processing_failed', 'muxing', 'Processing failed'], ['cancelled', 'downloading_video_1', 'Cancelled']]) {
+      act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status, stage } }));
+      expect(row.queryByText(/3\/4/)).toBeNull();
+      expect(detail.queryByText(/3\/4/)).toBeNull();
+      expect(row.getAllByText(label)).toHaveLength(2);
+      expect(detail.getByText(label, { selector: 'strong' })).toBeTruthy();
+    }
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'completed', stage: 'completed', stepIndex: 4 } }));
+    expect(row.queryByText(/4\/4/)).toBeNull();
+    expect(detail.queryByText(/4\/4/)).toBeNull();
+    expect(row.getAllByText('Completed')).toHaveLength(2);
+    expect(detail.getByText('Completed', { selector: 'strong' })).toBeTruthy();
   });
   it('returns collection duplicate reports to the task list and selects the existing paused task', async () => {
     const snapshot = makeSnapshot(); snapshot.tasks[1].status = 'paused';

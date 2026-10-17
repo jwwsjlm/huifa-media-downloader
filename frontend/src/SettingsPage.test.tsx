@@ -4,10 +4,55 @@ import { SettingsPage } from './SettingsPage';
 import { initialState } from './state';
 import type { Tool } from './types';
 
-const transport = vi.hoisted(() => ({ desktop: false, command: vi.fn(), paths: vi.fn() }));
-vi.mock('./transport', () => ({ host: { get desktop() { return transport.desktop; }, command: transport.command, paths: transport.paths, capabilities: () => ({ updates: false }) } }));
-beforeEach(() => { transport.desktop = false; transport.command.mockReset().mockResolvedValue([]); transport.paths.mockReset().mockResolvedValue({ downloadDir: '/downloads' }); });
+const transport = vi.hoisted(() => ({ desktop: false, command: vi.fn(), paths: vi.fn(), directory: vi.fn(), openDownloadDirectory: vi.fn() }));
+vi.mock('./transport', () => ({ host: { get desktop() { return transport.desktop; }, command: transport.command, paths: transport.paths, directory: transport.directory, openDownloadDirectory: transport.openDownloadDirectory, capabilities: () => ({ updates: false }) } }));
+beforeEach(() => { transport.desktop = false; transport.command.mockReset().mockResolvedValue([]); transport.paths.mockReset().mockResolvedValue({ downloadDir: '/downloads' }); transport.directory.mockReset().mockResolvedValue(null); transport.openDownloadDirectory.mockReset().mockResolvedValue(undefined); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
+it('saves the selected desktop download folder immediately and reloads its saved value', async () => {
+  transport.desktop = true;
+  const dispatch = vi.fn(); const message = vi.fn();
+  transport.paths.mockResolvedValue({ downloadDir: 'D:/old' });
+  transport.directory.mockResolvedValue('D:/new');
+  transport.command.mockImplementation(async (name, args) => name === 'host.download_directory' ? { downloadDir: args.path } : []);
+  const props = { state: { ...initialState, view: { ...initialState.view, settingsTab: 'downloads' as const } }, dispatch, t: (_zh: string, en: string) => en, run, message };
+  const page = render(<SettingsPage {...props} />);
+  await waitFor(() => expect((screen.getByLabelText('Download folder') as HTMLInputElement).value).toBe('D:/old'));
+  fireEvent.click(screen.getByRole('button', { name: 'Choose folder' }));
+  await waitFor(() => expect((screen.getByLabelText('Download folder') as HTMLInputElement).value).toBe('D:/new'));
+  expect(transport.directory).toHaveBeenCalledWith('D:/old');
+  expect(transport.command).toHaveBeenCalledWith('host.download_directory', { path: 'D:/new' });
+  expect(message).toHaveBeenCalledWith('Download folder saved for new tasks');
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(transport.command.mock.calls.some(([name]) => name === 'settings.save')).toBe(false);
+  fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+  expect(transport.openDownloadDirectory).toHaveBeenCalledTimes(1);
+  page.unmount();
+  transport.paths.mockResolvedValue({ downloadDir: 'D:/new' });
+  render(<SettingsPage {...props} />);
+  await waitFor(() => expect((screen.getByLabelText('Download folder') as HTMLInputElement).value).toBe('D:/new'));
+});
+it('keeps the existing download folder when choosing is cancelled or saving fails', async () => {
+  transport.desktop = true;
+  transport.paths.mockResolvedValue({ downloadDir: 'D:/old' });
+  render(<SettingsPage state={{ ...initialState, view: { ...initialState.view, settingsTab: 'downloads' } }} dispatch={vi.fn()} t={(_zh, en) => en} run={run} message={vi.fn()} />);
+  const choose = screen.getByRole('button', { name: 'Choose folder' }) as HTMLButtonElement;
+  await waitFor(() => expect(choose.disabled).toBe(false));
+  fireEvent.click(choose);
+  await waitFor(() => expect(choose.disabled).toBe(false));
+  expect(transport.command.mock.calls.some(([name]) => name === 'host.download_directory')).toBe(false);
+  transport.directory.mockResolvedValue('D:/new');
+  transport.command.mockRejectedValue(new Error('Download folder is not writable'));
+  fireEvent.click(choose);
+  expect((await screen.findByRole('alert')).textContent).toContain('not writable');
+  expect((screen.getByLabelText('Download folder') as HTMLInputElement).value).toBe('D:/old');
+  expect(choose.disabled).toBe(false);
+});
+it('keeps Docker download folders deployment-managed', () => {
+  render(<SettingsPage state={{ ...initialState, view: { ...initialState.view, settingsTab: 'downloads' } }} dispatch={vi.fn()} t={(_zh, en) => en} run={run} message={vi.fn()} />);
+  expect(screen.queryByRole('button', { name: 'Choose folder' })).toBeNull();
+  expect(screen.getByText('Configure the ./downloads volume in Docker Compose.')).toBeTruthy();
+  expect((screen.getByLabelText('Download folder') as HTMLInputElement).readOnly).toBe(true);
+});
 it('offers bounded fragment presets and subtitle language/source controls', () => {
   const dispatch = vi.fn();
   render(<SettingsPage state={{ ...initialState, view: { ...initialState.view, settingsTab: 'downloads' } }} dispatch={dispatch} t={(_zh,en) => en} run={run} message={vi.fn()} />);

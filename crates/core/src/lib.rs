@@ -7,6 +7,7 @@ mod cover;
 mod credentials;
 mod db;
 mod download;
+mod download_directory;
 pub(crate) mod model;
 #[cfg(test)]
 mod performance;
@@ -14,6 +15,7 @@ pub mod process;
 mod processing;
 pub mod releases;
 pub mod research;
+mod task_logs;
 mod thumbnail;
 mod tools;
 mod workflow;
@@ -45,6 +47,7 @@ struct Runtime {
 pub struct App {
     pub access: access::Access,
     pub(crate) config: AppConfig,
+    download_directories: download_directory::DownloadDirectories,
     pub(crate) db: Database,
     pub(crate) credentials: credentials::CredentialStore,
     pub(crate) shutdown_token: CancellationToken,
@@ -61,6 +64,7 @@ pub struct App {
     pub(crate) publication_lock: tokio::sync::Mutex<()>,
     pub(crate) media_info_lock: tokio::sync::Mutex<()>,
     task_add_lock: tokio::sync::Mutex<()>,
+    task_log_lock: Arc<Mutex<()>>,
     active_commands: AtomicUsize,
     commands_done: Notify,
 }
@@ -68,9 +72,19 @@ pub struct App {
 impl App {
     pub async fn open(mut config: AppConfig) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&config.data_dir)?;
-        std::fs::create_dir_all(&config.download_dir)?;
         config.data_dir = config.data_dir.canonicalize()?;
-        config.download_dir = config.download_dir.canonicalize()?;
+        let saved_download_directory = config
+            .data_dir
+            .join(download_directory::FILE_NAME)
+            .try_exists()?;
+        if !saved_download_directory {
+            std::fs::create_dir_all(&config.download_dir)?;
+        }
+        config.download_dir = match config.download_dir.canonicalize() {
+            Ok(path) => path,
+            Err(_) if saved_download_directory => std::path::absolute(&config.download_dir)?,
+            Err(reason) => return Err(reason.into()),
+        };
         if let Some(tool_dir) = &config.tool_dir {
             config.tool_dir = Some(tool_dir.canonicalize()?);
         }
@@ -79,10 +93,13 @@ impl App {
         let db = Database::open(&config.data_dir.join("rust-core.sqlite3"))?;
         let credentials = credentials::CredentialStore::open(&config.data_dir)?;
         let access = access::Access::open(&config.data_dir)?;
+        let download_directories =
+            download_directory::DownloadDirectories::open(&config.data_dir, &config.download_dir)?;
         let (events, _) = broadcast::channel(1024);
         let app = Arc::new(Self {
             access,
             config,
+            download_directories,
             db,
             credentials,
             shutdown_token: CancellationToken::new(),
@@ -99,11 +116,16 @@ impl App {
             publication_lock: Default::default(),
             media_info_lock: Default::default(),
             task_add_lock: Default::default(),
+            task_log_lock: Default::default(),
             active_commands: AtomicUsize::new(0),
             commands_done: Notify::new(),
         });
         app.myself.set(Arc::downgrade(&app)).unwrap();
-        for mut task in app.db.tasks()? {
+        for mut task in app.db.tasks_including_retained()? {
+            if task.download_dir.is_none() {
+                task.download_dir = Some(app.config.download_dir.clone());
+                app.db.save_task(&task)?;
+            }
             if matches!(
                 task.status.as_str(),
                 "queued" | "probing" | "downloading" | "waiting_processing" | "processing"
@@ -255,6 +277,7 @@ impl App {
                 .into();
                 task.speed = None;
                 task.eta = None;
+                let _ = app.log_task(&task_id, "error", &format!("{error:#}"));
                 task.error = Some(process::redact(&format!("{error:#}")));
                 let _ = app.save_task(&task);
             }
@@ -311,6 +334,8 @@ impl App {
     pub async fn command(&self, command: &str, args: Value) -> Result<Value> {
         let _active = CommandGuard::begin(self)?;
         match command {
+            "tasks.get" => Ok(self.db.task(required_id(&args)?)?.public()),
+            "tasks.logs" => self.task_logs(required_id(&args)?, &args),
             "tasks.info" => processing::task_info(self, required_id(&args)?)
                 .await
                 .map_err(|reason| anyhow::anyhow!(self.research_error(&format!("{reason:#}")))),
@@ -479,6 +504,7 @@ impl App {
                         warnings: vec![],
                         created_at: chrono::Utc::now().to_rfc3339(),
                         options: frozen_options,
+                        download_dir: Some(self.download_directory()),
                         output_path: previous.as_ref().and_then(|task| task.output_path.clone()),
                         previous_outputs: previous
                             .as_ref()
@@ -590,6 +616,9 @@ impl App {
                     .delete_secret(&format!("task-cookie:{id}"))?;
                 self.credentials
                     .delete_secret(&format!("task-proxy:{id}"))?;
+                if delete_files || self.db.media_for_task(id)?.is_none() {
+                    self.remove_task_log(id)?;
+                }
                 self.db.remove_task(&task, delete_files)?;
                 if let Some(media) = media {
                     self.emit("media.remove", json!({"id":media.id}));
@@ -772,7 +801,7 @@ impl App {
         reject_links(path)?;
         let canonical = path.canonicalize()?;
         ensure!(
-            canonical.starts_with(&self.config.download_dir)
+            self.owns_download_path(&canonical)
                 || canonical.starts_with(self.config.data_dir.join("assets")),
             "Media file is outside application-owned storage"
         );
@@ -1572,6 +1601,7 @@ mod tests {
             warnings: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
             options: DownloadOptions::default(),
+            download_dir: None,
             output_path: None,
             previous_outputs: vec![],
             cookie_snapshot: None,

@@ -164,7 +164,8 @@ input[type=color]{padding:3px!important}
 .task-id{display:block;color:var(--muted);font-size:11px;overflow-wrap:anywhere;margin-bottom:16px}
 .detail-stage{display:flex;align-items:center;justify-content:space-between;font-size:12px;margin:16px 0 8px;gap:8px}
 .detail-stage span{color:var(--muted);font-size:12px}
-.detail-actions{flex-wrap:wrap;margin:16px 0}
+.detail-actions{display:grid;gap:var(--space-sm);margin:16px 0}
+.detail-task-controls{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:var(--space-sm)}
 .detail-footer{padding:16px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0}
 .detail-footer .button{width:100%}
 .facts{margin:16px 0;display:grid;gap:6px}
@@ -250,7 +251,11 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
 .update-release{margin-top:16px;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .update-release details{flex-basis:100%}
 .release-notes{white-space:pre-wrap;font-family:inherit;font-size:12px;color:var(--muted);margin-bottom:0;line-height:1.7}
-.about-identity{padding:16px;display:flex;gap:16px;align-items:flex-start;margin-bottom:16px}
+.about-content{display:grid;align-content:start;gap:var(--space-lg)}
+.about-update{display:grid;gap:var(--space-md)}
+.about-update>h2,.about-update>.hint{margin:0}
+.about-update>.actions{gap:var(--space-md)}
+.about-identity{padding:16px;display:flex;gap:16px;align-items:flex-start}
 .about-identity .brand-mark{width:54px;height:58px;border-radius:8px}
 .about-identity .brand-mark svg{width:32px;height:32px}
 .about-identity h2{font-size:20px}
@@ -259,6 +264,7 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
 .dependency-row:last-child{border:0}
 .statusbar{height:36px;flex-shrink:0;background:var(--surface);border-top:1px solid var(--border-soft);display:flex;align-items:center;gap:12px;font-size:11px;padding:0 16px;color:var(--muted)}
 .status-message{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent)}
+.status-speed{flex-shrink:0;white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--text)}
 .status-shortcut{margin-left:auto;white-space:nowrap}
 .toasts{position:fixed;z-index:10000;right:23px;bottom:43px;width:min(480px,80vw);display:flex;flex-direction:column;gap:8px;pointer-events:none}
 .toast{background:var(--raised);border:1px solid var(--border);padding:12px 9px 12px 15px;border-radius:8px;box-shadow:var(--shadow);display:flex;align-items:center;gap:10px;pointer-events:auto;font-size:12px;line-height:1.6}
@@ -279,6 +285,8 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
 .dialog-footer>.field{flex:1;min-width:180px}
 .footer-spacer{flex:1}
 .dialog-copy{font-size:13px;margin:0 0 12px}
+.task-log-summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}.task-log-summary code{color:var(--muted);overflow-wrap:anywhere}
+.task-log-navigation{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.task-logs{max-height:50vh;overflow:auto;padding:12px;background:var(--field);border:1px solid var(--border-soft);border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.7 ui-monospace,monospace}
 .modal-list-holder{height:360px;max-height:48vh;margin-top:16px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .collection-selection{margin:12px 0}
 .collection-selection .muted{margin-left:auto;font-size:11px}

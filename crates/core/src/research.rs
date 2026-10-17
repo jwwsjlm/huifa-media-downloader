@@ -164,14 +164,14 @@ impl App {
     }
     pub fn research_error(&self, error: &str) -> String {
         let mut message = process::redact(error);
-        for path in [
-            Some(self.config.data_dir.as_path()),
-            Some(self.config.download_dir.as_path()),
-            self.config.tool_dir.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for path in self.download_roots().into_iter().chain(
+            [
+                Some(self.config.data_dir.clone()),
+                self.config.tool_dir.clone(),
+            ]
+            .into_iter()
+            .flatten(),
+        ) {
             let path = path.to_string_lossy();
             message = message
                 .replace(path.as_ref(), "[application storage]")

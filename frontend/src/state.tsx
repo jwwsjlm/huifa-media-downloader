@@ -3,13 +3,14 @@ import type { CoreEvent, DownloadOptions, Json, Media, Page, Settings, Snapshot,
 import { version as buildVersion } from '../package.json';
 
 export interface ViewState { page: Page; urls: string; quality: string | null; taskSearch: string; taskStatus: string; taskSort: string; taskSelection: string; mediaSearch: string; mediaSelection: string; settingsDraft: Settings | null; optionsDraft: DownloadOptions | null; settingsTab: string }
-export interface AppState { loaded: boolean; connected: boolean; version: string; tasks: Record<string, Task>; taskIds: string[]; taskListVersion: number; activeTaskCount: number; media: Record<string, Media>; mediaIds: string[]; mediaByTask: Record<string, string>; settings: Settings; tools: Tool[]; view: ViewState }
+export interface AppState { loaded: boolean; connected: boolean; version: string; tasks: Record<string, Task>; taskIds: string[]; taskListVersion: number; activeTaskCount: number; downloadSpeed: number; media: Record<string, Media>; mediaIds: string[]; mediaByTask: Record<string, string>; settings: Settings; tools: Tool[]; view: ViewState }
 export const initialState: AppState = {
-  loaded: false, connected: false, version: buildVersion, tasks: {}, taskIds: [], taskListVersion: 0, activeTaskCount: 0, media: {}, mediaIds: [], mediaByTask: {}, settings: {}, tools: [],
+  loaded: false, connected: false, version: buildVersion, tasks: {}, taskIds: [], taskListVersion: 0, activeTaskCount: 0, downloadSpeed: 0, media: {}, mediaIds: [], mediaByTask: {}, settings: {}, tools: [],
   view: { page: /^\/mcp\/?$/.test(window.location.pathname) ? 'mcp' : 'downloads', urls: '', quality: null, taskSearch: '', taskStatus: 'all', taskSort: 'newest', taskSelection: '', mediaSearch: '', mediaSelection: '', settingsDraft: null, optionsDraft: null, settingsTab: 'downloads' },
 };
 export type Action = { type: 'snapshot'; snapshot: Snapshot } | { type: 'event'; event: CoreEvent } | { type: 'connection'; connected: boolean } | { type: 'view'; patch: Partial<ViewState> } | { type: 'setting'; key: string; value: Json } | { type: 'option'; key: string; value: DownloadOptions[string] } | { type: 'saved'; settings: Settings } | { type: 'cookie.saved'; id: string };
 const active = (task?: Task): number => task && ['downloading', 'probing', 'processing'].includes(task.status) ? 1 : 0;
+const speed = (task?: Task): number => task?.status === 'downloading' && typeof task.speed === 'number' && Number.isFinite(task.speed) && task.speed > 0 ? task.speed : 0;
 export function reducer(state: AppState, action: Action): AppState {
   if (action.type === 'connection') return { ...state, connected: action.connected };
   if (action.type === 'view') return { ...state, view: { ...state.view, ...action.patch } };
@@ -21,7 +22,7 @@ export function reducer(state: AppState, action: Action): AppState {
     const tasks = Object.fromEntries(action.snapshot.tasks.map(task => [String(task.id), task]));
     const media = Object.fromEntries(action.snapshot.media.map(item => [String(item.id), item]));
     const taskIds = action.snapshot.tasks.map(task => String(task.id)); const mediaIds = action.snapshot.media.map(item => String(item.id));
-    return { ...state, ...action.snapshot, tools: action.snapshot.tools ?? state.tools, tasks, taskIds, taskListVersion: state.taskListVersion + 1, activeTaskCount: action.snapshot.tasks.reduce((count, task) => count + active(task), 0), media, mediaIds, mediaByTask: Object.fromEntries(action.snapshot.media.map(item => [item.taskId, item.id])), view: { ...state.view, taskSelection: state.view.taskSelection || taskIds[0] || '', mediaSelection: state.view.mediaSelection || mediaIds[0] || '' }, loaded: true, connected: true };
+    return { ...state, ...action.snapshot, tools: action.snapshot.tools ?? state.tools, tasks, taskIds, taskListVersion: state.taskListVersion + 1, activeTaskCount: action.snapshot.tasks.reduce((count, task) => count + active(task), 0), downloadSpeed: action.snapshot.tasks.reduce((total, task) => total + speed(task), 0), media, mediaIds, mediaByTask: Object.fromEntries(action.snapshot.media.map(item => [item.taskId, item.id])), view: { ...state.view, taskSelection: state.view.taskSelection || taskIds[0] || '', mediaSelection: state.view.mediaSelection || mediaIds[0] || '' }, loaded: true, connected: true };
   }
   const { kind, data } = action.event;
   if (kind === 'task.upsert') {
@@ -29,12 +30,12 @@ export function reducer(state: AppState, action: Action): AppState {
     if (!id || id === 'undefined') return state;
     const previous = state.tasks[id]; const next = { ...previous, ...task, id };
     const listChanged = !previous || (['title', 'url', 'status', 'createdAt'] as const).some(key => previous[key] !== next[key]);
-    return { ...state, tasks: { ...state.tasks, [id]: next }, taskIds: previous ? state.taskIds : [...state.taskIds, id], taskListVersion: state.taskListVersion + Number(listChanged), activeTaskCount: state.activeTaskCount + active(next) - active(previous), view: state.view.taskSelection ? state.view : { ...state.view, taskSelection: id } };
+    return { ...state, tasks: { ...state.tasks, [id]: next }, taskIds: previous ? state.taskIds : [...state.taskIds, id], taskListVersion: state.taskListVersion + Number(listChanged), activeTaskCount: state.activeTaskCount + active(next) - active(previous), downloadSpeed: Math.max(0, state.downloadSpeed + speed(next) - speed(previous)), view: state.view.taskSelection ? state.view : { ...state.view, taskSelection: id } };
   }
   if (kind === 'task.remove') {
     const id = typeof data === 'string' ? data : String((data as { id: string }).id);
     const tasks = { ...state.tasks }; delete tasks[id];
-    return { ...state, tasks, taskIds: state.taskIds.filter(value => value !== id), taskListVersion: state.taskListVersion + 1, activeTaskCount: state.activeTaskCount - active(state.tasks[id]), view: state.view.taskSelection === id ? { ...state.view, taskSelection: '' } : state.view };
+    return { ...state, tasks, taskIds: state.taskIds.filter(value => value !== id), taskListVersion: state.taskListVersion + 1, activeTaskCount: state.activeTaskCount - active(state.tasks[id]), downloadSpeed: Math.max(0, state.downloadSpeed - speed(state.tasks[id])), view: state.view.taskSelection === id ? { ...state.view, taskSelection: '' } : state.view };
   }
   if (kind === 'media.upsert') {
     const item = data as unknown as Media; const id = String(item.id);

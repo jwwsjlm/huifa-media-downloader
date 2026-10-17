@@ -99,6 +99,28 @@ describe('task delta state', () => {
     state = reducer(state, { type: 'snapshot', snapshot: makeSnapshot() });
     expect(state.activeTaskCount).toBe(2);
   });
+  it('sums only measured downloading speeds across updates, filtering, removal and resync', () => {
+    let state = reducer(initialState, { type: 'snapshot', snapshot: makeSnapshot() });
+    expect(state.downloadSpeed).toBe(2048);
+    state = reducer(state, { type: 'view', patch: { taskSearch: 'Alpha', taskStatus: 'completed' } });
+    expect(state.downloadSpeed).toBe(2048);
+    state = reducer(state, { type: 'event', event: { kind: 'task.upsert', data: { id: 'b', speed: 4096 } } });
+    expect(state.downloadSpeed).toBe(5120);
+    for (const status of ['paused', 'processing', 'completed', 'failed', 'cancelled']) {
+      state = reducer(state, { type: 'event', event: { kind: 'task.upsert', data: { id: 'b', status } } });
+      expect(state.downloadSpeed).toBe(1024);
+    }
+    for (const speed of [null, -1, Infinity, '1 MiB/s']) {
+      state = reducer(state, { type: 'event', event: { kind: 'task.upsert', data: { id: 'a', speed } } });
+      expect(state.downloadSpeed).toBe(0);
+    }
+    state = reducer(state, { type: 'event', event: { kind: 'task.upsert', data: { id: 'a', speed: 2048 } } });
+    expect(state.downloadSpeed).toBe(2048);
+    state = reducer(state, { type: 'event', event: { kind: 'task.remove', data: 'a' } });
+    expect(state.downloadSpeed).toBe(0);
+    state = reducer(state, { type: 'snapshot', snapshot: makeSnapshot() });
+    expect(state.downloadSpeed).toBe(2048);
+  });
   it('resolves task media after snapshots, partial updates and reassignment', () => {
     const snapshot = makeSnapshot();
     snapshot.media = [{ id: 'm', taskId: 'a', title: 'Media', filename: 'a.mp4', size: 12, duration: 1 }];

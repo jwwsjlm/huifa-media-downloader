@@ -4,6 +4,10 @@ export function explainError(message: string, t: Translate): string {
   const missing = message.match(/^Subtitles unavailable for (.+)\. Video download will continue without these subtitles\.$/);
   if (missing) return t(`没有 ${missing[1]} 字幕，视频将继续下载。`, `Subtitles are unavailable for ${missing[1]}. The video will continue downloading.`);
   const hints: [RegExp, string, string][] = [
+    [/liveFilter is set to videos/i, '当前方案仅下载非直播视频，这个来源正在直播或等待开播。请在“快速选项 → 直播筛选”选择“全部内容”，再重新添加链接。', 'This plan excludes live and upcoming streams. Under Quick options → Live stream filter, select All content and add the link again.'],
+    [/liveFilter is set to live/i, '当前方案仅下载直播，这个来源是普通视频或已结束的直播回放。请将“直播筛选”改为“全部内容”，再重新添加链接。', 'This plan only includes live streams. The source is a regular video or finished recording. Select All content under Live stream filter and add the link again.'],
+    [/Source duration is (?:shorter than durationMin|longer than durationMax)/i, '视频时长不符合当前方案的最小或最大时长限制。请在“快速选项 → 合集与筛选”调整时长后重新添加链接。', 'The video duration is outside this plan’s minimum or maximum. Adjust the duration under Quick options → Collections and filters and add the link again.'],
+    [/Source upload date is (?:earlier than dateAfter|later than dateBefore)/i, '视频上传日期不在当前方案的日期范围内。请在“快速选项 → 合集与筛选”调整日期后重新添加链接。', 'The upload date is outside this plan’s date range. Adjust the dates under Quick options → Collections and filters and add the link again.'],
     [/^The login browser was closed, but the last Cookie sync failed:/i, '登录浏览器已关闭，但最后一次 Cookie 同步失败。此前已保存的 Cookie 会保留，请重新打开登录浏览器重试。', 'The login browser is closed, but its final cookie sync failed. Previously saved cookies are kept. Reopen the login browser to retry.'],
     [/^Could not refresh browser cookies:/i, '未能刷新浏览器 Cookie，将继续使用已保存且匹配网站的 Cookie；没有匹配记录时匿名访问。可重新打开登录浏览器重试同步。', 'Browser cookies could not be refreshed. Downloads continue with previously saved matching cookies, or anonymously when none are saved. Reopen the login browser to retry syncing.'],
     [/Session expired\. Sign in again\./i, '登录已过期，请重新登录。', 'Session expired. Sign in again.'],

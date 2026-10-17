@@ -184,11 +184,10 @@ fn source_path(app: &App, media: &Media, request: &Request) -> Result<PathBuf> {
         "Cover must be a regular owned file"
     );
     let canonical = path.canonicalize()?;
-    let downloads = app.config.download_dir.canonicalize()?;
     let assets = app.config.data_dir.join("assets");
     let inside_assets = assets.is_dir() && canonical.starts_with(assets.canonicalize()?);
     ensure!(
-        canonical.starts_with(downloads) || inside_assets,
+        app.owns_download_path(&canonical) || inside_assets,
         "Cover path is outside owned storage"
     );
     Ok(canonical)

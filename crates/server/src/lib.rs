@@ -372,6 +372,8 @@ fn allowed_command(command: &str) -> bool {
             | "app.release_status"
             | "tasks.add"
             | "tasks.info"
+            | "tasks.get"
+            | "tasks.logs"
             | "tasks.pause"
             | "tasks.resume"
             | "tasks.cancel"
@@ -781,8 +783,11 @@ mod tests {
     #[test]
     fn media_info_only_uses_the_id_scoped_core_command() {
         assert!(allowed_command("tasks.info"));
+        assert!(allowed_command("tasks.get"));
+        assert!(allowed_command("tasks.logs"));
         assert!(!allowed_command("media.file"));
         assert!(!allowed_command("host.paths"));
+        assert!(!allowed_command("host.download_directory"));
     }
 
     #[test]
@@ -1340,6 +1345,21 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
+                    .uri("/api/command")
+                    .header("host", "localhost:19491")
+                    .header("origin", "http://localhost:19491")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"command":"tasks.logs","args":{"id":"missing"}}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
                     .uri("/api/login")
                     .header("host", "localhost:19491")
                     .header("origin", "http://localhost:19491")
@@ -1366,6 +1386,7 @@ mod tests {
         let csrf = body["csrfToken"].as_str().unwrap();
         for (command, expected) in [
             ("snapshot", StatusCode::OK),
+            ("tasks.logs", StatusCode::BAD_REQUEST),
             ("media.file", StatusCode::FORBIDDEN),
             ("sql.execute", StatusCode::FORBIDDEN),
         ] {
@@ -1389,6 +1410,10 @@ mod tests {
                     serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
                 assert!(body["value"]["tasks"].is_array());
                 assert!(!body.to_string().contains("test-password"));
+            } else if command == "tasks.logs" {
+                let body: Value =
+                    serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+                assert!(body.to_string().contains("An ID is required"));
             }
         }
         let response = router

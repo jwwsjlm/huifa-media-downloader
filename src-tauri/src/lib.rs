@@ -33,7 +33,6 @@ struct Host {
     core: Arc<App>,
     mcp: huifa_mcp::DesktopMcp,
     data_dir: PathBuf,
-    download_dir: PathBuf,
     portable: bool,
     closing: AtomicBool,
     shutdown_done: AtomicBool,
@@ -111,7 +110,21 @@ async fn command(
         let _ = app.emit("huifa-host-error", json!({"message":format!("Could not refresh browser cookies: {}. Continuing with previously saved matching cookies, or anonymously if none are saved.", error(reason))}));
     }
     if command == "host.paths" {
-        return Ok(json!({"downloadDir":host.download_dir,"dataDir":host.data_dir}));
+        return Ok(
+            json!({"downloadDir":clipboard_path(host.core.download_directory().to_string_lossy().into_owned()),"dataDir":host.data_dir}),
+        );
+    }
+    if command == "host.download_directory" {
+        if host.closing.load(Ordering::Acquire) {
+            return Err("Application is shutting down".into());
+        }
+        let path = PathBuf::from(args["path"].as_str().ok_or("Choose a download folder")?);
+        let core = host.core.clone();
+        let path = tauri::async_runtime::spawn_blocking(move || core.set_download_directory(&path))
+            .await
+            .map_err(error)?
+            .map_err(error)?;
+        return Ok(json!({"downloadDir":clipboard_path(path.to_string_lossy().into_owned())}));
     }
     if serde_json::to_vec(&args).map_err(error)?.len() > 3 * 1024 * 1024 {
         return Err("Command arguments are too large".into());
@@ -195,7 +208,15 @@ fn portable_mode(executable: &std::path::Path) -> bool {
 #[tauri::command]
 fn open_download_directory(app: tauri::AppHandle, host: State<'_, Host>) -> Result<(), String> {
     app.opener()
-        .open_path(host.download_dir.to_string_lossy().as_ref(), None::<&str>)
+        .open_path(
+            clipboard_path(
+                host.core
+                    .download_directory()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            None::<&str>,
+        )
         .map_err(error)
 }
 
@@ -502,7 +523,6 @@ pub fn run() {
                 mcp,
                 core,
                 data_dir: base,
-                download_dir,
                 portable,
                 closing: AtomicBool::new(false),
                 shutdown_done: AtomicBool::new(false),

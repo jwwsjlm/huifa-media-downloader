@@ -1127,10 +1127,11 @@ pub(crate) async fn process_task(
             "Processed duration differs from the requested cut"
         );
     }
+    let root = app.task_download_directory(&task)?;
     let directory = if task.options.organize_task_folder {
-        app.config.download_dir.join(sanitize_filename(&task.title))
+        root.join(sanitize_filename(&task.title))
     } else {
-        app.config.download_dir.clone()
+        root
     };
     crate::reject_links(&directory)?;
     std::fs::create_dir_all(&directory)?;
@@ -1288,10 +1289,11 @@ async fn prepare_assets(app: &Arc<App>, mut task: Task, cancel: &CancellationTok
         task.stage("completed", "completed", Some(100.0));
         return app.save_task(&task);
     }
+    let root = app.task_download_directory(&task)?;
     let directory = if task.options.organize_task_folder {
-        app.config.download_dir.join(sanitize_filename(&task.title))
+        root.join(sanitize_filename(&task.title))
     } else {
-        app.config.download_dir.clone()
+        root
     };
     crate::reject_links(&directory)?;
     std::fs::create_dir_all(&directory)?;
@@ -1632,7 +1634,7 @@ pub(crate) async fn prepare_redownload(app: &App, task: &Task) -> Result<()> {
                     path.parent()
                         .context("Publication path has no directory")?
                         .canonicalize()?
-                        .starts_with(&app.config.download_dir),
+                        .starts_with(app.task_download_directory(&task)?),
                     "Publication path is outside the owned downloads directory"
                 );
             }
@@ -1708,7 +1710,7 @@ pub(crate) async fn prepare_task_deletion(app: &App, id: &str) -> Result<()> {
                 path.parent()
                     .context("Publication path has no directory")?
                     .canonicalize()?
-                    .starts_with(&app.config.download_dir),
+                    .starts_with(app.task_download_directory(&task)?),
                 "Publication path is outside the owned downloads directory"
             );
         }
@@ -1760,7 +1762,7 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
                 path.parent()
                     .context("Publication path has no directory")?
                     .canonicalize()?
-                    .starts_with(&app.config.download_dir),
+                    .starts_with(app.task_download_directory(&task)?),
                 "Publication path is outside the owned downloads directory"
             );
         }
@@ -1947,7 +1949,7 @@ fn finish_publication(app: &App, mut task: Task, all_media: &[Media]) -> Result<
                 path.parent()
                     .context("Publication path has no directory")?
                     .canonicalize()?
-                    .starts_with(&app.config.download_dir),
+                    .starts_with(app.task_download_directory(&task)?),
                 "Publication path is outside the owned downloads directory"
             );
         }
@@ -2175,12 +2177,13 @@ async fn probe_file(
         "json".into(),
         path.to_string_lossy().into(),
     ];
-    let output = process::run(
+    let output = process::run_logged(
         &app.task_tool(task, "ffprobe").await?,
         &args,
         None,
         cancel,
         None,
+        app.raw_task_log(&task.id)?,
     )
     .await?;
     let value: Value = serde_json::from_str(&output.stdout)?;
@@ -2255,12 +2258,13 @@ async fn run_ffmpeg(
             }
         }
     });
-    process::run(
+    process::run_logged(
         &app.task_tool(&app.db.task(id)?, "ffmpeg").await?,
         args,
         None,
         cancel,
         Some(callback),
+        app.raw_task_log(id)?,
     )
     .await?;
     Ok(())
@@ -2425,12 +2429,13 @@ async fn subtitle_convert(
         input.to_string_lossy().into(),
         output.to_string_lossy().into(),
     ];
-    process::run(
+    process::run_logged(
         &app.task_tool(task, "ffmpeg").await?,
         &args,
         None,
         cancel,
         None,
+        app.raw_task_log(&task.id)?,
     )
     .await?;
     Ok(())

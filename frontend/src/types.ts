@@ -2,7 +2,7 @@ export type Json = null | boolean | number | string | Json[] | { [key: string]: 
 export type OptionValue = string | number | boolean | string[];
 export type DownloadOptions = Record<string, OptionValue>;
 export type Settings = Record<string, Json> & { downloadOptions?: DownloadOptions; uiPreferences?: { deleteMediaOnTaskDelete?: boolean } };
-export type TaskStatus = 'queued' | 'probing' | 'downloading' | 'waiting_processing' | 'processing' | 'processing_failed' | 'paused' | 'cancelled' | 'failed' | 'completed';
+export type TaskStatus = 'queued' | 'probing' | 'downloading' | 'waiting_processing' | 'processing' | 'processing_failed' | 'paused' | 'cancelled' | 'failed' | 'completed' | 'retained';
 export type MediaInfo = { width?: number | null; height?: number | null; fps?: number | null; videoCodec?: string | null; audioCodec?: string | null; container?: string | null; size?: number | null; duration?: number | null };
 export interface Task {
   id: string;
@@ -29,6 +29,7 @@ export interface Task {
   sourceInfo?: MediaInfo | null;
   mediaInfo?: MediaInfo | null;
 }
+export interface TaskLogs { text: string; start: number; end: number; total: number; hasMore: boolean; raw: boolean; legacy: boolean }
 export interface Media { id: string; taskId: string; title: string; filename: string; size: number; duration: number; hasCover?: boolean; mediaInfo?: MediaInfo | null }
 export interface Tool { name: string; available: boolean; version?: string; latest?: string; error?: string; path?: string; platform?: string; asset?: string }
 export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string }

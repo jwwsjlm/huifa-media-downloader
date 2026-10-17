@@ -46,6 +46,10 @@ impl Database {
                 CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL);
                 INSERT INTO settings VALUES(1,'{}'); PRAGMA user_version=1; COMMIT;")?;
         }
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_logs(seq INTEGER PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,timestamp TEXT NOT NULL,level TEXT NOT NULL,message TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS task_logs_by_task ON task_logs(task_id,seq);",
+        )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -79,19 +83,61 @@ impl Database {
         task_record(&state, media.as_deref())
     }
     pub fn insert_task(&self, task: &Task) -> Result<()> {
-        self.connection.lock().unwrap().execute(
+        let mut db = self.connection.lock().unwrap();
+        let transaction = db.transaction()?;
+        transaction.execute(
             "INSERT INTO tasks VALUES(?1,?2)",
             params![task.id, serde_json::to_string(task)?],
         )?;
+        crate::task_logs::record_changes(&transaction, None, task)?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn save_task(&self, task: &Task) -> Result<()> {
-        let changed = self.connection.lock().unwrap().execute(
+        let mut db = self.connection.lock().unwrap();
+        let transaction = db.transaction()?;
+        let previous: Option<String> = transaction
+            .query_row("SELECT state FROM tasks WHERE id=?1", [&task.id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let previous: Task = serde_json::from_str(&previous.context("Task does not exist")?)?;
+        let changed = transaction.execute(
             "UPDATE tasks SET state=?2 WHERE id=?1",
             params![task.id, serde_json::to_string(task)?],
         )?;
         ensure!(changed == 1, "Task does not exist");
+        crate::task_logs::record_changes(&transaction, Some(&previous), task)?;
+        transaction.commit()?;
         Ok(())
+    }
+    pub fn append_task_log(&self, id: &str, entry: &crate::task_logs::Entry) -> Result<()> {
+        let mut db = self.connection.lock().unwrap();
+        let transaction = db.transaction()?;
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
+            [id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        ensure!(exists, "Task does not exist");
+        crate::task_logs::append(&transaction, id, entry)?;
+        transaction.commit()?;
+        Ok(())
+    }
+    pub fn task_logs(&self, id: &str) -> Result<Vec<crate::task_logs::Entry>> {
+        let db = self.connection.lock().unwrap();
+        let mut query = db.prepare(
+            "SELECT timestamp,level,message FROM task_logs WHERE task_id=?1 ORDER BY seq",
+        )?;
+        Ok(query
+            .query_map([id], |row| {
+                Ok(crate::task_logs::Entry {
+                    timestamp: row.get(0)?,
+                    level: row.get(1)?,
+                    message: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
     pub fn remove_task(&self, task: &Task, delete_media: bool) -> Result<()> {
         let mut db = self.connection.lock().unwrap();

@@ -19,7 +19,27 @@ pub async fn run(
     cancel: &CancellationToken,
     callback: Option<LineCallback>,
 ) -> Result<ProcessOutput> {
-    run_inner(executable, args, directory, cancel, callback, None).await
+    run_inner(executable, args, directory, cancel, callback, None, None).await
+}
+
+pub(crate) async fn run_logged(
+    executable: &Path,
+    args: &[String],
+    directory: Option<&Path>,
+    cancel: &CancellationToken,
+    callback: Option<LineCallback>,
+    log: crate::task_logs::RawLog,
+) -> Result<ProcessOutput> {
+    run_inner(
+        executable,
+        args,
+        directory,
+        cancel,
+        callback,
+        None,
+        Some(log),
+    )
+    .await
 }
 
 /// Metadata queries must bound bytes while reading, including a single JSON line.
@@ -38,6 +58,7 @@ pub async fn run_limited(
         cancel,
         None,
         Some((max_stdout, timeout, false)),
+        None,
     )
     .await
 }
@@ -57,6 +78,7 @@ pub async fn run_limited_text(
         cancel,
         None,
         Some((max_stdout, timeout, true)),
+        None,
     )
     .await
 }
@@ -68,9 +90,19 @@ async fn run_inner(
     cancel: &CancellationToken,
     callback: Option<LineCallback>,
     limit: Option<(usize, std::time::Duration, bool)>,
+    log: Option<crate::task_logs::RawLog>,
 ) -> Result<ProcessOutput> {
     if cancel.is_cancelled() {
         bail!("Operation interrupted");
+    }
+    if let Some(log) = &log {
+        log.write(
+            "command",
+            serde_json::to_string(
+                &serde_json::json!({"executable":executable,"args":args,"directory":directory}),
+            )?
+            .as_bytes(),
+        )?;
     }
     let mut command = Command::new(executable);
     command
@@ -102,6 +134,8 @@ async fn run_inner(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let out_callback = callback.clone();
+    let out_log = log.clone();
+    let err_log = log.clone();
     let overflow = CancellationToken::new();
     let out_overflow = overflow.clone();
     let out = tokio::spawn(async move {
@@ -109,24 +143,28 @@ async fn run_inner(
             Some((max, _, legacy_text)) => {
                 read_limited_output(stdout, max, out_overflow, legacy_text).await
             }
-            None => read_lines(stdout, false, out_callback).await,
+            None => read_lines(stdout, false, out_callback, out_log).await,
         }
     });
     let err = tokio::spawn(async move {
         if limit.is_some() {
             read_diagnostics(stderr).await
         } else {
-            read_lines(stderr, true, callback).await
+            read_lines(stderr, true, callback, err_log).await
         }
     });
     let status = tokio::select! {
-        status=child.wait()=>status.context("Cannot wait for supervised tool")?,
-        _=cancel.cancelled()=> { guard.terminate(); let _=child.kill().await; let _=child.wait().await; out.abort(); err.abort(); bail!("Operation interrupted"); }
-        _=overflow.cancelled()=> { guard.terminate(); let _=child.kill().await; let _=child.wait().await; out.abort(); err.abort(); bail!("Metadata stdout exceeds its byte limit"); }
-        _=tokio::time::sleep(limit.map_or(std::time::Duration::from_secs(86400), |(_, timeout, _)| timeout)), if limit.is_some()=> { guard.terminate(); let _=child.kill().await; let _=child.wait().await; out.abort(); err.abort(); bail!("Metadata query timed out"); }
+        status=child.wait()=>status.context("Cannot wait for supervised tool"),
+        _=cancel.cancelled()=> Err(anyhow::anyhow!("Operation interrupted")),
+        _=overflow.cancelled()=> Err(anyhow::anyhow!("Metadata stdout exceeds its byte limit")),
+        _=tokio::time::sleep(limit.map_or(std::time::Duration::from_secs(86400), |(_, timeout, _)| timeout)), if limit.is_some()=> Err(anyhow::anyhow!("Metadata query timed out")),
     };
     // Descendants must be gone before draining pipes or shutdown can hang forever.
     guard.terminate();
+    if status.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
     let stdout = out
         .await
         .context("Tool stdout reader stopped")?
@@ -135,6 +173,17 @@ async fn run_inner(
         .await
         .context("Tool stderr reader stopped")?
         .context("Cannot read tool stderr")?;
+    if let Some(log) = &log {
+        log.write(
+            "exit",
+            match &status {
+                Ok(status) => format!("{status}"),
+                Err(error) => format!("{error:#}"),
+            }
+            .as_bytes(),
+        )?;
+    }
+    let status = status?;
     if !status.success() {
         bail!(
             "{} exited with code {}: {}",
@@ -259,11 +308,15 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     is_error: bool,
     callback: Option<LineCallback>,
+    log: Option<crate::task_logs::RawLog>,
 ) -> Result<String> {
     let mut reader = BufReader::new(reader);
     let mut bytes = Vec::new();
     let mut captured = String::new();
     while reader.read_until(b'\n', &mut bytes).await? != 0 {
+        if let Some(log) = &log {
+            log.write(if is_error { "stderr" } else { "stdout" }, &bytes)?;
+        }
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
             if bytes.last() == Some(&b'\r') {
@@ -532,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_utf8_metadata_is_still_rejected() {
         assert!(
-            read_lines(&b"{\"title\":\"\xff\"}\n"[..], false, None)
+            read_lines(&b"{\"title\":\"\xff\"}\n"[..], false, None, None)
                 .await
                 .is_err()
         );

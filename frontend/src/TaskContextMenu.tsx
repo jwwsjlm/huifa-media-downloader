@@ -35,8 +35,9 @@ export function TaskContextMenu({ task, media, position, trigger, close, action,
   }}>
     <span className="task-menu-title truncate">{task.title || task.url}</span>
     {taskActions(task, t).map(item => <button type="button" role="menuitem" tabIndex={-1} key={item.action} onClick={() => perform(() => action(task, item.action))}><Icon name={item.icon} />{item.label}</button>)}
+    <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => action(task, 'logs'))}><Icon name="info" />{t('查看日志', 'View logs')}</button>
     {media && <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => run(() => host.result(media.id, host.desktop ? 'reveal' : 'download')))}><Icon name={host.desktop ? 'folder' : 'download'} />{host.desktop ? t('定位结果文件', 'Reveal result file') : t('下载结果文件', 'Download result file')}</button>}
-    {media && task.status === 'completed' && <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => action(task, 'convert'))}><Icon name="refresh" />{t('转换格式', 'Convert format')}</button>}
+    {media && ['completed', 'retained'].includes(task.status) && <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => action(task, 'convert'))}><Icon name="refresh" />{t('转换格式', 'Convert format')}</button>}
     <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => run(() => host.copyTask(task, 'title')))}><Icon name="copy" />{t('复制视频名', 'Copy video title')}</button>
     <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => run(() => host.copyTask(task, 'source')))}><Icon name="copy" />{t('复制来源', 'Copy source')}</button>
     {host.desktop && <button type="button" role="menuitem" tabIndex={-1} disabled={!media} onClick={() => perform(() => run(() => host.copyTask(task, 'path')))}><Icon name="copy" />{t('复制完整路径', 'Copy full path')}</button>}
