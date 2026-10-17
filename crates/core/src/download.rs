@@ -1,6 +1,6 @@
 use crate::{
     App, DownloadOptions,
-    model::{Chapter, SourceFile, SourceManifest, Task, text},
+    model::{Chapter, SourceFile, SourceManifest, Task, TransferBytes, text},
     process::{self, LineCallback},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -587,15 +587,31 @@ struct TransferUpdate {
     percent: Option<f64>,
     speed: Option<f64>,
     eta: Option<f64>,
+    downloaded: Option<u64>,
+    total: Option<u64>,
+    estimated: bool,
 }
 
 impl TransferUpdate {
-    fn apply(self, task: &mut Task) {
+    fn apply(self, task: &mut Task, index: usize) {
         task.stage_progress = self.percent;
         task.stage_indeterminate = self.percent.is_none();
         task.progress = self.percent.unwrap_or(0.0).min(99.0);
         task.speed = self.speed;
         task.eta = self.eta;
+        if let Some(downloaded) = self.downloaded
+            && let Some(bytes) = task.transfer_bytes.get_mut(index)
+        {
+            bytes.downloaded = downloaded;
+            if self.total.is_some() {
+                bytes.total = self.total;
+                bytes.estimated = self.estimated;
+            }
+            if bytes.total.is_some_and(|total| total < downloaded) {
+                bytes.total = None;
+                bytes.estimated = false;
+            }
+        }
     }
 
     fn live(self, speeds: &mut [Option<f64>], index: usize) -> Self {
@@ -604,8 +620,23 @@ impl TransferUpdate {
             percent: None,
             speed: speeds.iter().flatten().copied().reduce(|a, b| a + b),
             eta: None,
+            ..self
         }
     }
+}
+
+fn byte_count(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|value| {
+                value.is_finite()
+                    && *value >= 0.0
+                    && *value < u64::MAX as f64
+                    && value.fract() == 0.0
+            })
+            .map(|value| value as u64)
+    })
 }
 
 impl TransferProgress {
@@ -616,9 +647,8 @@ impl TransferProgress {
         if !finished && text(&progress, "status") != "downloading" {
             return None;
         }
-        let downloaded = progress["downloaded_bytes"]
-            .as_f64()
-            .filter(|v| v.is_finite() && *v >= 0.0)?;
+        let downloaded_bytes = byte_count(&progress["downloaded_bytes"])?;
+        let downloaded = downloaded_bytes as f64;
         if self.samples.back().is_some_and(|(time, bytes)| {
             now.saturating_duration_since(*time) >= Duration::from_secs(5) || downloaded < *bytes
         }) {
@@ -631,15 +661,15 @@ impl TransferProgress {
         {
             self.samples.pop_front();
         }
-        let total = progress
-            .get("total_bytes")
-            .and_then(Value::as_f64)
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .or_else(|| {
-                progress["total_bytes_estimate"]
-                    .as_f64()
-                    .filter(|v| v.is_finite() && *v > 0.0)
-            });
+        let exact_total = byte_count(&progress["total_bytes"]).filter(|value| *value > 0);
+        let total_bytes = if finished {
+            (downloaded_bytes > 0).then_some(downloaded_bytes)
+        } else {
+            exact_total.or_else(|| {
+                byte_count(&progress["total_bytes_estimate"]).filter(|value| *value > 0)
+            })
+        };
+        let total = total_bytes.map(|value| value as f64);
         // Fragment hooks report burst speeds; use actual byte movement over one shared window.
         let (start, bytes) = self.samples.front().unwrap();
         let seconds = now.saturating_duration_since(*start).as_secs_f64();
@@ -663,6 +693,9 @@ impl TransferProgress {
             percent: total.map(|v| (downloaded / v * 100.0).clamp(0.0, 100.0)),
             speed,
             eta,
+            downloaded: Some(downloaded_bytes),
+            total: total_bytes,
+            estimated: !finished && exact_total.is_none() && total_bytes.is_some(),
         })
     }
 
@@ -699,8 +732,34 @@ pub(crate) async fn transfer(
             &formats,
             info["duration"].as_f64(),
         ));
-        app.save_task(&task)?;
     }
+    task.transfer_bytes = formats
+        .iter()
+        .enumerate()
+        .map(|(index, format)| {
+            task.transfer_bytes
+                .get(index)
+                .filter(|bytes| bytes.format_id == text(format, "format_id"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    let exact_total = byte_count(&format["filesize"]).filter(|value| *value > 0);
+                    let total = if is_live(&info) {
+                        None
+                    } else {
+                        exact_total.or_else(|| {
+                            byte_count(&format["filesize_approx"]).filter(|value| *value > 0)
+                        })
+                    };
+                    TransferBytes {
+                        format_id: text(format, "format_id").into(),
+                        downloaded: 0,
+                        total,
+                        estimated: exact_total.is_none() && total.is_some(),
+                    }
+                })
+        })
+        .collect();
+    app.save_task(&task)?;
     let directory = app
         .config
         .data_dir
@@ -805,7 +864,7 @@ pub(crate) async fn transfer(
                         if live {
                             update = update.live(&mut speeds, index);
                         }
-                        update.apply(&mut task);
+                        update.apply(&mut task, index);
                         let _ = app_progress.save_task(&task);
                     }
                 });
@@ -831,9 +890,9 @@ pub(crate) async fn transfer(
                                 && current.status == "downloading" && current.stage == stage
                             {
                                 if live {
-                                    TransferUpdate { percent: None, speed: None, eta: None }
+                                    TransferUpdate { percent: None, speed: None, eta: None, downloaded: None, total: None, estimated: false }
                                         .live(&mut speeds, index)
-                                        .apply(&mut current);
+                                        .apply(&mut current, index);
                                 } else {
                                     current.speed = None;
                                     current.eta = None;
@@ -874,6 +933,15 @@ pub(crate) async fn transfer(
                 );
                 let (hash, size) = hash_file(&canonical)?;
                 ensure!(size > 0, "Downloaded stream is empty");
+                {
+                    let _guard = speeds.lock().unwrap();
+                    let mut current = app.db.task(&task.id)?;
+                    let bytes = &mut current.transfer_bytes[index];
+                    bytes.downloaded = size;
+                    bytes.total = Some(size);
+                    bytes.estimated = false;
+                    app.save_task(&current)?;
+                }
                 Ok(SourceFile {
                     path: canonical,
                     hash,
@@ -1551,16 +1619,19 @@ mod tests {
             percent: Some(90.0),
             speed,
             eta: Some(1.0),
+            downloaded: None,
+            total: None,
+            estimated: false,
         };
-        update(Some(10.0)).live(&mut speeds, 0).apply(&mut task);
-        update(Some(20.0)).live(&mut speeds, 1).apply(&mut task);
+        update(Some(10.0)).live(&mut speeds, 0).apply(&mut task, 0);
+        update(Some(20.0)).live(&mut speeds, 1).apply(&mut task, 1);
         assert_eq!(task.speed, Some(30.0));
         assert_eq!(task.stage_progress, None);
         assert_eq!(task.eta, None);
         assert!(task.stage_indeterminate);
-        update(None).live(&mut speeds, 0).apply(&mut task);
+        update(None).live(&mut speeds, 0).apply(&mut task, 0);
         assert_eq!(task.speed, Some(20.0));
-        update(None).live(&mut speeds, 1).apply(&mut task);
+        update(None).live(&mut speeds, 1).apply(&mut task, 1);
         assert_eq!(task.speed, None);
     }
 
@@ -1649,6 +1720,126 @@ mod tests {
     }
 
     #[test]
+    fn transfer_bytes_sum_streams_and_preserve_unknown_totals_and_resume_positions() {
+        let mut task = crate::tests::paused_task(Default::default());
+        task.transfer_bytes = vec![
+            TransferBytes {
+                format_id: "video".into(),
+                downloaded: 0,
+                total: Some(1000),
+                estimated: false,
+            },
+            TransferBytes {
+                format_id: "audio".into(),
+                downloaded: 0,
+                total: None,
+                estimated: false,
+            },
+        ];
+        let now = Instant::now();
+        let mut video = TransferProgress::default();
+        video.update("HU_PROGRESS:{\"status\":\"downloading\",\"downloaded_bytes\":400,\"total_bytes\":1000}", now).unwrap().apply(&mut task, 0);
+        assert_eq!(task.public()["downloadedBytes"], 400);
+        assert!(task.public()["totalBytes"].is_null());
+        video
+            .update(
+                "HU_PROGRESS:{\"status\":\"finished\",\"downloaded_bytes\":1000}",
+                now,
+            )
+            .unwrap()
+            .apply(&mut task, 0);
+        task.stage("downloading", "downloading_audio_2", None);
+        assert_eq!(task.public()["downloadedBytes"], 1000);
+        let mut audio = TransferProgress::default();
+        audio.update("HU_PROGRESS:{\"status\":\"downloading\",\"downloaded_bytes\":50,\"total_bytes_estimate\":100}", now).unwrap().apply(&mut task, 1);
+        assert_eq!(task.public()["downloadedBytes"], 1050);
+        assert_eq!(task.public()["totalBytes"], 1100);
+        assert_eq!(task.public()["totalBytesEstimated"], true);
+        task.stage("paused", "paused", None);
+        let mut resumed: Task =
+            serde_json::from_value(serde_json::to_value(&task).unwrap()).unwrap();
+        assert_eq!(resumed.public()["downloadedBytes"], 1050);
+        TransferProgress::default().update("HU_PROGRESS:{\"status\":\"downloading\",\"downloaded_bytes\":50,\"total_bytes_estimate\":100}", now).unwrap().apply(&mut resumed, 1);
+        assert_eq!(
+            resumed.public()["downloadedBytes"],
+            1050,
+            "resume hooks contain absolute bytes, not deltas"
+        );
+        audio
+            .update(
+                "HU_PROGRESS:{\"status\":\"finished\",\"downloaded_bytes\":90}",
+                now,
+            )
+            .unwrap()
+            .apply(&mut resumed, 1);
+        assert_eq!(resumed.public()["downloadedBytes"], 1090);
+        assert_eq!(resumed.public()["totalBytes"], 1090);
+        assert_eq!(resumed.public()["totalBytesEstimated"], false);
+        assert!(resumed.public().get("transferBytes").is_none());
+        let mut legacy = serde_json::to_value(&task).unwrap();
+        legacy.as_object_mut().unwrap().remove("transferBytes");
+        let legacy: Task = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.public()["downloadedBytes"].is_null());
+        assert!(legacy.public()["totalBytes"].is_null());
+    }
+
+    #[test]
+    fn transfer_bytes_live_updates_do_not_reset_other_streams_on_speed_expiry_or_restart() {
+        let mut task = crate::tests::paused_task(Default::default());
+        task.transfer_bytes = (0..2)
+            .map(|index| TransferBytes {
+                format_id: index.to_string(),
+                downloaded: 0,
+                total: None,
+                estimated: false,
+            })
+            .collect();
+        let now = Instant::now();
+        let mut speeds = [None, None];
+        for (index, bytes) in [(0, 100), (1, 20), (0, 50)] {
+            TransferProgress::default()
+                .update(
+                    &format!(
+                        "HU_PROGRESS:{}",
+                        json!({"status":"downloading","downloaded_bytes":bytes})
+                    ),
+                    now,
+                )
+                .unwrap()
+                .live(&mut speeds, index)
+                .apply(&mut task, index);
+        }
+        assert_eq!(
+            task.public()["downloadedBytes"],
+            70,
+            "a restarted stream replaces its previous absolute byte count"
+        );
+        TransferUpdate {
+            percent: None,
+            speed: None,
+            eta: None,
+            downloaded: None,
+            total: None,
+            estimated: false,
+        }
+        .live(&mut speeds, 0)
+        .apply(&mut task, 0);
+        assert_eq!(task.public()["downloadedBytes"], 70);
+        assert!(task.public()["totalBytes"].is_null());
+        for invalid in [
+            json!(-1),
+            json!(0.5),
+            json!(1e40),
+            json!("123"),
+            Value::Null,
+        ] {
+            assert!(byte_count(&invalid).is_none());
+        }
+        assert_eq!(byte_count(&json!(u64::MAX)), Some(u64::MAX));
+        assert_eq!(byte_count(&json!(123.0)), Some(123));
+    }
+
+    #[test]
     fn fragment_progress_uses_measured_throughput_instead_of_instantaneous_spikes() {
         let mut task = crate::tests::paused_task(Default::default());
         task.stage("downloading", "downloading_video_1", None);
@@ -1665,7 +1856,7 @@ mod tests {
             tracker
                 .update(&line, now + Duration::from_secs(seconds))
                 .unwrap()
-                .apply(&mut task);
+                .apply(&mut task, 0);
         }
         assert_eq!(task.stage_progress, Some(20.0));
         assert_eq!(task.speed, Some(10.0 * mib));

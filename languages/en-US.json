@@ -7,6 +7,15 @@
     "Huifa Video Downloader contributors"
   ],
   "translations": {
+    "Downloaded / total": "Downloaded / total",
+    "Downloaded": "Downloaded",
+    "Total size unknown; showing downloaded bytes": "Total size unknown; showing downloaded bytes",
+    "Select all tasks in this list": "Select all tasks in this list",
+    "Select all": "Select all",
+    "Delete selected": "Delete selected",
+    "Delete selected tasks": "Delete selected tasks",
+    "Delete failed": "Delete failed",
+    "Also delete media files managed by selected tasks": "Also delete media files managed by selected tasks",
     "application.name::Huifa Video Downloader": "HuifaMediaDownloader",
     "application.update::Up to Date": "Up to Date",
     "completed.filter::All": "All",

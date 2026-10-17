@@ -207,6 +207,7 @@ fn fixture_task(tools: HashMap<String, PathBuf>) -> Task {
         title: "Performance audit tool fixture".into(),
         thumbnail: None,
         size: None,
+        transfer_bytes: vec![],
         source_info: None,
         media_info: None,
         steps: vec![],

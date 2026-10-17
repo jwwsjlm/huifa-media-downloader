@@ -597,6 +597,7 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         title: "Option sample".into(),
         thumbnail: None,
         size: None,
+        transfer_bytes: vec![],
         source_info: None,
         media_info: None,
         steps: vec![],
@@ -940,6 +941,15 @@ async fn real_generic_http_mp4_and_audio_extraction() -> Result<()> {
             );
         }
         wait_for(&app, &ids, &["waiting_processing"]).await?;
+        let progress = app.db.task(id)?.public();
+        let source_size = std::fs::metadata(&input)?.len();
+        ensure!(
+            progress["downloadedBytes"] == source_size
+                && progress["totalBytes"] == source_size
+                && progress["totalBytesEstimated"] == false
+                && progress["size"].is_null(),
+            "Source transfer sizes did not reach the task before processing: {progress}"
+        );
         if let Some(previous) = &previous {
             let retained = app
                 .db

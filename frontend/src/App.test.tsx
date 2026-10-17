@@ -19,6 +19,21 @@ beforeEach(() => {
   transport.copyTask.mockReset().mockResolvedValue(undefined); transport.result.mockReset().mockResolvedValue(undefined);
 });
 describe('live interface stability', () => {
+  it('updates downloaded sizes through stream changes and pause, then shows the final completed file size', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const row = within(screen.getByRole('option', { name: /Alpha/ }));
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', downloadedBytes: 1048576, totalBytes: null } }));
+    expect(row.getByText('1.0 MiB')).toBeTruthy();
+    expect(row.getByText('Downloaded')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', downloadedBytes: 2097152, totalBytes: 4194304, totalBytesEstimated: true } }));
+    expect(row.getByText('2.0 MiB')).toBeTruthy(); expect(row.getByText('/ ≈ 4.0 MiB')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', stage: 'downloading_audio_2', downloadedBytes: 3145728, totalBytes: 4194304, totalBytesEstimated: false } }));
+    expect(row.getByText('3.0 MiB')).toBeTruthy(); expect(row.getByText('/ 4.0 MiB')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'paused' } }));
+    expect(row.getByText('3.0 MiB')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'completed', stage: 'completed', size: 5242880 } }));
+    expect(row.getByText('5.0 MiB')).toBeTruthy(); expect(row.queryByText('/ 4.0 MiB')).toBeNull();
+  });
   it('updates total download speed independently of the visible task filter', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     const total = screen.getByLabelText('Total download speed');
@@ -84,6 +99,7 @@ describe('live interface stability', () => {
     Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed', stepIndex: 6, stepCount: 6, size: 10485760, sourceInfo: { width: 3840, height: 2160, fps: 59.94, videoCodec: 'vp9', audioCodec: 'opus', size: 20971520, duration: 60, container: 'webm' }, mediaInfo: { width: 1920, height: 1080, fps: 29.97, videoCodec: 'h264', audioCodec: 'aac', size: 10485760, duration: 60, container: 'mp4' } });
     transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     const row = within(screen.getByRole('option', { name: /Alpha/ }));
     expect(row.getByText('Completed · 1080p')).toBeTruthy();
     expect(row.getByText('10.0 MiB')).toBeTruthy();
@@ -102,6 +118,7 @@ describe('live interface stability', () => {
     snapshot.media = [{ id: 'media-a', taskId: 'a', title: 'Alpha', filename: 'alpha.mp4', size: 1048576, duration: 60, mediaInfo }];
     transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     const row = within(screen.getByRole('option', { name: /Alpha/ }));
     expect(row.getByText('Completed · 1080p60')).toBeTruthy(); expect(row.queryByText(/4K120/)).toBeNull();
     const result = within(screen.getByRole('region', { name: 'Result file information' }));
@@ -115,6 +132,7 @@ describe('live interface stability', () => {
     let finish!: (value: unknown) => void;
     transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tasks.info' ? new Promise(resolve => { finish = resolve; }) : true);
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     const row = within(screen.getByRole('option', { name: /Alpha/ }));
     expect(row.getByText('1.0 MiB')).toBeTruthy(); expect(row.queryByText(/4K/)).toBeNull();
     await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.info', { id: 'a' }));
@@ -129,6 +147,7 @@ describe('live interface stability', () => {
     const snapshot = makeSnapshot(); Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed' });
     transport.command.mockImplementation(async command => { if (command === 'snapshot') return snapshot; if (command === 'tasks.info') throw new Error('fixture probe failed'); return true; });
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     expect(await screen.findByText(/Result information could not be read/)).toBeTruthy();
     expect(screen.queryByRole('alert')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
@@ -175,6 +194,7 @@ describe('live interface stability', () => {
   });
   it('shows a task cover during download before a completed media record exists', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     const detail = screen.getByRole('complementary', { name: 'Task details' });
     expect(detail.querySelector('.thumbnail img')).toBeNull();
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'downloading', hasThumbnail: true } }));
@@ -258,6 +278,7 @@ describe('live interface stability', () => {
   });
   it('opens task actions with right click and acts on that task rather than the previous selection', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     const row = screen.getByRole('option', { name: /Beta/ });
     const nativeMenu = fireEvent.contextMenu(row, { clientX: 800, clientY: 500 });
     expect(nativeMenu).toBe(false);
@@ -284,6 +305,7 @@ describe('live interface stability', () => {
   });
   it('supports keyboard context menus, status-specific actions and dismissing stale virtual rows', async () => {
     render(<AppProvider><App /></AppProvider>); const list = await screen.findByRole('listbox');
+    fireEvent.click(within(list).getByRole('option', { name: /Alpha/ }));
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'paused' } }));
     list.focus(); fireEvent.keyDown(list, { key: 'F10', shiftKey: true });
     let menu = screen.getByRole('menu', { name: 'Task actions' });
@@ -367,6 +389,8 @@ describe('live interface stability', () => {
     snapshot.tasks[1].status = status; snapshot.tasks[1].url = url;
     transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tasks.add' ? { ids: ['b'], results: [{ id: 'b', status, action: 'existing' }] } : true);
     render(<AppProvider><App /></AppProvider>); const list = await screen.findByRole('listbox');
+    expect(within(list).queryByRole('option', { selected: true })).toBeNull();
+    fireEvent.click(within(list).getByRole('option', { name: /Alpha/ }));
     expect(within(list).getByRole('option', { selected: true }).textContent).toContain('Alpha');
     fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: url } });
     fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
@@ -386,6 +410,7 @@ describe('live interface stability', () => {
   });
   it('retains paused positions and replaces stale stages with terminal status in both the row and details', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'processing', stage: 'muxing', stepIndex: 2, stepCount: 4, stageProgress: 35 } }));
     const row = within(screen.getByRole('option', { name: /Alpha/ }));
     const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
@@ -452,6 +477,7 @@ describe('live interface stability', () => {
       return true;
     });
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
     fireEvent.click(detail.getByText('More actions'));
     fireEvent.click(detail.getByRole('button', { name: 'Convert format' }));
@@ -614,6 +640,7 @@ describe('live interface stability', () => {
   });
   it('gives recovery guidance for failed downloads while keeping the diagnostic', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'failed', error: 'yt-dlp.exe exited with code 1: Sign in to confirm you are not a bot' } }));
     expect(screen.getByRole('alert').textContent).toContain('Open browser sign-in');
     expect(screen.getByRole('alert').textContent).toContain('yt-dlp.exe exited with code 1');
@@ -641,6 +668,7 @@ describe('live interface stability', () => {
   });
   it('refreshes a missed snapshot while preserving the selected task and URL draft', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'still editing' } });
     const next = makeSnapshot(); next.tasks[0].progress = 92; next.tasks[0].stageProgress = 92; next.tasks.reverse();
     transport.command.mockImplementation(async command => command === 'snapshot' ? next : []);

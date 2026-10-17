@@ -26,6 +26,9 @@ export interface Task {
   options: DownloadOptions;
   outputPath?: string;
   size?: number | string | null;
+  downloadedBytes?: number | null;
+  totalBytes?: number | null;
+  totalBytesEstimated?: boolean;
   sourceInfo?: MediaInfo | null;
   mediaInfo?: MediaInfo | null;
 }

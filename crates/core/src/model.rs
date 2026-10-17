@@ -529,6 +529,8 @@ pub(crate) struct Task {
     #[serde(default)]
     pub size: Option<u64>,
     #[serde(default)]
+    pub transfer_bytes: Vec<TransferBytes>,
+    #[serde(default)]
     pub source_info: Option<MediaInfo>,
     #[serde(default)]
     pub media_info: Option<MediaInfo>,
@@ -570,9 +572,23 @@ pub(crate) struct Task {
 
 impl Task {
     pub fn public(&self) -> Value {
+        let downloaded_bytes = (!self.transfer_bytes.is_empty())
+            .then(|| {
+                self.transfer_bytes
+                    .iter()
+                    .try_fold(0u64, |sum, item| sum.checked_add(item.downloaded))
+            })
+            .flatten();
+        let total_bytes = (!self.transfer_bytes.is_empty())
+            .then(|| {
+                self.transfer_bytes
+                    .iter()
+                    .try_fold(0u64, |sum, item| sum.checked_add(item.total?))
+            })
+            .flatten();
         json!({"id":self.id,"kind":self.kind,"files":self.files,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,
             "progress":self.progress,"stageProgress":self.stage_progress,"stageIndeterminate":self.stage_indeterminate,"stepIndex":self.step_index,"stepCount":self.steps.len(),
-            "speed":self.speed,"eta":self.eta,"size":self.size,"sourceInfo":self.source_info,"mediaInfo":self.media_info,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
+            "speed":self.speed,"eta":self.eta,"size":self.size,"downloadedBytes":downloaded_bytes,"totalBytes":total_bytes,"totalBytesEstimated":total_bytes.is_some() && self.transfer_bytes.iter().any(|item| item.estimated),"sourceInfo":self.source_info,"mediaInfo":self.media_info,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
             "outputPath":self.output_path.as_ref().and_then(|p|p.file_name()).map(|p|p.to_string_lossy())})
     }
     pub fn stage(&mut self, status: &str, stage: &str, percent: Option<f64>) {
@@ -591,6 +607,14 @@ impl Task {
             percent.unwrap_or(0.0).min(99.0)
         };
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TransferBytes {
+    pub format_id: String,
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub estimated: bool,
 }
 
 fn media_kind() -> String {

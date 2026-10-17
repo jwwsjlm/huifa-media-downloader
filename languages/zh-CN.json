@@ -7,6 +7,14 @@
     "Huifa Video Downloader contributors"
   ],
   "translations": {
+    "Downloaded / total": "已下载 / 总大小",
+    "Total size unknown; showing downloaded bytes": "总大小未知，显示已下载大小",
+    "Select all tasks in this list": "全选当前列表",
+    "Select all": "全选",
+    "Delete selected": "批量删除",
+    "Delete selected tasks": "批量删除任务",
+    "Delete failed": "删除失败",
+    "Also delete media files managed by selected tasks": "同时删除所选任务管理的媒体文件",
     "\n\nConfiguration warnings:\n": "\n\n配置提醒：\n",
     "\n\nDetails were written to: data/logs/app-crash.log": "\n\n详细信息已写入：data/logs/app-crash.log",
     "\n\nExit, move the complete application folder to a writable location, and start it again.": "\n\n请退出后将完整软件目录移动到有写入权限的位置，再重新启动。",

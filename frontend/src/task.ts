@@ -55,6 +55,18 @@ export function bytes(value: number | string | undefined | null): string {
   const power = Math.max(0, Math.min(4, Math.floor(Math.log(value) / Math.log(1024))));
   return `${(value / 1024 ** power).toFixed(power ? 1 : 0)} ${['B', 'KiB', 'MiB', 'GiB', 'TiB'][power]}`;
 }
+export function taskSize(task: Task, t: Translate): { value: string; detail?: string; title?: string } {
+  if (['completed', 'retained'].includes(task.status)) return { value: bytes(task.size ?? task.mediaInfo?.size) };
+  const downloaded = task.downloadedBytes;
+  if (downloaded == null || !Number.isFinite(downloaded) || downloaded < 0) return { value: '—' };
+  const value = downloaded === 0 ? '0 B' : bytes(downloaded);
+  const total = task.totalBytes;
+  if (total != null && Number.isFinite(total) && total > 0) {
+    const detail = `/ ${task.totalBytesEstimated ? '≈ ' : ''}${bytes(total)}`;
+    return { value, detail, title: `${t('已下载 / 总大小', 'Downloaded / total')}: ${value} ${detail}` };
+  }
+  return { value, detail: t('已下载', 'Downloaded'), title: t('总大小未知，显示已下载大小', 'Total size unknown; showing downloaded bytes') };
+}
 export function duration(value: number | string | undefined | null): string {
   if (typeof value === 'string') return value || '—';
   if (value == null || !Number.isFinite(value)) return '—';

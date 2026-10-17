@@ -379,6 +379,7 @@ fn allowed_command(command: &str) -> bool {
             | "tasks.cancel"
             | "tasks.retry"
             | "tasks.delete"
+            | "tasks.deleteBatch"
             | "tasks.pauseAll"
             | "tasks.resumeAll"
             | "tasks.convert"
@@ -788,6 +789,12 @@ mod tests {
         assert!(!allowed_command("media.file"));
         assert!(!allowed_command("host.paths"));
         assert!(!allowed_command("host.download_directory"));
+    }
+
+    #[test]
+    fn batch_deletion_uses_the_same_authenticated_web_command_route() {
+        assert!(allowed_command("tasks.delete"));
+        assert!(allowed_command("tasks.deleteBatch"));
     }
 
     #[test]

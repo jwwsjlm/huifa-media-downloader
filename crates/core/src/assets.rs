@@ -146,6 +146,7 @@ impl App {
             title: "Waiting for metadata".into(),
             thumbnail: None,
             size: None,
+            transfer_bytes: vec![],
             source_info: None,
             media_info: None,
             status: "queued".into(),

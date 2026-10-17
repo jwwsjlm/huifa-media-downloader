@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest';
-import { bytes, dimensions, frameRate, mediaQuality, mediaQualityWithFps } from './task';
+import { bytes, dimensions, frameRate, mediaQuality, mediaQualityWithFps, taskSize } from './task';
+import { makeTask } from './test-fixtures';
 
 it.each([
   [3840, 2160, '4K'], [2160, 3840, '4K'], [3840, 1600, '4K'],
@@ -21,4 +22,16 @@ it('does not infer a resolution from FPS alone or change the detailed resolution
   expect(mediaQualityWithFps({ fps: 60 })).toBe('—');
   expect(mediaQualityWithFps({ width: 3840, height: 2160, fps: 59.94 })).toBe('4K60');
   expect(mediaQuality({ width: 3840, height: 2160, fps: 59.94 })).toBe('4K');
+});
+it('shows actual downloaded bytes with known, estimated and unknown totals, preserving final output sizes', () => {
+  const en = (_zh: string, english: string) => english;
+  const task = { ...makeTask('a'), downloadedBytes: 1048576, size: 999999999 };
+  expect(taskSize(task, en)).toEqual({ value: '1.0 MiB', detail: 'Downloaded', title: 'Total size unknown; showing downloaded bytes' });
+  expect(taskSize({ ...task, totalBytes: 2097152 }, en)).toEqual({ value: '1.0 MiB', detail: '/ 2.0 MiB', title: 'Downloaded / total: 1.0 MiB / 2.0 MiB' });
+  expect(taskSize({ ...task, totalBytes: 2097152, totalBytesEstimated: true }, en).detail).toBe('/ ≈ 2.0 MiB');
+  expect(taskSize({ ...task, downloadedBytes: 0 }, en).value).toBe('0 B');
+  for (const downloadedBytes of [undefined, null, -1, Infinity]) expect(taskSize({ ...task, downloadedBytes }, en)).toEqual({ value: '—' });
+  expect(taskSize({ ...task, status: 'paused' }, en).value).toBe('1.0 MiB');
+  expect(taskSize({ ...task, status: 'completed', size: 3145728 }, en)).toEqual({ value: '3.0 MiB' });
+  expect(taskSize({ ...task, status: 'retained', size: undefined, mediaInfo: { size: 4194304 } }, en)).toEqual({ value: '4.0 MiB' });
 });

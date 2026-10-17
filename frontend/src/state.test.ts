@@ -4,6 +4,21 @@ import { taskProgress } from './task';
 import { makeTask, makeSnapshot } from './test-fixtures';
 import { version as buildVersion } from '../package.json';
 describe('task delta state', () => {
+  it('does not select tasks on load, background updates, reconnect or removal', () => {
+    let state = reducer(initialState, { type: 'snapshot', snapshot: makeSnapshot() });
+    expect(state.view.taskSelection).toBe('');
+    state = reducer(state, { type: 'event', event: { kind: 'task.upsert', data: { ...makeTask('c') } } });
+    expect(state.view.taskSelection).toBe('');
+    state = reducer(state, { type: 'event', event: { kind: 'task.upsert', data: { id: 'a', progress: 50 } } });
+    expect(state.view.taskSelection).toBe('');
+    state = reducer(state, { type: 'snapshot', snapshot: makeSnapshot() });
+    expect(state.view.taskSelection).toBe('');
+    state = reducer(state, { type: 'view', patch: { taskSelection: 'a' } });
+    state = reducer(state, { type: 'event', event: { kind: 'task.remove', data: { id: 'a' } } });
+    expect(state.view.taskSelection).toBe('');
+    state = reducer(state, { type: 'snapshot', snapshot: { ...makeSnapshot(), tasks: [makeTask('b')] } });
+    expect(state.view.taskSelection).toBe('');
+  });
   it('starts at the packaged version and accepts the connected runtime version', () => {
     expect(initialState.version).toBe(buildVersion);
     const snapshot = makeSnapshot(); snapshot.version = '1.2.3';

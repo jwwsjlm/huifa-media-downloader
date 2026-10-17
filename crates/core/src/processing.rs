@@ -76,6 +76,7 @@ pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Resu
     task.conversion = true;
     task.source_info = task.media_info.take();
     task.size = None;
+    task.transfer_bytes.clear();
     task.steps.clear();
     task.step_index = None;
     task.publication = None;
@@ -384,6 +385,7 @@ async fn queue_conversion_prepared(
     task.thumbnail = None;
     task.source_info = task.media_info.take();
     task.size = None;
+    task.transfer_bytes.clear();
     task.created_at = chrono::Utc::now().to_rfc3339();
     task.options = options;
     task.conversion = true;

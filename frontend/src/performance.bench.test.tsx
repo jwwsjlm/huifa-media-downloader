@@ -101,6 +101,7 @@ describe.skipIf(!enabled)('opt-in generated-data performance audit', () => {
             fireEvent.change(screen.getByRole('combobox', { name: 'Sort' }), { target: { value: 'title' } });
           }
           const viewport = screen.getByRole('listbox', { name: 'Download task list' });
+          fireEvent.click(within(viewport).getAllByRole('option')[0]);
           const initialOrder = [...latest!.taskIds];
           renderMs = 0; commits = 0;
           const start = performance.now();

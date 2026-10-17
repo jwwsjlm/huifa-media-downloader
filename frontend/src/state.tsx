@@ -22,7 +22,7 @@ export function reducer(state: AppState, action: Action): AppState {
     const tasks = Object.fromEntries(action.snapshot.tasks.map(task => [String(task.id), task]));
     const media = Object.fromEntries(action.snapshot.media.map(item => [String(item.id), item]));
     const taskIds = action.snapshot.tasks.map(task => String(task.id)); const mediaIds = action.snapshot.media.map(item => String(item.id));
-    return { ...state, ...action.snapshot, tools: action.snapshot.tools ?? state.tools, tasks, taskIds, taskListVersion: state.taskListVersion + 1, activeTaskCount: action.snapshot.tasks.reduce((count, task) => count + active(task), 0), downloadSpeed: action.snapshot.tasks.reduce((total, task) => total + speed(task), 0), media, mediaIds, mediaByTask: Object.fromEntries(action.snapshot.media.map(item => [item.taskId, item.id])), view: { ...state.view, taskSelection: state.view.taskSelection || taskIds[0] || '', mediaSelection: state.view.mediaSelection || mediaIds[0] || '' }, loaded: true, connected: true };
+    return { ...state, ...action.snapshot, tools: action.snapshot.tools ?? state.tools, tasks, taskIds, taskListVersion: state.taskListVersion + 1, activeTaskCount: action.snapshot.tasks.reduce((count, task) => count + active(task), 0), downloadSpeed: action.snapshot.tasks.reduce((total, task) => total + speed(task), 0), media, mediaIds, mediaByTask: Object.fromEntries(action.snapshot.media.map(item => [item.taskId, item.id])), view: { ...state.view, taskSelection: taskIds.includes(state.view.taskSelection) ? state.view.taskSelection : '', mediaSelection: state.view.mediaSelection || mediaIds[0] || '' }, loaded: true, connected: true };
   }
   const { kind, data } = action.event;
   if (kind === 'task.upsert') {
@@ -30,7 +30,7 @@ export function reducer(state: AppState, action: Action): AppState {
     if (!id || id === 'undefined') return state;
     const previous = state.tasks[id]; const next = { ...previous, ...task, id };
     const listChanged = !previous || (['title', 'url', 'status', 'createdAt'] as const).some(key => previous[key] !== next[key]);
-    return { ...state, tasks: { ...state.tasks, [id]: next }, taskIds: previous ? state.taskIds : [...state.taskIds, id], taskListVersion: state.taskListVersion + Number(listChanged), activeTaskCount: state.activeTaskCount + active(next) - active(previous), downloadSpeed: Math.max(0, state.downloadSpeed + speed(next) - speed(previous)), view: state.view.taskSelection ? state.view : { ...state.view, taskSelection: id } };
+    return { ...state, tasks: { ...state.tasks, [id]: next }, taskIds: previous ? state.taskIds : [...state.taskIds, id], taskListVersion: state.taskListVersion + Number(listChanged), activeTaskCount: state.activeTaskCount + active(next) - active(previous), downloadSpeed: Math.max(0, state.downloadSpeed + speed(next) - speed(previous)) };
   }
   if (kind === 'task.remove') {
     const id = typeof data === 'string' ? data : String((data as { id: string }).id);

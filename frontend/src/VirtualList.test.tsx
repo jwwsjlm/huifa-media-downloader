@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { useState } from 'react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { keyboardIndex, ROW_HEIGHT, virtualRange, VirtualList } from './VirtualList';
 
 describe('56px virtual lists', () => {
@@ -25,5 +25,47 @@ describe('56px virtual lists', () => {
     fireEvent.keyDown(list, { key: 'ArrowUp' }); expect(screen.getByRole('option', { selected: true }).textContent).toBe('b');
     fireEvent.keyDown(list, { key: 'Home' }); expect(screen.getByRole('option', { selected: true }).textContent).toBe('a');
     expect(keyboardIndex('ArrowDown', -1, 3)).toBe(0); expect(keyboardIndex('End', 0, 0)).toBe(-1);
+  });
+  it('selects a stable Shift range, toggles with Ctrl or Meta, and preserves the range on right-click', () => {
+    const context = vi.fn();
+    function List() {
+      const [selected, setSelected] = useState('a'); const [selection, setSelection] = useState(['a']);
+      return <VirtualList ids={['a', 'b', 'c', 'd']} selected={selected} selection={selection} onSelectionChange={setSelection} onSelect={setSelected} onContextMenu={context} renderRow={id => id} label="Tasks" scrollKey="test-multiple" />;
+    }
+    render(<List />);
+    const chosen = () => screen.queryAllByRole('option', { selected: true }).map(row => row.textContent);
+    const row = (name: string) => screen.getByRole('option', { name });
+    expect(screen.getByRole('listbox').getAttribute('aria-multiselectable')).toBe('true');
+    expect(fireEvent.mouseDown(row('c'), { shiftKey: true })).toBe(false);
+    fireEvent.click(row('c'), { shiftKey: true }); expect(chosen()).toEqual(['a', 'b', 'c']);
+    fireEvent.click(row('b'), { shiftKey: true }); expect(chosen()).toEqual(['a', 'b']);
+    fireEvent.click(row('d'), { ctrlKey: true }); expect(chosen()).toEqual(['a', 'b', 'd']);
+    fireEvent.click(row('b'), { metaKey: true }); expect(chosen()).toEqual(['a', 'd']);
+    fireEvent.contextMenu(row('a')); expect(chosen()).toEqual(['a', 'd']); expect(context.mock.calls[0][0]).toBe('a');
+    fireEvent.contextMenu(row('c')); expect(chosen()).toEqual(['c']);
+  });
+  it('extends and contracts keyboard ranges from their anchor', () => {
+    function List() {
+      const [selected, setSelected] = useState('b'); const [selection, setSelection] = useState(['b']);
+      return <VirtualList ids={['a', 'b', 'c', 'd']} selected={selected} selection={selection} onSelectionChange={setSelection} onSelect={setSelected} renderRow={id => id} label="Tasks" scrollKey="test-multiple-keyboard" />;
+    }
+    render(<List />); const list = screen.getByRole('listbox');
+    const chosen = () => screen.queryAllByRole('option', { selected: true }).map(row => row.textContent);
+    fireEvent.keyDown(list, { key: 'ArrowDown', shiftKey: true }); expect(chosen()).toEqual(['b', 'c']);
+    fireEvent.keyDown(list, { key: 'ArrowDown', shiftKey: true }); expect(chosen()).toEqual(['b', 'c', 'd']);
+    fireEvent.keyDown(list, { key: 'ArrowUp', shiftKey: true }); expect(chosen()).toEqual(['b', 'c']);
+    fireEvent.keyDown(list, { key: 'Home' }); expect(chosen()).toEqual(['a']);
+  });
+  it('selects every virtual item with Ctrl+A without rendering every row', () => {
+    const ids = Array.from({ length: 10000 }, (_, index) => `task-${index}`);
+    function List() {
+      const [selection, setSelection] = useState<string[]>([]);
+      return <><output aria-label="Selected count">{selection.length}</output><VirtualList ids={ids} selected={ids[0]} selection={selection} onSelectionChange={setSelection} onSelect={() => {}} renderRow={id => id} label="Tasks" scrollKey="test-multiple-all" /></>;
+    }
+    render(<List />); const list = screen.getByRole('listbox');
+    expect(fireEvent.keyDown(list, { key: 'a', ctrlKey: true })).toBe(false);
+    expect(screen.getByLabelText('Selected count').textContent).toBe('10000');
+    expect(screen.getAllByRole('option').length).toBeLessThan(20);
+    expect(screen.getAllByRole('option', { selected: true })).toHaveLength(screen.getAllByRole('option').length);
   });
 });

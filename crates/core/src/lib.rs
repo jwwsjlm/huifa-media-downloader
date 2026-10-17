@@ -300,6 +300,52 @@ impl App {
         task.eta = None;
         self.save_task(&task)
     }
+    async fn delete_task(&self, id: &str, delete_files: bool) -> Result<()> {
+        self.stop_task(id, "cancelled").await?;
+        processing::prepare_task_deletion(self, id).await?;
+        let task = self.db.task(id)?;
+        let media = if delete_files {
+            self.db.media_for_task(id)?
+        } else {
+            None
+        };
+        if delete_files {
+            if let Some(media) = &media {
+                self.remove_owned(&media.path)?;
+                for asset in &media.assets {
+                    self.remove_owned(asset)?;
+                }
+            }
+            if task.kind == "assets"
+                && let Some(publication) = &task.publication
+            {
+                self.remove_owned(&publication.target)?;
+                for auxiliary in &publication.auxiliary {
+                    self.remove_owned(&auxiliary.target)?;
+                }
+            }
+            for path in &task.previous_outputs {
+                self.remove_owned(path)?;
+            }
+            if !task.options.processing_temp_dir.is_empty() {
+                remove_task_directory(&processing::workspace(self, &task))?;
+            }
+            remove_task_directory(&self.config.data_dir.join("tasks").join(id))?;
+        }
+        self.credentials
+            .delete_secret(&format!("task-cookie:{id}"))?;
+        self.credentials
+            .delete_secret(&format!("task-proxy:{id}"))?;
+        if delete_files || self.db.media_for_task(id)?.is_none() {
+            self.remove_task_log(id)?;
+        }
+        self.db.remove_task(&task, delete_files)?;
+        if let Some(media) = media {
+            self.emit("media.remove", json!({"id":media.id}));
+        }
+        self.emit("task.remove", json!({"id":id}));
+        Ok(())
+    }
     async fn resume(&self, id: &str, retry: bool) -> Result<Value> {
         let mut task = self.db.task(id)?;
         ensure!(
@@ -489,6 +535,7 @@ impl App {
                         title: "Waiting for metadata".into(),
                         thumbnail: None,
                         size: None,
+                        transfer_bytes: vec![],
                         source_info: None,
                         media_info: None,
                         status: "queued".into(),
@@ -579,52 +626,52 @@ impl App {
             }
             "tasks.delete" => {
                 let _adding = self.task_add_lock.lock().await;
-                let id = required_id(&args)?;
-                self.stop_task(id, "cancelled").await?;
-                processing::prepare_task_deletion(self, id).await?;
-                let task = self.db.task(id)?;
-                let delete_files = args["deleteFiles"].as_bool().unwrap_or(false);
-                let media = if delete_files {
-                    self.db.media_for_task(id)?
-                } else {
-                    None
-                };
-                if delete_files {
-                    if let Some(media) = &media {
-                        self.remove_owned(&media.path)?;
-                        for asset in &media.assets {
-                            self.remove_owned(asset)?;
-                        }
-                    }
-                    if task.kind == "assets"
-                        && let Some(publication) = &task.publication
-                    {
-                        self.remove_owned(&publication.target)?;
-                        for auxiliary in &publication.auxiliary {
-                            self.remove_owned(&auxiliary.target)?;
-                        }
-                    }
-                    for path in &task.previous_outputs {
-                        self.remove_owned(path)?;
-                    }
-                    if !task.options.processing_temp_dir.is_empty() {
-                        remove_task_directory(&processing::workspace(self, &task))?;
-                    }
-                    remove_task_directory(&self.config.data_dir.join("tasks").join(id))?;
-                }
-                self.credentials
-                    .delete_secret(&format!("task-cookie:{id}"))?;
-                self.credentials
-                    .delete_secret(&format!("task-proxy:{id}"))?;
-                if delete_files || self.db.media_for_task(id)?.is_none() {
-                    self.remove_task_log(id)?;
-                }
-                self.db.remove_task(&task, delete_files)?;
-                if let Some(media) = media {
-                    self.emit("media.remove", json!({"id":media.id}));
-                }
-                self.emit("task.remove", json!({"id":id}));
+                self.delete_task(
+                    required_id(&args)?,
+                    args["deleteFiles"].as_bool().unwrap_or(false),
+                )
+                .await?;
                 Ok(json!(true))
+            }
+            "tasks.deleteBatch" => {
+                let ids = args["ids"]
+                    .as_array()
+                    .context("Task IDs must be an array")?;
+                ensure!(
+                    !ids.is_empty() && ids.len() <= 1000,
+                    "Select 1 to 1000 tasks per batch"
+                );
+                let delete_files = match args.get("deleteFiles") {
+                    Some(value) => value.as_bool().context("deleteFiles must be a boolean")?,
+                    None => false,
+                };
+                let ids = ids
+                    .iter()
+                    .map(|value| {
+                        let id = value.as_str().context("Every task ID must be a string")?;
+                        uuid::Uuid::parse_str(id).context("Invalid task ID")?;
+                        Ok(id)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let _adding = self.task_add_lock.lock().await;
+                let mut seen = std::collections::HashSet::new();
+                let mut results = Vec::new();
+                let mut deleted = 0;
+                for id in ids {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    match self.delete_task(id, delete_files).await {
+                        Ok(()) => {
+                            deleted += 1;
+                            results.push(json!({"id":id,"ok":true}));
+                        }
+                        Err(error) => results.push(json!({
+                            "id":id,"ok":false,"error":self.research_error(&format!("{error:#}"))
+                        })),
+                    }
+                }
+                Ok(json!({"deleted":deleted,"failed":results.len() - deleted,"results":results}))
             }
             "tasks.convert" => {
                 if let Some(options) = args.get("options") {
@@ -1577,6 +1624,128 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn batch_deletion_validates_the_complete_request_before_removing_tasks() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let task = paused_task(HashMap::new());
+        app.db.insert_task(&task)?;
+        for args in [
+            json!({"ids":[]}),
+            json!({"ids":[task.id,7]}),
+            json!({"ids":[task.id,"../outside"]}),
+            json!({"ids":[task.id],"deleteFiles":"true"}),
+            json!({"ids":vec![task.id.clone();1001]}),
+        ] {
+            assert!(app.command("tasks.deleteBatch", args).await.is_err());
+            assert_eq!(app.db.task(&task.id)?.status, "paused");
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_deletion_stops_work_deduplicates_and_reports_partial_results() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        for delete_files in [false, true] {
+            let mut active = paused_task(HashMap::new());
+            active.status = "downloading".into();
+            app.db.insert_task(&active)?;
+            let stopped = Arc::new(AtomicBool::new(false));
+            let did_stop = stopped.clone();
+            let cancel = CancellationToken::new();
+            let running_cancel = cancel.clone();
+            let handle = tokio::spawn(async move {
+                running_cancel.cancelled().await;
+                did_stop.store(true, Ordering::Release);
+            });
+            app.runners
+                .lock()
+                .unwrap()
+                .insert(active.id.clone(), Runtime { cancel, handle });
+
+            let mut completed = paused_task(HashMap::new());
+            completed.stage("completed", "completed", Some(100.0));
+            app.db.insert_task(&completed)?;
+            let path = app
+                .config
+                .download_dir
+                .join(format!("{}.mp4", completed.id));
+            let asset = path.with_extension("srt");
+            std::fs::write(&path, b"video")?;
+            std::fs::write(&asset, b"subtitle")?;
+            let media = model::Media {
+                id: uuid::Uuid::new_v4().to_string(),
+                task_id: completed.id.clone(),
+                title: completed.title.clone(),
+                filename: "output.mp4".into(),
+                size: 5,
+                duration: 1.0,
+                path: path.clone(),
+                assets: vec![asset.clone()],
+                media_info: None,
+            };
+            app.db.complete(&completed, &media)?;
+            let mut blocked = paused_task(HashMap::new());
+            let outside = root.path().join(format!("{}.txt", blocked.id));
+            std::fs::write(&outside, b"unrelated")?;
+            blocked.previous_outputs.push(outside.clone());
+            app.db.insert_task(&blocked)?;
+            let missing = uuid::Uuid::new_v4().to_string();
+            let report = app
+                .command(
+                    "tasks.deleteBatch",
+                    json!({
+                        "ids":[active.id,missing,completed.id,active.id,blocked.id],
+                        "deleteFiles":delete_files
+                    }),
+                )
+                .await?;
+            assert_eq!(report["results"].as_array().unwrap().len(), 4);
+            assert_eq!(report["deleted"], if delete_files { 2 } else { 3 });
+            assert_eq!(report["failed"], if delete_files { 2 } else { 1 });
+            assert_eq!(report["results"][0], json!({"id":active.id,"ok":true}));
+            assert_eq!(report["results"][1]["id"], missing);
+            assert_eq!(report["results"][1]["ok"], false);
+            assert_eq!(report["results"][2], json!({"id":completed.id,"ok":true}));
+            assert!(stopped.load(Ordering::Acquire));
+            assert!(app.db.task(&active.id).is_err());
+            assert_eq!(path.exists(), !delete_files);
+            assert_eq!(asset.exists(), !delete_files);
+            assert_eq!(
+                app.db.media_for_task(&completed.id)?.is_none(),
+                delete_files
+            );
+            if delete_files {
+                assert!(app.db.task(&completed.id).is_err());
+                assert_eq!(report["results"][3]["ok"], false);
+                assert!(app.db.task(&blocked.id).is_ok());
+            } else {
+                assert_eq!(app.db.task(&completed.id)?.status, "retained");
+                assert!(app.db.task(&blocked.id).is_err());
+            }
+            assert_eq!(std::fs::read(&outside)?, b"unrelated");
+            assert!(
+                !report
+                    .to_string()
+                    .contains(root.path().to_string_lossy().as_ref())
+            );
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
+
     pub(super) fn paused_task(tools: HashMap<String, PathBuf>) -> Task {
         Task {
             kind: "media".into(),
@@ -1586,6 +1755,7 @@ mod tests {
             title: "Frozen runtime".into(),
             thumbnail: None,
             size: None,
+            transfer_bytes: vec![],
             source_info: None,
             media_info: None,
             status: "paused".into(),
