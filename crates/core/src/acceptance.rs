@@ -120,8 +120,12 @@ fn config(root: &Path) -> AppConfig {
 }
 
 #[tokio::test]
-#[ignore = "requires native tools and public Douyin access; downloads the supplied public video anonymously"]
+#[ignore = "requires HUIFA_TEST_DOUYIN=1, native tools and public Douyin access"]
 async fn real_douyin_short_link_identification_and_download() -> Result<()> {
+    if std::env::var("HUIFA_TEST_DOUYIN").as_deref() != Ok("1") {
+        eprintln!("Skipping public Douyin test; set HUIFA_TEST_DOUYIN=1 to enable it");
+        return Ok(());
+    }
     let root = tempfile::tempdir()?;
     let app = App::open(config(root.path())).await?;
     let url = "https://v.douyin.com/L1nHlRt2ohQ";

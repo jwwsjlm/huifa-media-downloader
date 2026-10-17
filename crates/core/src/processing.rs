@@ -1169,40 +1169,30 @@ pub(crate) async fn process_task(
                     cancel,
                 )
                 .await?;
-                let name = format!(
+                let mut chapter_title = sanitize_filename(&chapter.title);
+                truncate_filename_bytes(&mut chapter_title, 80);
+                let name = bounded_filename(&format!(
                     "{}.chapter-{:02}-{}.{}",
                     target.file_stem().unwrap().to_string_lossy(),
                     index + 1,
-                    sanitize_filename(&chapter.title),
+                    chapter_title,
                     extension
-                );
+                ));
                 auxiliary.push(make_auxiliary(&path, directory.join(name), &task.id)?);
             }
         }
     }
-    let temporary = target.with_file_name(format!(
-        ".{}.{}.publish",
-        target.file_name().unwrap().to_string_lossy(),
-        task.id
-    ));
-    copy_sync(&output, &temporary)?;
-    let (hash, size) = hash_file(&temporary)?;
+    let staged = make_auxiliary(&output, target.clone(), &task.id)?;
     let mut prepared = app.db.task(id)?;
     prepared.publication = Some(Publication {
         committed: false,
-        temporary,
-        target: target.clone(),
-        hash,
-        size,
+        temporary: staged.temporary,
+        target: staged.target,
+        hash: staged.hash,
+        size: staged.size,
         duration: final_duration,
         auxiliary,
-        backup: task.conversion.then(|| {
-            target.with_file_name(format!(
-                ".{}.{}.before-conversion",
-                target.file_name().unwrap().to_string_lossy(),
-                task.id
-            ))
-        }),
+        backup: None,
     });
     prepared.stage("processing", "publishing", None);
     app.save_task(&prepared)?;
@@ -1284,7 +1274,7 @@ async fn prepare_assets(app: &Arc<App>, mut task: Task, cancel: &CancellationTok
         if cancel.is_cancelled() {
             bail!("Operation interrupted");
         }
-        let target = directory.join(format!("{stem}.{suffix}"));
+        let target = directory.join(bounded_filename(&format!("{stem}.{suffix}")));
         let output = make_auxiliary(&path, target, &task.id)?;
         task.files.push(GeneratedFile {
             filename: output
@@ -1493,11 +1483,30 @@ async fn split_chapter(
 }
 
 fn make_auxiliary(source: &Path, target: PathBuf, task_id: &str) -> Result<AuxiliaryPublication> {
-    let temporary = target.with_file_name(format!(
-        ".{}.{task_id}.publish",
-        target.file_name().unwrap().to_string_lossy()
+    let target = target.with_file_name(bounded_filename(
+        &target
+            .file_name()
+            .context("Publication target has no filename")?
+            .to_string_lossy(),
     ));
-    copy_sync(source, &temporary)?;
+    crate::reject_links(source)?;
+    crate::reject_links(&target)?;
+    let directory = target
+        .parent()
+        .context("Publication target has no directory")?;
+    std::fs::create_dir_all(directory)?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(&format!(".huifa-{task_id}-"))
+        .suffix(".publish")
+        .rand_bytes(16)
+        .tempfile_in(directory)?;
+    std::io::copy(&mut std::fs::File::open(source)?, staged.as_file_mut())?;
+    staged.as_file().sync_all()?;
+    ensure!(
+        !staged.path().with_extension("before-publication").exists(),
+        "Publication backup already exists"
+    );
+    let (_, temporary) = staged.keep().map_err(|reason| reason.error)?;
     let (hash, size) = hash_file(&temporary)?;
     Ok(AuxiliaryPublication {
         temporary,
@@ -1540,6 +1549,21 @@ fn publication_files(
             {
                 return path.clone();
             }
+            let name = entry
+                .temporary
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            if name
+                .strip_prefix(&format!(".huifa-{task_id}-"))
+                .and_then(|name| name.strip_suffix(".publish"))
+                .is_some_and(|nonce| {
+                    nonce.len() == 16 && nonce.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+            {
+                return entry.temporary.with_extension("before-publication");
+            }
+            // Existing journals retain their original backup paths for interrupted publication recovery.
             entry.target.with_file_name(format!(
                 ".{}.{task_id}.before-publication",
                 entry.target.file_name().unwrap().to_string_lossy()
@@ -2381,6 +2405,7 @@ pub(crate) fn sanitize_filename(value: &str) -> String {
         })
         .take(120)
         .collect::<String>();
+    truncate_filename_bytes(&mut value, 240);
     value = value.trim().trim_matches('.').trim_end().to_string();
     if value.is_empty() {
         value = "media".into();
@@ -2415,6 +2440,44 @@ pub(crate) fn sanitize_filename(value: &str) -> String {
     }
     value
 }
+
+fn truncate_filename_bytes(value: &mut String, limit: usize) {
+    if value.len() > limit {
+        let mut end = limit;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+}
+
+fn bounded_filename(value: &str) -> String {
+    let mut value = value.to_owned();
+    if value.len() > 240 {
+        // Keep media IDs and multi-part attachment extensions when a long title must be shortened.
+        let mut suffix = value
+            .rfind(" [")
+            .map(|index| value.split_off(index))
+            .unwrap_or_else(|| {
+                value
+                    .find('.')
+                    .map(|index| value.split_off(index))
+                    .unwrap_or_default()
+            });
+        if suffix.len() > 240 {
+            let extension = suffix
+                .rfind('.')
+                .map(|index| suffix.split_off(index))
+                .unwrap_or_default();
+            truncate_filename_bytes(&mut suffix, 240usize.saturating_sub(extension.len()));
+            suffix.push_str(&extension);
+        }
+        truncate_filename_bytes(&mut value, 240usize.saturating_sub(suffix.len()));
+        value.push_str(&suffix);
+    }
+    value
+}
+
 fn output_filename(task: &Task, extension: &str) -> String {
     let title = sanitize_filename(&task.title)
         .chars()
@@ -2426,6 +2489,15 @@ fn output_filename(task: &Task, extension: &str) -> String {
         .map(|m| text(&m.metadata, "id"))
         .filter(|v| !v.is_empty())
         .unwrap_or(&task.id[..8]);
+    let suffix_bytes = task
+        .options
+        .filename_template
+        .replace("%(title)s", "")
+        .replace("%(id)s", &sanitize_filename(source_id))
+        .replace("%(ext)s", extension)
+        .len();
+    let mut title = title;
+    truncate_filename_bytes(&mut title, 220usize.saturating_sub(suffix_bytes));
     let template = task
         .options
         .filename_template
@@ -2520,6 +2592,143 @@ fn srt_time(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_publication_backup_names_remain_unchanged() {
+        let task_id = "11111111-1111-4111-8111-111111111111";
+        let target = PathBuf::from("output/video.mp4");
+        let mut journal = Publication {
+            committed: false,
+            temporary: target.with_file_name(format!(".video.mp4.{task_id}.publish")),
+            target: target.clone(),
+            hash: String::new(),
+            size: 0,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        };
+        assert_eq!(
+            publication_files(&journal, task_id).1[0],
+            target.with_file_name(format!(".video.mp4.{task_id}.before-publication"))
+        );
+        let conversion = target.with_file_name(format!(".video.mp4.{task_id}.before-conversion"));
+        journal.backup = Some(conversion.clone());
+        assert_eq!(publication_files(&journal, task_id).1[0], conversion);
+    }
+
+    #[test]
+    fn unicode_filenames_fit_component_limits_and_keep_media_ids_and_extensions() {
+        let mut task = crate::tests::paused_task(Default::default());
+        task.title = "多字节😀视频标题".repeat(40);
+        task.manifest = Some(SourceManifest {
+            version: 1,
+            directory: PathBuf::new(),
+            files: vec![],
+            metadata: json!({"id":"7695747024182590437"}),
+            duration: None,
+            chapters: vec![],
+            sponsor_segments: vec![],
+            output_extension: "mp4".into(),
+        });
+        let filename = output_filename(&task, "mp4");
+        assert!(filename.len() <= 220, "{filename}");
+        assert!(filename.ends_with(" [7695747024182590437].mp4"));
+        let sidecar = PathBuf::from(&filename).with_extension("info.json");
+        assert!(sidecar.file_name().unwrap().len() <= 240);
+        assert!(sanitize_filename(&task.title).len() <= 240);
+        for name in [
+            format!(
+                "{} [assets-12345678].info.json",
+                sanitize_filename(&task.title)
+            ),
+            format!(
+                "{}.chapter-01-{}.mkv",
+                filename,
+                sanitize_filename(&task.title)
+            ),
+            format!("{}.info.json", "😀".repeat(150)),
+        ] {
+            let bounded = bounded_filename(&name);
+            assert!(bounded.len() <= 240, "{} bytes: {bounded}", bounded.len());
+            assert_eq!(
+                Path::new(&bounded).extension(),
+                Path::new(&name).extension()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn long_unicode_publication_replaces_and_recovers_with_short_journal_files() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.kind = "assets".into();
+        let target = app.config.download_dir.join(format!(
+            "{} [7695747024182590437].info.json",
+            "视".repeat(70)
+        ));
+        assert!(target.file_name().unwrap().len() <= 255);
+        assert!(
+            format!(
+                ".{}.{}.publish",
+                target.file_name().unwrap().to_string_lossy(),
+                task.id
+            )
+            .len()
+                > 255
+        );
+        write_sync(&target, b"old metadata")?;
+        let source = app.config.data_dir.join("source.json");
+        write_sync(&source, b"new metadata")?;
+        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        let other = make_auxiliary(&source, target.clone(), &task.id)?;
+        assert_ne!(output.temporary, other.temporary);
+        std::fs::remove_file(other.temporary)?;
+        task.previous_outputs = vec![target.clone()];
+        task.publication = Some(Publication {
+            committed: false,
+            temporary: output.temporary.clone(),
+            target: target.clone(),
+            hash: output.hash,
+            size: output.size,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        app.db.insert_task(&task)?;
+        let (_, backups) = publication_files(task.publication.as_ref().unwrap(), &task.id);
+        assert!(backups[0].file_name().unwrap().len() < 100);
+        assert!(output.temporary.file_name().unwrap().len() < 100);
+        std::fs::rename(&target, &backups[0])?;
+        std::fs::rename(&output.temporary, &target)?;
+        prepare_redownload(&app, &task).await?;
+        assert_eq!(std::fs::read(&target)?, b"old metadata");
+        assert!(!backups[0].exists() && !output.temporary.exists());
+        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        task.publication = Some(Publication {
+            committed: false,
+            temporary: output.temporary.clone(),
+            target: target.clone(),
+            hash: output.hash,
+            size: output.size,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        app.db.save_task(&task)?;
+        publish(&app, task, &CancellationToken::new()).await?;
+        assert_eq!(std::fs::read(&target)?, b"new metadata");
+        assert!(!output.temporary.exists());
+        app.shutdown().await?;
+        Ok(())
+    }
+
     #[test]
     fn conversion_preview_selects_copy_or_compatible_encoders() -> Result<()> {
         let h264 = json!({"streams":[{"codec_type":"video","codec_name":"h264"},{"codec_type":"audio","codec_name":"aac"}]});
@@ -3128,6 +3337,7 @@ mod tests {
         let main = make_auxiliary(&source, target.clone(), &task.id)?;
         task.publication.as_mut().unwrap().temporary = main.temporary;
         app.db.save_task(&task)?;
+        let (_, backups) = publication_files(task.publication.as_ref().unwrap(), &task.id);
         std::fs::rename(&target, &backups[0])?;
         write_sync(&target, b"external changes")?;
         let error = prepare_redownload(&app, &task)

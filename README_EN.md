@@ -72,7 +72,7 @@ Create a directory and save the following as `compose.yaml`. No repository clone
 ```yaml
 services:
   downloader:
-    image: ghcr.io/jwwsjlm/huifa-media-downloader:0.4.0
+    image: ghcr.io/jwwsjlm/huifa-media-downloader:0.4.1
     ports:
       - "19491:19491"
     environment:

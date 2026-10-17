@@ -72,7 +72,7 @@ Windows 原生回归可运行 `node scripts/check-login-browser.mjs`（需 WebVi
 ```yaml
 services:
   downloader:
-    image: ghcr.io/jwwsjlm/huifa-media-downloader:0.4.0
+    image: ghcr.io/jwwsjlm/huifa-media-downloader:0.4.1
     ports:
       - "19491:19491"
     environment:
