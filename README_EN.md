@@ -37,7 +37,7 @@ Choose an artifact from [Releases](https://github.com/jwwsjlm/huifa-media-downlo
 | Windows 10/11 x64 installer | `HuifaDownloader-<version>-windows-x64-setup.exe` |
 | Windows x64 portable | `HuifaDownloader-<version>-windows-x64-portable.zip` |
 | Linux x64 | `HuifaDownloader-<version>-linux-x64.AppImage` |
-| Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:<version>` |
+| Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:latest` |
 
 The installer and portable ZIP contain the same application with verified download and processing tools. You do not need a separate Python or FFmpeg install. The Windows installer currently has no Authenticode publisher certificate, but installers, portable archives and update manifests carry signatures and SHA-256 checksums.
 
@@ -74,7 +74,7 @@ Create a directory and save the following as `compose.yaml`. No repository clone
 ```yaml
 services:
   downloader:
-    image: ghcr.io/jwwsjlm/huifa-media-downloader:0.4.1
+    image: ghcr.io/jwwsjlm/huifa-media-downloader:latest
     ports:
       - "19491:19491"
     environment:
@@ -114,6 +114,8 @@ Then start the service:
 docker compose pull
 docker compose up -d
 ```
+
+The example uses `latest` to follow the latest stable release. To update, run the same two commands in this directory and keep `./data` and `./downloads`.
 
 Open [http://localhost:19491](http://localhost:19491). For NAS or remote access, set `HUIFA_PUBLIC_ORIGIN` to the complete origin used by the browser (scheme, host and port), such as `http://192.168.1.10:19491`. With an HTTPS reverse proxy, use `https://download.example.com` without a path. Update this origin when changing the published host port. The image supports amd64 and ARM64 and selects the matching architecture automatically.
 

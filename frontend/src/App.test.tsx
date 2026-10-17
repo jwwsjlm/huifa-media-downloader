@@ -292,9 +292,12 @@ describe('live interface stability', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
   it('opens version details from an up-to-date sidebar link and lets the user recheck', async () => {
+    const snapshot = makeSnapshot(); snapshot.version = '0.4.1';
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
+    transport.releaseStatus.mockResolvedValue({ currentVersion: '0.4.1', latestVersion: '0.4.1', updateAvailable: false, url: 'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1' });
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     await waitFor(() => expect(transport.releaseStatus).toHaveBeenCalledOnce());
-    fireEvent.click(screen.getByRole('button', { name: 'v0.2.0' }));
+    fireEvent.click(screen.getByRole('button', { name: 'v0.4.1' }));
     expect(await screen.findByText('You have the latest stable release.')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Open new release page' })).toBeNull();
     expect(transport.openRelease).not.toHaveBeenCalled();
@@ -302,15 +305,39 @@ describe('live interface stability', () => {
     await waitFor(() => expect(transport.releaseStatus).toHaveBeenCalledTimes(2));
   });
   it('opens the detected release directly from the sidebar update badge', async () => {
-    const url = 'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.1';
-    transport.releaseStatus.mockResolvedValue({ currentVersion: '0.3.0', latestVersion: '0.3.1', updateAvailable: true, url });
+    const snapshot = makeSnapshot(); snapshot.version = '0.4.0';
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
+    const url = 'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1';
+    transport.releaseStatus.mockResolvedValue({ currentVersion: '0.4.0', latestVersion: '0.4.1', updateAvailable: true, url });
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
-    const version = await screen.findByRole('button', { name: /v0\.2\.0.*Update/ });
+    const version = await screen.findByRole('button', { name: /v0\.4\.0.*Update/ });
     expect(version.title).toBe('Open new release page');
     fireEvent.click(version);
     await waitFor(() => expect(transport.openRelease).toHaveBeenCalledWith(url));
     expect(transport.releaseStatus).toHaveBeenCalledOnce();
     expect(screen.getByRole('listbox')).toBeTruthy();
+  });
+  it('keeps the app usable after update checks fail and allows a successful manual retry', async () => {
+    const snapshot = makeSnapshot(); snapshot.version = '0.4.0';
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
+    transport.releaseStatus.mockRejectedValue(new Error('fixture GitHub unavailable'));
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'v0.4.0' }));
+    expect(await screen.findByText('Cannot check for updates right now. Try again later.')).toBeTruthy();
+    const recheck = screen.getByRole('button', { name: 'Check for updates' }) as HTMLButtonElement;
+    fireEvent.click(recheck);
+    await waitFor(() => expect(transport.releaseStatus).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(recheck.disabled).toBe(false));
+    expect(screen.queryByRole('alert')).toBeNull();
+    const url = 'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1';
+    transport.releaseStatus.mockResolvedValue({ currentVersion: '0.4.0', latestVersion: '0.4.1', updateAvailable: true, url });
+    fireEvent.click(recheck);
+    const release = await screen.findByRole('button', { name: 'Open new release page' });
+    expect(screen.queryByText('Cannot check for updates right now. Try again later.')).toBeNull();
+    fireEvent.click(release);
+    await waitFor(() => expect(transport.openRelease).toHaveBeenCalledWith(url));
+    expect(transport.releaseStatus).toHaveBeenCalledTimes(3);
   });
   it.each(['video','collection'])('uses backend classification for a one-item %s', async kind => {
     const url = 'https://example.test/unknown';

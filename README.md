@@ -37,7 +37,7 @@
 | Windows 10/11 x64 安装版 | `HuifaDownloader-<版本>-windows-x64-setup.exe` |
 | Windows x64 便携版 | `HuifaDownloader-<版本>-windows-x64-portable.zip` |
 | Linux x64 | `HuifaDownloader-<版本>-linux-x64.AppImage` |
-| Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:<版本>` |
+| Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:latest` |
 
 安装包和便携 ZIP 提供同一套程序，均包含下载与处理工具，用户无需另行安装 Python 或 FFmpeg。Windows 安装包目前没有 Authenticode 发布者证书，但安装包、便携 ZIP 和更新清单均有签名及 SHA-256 校验。
 
@@ -74,7 +74,7 @@ Windows 原生回归可运行 `node scripts/check-login-browser.mjs`（需 WebVi
 ```yaml
 services:
   downloader:
-    image: ghcr.io/jwwsjlm/huifa-media-downloader:0.4.1
+    image: ghcr.io/jwwsjlm/huifa-media-downloader:latest
     ports:
       - "19491:19491"
     environment:
@@ -114,6 +114,8 @@ sudo chown 10001:10001 data downloads
 docker compose pull
 docker compose up -d
 ```
+
+示例使用 `latest`，跟随最新正式版本。以后更新仍在该目录执行以上两条命令，保留 `./data` 和 `./downloads`。
 
 本机打开 [http://localhost:19491](http://localhost:19491)。NAS 或远程访问时，将 `HUIFA_PUBLIC_ORIGIN` 改成浏览器实际访问的完整来源（协议、主机和端口），例如 `http://192.168.1.10:19491`；HTTPS 反向代理使用 `https://download.example.com`，不带路径。修改宿主机端口时，也要同步修改此地址。容器同时支持 amd64 和 ARM64，会自动选择对应架构。
 
