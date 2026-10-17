@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -7,14 +7,58 @@ pub(crate) async fn status() -> Result<Value> {
 }
 
 async fn status_for(current: &str) -> Result<Value> {
-    let response = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
-        .build()?
-        .get("https://api.github.com/repos/jwwsjlm/huifa-media-downloader/releases/latest")
-        .header(
-            "User-Agent",
-            concat!("HuifaDownloader/", env!("CARGO_PKG_VERSION")),
-        )
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("HuifaDownloader/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    check(
+        &client,
+        current,
+        "https://api.github.com/repos/jwwsjlm/huifa-media-downloader/releases/latest",
+        "https://github.com/jwwsjlm/huifa-media-downloader/releases/latest",
+    )
+    .await
+}
+
+async fn check(client: &reqwest::Client, current: &str, api: &str, page: &str) -> Result<Value> {
+    let api_error = match api_status(client, current, api).await {
+        Ok(value) => return Ok(value),
+        Err(reason) => reason,
+    };
+    let fallback = async {
+        let response = client.get(page).send().await?.error_for_status()?;
+        ensure!(
+            response.status().is_redirection(),
+            "GitHub did not return the latest release redirect"
+        );
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .context("GitHub release redirect has no destination")?
+            .to_str()?;
+        let destination = response.url().join(location)?;
+        release_page(destination.as_str(), current)
+    };
+    fallback.await.with_context(|| {
+        format!("GitHub API check failed: {api_error:#}; official release page check also failed")
+    })
+}
+
+fn release_page(url: &str, current: &str) -> Result<Value> {
+    ensure!(valid_url(url), "Invalid release page");
+    let parsed = url::Url::parse(url)?;
+    let tag = parsed
+        .path()
+        .strip_prefix("/jwwsjlm/huifa-media-downloader/releases/tag/")
+        .filter(|tag| !tag.is_empty() && !tag.contains('/'))
+        .context("GitHub did not identify a release version")?;
+    parse(&json!({"tag_name":tag,"html_url":url}), current)
+}
+
+async fn api_status(client: &reqwest::Client, current: &str, api: &str) -> Result<Value> {
+    let response = client
+        .get(api)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?
@@ -70,6 +114,51 @@ pub fn valid_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rate_limited_api_uses_official_release_redirect() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let fixture = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0; 8192];
+                    let size = socket.read(&mut request).await.unwrap_or(0);
+                    let latest = request[..size].starts_with(b"GET /latest ");
+                    let reply = if latest {
+                        "HTTP/1.1 302 Found\r\nLocation: https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let result = check(
+            &client,
+            "0.4.0",
+            &format!("{base}/api"),
+            &format!("{base}/latest"),
+        )
+        .await;
+        fixture.abort();
+        let result = result?;
+        assert_eq!(result["latestVersion"], "0.4.1");
+        assert_eq!(result["updateAvailable"], true);
+        assert_eq!(
+            result["url"],
+            "https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1"
+        );
+        Ok(())
+    }
     #[test]
     fn release_comparison_uses_semantic_versions_and_trusted_pages() {
         let release = |tag: &str| json!({"tag_name":tag,"html_url":"https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.0"});
@@ -94,6 +183,16 @@ mod tests {
         assert!(!valid_url(
             "https://github.com.evil.test/jwwsjlm/huifa-media-downloader/releases/latest"
         ));
+        for url in [
+            "http://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1",
+            "https://github.com/other/repo/releases/tag/v0.4.1",
+            "https://github.com/jwwsjlm/huifa-media-downloader/releases/latest",
+            "https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1/extra",
+            "https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.2-beta.1",
+            "https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1?token=secret",
+        ] {
+            assert!(release_page(url, "0.4.0").is_err(), "{url}");
+        }
     }
 
     #[tokio::test]

@@ -325,6 +325,7 @@ describe('live interface stability', () => {
     expect(screen.queryByRole('alert')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'v0.4.0' }));
     expect(await screen.findByText('Cannot check for updates right now. Try again later.')).toBeTruthy();
+    expect(screen.getByText('Error: fixture GitHub unavailable')).toBeTruthy();
     const recheck = screen.getByRole('button', { name: 'Check for updates' }) as HTMLButtonElement;
     fireEvent.click(recheck);
     await waitFor(() => expect(transport.releaseStatus).toHaveBeenCalledTimes(2));
@@ -338,6 +339,29 @@ describe('live interface stability', () => {
     fireEvent.click(release);
     await waitFor(() => expect(transport.openRelease).toHaveBeenCalledWith(url));
     expect(transport.releaseStatus).toHaveBeenCalledTimes(3);
+  });
+  it.each([
+    ['GitHub release request failed: HTTP 403 rate limit exceeded', 'GitHub has temporarily limited update checks. Retry after the limit resets.'],
+    ['GitHub release request failed: HTTP 429 Too Many Requests', 'GitHub has temporarily limited update checks. Retry after the limit resets.'],
+    ['GitHub release request timed out', 'The update request timed out. Check GitHub connectivity and retry.'],
+  ])('shows update-specific advice and the concrete cause for %s', async (error, hint) => {
+    transport.releaseStatus.mockRejectedValue(error);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('button', { name: 'v0.2.0' }));
+    expect(await screen.findByText(hint)).toBeTruthy();
+    expect(screen.getByText(error)).toBeTruthy();
+    expect(screen.queryByText(/Check permissions, cookies/)).toBeNull();
+    expect(screen.queryByText(/Connection to the source site failed/)).toBeNull();
+  });
+  it('does not claim to be current after a newer update check fails', async () => {
+    transport.releaseStatus.mockResolvedValue({ currentVersion: '0.4.1', latestVersion: '0.4.1', updateAvailable: false, url: 'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.4.1' });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('button', { name: 'v0.2.0' }));
+    expect(await screen.findByText('You have the latest stable release.')).toBeTruthy();
+    transport.releaseStatus.mockRejectedValue('GitHub release request failed: HTTP 403 rate limit exceeded');
+    fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
+    expect(await screen.findByText('GitHub has temporarily limited update checks. Retry after the limit resets.')).toBeTruthy();
+    expect(screen.queryByText('You have the latest stable release.')).toBeNull();
   });
   it.each(['video','collection'])('uses backend classification for a one-item %s', async kind => {
     const url = 'https://example.test/unknown';
