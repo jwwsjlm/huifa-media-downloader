@@ -1,10 +1,11 @@
 import { createContext, useContext, useReducer, type Dispatch, type ReactNode } from 'react';
 import type { CoreEvent, DownloadOptions, Json, Media, Page, Settings, Snapshot, Task, Tool } from './types';
+import { version as buildVersion } from '../package.json';
 
 export interface ViewState { page: Page; urls: string; quality: string | null; taskSearch: string; taskStatus: string; taskSort: string; taskSelection: string; mediaSearch: string; mediaSelection: string; settingsDraft: Settings | null; optionsDraft: DownloadOptions | null; settingsTab: string }
 export interface AppState { loaded: boolean; connected: boolean; version: string; tasks: Record<string, Task>; taskIds: string[]; taskListVersion: number; activeTaskCount: number; media: Record<string, Media>; mediaIds: string[]; mediaByTask: Record<string, string>; settings: Settings; tools: Tool[]; view: ViewState }
 export const initialState: AppState = {
-  loaded: false, connected: false, version: '', tasks: {}, taskIds: [], taskListVersion: 0, activeTaskCount: 0, media: {}, mediaIds: [], mediaByTask: {}, settings: {}, tools: [],
+  loaded: false, connected: false, version: buildVersion, tasks: {}, taskIds: [], taskListVersion: 0, activeTaskCount: 0, media: {}, mediaIds: [], mediaByTask: {}, settings: {}, tools: [],
   view: { page: /^\/mcp\/?$/.test(window.location.pathname) ? 'mcp' : 'downloads', urls: '', quality: null, taskSearch: '', taskStatus: 'all', taskSort: 'newest', taskSelection: '', mediaSearch: '', mediaSelection: '', settingsDraft: null, optionsDraft: null, settingsTab: 'downloads' },
 };
 export type Action = { type: 'snapshot'; snapshot: Snapshot } | { type: 'event'; event: CoreEvent } | { type: 'connection'; connected: boolean } | { type: 'view'; patch: Partial<ViewState> } | { type: 'setting'; key: string; value: Json } | { type: 'option'; key: string; value: DownloadOptions[string] } | { type: 'saved'; settings: Settings } | { type: 'cookie.saved'; id: string };
@@ -20,7 +21,7 @@ export function reducer(state: AppState, action: Action): AppState {
     const tasks = Object.fromEntries(action.snapshot.tasks.map(task => [String(task.id), task]));
     const media = Object.fromEntries(action.snapshot.media.map(item => [String(item.id), item]));
     const taskIds = action.snapshot.tasks.map(task => String(task.id)); const mediaIds = action.snapshot.media.map(item => String(item.id));
-    return { ...state, ...action.snapshot, tasks, taskIds, taskListVersion: state.taskListVersion + 1, activeTaskCount: action.snapshot.tasks.reduce((count, task) => count + active(task), 0), media, mediaIds, mediaByTask: Object.fromEntries(action.snapshot.media.map(item => [item.taskId, item.id])), view: { ...state.view, taskSelection: state.view.taskSelection || taskIds[0] || '', mediaSelection: state.view.mediaSelection || mediaIds[0] || '' }, loaded: true, connected: true };
+    return { ...state, ...action.snapshot, tools: action.snapshot.tools ?? state.tools, tasks, taskIds, taskListVersion: state.taskListVersion + 1, activeTaskCount: action.snapshot.tasks.reduce((count, task) => count + active(task), 0), media, mediaIds, mediaByTask: Object.fromEntries(action.snapshot.media.map(item => [item.taskId, item.id])), view: { ...state.view, taskSelection: state.view.taskSelection || taskIds[0] || '', mediaSelection: state.view.mediaSelection || mediaIds[0] || '' }, loaded: true, connected: true };
   }
   const { kind, data } = action.event;
   if (kind === 'task.upsert') {

@@ -314,9 +314,17 @@ impl App {
             "tasks.info" => processing::task_info(self, required_id(&args)?)
                 .await
                 .map_err(|reason| anyhow::anyhow!(self.research_error(&format!("{reason:#}")))),
-            "snapshot" => Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"tasks":self.db.tasks()?.iter().map(Task::public).collect::<Vec<_>>(),"media":self.db.media()?.iter().map(model::Media::public).collect::<Vec<_>>(),"settings":self.public_settings()?,"tools":tools::check(self).await?}),
-            ),
+            "snapshot" => {
+                let include_tools = match args.get("includeTools") {
+                    Some(value) => value.as_bool().context("includeTools must be a boolean")?,
+                    None => true,
+                };
+                let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"tasks":self.db.tasks()?.iter().map(Task::public).collect::<Vec<_>>(),"media":self.db.media()?.iter().map(model::Media::public).collect::<Vec<_>>(),"settings":self.public_settings()?});
+                if include_tools {
+                    value["tools"] = tools::check(self).await?;
+                }
+                Ok(value)
+            }
             "tasks.add" => {
                 let _adding = self.task_add_lock.lock().await;
                 let urls = args["urls"].as_array().context("urls must be an array")?;
@@ -1089,6 +1097,60 @@ pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quick_snapshot_reads_saved_state_without_executing_runtime_tools() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let tools = root.path().join("tools");
+        std::fs::create_dir(&tools)?;
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "qjs"] {
+            std::fs::write(
+                tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+                b"not an executable",
+            )?;
+        }
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: Some(tools),
+        })
+        .await?;
+        let task = paused_task(Default::default());
+        app.db.insert_task(&task)?;
+        app.command("settings.save", json!({"settings":{"uiLanguage":"zh-CN"}}))
+            .await?;
+        let quick = app
+            .command("snapshot", json!({"includeTools":false}))
+            .await?;
+        assert_eq!(quick["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(quick["tasks"][0]["id"], task.id);
+        assert_eq!(quick["settings"]["uiLanguage"], "zh-CN");
+        assert!(quick["media"].is_array());
+        assert!(quick.get("tools").is_none());
+        let full = app.command("snapshot", json!({})).await?;
+        assert_eq!(full["tools"].as_array().unwrap().len(), 4);
+        assert!(
+            full["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool["available"] == false)
+        );
+        assert_eq!(
+            app.command("snapshot", json!({"includeTools":true}))
+                .await?["tools"],
+            full["tools"]
+        );
+        for value in [json!(null), json!("false"), json!(0), json!([])] {
+            assert!(
+                app.command("snapshot", json!({"includeTools":value}))
+                    .await
+                    .is_err()
+            );
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
     #[tokio::test]
     async fn saved_media_info_errors_hide_storage_paths_and_preserve_task_state() -> Result<()> {
         let root = tempfile::tempdir()?;

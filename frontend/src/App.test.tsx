@@ -4,6 +4,7 @@ import { App } from './App';
 import { AppProvider } from './state';
 import { makeSnapshot } from './test-fixtures';
 import type { CoreEvent } from './types';
+import { version as buildVersion } from '../package.json';
 
 const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn() }));
 vi.mock('./transport', () => ({ host: {
@@ -17,6 +18,54 @@ beforeEach(() => {
   transport.openRelease.mockReset().mockResolvedValue(undefined);
 });
 describe('live interface stability', () => {
+  it('loads tasks before slow runtime and release checks and keeps tools through fast refreshes', async () => {
+    const snapshot = makeSnapshot(); delete snapshot.tools;
+    let finishTools!: (value: unknown) => void; let finishRelease!: (value: unknown) => void;
+    transport.releaseStatus.mockImplementation(() => new Promise(resolve => { finishRelease = resolve; }));
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tools.check' ? new Promise(resolve => { finishTools = resolve; }) : true);
+    render(<AppProvider><App /></AppProvider>);
+    expect(await screen.findByRole('listbox')).toBeTruthy();
+    expect(transport.command).toHaveBeenCalledWith('snapshot', { includeTools: false });
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.check'));
+    await act(async () => finishTools([{ name: 'qjs', available: true, version: '0.17.0' }]));
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Tools & updates' }));
+    expect(screen.getByText('qjs')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'snapshot.required', data: null }));
+    await waitFor(() => expect(transport.command.mock.calls.filter(([name]) => name === 'snapshot')).toHaveLength(2));
+    expect(screen.getByText('qjs')).toBeTruthy();
+    expect(transport.command.mock.calls.filter(([name]) => name === 'tools.check')).toHaveLength(1);
+    await act(async () => finishRelease({ currentVersion: '0.2.0', latestVersion: '0.2.0', updateAvailable: false, url: 'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.2.0' }));
+  });
+  it('keeps the task list available when the background runtime check fails', async () => {
+    const snapshot = makeSnapshot(); delete snapshot.tools;
+    transport.command.mockImplementation(async command => { if (command === 'snapshot') return snapshot; if (command === 'tools.check') throw new Error('fixture tools unavailable'); return true; });
+    render(<AppProvider><App /></AppProvider>);
+    expect(await screen.findByRole('listbox')).toBeTruthy();
+    expect((await screen.findAllByText('Runtime components could not be checked. Retry under Tools & updates.')).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(transport.command.mock.calls.filter(([name]) => name === 'tools.check')).toHaveLength(1);
+  });
+  it('shows the packaged version while the snapshot is loading and then uses the runtime version', async () => {
+    let finish!: (value: unknown) => void;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? new Promise(resolve => { finish = resolve; }) : true);
+    render(<AppProvider><App /></AppProvider>);
+    expect(await screen.findByRole('button', { name: `v${buildVersion}` })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'v0.3.0' })).toBeNull();
+    const snapshot = makeSnapshot(); snapshot.version = '1.2.3';
+    await act(async () => finish(snapshot));
+    expect(await screen.findByRole('button', { name: 'v1.2.3' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: `v${buildVersion}` })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'v1.2.3' }));
+    expect(screen.getByText('Current version 1.2.3 · Latest release 0.3.0')).toBeTruthy();
+  });
+  it('keeps the packaged version if the initial snapshot fails', async () => {
+    transport.command.mockImplementation(async command => { if (command === 'snapshot') throw new Error('fixture snapshot unavailable'); return true; });
+    render(<AppProvider><App /></AppProvider>);
+    expect(await screen.findByRole('alert')).toBeTruthy();
+    expect(screen.getByRole('button', { name: `v${buildVersion}` })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'v0.3.0' })).toBeNull();
+  });
   it('shows actual completed quality and bytes with separate source and result details', async () => {
     const snapshot = makeSnapshot();
     Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed', size: 10485760, sourceInfo: { width: 3840, height: 2160, fps: 59.94, videoCodec: 'vp9', audioCodec: 'opus', size: 20971520, duration: 60, container: 'webm' }, mediaInfo: { width: 1920, height: 1080, fps: 29.97, videoCodec: 'h264', audioCodec: 'aac', size: 10485760, duration: 60, container: 'mp4' } });
@@ -247,7 +296,7 @@ describe('live interface stability', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'https://example.test/collection' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
     const dialog = within(await screen.findByRole('dialog'));
-    const confirm = dialog.getByRole('button', { name: 'Download selected items' });
+    const confirm = await dialog.findByRole('button', { name: 'Download selected items' });
     await waitFor(() => expect((confirm as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(confirm);
     expect((await screen.findByRole('status')).textContent).toBe('This task is paused. Resume it from task details.');

@@ -2,7 +2,20 @@ import { describe, expect, it } from 'vitest';
 import { initialState, reducer } from './state';
 import { taskProgress } from './task';
 import { makeTask, makeSnapshot } from './test-fixtures';
+import { version as buildVersion } from '../package.json';
 describe('task delta state', () => {
+  it('starts at the packaged version and accepts the connected runtime version', () => {
+    expect(initialState.version).toBe(buildVersion);
+    const snapshot = makeSnapshot(); snapshot.version = '1.2.3';
+    expect(reducer(initialState, { type: 'snapshot', snapshot }).version).toBe('1.2.3');
+  });
+  it('preserves runtime tools when a fast snapshot omits them', () => {
+    const snapshot = makeSnapshot(); snapshot.tools = [{ name: 'qjs', available: true, version: '0.17.0' }];
+    const state = reducer(initialState, { type: 'snapshot', snapshot });
+    const fast = makeSnapshot(); delete fast.tools;
+    const refreshed = reducer(state, { type: 'snapshot', snapshot: fast });
+    expect(refreshed.tools).toBe(state.tools); expect(refreshed.loaded).toBe(true);
+  });
   it('enables automatic cookies from a background sync while preserving unrelated drafts and task snapshots', () => {
     let state = reducer(initialState, { type: 'snapshot', snapshot: makeSnapshot() });
     state = reducer(state, { type: 'view', patch: { settingsDraft: { uiLanguage: 'zh-CN' }, optionsDraft: { cookieId: '', quality: '720p', proxy: 'draft-proxy' } } });

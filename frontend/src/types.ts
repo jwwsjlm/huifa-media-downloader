@@ -32,7 +32,7 @@ export interface Task {
 export interface Media { id: string; taskId: string; title: string; filename: string; size: number; duration: number; hasCover?: boolean; mediaInfo?: MediaInfo | null }
 export interface Tool { name: string; available: boolean; version?: string; latest?: string; error?: string; path?: string; platform?: string; asset?: string }
 export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string }
-export interface Snapshot { version: string; tasks: Task[]; media: Media[]; settings: Settings; tools: Tool[] }
+export interface Snapshot { version: string; tasks: Task[]; media: Media[]; settings: Settings; tools?: Tool[] }
 export interface CoreEvent { kind: string; data: Json }
 export interface AddReport { ids: string[]; results: { id: string; status: TaskStatus; action: 'added' | 'existing' | 'restarted' }[] }
 export interface ReleaseStatus { currentVersion: string; latestVersion: string; updateAvailable: boolean; url: string }
