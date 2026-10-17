@@ -24,22 +24,22 @@
     },
     "ffmpeg": {
       "repository": "BtbN/FFmpeg-Builds",
-      "version": "autobuild-2026-10-16-13-04",
+      "version": "autobuild-2026-10-17-20-51",
       "assets": {
         "windows-x86_64": {
-          "name": "ffmpeg-N-127579-g5cb9fcd211-win64-gpl-shared.zip",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-16-13-04/ffmpeg-N-127579-g5cb9fcd211-win64-gpl-shared.zip",
-          "sha256": "345ab5b89c11583c1e309a3d47fce5d44dabe8f7acf81cff3fc974485a500070"
+          "name": "ffmpeg-N-127617-g94cba3150c-win64-gpl-shared.zip",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-17-20-51/ffmpeg-N-127617-g94cba3150c-win64-gpl-shared.zip",
+          "sha256": "2983d719523f01ce9fd3618cd4b511a33df7c1fef8f3a472d75fc4c9051ebe1e"
         },
         "linux-x86_64": {
-          "name": "ffmpeg-N-127579-g5cb9fcd211-linux64-gpl.tar.xz",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-16-13-04/ffmpeg-N-127579-g5cb9fcd211-linux64-gpl.tar.xz",
-          "sha256": "3d994f31aa9ee78ef56eab530a86d50d8307200cb9d1788be36c1ea9410e605c"
+          "name": "ffmpeg-N-127617-g94cba3150c-linux64-gpl.tar.xz",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-17-20-51/ffmpeg-N-127617-g94cba3150c-linux64-gpl.tar.xz",
+          "sha256": "57df359b805dd512d80f2780057273d708e85753545537859ac84147c5dad841"
         },
         "linux-aarch64": {
-          "name": "ffmpeg-N-127579-g5cb9fcd211-linuxarm64-gpl.tar.xz",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-16-13-04/ffmpeg-N-127579-g5cb9fcd211-linuxarm64-gpl.tar.xz",
-          "sha256": "56c9cd900daa38fd07eaab8e144e577fe637293d376a0b33de21364923a90709"
+          "name": "ffmpeg-N-127617-g94cba3150c-linuxarm64-gpl.tar.xz",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-17-20-51/ffmpeg-N-127617-g94cba3150c-linuxarm64-gpl.tar.xz",
+          "sha256": "a61b8ee89958ad59095845cc479a8bfc0081f3e8438fe0305350a7fe9aa76a7b"
         }
       }
     },
