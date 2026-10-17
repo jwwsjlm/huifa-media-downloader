@@ -18,6 +18,17 @@ use tokio::sync::Mutex;
 
 mod login_browser;
 
+#[tauri::command]
+async fn login_navigation(
+    webview: tauri::Webview,
+    action: String,
+    url: Option<String>,
+) -> Result<Value, String> {
+    login_browser::navigation::command(webview, &action, url.as_deref())
+        .await
+        .map_err(error)
+}
+
 struct Host {
     core: Arc<App>,
     mcp: huifa_mcp::DesktopMcp,
@@ -95,11 +106,9 @@ async fn command(
     if matches!(
         command.as_str(),
         "tasks.add" | "probe.video" | "probe.collection"
-    ) {
-        host.login_browser
-            .sync(&app, &host.core)
-            .await
-            .map_err(error)?;
+    ) && let Err(reason) = host.login_browser.sync(&app, &host.core).await
+    {
+        let _ = app.emit("huifa-host-error", json!({"message":format!("Could not refresh browser cookies: {}. Continuing with previously saved matching cookies, or anonymously if none are saved.", error(reason))}));
     }
     if command == "host.paths" {
         return Ok(json!({"downloadDir":host.download_dir,"dataDir":host.data_dir}));
@@ -422,7 +431,7 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         let host = handle.state::<Host>();
                         if let Err(reason) = host.login_browser.close_window(&handle, &host.core, &label).await {
-                            let _ = handle.emit("huifa-host-error", json!({"message":format!("Could not save login cookies: {}. Keep the browser open and try again.", error(reason))}));
+                            let _ = handle.emit("huifa-host-error", json!({"message":format!("The login browser was closed, but the last Cookie sync failed: {}. Previously saved cookies were kept. Reopen the login browser to retry.", error(reason))}));
                         }
                     });
                     return;
@@ -558,7 +567,8 @@ pub fn run() {
             install_update,
             task_copy_value,
             release_status,
-            open_release
+            open_release,
+            login_navigation
         ]);
     let application = builder
         .build(tauri::generate_context!())

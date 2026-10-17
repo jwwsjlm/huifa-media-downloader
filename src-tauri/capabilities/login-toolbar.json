@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "login-toolbar",
+  "description": "The local login toolbar may navigate its own website webview only.",
+  "local": true,
+  "webviews": ["login-*-toolbar"],
+  "permissions": ["allow-login-navigation"]
+}

@@ -383,6 +383,7 @@ fn allowed_command(command: &str) -> bool {
             | "probe.video"
             | "probe.collection"
             | "settings.save"
+            | "settings.preferences"
             | "tools.check"
             | "tools.latest"
             | "cookies.import"
@@ -443,7 +444,10 @@ async fn command(
     if input.command == "snapshot" {
         strip_processing_folder(&mut value["settings"]);
     }
-    if input.command == "settings.save" {
+    if matches!(
+        input.command.as_str(),
+        "settings.save" | "settings.preferences"
+    ) {
         strip_processing_folder(&mut value);
     }
     if input.command == "access.change_password" {
@@ -1053,6 +1057,102 @@ mod tests {
             !server.app.access.check_attempt(peer.ip()),
             "Disconnecting during password verification must still count the failure"
         );
+        server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_ui_preferences_preserve_settings_drafts_and_hide_internal_paths() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let server = Server::open(Config {
+            account: "admin".into(),
+            password: "test-password".into(),
+            public_origin: None,
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+            frontend_dir: root.path().join("frontend"),
+            chromium: "missing-chromium".into(),
+        })
+        .await?;
+        let private = root.path().join("private-processing");
+        server
+            .app
+            .command(
+                "settings.save",
+                json!({"settings":{
+                    "uiLanguage":"zh-CN","aiApiKey":"fixture-api-key",
+                    "downloadOptions":{"quality":"1080p","processingTempDir":private,
+                    "proxy":"http://fixture-user:fixture-password@proxy.example.test:8080"}
+                }}),
+            )
+            .await?;
+        let router = server.router();
+        let (token, session) = server.auth.create_session(server.app.access.generation());
+        let request = |command: &str, args: Value, csrf: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/command")
+                .header("host", "localhost:19491")
+                .header("origin", "http://localhost:19491")
+                .header("cookie", format!("huifa_session={token}"))
+                .header("x-csrf-token", csrf)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"command":command,"args":args}).to_string(),
+                ))
+        };
+        let args = json!({"preferences":{"deleteMediaOnTaskDelete":true}});
+        let forbidden = router
+            .clone()
+            .oneshot(request("settings.preferences", args.clone(), "incorrect")?)
+            .await?;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let response = router
+            .clone()
+            .oneshot(request("settings.preferences", args, &session.csrf)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+        assert_eq!(
+            body["value"]["uiPreferences"]["deleteMediaOnTaskDelete"],
+            true
+        );
+        assert_eq!(body["value"]["downloadOptions"]["quality"], "1080p");
+        assert!(
+            body["value"]["downloadOptions"]
+                .get("processingTempDir")
+                .is_none()
+        );
+        assert!(!body.to_string().contains("fixture-password"));
+        assert!(!body.to_string().contains("fixture-api-key"));
+        let snapshot = server.app.command("snapshot", json!({})).await?;
+        assert_eq!(
+            snapshot["settings"]["downloadOptions"]["processingTempDir"],
+            json!(private)
+        );
+        let response = router
+            .clone()
+            .oneshot(request(
+                "settings.save",
+                json!({"settings":{
+                    "uiLanguage":"en-US","uiPreferences":{"deleteMediaOnTaskDelete":false},
+                    "downloadOptions":{"quality":"720p"}
+                }}),
+                &session.csrf,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+        assert_eq!(
+            body["value"]["uiPreferences"]["deleteMediaOnTaskDelete"],
+            true
+        );
+        assert_eq!(body["value"]["uiLanguage"], "en-US");
+        assert_eq!(body["value"]["hasProxy"], true);
+        assert_eq!(body["value"]["hasAiApiKey"], true);
         server.shutdown().await;
         Ok(())
     }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, Empty, Field, Modal } from './components';
+import { Button, Empty, Modal } from './components';
 import { host } from './transport';
 import { explainError } from './errors';
 import type { Translate } from './i18n';
@@ -7,7 +7,7 @@ import type { Run } from './App';
 
 export function RemoteBrowser({ close, saved, t, run }: { close: () => void; saved: () => void; t: Translate; run: Run }) {
   const [url, setUrl] = useState('https://www.youtube.com/'); const [active, setActive] = useState(false); const [busyAction, setBusyAction] = useState<'open' | 'save' | 'close' | null>(null); const busy = busyAction !== null; const [image, setImage] = useState(''); const [size, setSize] = useState({ width: 1280, height: 720 });
-  const [name, setName] = useState(t('下载登录', 'Download login')); const [text, setText] = useState(''); const [status, setStatus] = useState(''); const [error, setError] = useState(''); const frame = useRef<HTMLDivElement>(null);
+  const [text, setText] = useState(''); const [status, setStatus] = useState(''); const [error, setError] = useState(''); const frame = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let disposed = false;
     void host.browserGet().then(value => { if (!disposed) { setActive(value.active); if (value.targetUrl) setUrl(value.targetUrl); } }).catch(reason => { if (!disposed) setError(String(reason)); });
@@ -18,7 +18,7 @@ export function RemoteBrowser({ close, saved, t, run }: { close: () => void; sav
     return () => { disposed = true; events.close(); };
   }, [t]);
   const stop = () => { setBusyAction('close'); run(async () => { try { await host.browserStop(); close(); } finally { setBusyAction(null); } }); };
-  return <Modal title={t('远程浏览器登录', 'Remote browser sign-in')} subtitle={t('完成来源网站登录后，将 Cookie 保存为下载身份。', 'Sign in to the source site, then save cookies as a download identity.')} wide close={stop} t={t} footer={<><Field label={t('Cookie 名称', 'Cookie name')}><input value={name} maxLength={128} onChange={event => setName(event.target.value)} /></Field><span className="footer-spacer" /><Button disabled={busy} onClick={stop}>{busyAction === 'close' ? t('关闭中…', 'Closing…') : t('关闭浏览器', 'Close browser')}</Button><Button disabled={!active || busy || !name.trim()} tone="primary" icon="check" onClick={() => { setBusyAction('save'); run(async () => { try { await host.browserSave(name); saved(); setStatus(t('Cookie 已保存', 'Cookies saved')); } finally { setBusyAction(null); } }); }}>{busyAction === 'save' ? t('保存中…', 'Saving…') : t('保存 Cookie', 'Save cookies')}</Button></>}>
+  return <Modal title={t('远程浏览器登录', 'Remote browser sign-in')} subtitle={t('登录后保存，后续下载按网站自动使用 Cookie，无需选择。', 'Save after signing in. Future downloads match cookies to the website automatically, with nothing to select.')} wide close={stop} t={t} footer={<><Button disabled={busy} onClick={stop}>{busyAction === 'close' ? t('关闭中…', 'Closing…') : t('关闭浏览器', 'Close browser')}</Button><Button disabled={!active || busy} tone="primary" icon="check" onClick={() => { setBusyAction('save'); run(async () => { try { await host.browserSave(t('下载登录', 'Download login')); saved(); setStatus(t('Cookie 已保存', 'Cookies saved')); } finally { setBusyAction(null); } }); }}>{busyAction === 'save' ? t('保存中…', 'Saving…') : t('保存 Cookie', 'Save cookies')}</Button></>}>
     <form className="toolbar" onSubmit={event => { event.preventDefault(); setBusyAction('open'); run(async () => { try { const parsed = new URL(url); if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error(t('请输入公开 HTTP / HTTPS 链接', 'Enter a public HTTP / HTTPS URL')); await host.browserStart(url); setActive(true); } finally { setBusyAction(null); } }); }}><input type="url" aria-label={t('登录网站地址', 'Sign-in website URL')} value={url} onChange={event => setUrl(event.target.value)} required /><Button type="submit" icon="external" tone="primary" disabled={busy}>{busyAction === 'open' ? t('打开中…', 'Opening…') : t('打开', 'Open')}</Button></form>
     <div ref={frame} className="remote-frame" tabIndex={0} role="application" aria-label={t('远程浏览器画面，点击并用键盘操作', 'Remote browser view, click and use the keyboard')}
       onClick={event => { if (!active || !image) return; event.currentTarget.focus(); const bounds = event.currentTarget.getBoundingClientRect(); const scale = Math.min(bounds.width / size.width, bounds.height / size.height); const x = Math.round((event.clientX - bounds.left - (bounds.width - size.width * scale) / 2) / scale); const y = Math.round((event.clientY - bounds.top - (bounds.height - size.height * scale) / 2) / scale); if (x >= 0 && x < size.width && y >= 0 && y < size.height) run(() => host.browserInput({ type: 'click', x, y })); }}

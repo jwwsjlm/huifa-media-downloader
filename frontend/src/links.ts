@@ -16,5 +16,6 @@ export function singleVideoLink(value: string): boolean {
   if (host === 'youtu.be') return url.pathname.length > 1;
   if (host === 'youtube.com' || host.endsWith('.youtube.com')) return url.pathname === '/watch' && Boolean(url.searchParams.get('v')) || /^\/(shorts|live|embed)\/[^/]+/.test(url.pathname);
   if (host === 'bilibili.com' || host.endsWith('.bilibili.com')) return /^\/video\/(BV[a-z\d]+|av\d+)/i.test(url.pathname);
+  if (host === 'douyin.com' || host === 'www.douyin.com') return /^\/(video|note)\/\d+\/?$/.test(url.pathname);
   return /\.(mp4|webm|mkv|mov|mp3|m4a|flac|wav|ogg|opus)$/i.test(url.pathname);
 }

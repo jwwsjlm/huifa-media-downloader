@@ -4,18 +4,24 @@ use huifa_core::{
     browser::{Cdp, netscape},
     process::ProcessTree,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, Manager, Webview, WebviewBuilder, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowBuilder,
+};
 use tokio::{
     process::{Child, Command},
     sync::Mutex,
 };
 
+pub(super) mod navigation;
 #[cfg(all(test, windows, feature = "login-smoke"))]
 mod smoke;
 
@@ -24,6 +30,52 @@ pub struct LoginBrowser {
     system: Option<(String, PathBuf)>,
     running: Mutex<Option<Session>>,
     synced: std::sync::Mutex<SyncState>,
+    preferred: std::sync::Mutex<Preferences>,
+    preference_error: std::sync::Mutex<Option<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct Preferences {
+    url: String,
+    mode: String,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            url: "https://www.youtube.com/".into(),
+            mode: "embedded".into(),
+        }
+    }
+}
+
+impl Preferences {
+    fn new(url: &str, mode: &str) -> Result<Self> {
+        ensure!(matches!(mode, "embedded" | "system"), "Invalid login mode");
+        Ok(Self {
+            url: login_url(url)?.to_string(),
+            mode: mode.into(),
+        })
+    }
+
+    fn load(directory: &Path) -> Self {
+        Self::read(directory).unwrap_or_default()
+    }
+
+    fn read(directory: &Path) -> Result<Self> {
+        let path = directory.join("preferences.json");
+        ensure!(
+            std::fs::symlink_metadata(&path)?.file_type().is_file(),
+            "Invalid login preferences file"
+        );
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(4097)
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 4096, "Login preferences are too large");
+        let value: Self = serde_json::from_slice(&bytes)?;
+        Self::new(&value.url, &value.mode)
+    }
 }
 
 #[derive(Default)]
@@ -43,17 +95,21 @@ enum Session {
         guard: ProcessTree,
         cdp: Cdp,
         url: String,
+        target_id: std::sync::Mutex<Option<String>>,
     },
 }
 
 impl LoginBrowser {
     pub fn new(directory: PathBuf) -> Result<Self> {
         private_directory(&directory)?;
+        let preferred = Preferences::load(&directory);
         Ok(Self {
             directory,
             system: find_browser(),
             running: Mutex::new(None),
             synced: Default::default(),
+            preferred: std::sync::Mutex::new(preferred),
+            preference_error: Default::default(),
         })
     }
 
@@ -91,7 +147,7 @@ impl LoginBrowser {
                         "Close the active login browser before opening another website or mode"
                     );
                     if let Session::Embedded { label, .. } = session
-                        && let Some(window) = app.get_webview_window(label)
+                        && let Some(window) = app.get_window(label)
                     {
                         window.show()?;
                         window.set_focus()?;
@@ -102,7 +158,7 @@ impl LoginBrowser {
                     let profile = self.directory.join("embedded");
                     private_directory(&profile)?;
                     let label = format!("login-{}", uuid::Uuid::new_v4());
-                    let window = embedded_window(app, &label, profile.clone(), &label, None)?;
+                    let window = embedded_browser(app, &label, &profile)?;
                     if let Err(reason) = initialize_storage(&window, &profile)
                         .await
                         .and_then(|()| window.navigate(url.clone()).map_err(Into::into))
@@ -124,6 +180,7 @@ impl LoginBrowser {
                     launch_system(executable, &profile, url.as_str()).await?
                 };
                 *running = Some(session);
+                let _ = self.remember(url.as_str(), mode);
                 *self.synced.lock().unwrap() = SyncState {
                     name: name.map(str::to_owned),
                     ..Default::default()
@@ -150,11 +207,10 @@ impl LoginBrowser {
                     .context("No cookies to save")
             }
             "browser.login.close" => {
-                if let Some(session) = running.as_ref() {
-                    self.sync_session(app, core, session, None).await?;
-                }
                 if let Some(session) = running.take() {
+                    let saved = self.sync_session(app, core, &session, None).await;
                     session.stop(app).await;
+                    saved?;
                 }
                 Ok(json!(true))
             }
@@ -164,7 +220,73 @@ impl LoginBrowser {
 
     fn status(&self, running: &Option<Session>) -> Value {
         let synced = self.synced.lock().unwrap();
-        json!({"active":running.is_some(),"mode":running.as_ref().map(Session::mode),"targetUrl":running.as_ref().map(Session::url),"systemBrowser":self.system.as_ref().map(|(name,_)|name),"cookie":synced.saved.as_ref().map(|value| &value["cookie"]),"saveError":synced.error})
+        let preferred = self.preferred.lock().unwrap();
+        let preference_error = self.preference_error.lock().unwrap();
+        json!({"active":running.is_some(),"mode":running.as_ref().map(Session::mode),"targetUrl":running.as_ref().map(|_| preferred.url.as_str()),"preferredUrl":preferred.url,"preferredMode":preferred.mode,"preferenceError":*preference_error,"systemBrowser":self.system.as_ref().map(|(name,_)|name),"cookie":synced.saved.as_ref().map(|value| &value["cookie"]),"saveError":synced.error})
+    }
+
+    fn remember(&self, url: &str, mode: &str) -> Result<()> {
+        let next = Preferences::new(url, mode)?;
+        let mut preferred = self.preferred.lock().unwrap();
+        let path = self.directory.join("preferences.json");
+        if *preferred == next && Preferences::read(&self.directory).is_ok_and(|saved| saved == next)
+        {
+            *self.preference_error.lock().unwrap() = None;
+            return Ok(());
+        }
+        let saved = (|| -> Result<()> {
+            let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
+            file.write_all(&serde_json::to_vec(&next)?)?;
+            file.as_file().sync_all()?;
+            file.persist(path).map_err(|reason| reason.error)?;
+            Ok(())
+        })();
+        *preferred = next;
+        *self.preference_error.lock().unwrap() = saved
+            .as_ref()
+            .err()
+            .map(|reason| huifa_core::process::redact(&format!("{reason:#}")));
+        saved
+    }
+
+    async fn remember_session(&self, app: &AppHandle, session: &Session) -> Result<()> {
+        let url = match session {
+            Session::Embedded { label, .. } => app
+                .get_webview(&format!("{label}-page"))
+                .context("Login window was closed")?
+                .url()?
+                .to_string(),
+            Session::System {
+                cdp,
+                url,
+                target_id,
+                ..
+            } => {
+                let targets = cdp.request("Target.getTargets", json!({}), None).await?;
+                let pages: Vec<_> = targets["targetInfos"]
+                    .as_array()
+                    .context("Browser returned invalid windows")?
+                    .iter()
+                    .filter(|target| target["type"] == "page")
+                    .collect();
+                let mut target_id = target_id.lock().unwrap();
+                let target = if let Some(id) = target_id.as_ref() {
+                    pages.iter().find(|target| target["targetId"] == *id)
+                } else {
+                    pages
+                        .iter()
+                        .find(|target| target["url"] == *url)
+                        .or_else(|| pages.iter().find(|target| target["openerId"].is_null()))
+                }
+                .context("No website is open in the login browser")?;
+                *target_id = target["targetId"].as_str().map(str::to_owned);
+                target["url"]
+                    .as_str()
+                    .context("Browser returned an invalid website")?
+                    .to_owned()
+            }
+        };
+        self.remember(&url, session.mode())
     }
 
     async fn sync_session(
@@ -174,11 +296,13 @@ impl LoginBrowser {
         session: &Session,
         name: Option<&str>,
     ) -> Result<()> {
+        // Preferences must survive even when cookie export fails.
+        let _ = self.remember_session(app, session).await;
         let result = async {
             let cookies = match session {
                 Session::Embedded { label, .. } => {
                     native_cookies(
-                        &app.get_webview_window(label)
+                        &app.get_webview(&format!("{label}-page"))
                             .context("Login window was closed")?,
                     )
                     .await?
@@ -259,12 +383,12 @@ impl LoginBrowser {
         if let Some(Session::Embedded { label: root, .. }) = running.as_ref()
             && root == label
         {
-            self.sync_session(app, core, running.as_ref().unwrap(), None)
-                .await?;
             if let Some(session) = running.take() {
+                let saved = self.sync_session(app, core, &session, None).await;
                 session.stop(app).await;
+                saved?;
             }
-        } else if let Some(window) = app.get_webview_window(label) {
+        } else if let Some(window) = app.get_window(label) {
             window.destroy()?;
         }
         Ok(())
@@ -302,7 +426,7 @@ impl Session {
     }
     fn active(&mut self, app: &AppHandle) -> bool {
         match self {
-            Self::Embedded { label, .. } => app.get_webview_window(label).is_some(),
+            Self::Embedded { label, .. } => app.get_window(label).is_some(),
             Self::System { child, cdp, .. } => {
                 child.try_wait().ok().flatten().is_none() && !cdp.is_closed()
             }
@@ -370,10 +494,135 @@ fn website(url: &tauri::Url) -> bool {
 }
 
 fn close_windows(app: &AppHandle, group: &str) {
-    for (label, window) in app.webview_windows() {
+    for (label, window) in app.windows() {
         if label == group || label.starts_with(&format!("{group}-")) {
             let _ = window.destroy();
         }
+    }
+}
+
+const TOOLBAR_HEIGHT: f64 = 44.0;
+
+fn layout_browser(app: &AppHandle, label: &str) -> Result<()> {
+    let window = app.get_window(label).context("Login window was closed")?;
+    let size = window
+        .inner_size()?
+        .to_logical::<f64>(window.scale_factor()?);
+    for (suffix, top, height) in [
+        ("toolbar", 0.0, TOOLBAR_HEIGHT),
+        (
+            "page",
+            TOOLBAR_HEIGHT,
+            (size.height - TOOLBAR_HEIGHT).max(1.0),
+        ),
+    ] {
+        if let Some(webview) = app.get_webview(&format!("{label}-{suffix}")) {
+            webview.set_bounds(tauri::Rect {
+                position: tauri::LogicalPosition::new(0.0, top).into(),
+                size: tauri::LogicalSize::new(size.width, height).into(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn embedded_browser(app: &AppHandle, label: &str, profile: &Path) -> Result<Webview> {
+    let window = WindowBuilder::new(app, label)
+        .title("Huifa — Website sign-in")
+        .inner_size(1100.0, 780.0)
+        .min_inner_size(480.0, 320.0)
+        .visible(false)
+        .build()?;
+    let result = (|| {
+        let toolbar_profile = profile
+            .parent()
+            .context("Invalid browser profile")?
+            .join("toolbar");
+        private_directory(&toolbar_profile)?;
+        let toolbar_url = WebviewUrl::App("index.html?login-toolbar".into());
+        window.add_child(
+            WebviewBuilder::new(format!("{label}-toolbar"), toolbar_url)
+                .data_directory(toolbar_profile)
+                .on_navigation(|url| {
+                    url.path() == "/index.html"
+                        && url.query() == Some("login-toolbar")
+                        && (url.scheme() == "tauri"
+                            || url.host_str() == Some("tauri.localhost")
+                            || cfg!(debug_assertions) && url.host_str() == Some("127.0.0.1"))
+                })
+                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+                .on_download(|_, _| false),
+            tauri::LogicalPosition::new(0.0, 0.0),
+            tauri::LogicalSize::new(1100.0, TOOLBAR_HEIGHT),
+        )?;
+        let handle = app.clone();
+        let root = label.to_owned();
+        let popup_profile = profile.to_owned();
+        let page = WebviewBuilder::new(
+            format!("{label}-page"),
+            WebviewUrl::External("about:blank".parse()?),
+        )
+        .data_directory(profile.to_owned())
+        .on_page_load(|view, page| {
+            if let Some(host) = page.url().host_str() {
+                let _ = view.window().set_title(&format!("Huifa — {host}"));
+            }
+        })
+        .on_navigation(|url| website(url) || url.as_str() == "about:blank")
+        .on_download(|_, _| false)
+        .on_new_window(move |url, features| {
+            login_popup(&handle, &root, &popup_profile, url, features)
+        });
+        #[cfg(all(test, windows, feature = "login-smoke"))]
+        let page = page.additional_browser_args("--host-resolver-rules=\"MAP *.huifa.test 127.0.0.1\" --proxy-bypass-list=\"*.huifa.test\"");
+        let page = window.add_child(
+            page,
+            tauri::LogicalPosition::new(0.0, TOOLBAR_HEIGHT),
+            tauri::LogicalSize::new(1100.0, 780.0 - TOOLBAR_HEIGHT),
+        )?;
+        layout_browser(app, label)?;
+        let handle = app.clone();
+        let root = label.to_owned();
+        window.on_window_event(move |event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::ScaleFactorChanged { .. }
+            ) {
+                let _ = layout_browser(&handle, &root);
+            }
+        });
+        window.show()?;
+        Ok(page)
+    })();
+    if result.is_err() {
+        let _ = window.destroy();
+    }
+    result
+}
+
+fn login_popup(
+    app: &AppHandle,
+    group: &str,
+    profile: &Path,
+    url: tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
+) -> tauri::webview::NewWindowResponse<tauri::Wry> {
+    use tauri::webview::NewWindowResponse;
+    if !(website(&url) || url.as_str() == "about:blank")
+        || app.get_window(group).is_none()
+        || app
+            .windows()
+            .keys()
+            .filter(|label| label.starts_with(group))
+            .count()
+            >= 10
+    {
+        return NewWindowResponse::Deny;
+    }
+    let label = format!("{group}-{}", uuid::Uuid::new_v4());
+    match embedded_window(app, &label, profile.to_owned(), group, Some(features)) {
+        Ok(window) => NewWindowResponse::Create { window },
+        Err(_) => NewWindowResponse::Deny,
     }
 }
 
@@ -400,29 +649,7 @@ fn embedded_window(
             .on_navigation(|url| website(url) || url.as_str() == "about:blank")
             .on_download(|_, _| false)
             .on_new_window(move |url, features| {
-                use tauri::webview::NewWindowResponse;
-                if !(website(&url) || url.as_str() == "about:blank")
-                    || handle.get_webview_window(&root).is_none()
-                    || handle
-                        .webview_windows()
-                        .keys()
-                        .filter(|label| label.starts_with(&root))
-                        .count()
-                        >= 10
-                {
-                    return NewWindowResponse::Deny;
-                }
-                let label = format!("{root}-{}", uuid::Uuid::new_v4());
-                match embedded_window(
-                    &handle,
-                    &label,
-                    popup_profile.clone(),
-                    &root,
-                    Some(features),
-                ) {
-                    Ok(window) => NewWindowResponse::Create { window },
-                    Err(_) => NewWindowResponse::Deny,
-                }
+                login_popup(&handle, &root, &popup_profile, url, features)
             });
     if let Some(features) = features {
         builder = builder.window_features(features);
@@ -544,6 +771,7 @@ async fn launch_system(executable: &Path, profile: &Path, url: &str) -> Result<S
             guard,
             cdp,
             url: url.into(),
+            target_id: Default::default(),
         }),
         result => {
             guard.terminate();
@@ -558,7 +786,7 @@ async fn launch_system(executable: &Path, profile: &Path, url: &str) -> Result<S
 }
 
 #[cfg(windows)]
-async fn native_cookies(window: &WebviewWindow) -> Result<Value> {
+async fn native_cookies(window: &Webview) -> Result<Value> {
     use std::sync::{Arc, Mutex};
     use webview2_com::{
         GetCookiesCompletedHandler, Microsoft::Web::WebView2::Win32::ICoreWebView2_2,
@@ -642,7 +870,7 @@ fn windows_cookie_values(
 }
 
 #[cfg(target_os = "linux")]
-async fn native_cookies(window: &WebviewWindow) -> Result<Value> {
+async fn native_cookies(window: &Webview) -> Result<Value> {
     use webkit2gtk::{WebViewExt, WebsiteDataManagerExt};
     let (sender, receiver) = tokio::sync::oneshot::channel();
     window.with_webview(move |webview| {
@@ -721,7 +949,7 @@ fn all_cookie_values(
 }
 
 #[cfg(target_os = "linux")]
-async fn initialize_storage(window: &WebviewWindow, profile: &Path) -> Result<()> {
+async fn initialize_storage(window: &Webview, profile: &Path) -> Result<()> {
     use webkit2gtk::{CookieManagerExt, WebViewExt, WebsiteDataManagerExt};
     let path = profile.join("cookies.sqlite");
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -746,18 +974,118 @@ async fn initialize_storage(window: &WebviewWindow, profile: &Path) -> Result<()
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn initialize_storage(_: &WebviewWindow, _: &Path) -> Result<()> {
+async fn initialize_storage(_: &Webview, _: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-async fn native_cookies(_: &WebviewWindow) -> Result<Value> {
+async fn native_cookies(_: &Webview) -> Result<Value> {
     bail!("Use compatible sign-in on this platform")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferences_persist_across_reopening_and_leave_profile_data_alone() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let browser = LoginBrowser::new(directory.path().into())?;
+        assert_eq!(
+            browser.status(&None)["preferredUrl"],
+            "https://www.youtube.com/"
+        );
+        assert_eq!(browser.status(&None)["preferredMode"], "embedded");
+        let profile = directory.path().join("embedded");
+        private_directory(&profile)?;
+        std::fs::write(profile.join("login-data"), b"keep")?;
+        browser.remember("https://www.douyin.com/video/123?from=web", "system")?;
+        browser.remember("https://www.bilibili.com/video/BV123/", "embedded")?;
+        drop(browser);
+        let reopened = LoginBrowser::new(directory.path().into())?;
+        assert_eq!(
+            reopened.status(&None)["preferredUrl"],
+            "https://www.bilibili.com/video/BV123/"
+        );
+        assert_eq!(reopened.status(&None)["preferredMode"], "embedded");
+        assert_eq!(std::fs::read(profile.join("login-data"))?, b"keep");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(directory.path().join("preferences.json"))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_preferences_fall_back_and_cannot_replace_the_last_website() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let browser = LoginBrowser::new(directory.path().into())?;
+        browser.remember("https://www.douyin.com/", "system")?;
+        let expected = browser.status(&None);
+        for (url, mode) in [
+            ("about:blank", "embedded"),
+            ("file:///secret", "embedded"),
+            ("javascript:alert(1)", "embedded"),
+            ("https://user:password@example.com/", "embedded"),
+            ("https://example.com/", "invalid"),
+        ] {
+            assert!(browser.remember(url, mode).is_err());
+            assert_eq!(browser.status(&None), expected);
+            std::fs::write(
+                directory.path().join("preferences.json"),
+                serde_json::to_vec(&json!({"url":url,"mode":mode}))?,
+            )?;
+            assert_eq!(Preferences::load(directory.path()), Preferences::default());
+        }
+        for text in ["{broken", "[]", "null", &"x".repeat(4097)] {
+            std::fs::write(directory.path().join("preferences.json"), text)?;
+            assert_eq!(Preferences::load(directory.path()), Preferences::default());
+        }
+        let reopened = LoginBrowser::new(directory.path().into())?;
+        assert_eq!(
+            reopened.status(&None)["preferredUrl"],
+            "https://www.youtube.com/"
+        );
+        reopened.remember("https://www.youtube.com/", "embedded")?;
+        assert_eq!(Preferences::read(directory.path())?, Preferences::default());
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_preference_storage_keeps_the_current_website_in_memory() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::create_dir(directory.path().join("preferences.json"))?;
+        let browser = LoginBrowser::new(directory.path().into())?;
+        assert!(
+            browser
+                .remember("https://www.douyin.com/", "system")
+                .is_err()
+        );
+        assert_eq!(
+            browser.status(&None)["preferredUrl"],
+            "https://www.douyin.com/"
+        );
+        assert_eq!(browser.status(&None)["preferredMode"], "system");
+        assert!(browser.status(&None)["preferenceError"].is_string());
+        assert!(browser.status(&None)["saveError"].is_null());
+        std::fs::remove_dir(directory.path().join("preferences.json"))?;
+        std::fs::write(directory.path().join("preferences.json"), b"corrupt")?;
+        browser.remember("https://www.douyin.com/", "system")?;
+        assert!(browser.status(&None)["preferenceError"].is_null());
+        assert_eq!(
+            Preferences::load(directory.path()).url,
+            "https://www.douyin.com/"
+        );
+        Ok(())
+    }
+
     #[test]
     fn validates_login_urls_and_preserves_profile_data() -> Result<()> {
         for url in [

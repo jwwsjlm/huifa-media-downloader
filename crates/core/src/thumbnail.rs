@@ -260,7 +260,11 @@ fn cookie_header(text: &str, url: &url::Url) -> String {
             {
                 return None;
             }
-            Some(format!("{}={}", fields[5], fields[6]))
+            Some(if fields[5].is_empty() {
+                fields[6].to_owned()
+            } else {
+                format!("{}={}", fields[5], fields[6])
+            })
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -271,6 +275,18 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn nameless_cookie_values_are_sent_as_bare_tokens() {
+        let text = "# Netscape HTTP Cookie File\nwww.example.com\tFALSE\t/\tTRUE\t0\t\tanonymous\nwww.example.com\tFALSE\t/\tTRUE\t0\tnamed\tvalue\n";
+        assert_eq!(
+            cookie_header(
+                text,
+                &url::Url::parse("https://www.example.com/cover").unwrap()
+            ),
+            "anonymous; named=value"
+        );
+    }
 
     #[test]
     fn cookies_follow_domain_path_security_and_expiry() {

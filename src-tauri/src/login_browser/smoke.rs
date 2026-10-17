@@ -20,6 +20,7 @@ struct Fixture {
     stopped: Arc<AtomicBool>,
     denied: Arc<AtomicBool>,
     main_ready: Arc<AtomicBool>,
+    toolbar_ready: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -31,7 +32,13 @@ impl Fixture {
         let stopped = Arc::new(AtomicBool::new(false));
         let denied = Arc::new(AtomicBool::new(false));
         let main_ready = Arc::new(AtomicBool::new(false));
-        let flags = (stopped.clone(), denied.clone(), main_ready.clone());
+        let toolbar_ready = Arc::new(AtomicBool::new(false));
+        let flags = (
+            stopped.clone(),
+            denied.clone(),
+            main_ready.clone(),
+            toolbar_ready.clone(),
+        );
         let thread = std::thread::spawn(move || {
             while !flags.0.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -47,11 +54,37 @@ impl Fixture {
                     .next()
                     .and_then(|line| line.split_whitespace().nth(1))
                     .unwrap_or("/");
+                let asset_path = path.split('?').next().unwrap_or("");
+                if (asset_path == "/index.html" || asset_path.starts_with("/assets/"))
+                    && !asset_path.contains("..")
+                {
+                    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../frontend/dist")
+                        .join(asset_path.trim_start_matches('/'));
+                    let body = std::fs::read(file).unwrap_or_default();
+                    let mime = if asset_path.ends_with(".js") {
+                        "text/javascript"
+                    } else if asset_path.ends_with(".css") {
+                        "text/css"
+                    } else {
+                        "text/html"
+                    };
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&body);
+                    continue;
+                }
                 if path == "/denied" {
                     flags.1.store(true, Ordering::SeqCst);
                 }
                 if path == "/main-ready" {
                     flags.2.store(true, Ordering::SeqCst);
+                }
+                if path == "/toolbar-ready" {
+                    flags.3.store(true, Ordering::SeqCst);
                 }
                 let cookies = match path {
                     "/login" => {
@@ -79,6 +112,7 @@ impl Fixture {
             stopped,
             denied,
             main_ready,
+            toolbar_ready,
             thread: Some(thread),
         })
     }
@@ -100,7 +134,7 @@ async fn wait_cookie(browser: &LoginBrowser, app: &AppHandle, name: &str) -> Res
             let cookies = match running.as_ref().context("Missing login session")? {
                 Session::Embedded { label, .. } => {
                     native_cookies(
-                        &app.get_webview_window(label)
+                        &app.get_webview(&format!("{label}-page"))
                             .context("Missing login window")?,
                     )
                     .await?
@@ -121,6 +155,20 @@ async fn wait_cookie(browser: &LoginBrowser, app: &AppHandle, name: &str) -> Res
     })
     .await
     .with_context(|| format!("Test cookie {name} was not received"))?
+}
+
+async fn wait_navigation(toolbar: &Webview, path: &str) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = navigation::command(toolbar.clone(), "state", None).await?;
+            if state["url"].as_str().is_some_and(|url| url.ends_with(path)) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("Browser navigation did not reach the requested page")?
 }
 
 #[test]
@@ -148,9 +196,10 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
     context.config_mut().build.dev_url =
         Some(format!("http://127.0.0.1:{}/", fixture.port).parse()?);
     let main_profile = directory.path().join("main");
+    let test_directory = directory.path().to_owned();
     let application = tauri::Builder::default()
         .any_thread()
-        .invoke_handler(tauri::generate_handler![upload_asset])
+        .invoke_handler(tauri::generate_handler![upload_asset, crate::login_navigation])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event
                 && window.label().starts_with("login-")
@@ -161,7 +210,7 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                 let browser = observer.clone();
                 let core = observed_core.clone();
                 tauri::async_runtime::spawn(async move {
-                    browser.close_window(&handle, &core, &label).await.unwrap();
+                    let _ = browser.close_window(&handle, &core, &label).await;
                 });
             }
             if matches!(event, tauri::WindowEvent::Destroyed) {
@@ -230,14 +279,44 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                         Session::Embedded { label, .. } => label.clone(),
                         _ => unreachable!(),
                     };
+                    let toolbar = handle.get_webview(&format!("{label}-toolbar")).context("Missing navigation toolbar")?;
+                    let page = handle.get_webview(&format!("{label}-page")).unwrap();
+                    toolbar.eval("function checkToolbar(){const nav=document.querySelector('.browser-toolbar');if(!nav||nav.querySelectorAll('button').length!==3||Math.abs(nav.getBoundingClientRect().height-44)>1){setTimeout(checkToolbar,50);return}window.__TAURI_INTERNALS__.invoke('login_navigation',{action:'state'}).then(()=>fetch('/toolbar-ready'))}checkToolbar()")?;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !fixture.toolbar_ready.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(20)).await; }
+                    }).await.context("The toolbar could not use its dedicated navigation command")?;
+                    ensure!(navigation::command(page.clone(), "state", None).await.is_err(), "The website received navigation access");
+                    let second = format!("http://login.huifa.test:{}/second", fixture.port);
+                    navigation::command(toolbar.clone(), "navigate", Some(&second)).await?;
+                    wait_navigation(&toolbar, "/second").await?;
+                    ensure!(navigation::command(toolbar.clone(), "state", None).await?["canGoBack"] == true, "Back history unavailable after navigation");
+                    navigation::command(toolbar.clone(), "back", None).await?;
+                    wait_navigation(&toolbar, "/login").await?;
+                    ensure!(navigation::command(toolbar.clone(), "state", None).await?["canGoForward"] == true, "Forward history unavailable after going back");
+                    navigation::command(toolbar.clone(), "forward", None).await?;
+                    wait_navigation(&toolbar, "/second").await?;
+                    navigation::command(toolbar.clone(), "reload", None).await?;
+                    wait_navigation(&toolbar, "/second").await?;
+                    let status = browser.command(&handle, &core, "browser.login.status", &json!({})).await?;
+                    ensure!(status["preferredUrl"] == second && status["preferredMode"] == "embedded", "Navigation did not update saved browser preferences");
+                    let reopened = LoginBrowser::new(browser.directory.clone())?;
+                    ensure!(reopened.status(&None)["preferredUrl"] == second && reopened.status(&None)["preferenceError"].is_null(), "Browser preferences did not survive reopening");
+                    let parent = handle.get_window(&label).unwrap();
+                    parent.set_size(tauri::LogicalSize::new(760.0, 600.0))?;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let scale = parent.scale_factor()?;
+                    let toolbar_bounds = toolbar.bounds()?;
+                    let page_bounds = page.bounds()?;
+                    ensure!((toolbar_bounds.size.to_logical::<f64>(scale).height - TOOLBAR_HEIGHT).abs() < 1.0, "Resizing changed the toolbar height");
+                    ensure!((page_bounds.position.to_logical::<f64>(scale).y - TOOLBAR_HEIGHT).abs() < 1.0, "The toolbar overlapped the website after resizing");
                     handle
-                        .get_webview_window(&label)
+                        .get_webview(&format!("{label}-page"))
                         .unwrap()
                         .eval("window.open('/popup')")?;
                     wait_cookie(&browser, &handle, "popup_sid")
                         .await
                         .context("Login popup did not share the cookie store")?;
-                    handle.get_webview_window(&label).unwrap().close()?;
+                    handle.get_window(&label).unwrap().close()?;
                     tokio::time::timeout(Duration::from_secs(10), async {
                         loop {
                             let status = browser.command(&handle, &core, "browser.login.status", &json!({})).await?;
@@ -254,7 +333,7 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                     ensure!(!saved.to_string().contains("host-secret"));
                     tokio::time::timeout(Duration::from_secs(5), async {
                         while handle
-                            .webview_windows()
+                            .windows()
                             .keys()
                             .any(|label| label.starts_with("login-"))
                         {
@@ -283,7 +362,22 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                         Session::Embedded { label, .. } => label.clone(),
                         _ => unreachable!(),
                     };
-                    handle.get_webview_window(&label).unwrap().close()?;
+                    let credentials = test_directory.join("data/credentials");
+                    let retained = test_directory.join("retained-credentials");
+                    std::fs::rename(&credentials, &retained)?;
+                    std::fs::write(&credentials, b"simulate unavailable cookie storage")?;
+                    handle.get_window(&label).unwrap().close()?;
+                    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+                        while handle.get_window(&label).is_some() {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }).await;
+                    std::fs::remove_file(&credentials)?;
+                    std::fs::rename(&retained, &credentials)?;
+                    closed.context("Cookie sync failure prevented closing the login window")?;
+                    let status = browser.command(&handle, &core, "browser.login.status", &json!({})).await?;
+                    ensure!(status["active"] == false && status["saveError"].is_string(), "Closing after a sync failure lost the error or kept the session active");
+                    ensure!(core.read_cookie(saved["cookie"]["id"].as_str().unwrap())? == saved_text, "Failed final sync replaced previously saved cookies");
                     tokio::time::timeout(Duration::from_secs(10), async {
                         loop {
                             if browser
@@ -299,6 +393,25 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                     })
                     .await
                     .context("Closed login session remained active")?;
+                    browser.command(&handle, &core, "browser.login.open", &json!({"url":resume,"mode":"embedded"})).await?;
+                    wait_cookie(&browser, &handle, "host_sid").await?;
+                    let label = match browser.running.lock().await.as_ref().unwrap() {
+                        Session::Embedded { label, .. } => label.clone(),
+                        _ => unreachable!(),
+                    };
+                    std::fs::rename(&credentials, &retained)?;
+                    std::fs::write(&credentials, b"simulate unavailable cookie storage")?;
+                    let result = browser.command(&handle, &core, "browser.login.close", &json!({})).await;
+                    std::fs::remove_file(&credentials)?;
+                    std::fs::rename(&retained, &credentials)?;
+                    ensure!(result.is_err(), "Closing hid the final cookie-sync failure");
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while handle.get_window(&label).is_some() {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }).await.context("Cookie sync failure prevented the close command from closing the browser")?;
+                    ensure!(browser.running.lock().await.is_none(), "Close command kept a failed login session active");
+                    ensure!(core.read_cookie(saved["cookie"]["id"].as_str().unwrap())? == saved_text, "Close command changed previously saved cookies after a sync failure");
                     browser
                         .command(
                             &handle,

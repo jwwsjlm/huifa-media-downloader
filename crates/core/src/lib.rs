@@ -623,6 +623,23 @@ impl App {
                 }
             }
             "settings.save" => self.save_settings(args["settings"].clone()),
+            "settings.preferences" => {
+                let preferences = args["preferences"]
+                    .as_object()
+                    .context("preferences must be an object")?;
+                ensure!(
+                    preferences.len() == 1 && preferences.contains_key("deleteMediaOnTaskDelete"),
+                    "Unknown preference"
+                );
+                ensure!(
+                    preferences["deleteMediaOnTaskDelete"].is_boolean(),
+                    "deleteMediaOnTaskDelete must be a boolean"
+                );
+                self.db.save_ui_preferences(&args["preferences"])?;
+                let settings = self.public_settings()?;
+                self.emit("settings.updated", settings.clone());
+                Ok(settings)
+            }
             "access.status" => Ok(self.access.status()),
             "access.change_password" => {
                 let app = self
@@ -872,15 +889,9 @@ impl App {
     }
 
     fn save_settings(&self, mut value: Value) -> Result<Value> {
-        // MCP listener state is managed by the desktop host, never by stale settings drafts.
-        let mcp = self.db.settings()?["mcp"].clone();
         let object = value
             .as_object_mut()
             .context("settings must be an object")?;
-        object.remove("mcp");
-        if !mcp.is_null() {
-            object.insert("mcp".into(), mcp);
-        }
         if let Some(options) = object.get("downloadOptions") {
             DownloadOptions::parse(options.clone())?;
         }
@@ -1116,6 +1127,196 @@ mod tests {
             assert!(remove_task_directory(&link).is_err());
             assert!(keep.join("keep.txt").is_file());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_mcp_and_ui_saves_do_not_replay_stale_settings() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        app.mcp_save_settings(json!({"enabled":false,"autoStart":false,"port":19492}))?;
+        let mut stale = app.db.settings()?;
+        app.mcp_save_settings(json!({"enabled":true,"autoStart":true,"port":20492}))?;
+        stale["uiLanguage"] = json!("en-US");
+        app.db.save_settings(&stale)?;
+        assert_eq!(app.mcp_settings()?["port"], 20492);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| -> Result<()> {
+            let app = &app;
+            let mcp_start = barrier.clone();
+            let mcp = scope.spawn(move || -> Result<()> {
+                mcp_start.wait();
+                for port in 21000..21032 {
+                    app.mcp_save_settings(json!({"enabled":true,"autoStart":true,"port":port}))?;
+                }
+                Ok(())
+            });
+            barrier.wait();
+            for index in 0..32 {
+                app.save_settings(json!({"uiLanguage":"en-US","appearanceTheme":"light",
+                    "downloadOptions":{"fragmentConcurrent":6},"saveIndex":index,
+                    "mcp":{"enabled":false,"autoStart":false,"port":19492}}))?;
+            }
+            mcp.join().expect("MCP save thread panicked")?;
+            Ok(())
+        })?;
+        let saved = app.public_settings()?;
+        assert_eq!(saved["mcp"]["port"], 21031);
+        assert_eq!(saved["mcp"]["autoStart"], true);
+        assert_eq!(saved["saveIndex"], 31);
+        assert_eq!(saved["downloadOptions"]["fragmentConcurrent"], 6);
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ui_preferences_persist_without_overwriting_settings_or_accepting_stale_drafts()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let draft = json!({"uiLanguage":"en-US","appearanceTheme":"light","downloadOptions":{"fragmentConcurrent":6}});
+        app.command("settings.save", json!({"settings":draft}))
+            .await?;
+        let saved = app
+            .command(
+                "settings.preferences",
+                json!({"preferences":{"deleteMediaOnTaskDelete":true}}),
+            )
+            .await?;
+        assert_eq!(saved["uiPreferences"]["deleteMediaOnTaskDelete"], true);
+        assert_eq!(saved["uiLanguage"], "en-US");
+        assert_eq!(saved["downloadOptions"]["fragmentConcurrent"], 6);
+        let mut stale = draft;
+        stale["appearanceTheme"] = json!("dark");
+        stale["uiPreferences"] = json!({"deleteMediaOnTaskDelete":false});
+        let saved = app
+            .command("settings.save", json!({"settings":stale}))
+            .await?;
+        assert_eq!(saved["appearanceTheme"], "dark");
+        assert_eq!(saved["uiPreferences"]["deleteMediaOnTaskDelete"], true);
+        app.mcp_save_settings(json!({"enabled":false,"autoStart":true,"port":19492}))?;
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        let saved = app.public_settings()?;
+        assert_eq!(saved["uiPreferences"]["deleteMediaOnTaskDelete"], true);
+        assert_eq!(saved["appearanceTheme"], "dark");
+        assert_eq!(saved["downloadOptions"]["fragmentConcurrent"], 6);
+        assert_eq!(saved["mcp"]["autoStart"], true);
+        app.command(
+            "settings.preferences",
+            json!({"preferences":{"deleteMediaOnTaskDelete":false}}),
+        )
+        .await?;
+        assert_eq!(
+            app.public_settings()?["uiPreferences"]["deleteMediaOnTaskDelete"],
+            false
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ui_preferences_reject_unknown_fields_and_non_boolean_values() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let previous = app.public_settings()?;
+        for preferences in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"deleteMediaOnTaskDelete":"true"}),
+            json!({"deleteMediaOnTaskDelete":1}),
+            json!({"unknown":true}),
+            json!({"deleteMediaOnTaskDelete":true,"unknown":false}),
+        ] {
+            assert!(
+                app.command("settings.preferences", json!({"preferences":preferences}))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(app.public_settings()?, previous);
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saved_configuration_and_secrets_survive_reopening() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let options = DownloadOptions {
+            quality: "1080p".into(),
+            container: "mp4".into(),
+            fragment_concurrent: 6,
+            subtitle_language: "en".into(),
+            organize_task_folder: true,
+            proxy: "http://fixture-user:fixture-password@proxy.example.test:8080".into(),
+            ..Default::default()
+        };
+        app.command(
+            "settings.save",
+            json!({"settings":{
+                "downloadOptions":options,"uiLanguage":"en-US","appearanceTheme":"light",
+                "desktopNotifications":true,"aiBaseUrl":"https://models.example.test/v1",
+                "aiModel":"fixture-image","aiApiKey":"fixture-api-key"
+            }}),
+        )
+        .await?;
+        app.mcp_save_settings(json!({"enabled":false,"autoStart":true,"port":20492}))?;
+        let cookies =
+            "# Netscape HTTP Cookie File\n.example.test\tTRUE\t/\tTRUE\t0\tSID\tfixture-session\n";
+        app.sync_login_cookies("embedded", "Browser", Some(cookies))?;
+        let saved = app.public_settings()?;
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        assert_eq!(app.public_settings()?, saved);
+        assert_eq!(saved["hasAiApiKey"], true);
+        assert_eq!(saved["hasProxy"], true);
+        assert!(!saved.to_string().contains("fixture-api-key"));
+        assert!(!saved.to_string().contains("fixture-password"));
+        assert_eq!(
+            app.credentials.secret("aiApiKey")?.as_deref(),
+            Some("fixture-api-key")
+        );
+        assert_eq!(
+            app.credentials.secret("downloadProxy")?.as_deref(),
+            Some(options.proxy.as_str())
+        );
+        assert_eq!(
+            app.credentials
+                .matching("https://www.example.test/media")?
+                .as_deref(),
+            Some(cookies)
+        );
+        let mut stored = DownloadOptions::parse(saved["downloadOptions"].clone())?;
+        stored.proxy = options.proxy.clone();
+        assert_eq!(
+            serde_json::to_value(stored)?,
+            serde_json::to_value(options)?
+        );
+        app.shutdown().await?;
         Ok(())
     }
 

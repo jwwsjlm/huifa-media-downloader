@@ -116,6 +116,7 @@ impl CredentialStore {
                 "www.youtube.com"
             }
             "b23.tv" | "www.b23.tv" => "www.bilibili.com",
+            "v.douyin.com" => "www.douyin.com",
             _ => &host,
         };
         let _guard = self
@@ -433,7 +434,9 @@ pub fn validate_cookies(text: &str) -> Result<()> {
         let columns: Vec<_> = line.split('\t').collect();
         ensure!(columns.len() == 7, "invalid Netscape cookie row");
         ensure!(
-            !columns[0].is_empty() && !columns[2].is_empty() && !columns[5].is_empty(),
+            !columns[0].is_empty()
+                && !columns[2].is_empty()
+                && (!columns[5].is_empty() || !columns[6].is_empty()),
             "invalid Netscape cookie row"
         );
         ensure!(
@@ -513,6 +516,48 @@ mod tests {
     use super::*;
     const COOKIES: &str =
         "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t0\tsession\ttop-secret\n";
+
+    #[test]
+    fn nameless_cookies_roundtrip_but_empty_or_control_content_is_rejected() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = CredentialStore::open(root.path())?;
+        let cookies =
+            "# Netscape HTTP Cookie File\nwww.example.com\tFALSE\t/\tTRUE\t0\t\tanonymous\n";
+        let saved = store.put("Nameless", cookies)?;
+        assert_eq!(store.get(saved["id"].as_str().unwrap())?, cookies);
+        assert_eq!(
+            store.matching("https://www.example.com/video")?.as_deref(),
+            Some(cookies)
+        );
+        for value in ["", "bad\nrow", "bad\trow", "bad\rrow", "bad\0row"] {
+            assert!(validate_cookies(&cookies.replace("anonymous", value)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn douyin_short_links_keep_canonical_host_cookies() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = CredentialStore::open(root.path())?;
+        let cookies = "# Netscape HTTP Cookie File\n#HttpOnly_www.douyin.com\tFALSE\t/\tTRUE\t0\tsession\tdouyin-login\n";
+        store.put("Douyin", cookies)?;
+        assert_eq!(
+            store.matching("https://v.douyin.com/example/")?.as_deref(),
+            Some(cookies)
+        );
+        assert!(
+            store
+                .matching("https://www.bilibili.com/video/demo")?
+                .is_none()
+        );
+        assert!(
+            store
+                .matching("https://v.douyin.com.attacker.invalid/example/")?
+                .is_none()
+        );
+        assert!(store.matching("https://notdouyin.com/example/")?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn automatic_matching_is_scoped_and_keeps_profiles_separate() -> Result<()> {

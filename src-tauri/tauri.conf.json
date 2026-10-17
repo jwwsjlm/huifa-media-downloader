@@ -31,7 +31,8 @@
       "csp": "default-src 'self'; img-src 'self' data: http://huifa-media.localhost huifa-media:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; script-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'",
       "devCsp": "default-src 'self'; img-src 'self' data: http://huifa-media.localhost huifa-media:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420; script-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'",
       "capabilities": [
-        "main"
+        "main",
+        "login-toolbar"
       ]
     }
   },

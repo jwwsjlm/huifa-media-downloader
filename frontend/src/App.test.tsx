@@ -62,9 +62,55 @@ describe('live interface stability', () => {
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: 'Beta' } });
     expect(screen.queryByRole('menu')).toBeNull();
   });
-  it('immediately queues a single YouTube video with automatic quality even when a playlist parameter is present', async () => {
+  it('persists the delete-files preference even when cancelled and restores it after reloading', async () => {
+    const snapshot = makeSnapshot();
+    transport.command.mockImplementation(async (command, args) => {
+      if (command === 'snapshot') return snapshot;
+      if (command === 'settings.preferences') { snapshot.settings.uiPreferences = args.preferences; return snapshot.settings; }
+      return true;
+    });
+    const openDelete = async () => {
+      await screen.findByRole('listbox');
+      fireEvent.contextMenu(screen.getByRole('option', { name: /Alpha/ }));
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Delete task' }));
+      return within(screen.getByRole('dialog'));
+    };
+    const first = render(<AppProvider><App /></AppProvider>);
+    let dialog = await openDelete();
+    const checkbox = dialog.getByRole('checkbox') as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(checkbox.disabled).toBe(false));
+    expect(transport.command).toHaveBeenCalledWith('settings.preferences', { preferences: { deleteMediaOnTaskDelete: true } });
+    fireEvent.click(dialog.getByRole('button', { name: 'Cancel' }));
+    expect(transport.command.mock.calls.some(([name]) => name === 'tasks.delete' || name === 'settings.save')).toBe(false);
+    dialog = await openDelete();
+    expect((dialog.getByRole('checkbox') as HTMLInputElement).checked).toBe(true);
+    first.unmount();
+    render(<AppProvider><App /></AppProvider>);
+    dialog = await openDelete();
+    expect((dialog.getByRole('checkbox') as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(dialog.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.delete', { id: 'a', deleteFiles: true }));
+  });
+  it('restores the previous delete-files choice if saving the preference fails', async () => {
+    transport.command.mockImplementation(async command => {
+      if (command === 'snapshot') return makeSnapshot();
+      if (command === 'settings.preferences') throw new Error('Unable to save preference');
+      return true;
+    });
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
-    const url = 'https://www.youtube.com/watch?v=abcdefghijk&list=PL123';
+    fireEvent.contextMenu(screen.getByRole('option', { name: /Alpha/ }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete task' }));
+    const dialog = within(screen.getByRole('dialog')); const checkbox = dialog.getByRole('checkbox') as HTMLInputElement;
+    fireEvent.click(checkbox);
+    expect((await dialog.findByRole('alert')).textContent).toContain('Unable to save preference');
+    await waitFor(() => expect(checkbox.checked).toBe(false));
+    fireEvent.click(dialog.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.delete', { id: 'a', deleteFiles: false }));
+  });
+  it.each(['https://www.youtube.com/watch?v=abcdefghijk&list=PL123', 'https://www.douyin.com/video/7695747024182590437', 'https://www.douyin.com/note/7695747024182590437'])('immediately queues an explicit single media URL with automatic quality: %s', async url => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: url } });
     fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
     await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [url], options: expect.objectContaining({ quality: 'best', cookieId: 'auto', fragmentConcurrent: 4, collectionMode: 'single' }), report: true }));

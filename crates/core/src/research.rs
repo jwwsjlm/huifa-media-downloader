@@ -158,9 +158,7 @@ impl App {
         Ok(value)
     }
     pub fn mcp_save_settings(&self, config: Value) -> Result<()> {
-        let mut settings = self.db.settings()?;
-        settings["mcp"] = config;
-        self.db.save_settings(&settings)?;
+        self.db.save_mcp_settings(&config)?;
         self.emit("settings.updated", self.public_settings()?);
         Ok(())
     }

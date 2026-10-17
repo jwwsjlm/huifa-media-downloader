@@ -28,6 +28,27 @@ it('leaves unknown errors intact and supports Chinese guidance', () => {
   expect(explainError('disk fixture failure', en)).toBe('disk fixture failure');
   expect(explainError('HTTP Error 429', zh => zh)).toContain('来源网站限制');
 });
+it('explains fresh-cookie requirements without treating not-logged-in as mandatory sign-in', () => {
+  const raw = 'ERROR: [Douyin] 123: Fresh cookies (not necessarily logged in) are needed';
+  const message = explainError(raw, en);
+  expect(message).toContain('do not necessarily require sign-in');
+  expect(message).toContain('reopen the target webpage');
+  expect(message).toContain('extractor or site limitation');
+  expect(message).not.toContain('source site requires sign-in');
+  expect(message.endsWith(raw)).toBe(true);
+  const chinese = explainError(raw, zh => zh);
+  expect(chinese).toContain('不一定需要登录');
+  expect(chinese.endsWith(raw)).toBe(true);
+});
+it.each([
+  ['The login browser was closed, but the last Cookie sync failed: native Cookie read timeout. Previously saved cookies were kept. Reopen the login browser to retry.', '登录浏览器已关闭，但最后一次 Cookie 同步失败。此前已保存的 Cookie 会保留，请重新打开登录浏览器重试。', 'The login browser is closed, but its final cookie sync failed. Previously saved cookies are kept. Reopen the login browser to retry.'],
+  ['Could not refresh browser cookies: Sign in again. Continuing with previously saved matching cookies, or anonymously if none are saved.', '未能刷新浏览器 Cookie，将继续使用已保存且匹配网站的 Cookie；没有匹配记录时匿名访问。可重新打开登录浏览器重试同步。', 'Browser cookies could not be refreshed. Downloads continue with previously saved matching cookies, or anonymously when none are saved. Reopen the login browser to retry syncing.'],
+])('explains cookie sync recovery before nested source-site errors: %s', (raw, chinese, english) => {
+  const translated = explainError(raw, en);
+  expect(translated.startsWith(english)).toBe(true);
+  expect(translated.endsWith(raw)).toBe(true);
+  expect(explainError(raw, zh => zh).startsWith(chinese)).toBe(true);
+});
 it.each([
   ['Session expired. Sign in again.', '登录已过期'],
   ['Service unavailable. Check that the server is running and try again.', '服务暂不可用'],

@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Cookies {
     file: Option<tempfile::NamedTempFile>,
+    plugins: tempfile::TempDir,
 }
 impl Cookies {
     pub(crate) fn new(app: &App, text: Option<&str>) -> Result<Self> {
@@ -37,9 +38,24 @@ impl Cookies {
         } else {
             None
         };
-        Ok(Self { file })
+        let plugins = tempfile::Builder::new()
+            .prefix(".ytdlp-plugins-")
+            .tempdir_in(&app.config.data_dir)?;
+        let extractor = plugins.path().join("huifa/yt_dlp_plugins/extractor");
+        std::fs::create_dir_all(&extractor)?;
+        std::fs::write(
+            extractor.join("douyin.py"),
+            include_bytes!("ytdlp_plugins/yt_dlp_plugins/extractor/douyin.py"),
+        )?;
+        Ok(Self { file, plugins })
     }
     fn apply(&self, args: &mut Vec<String>) {
+        // Load only the compatibility code shipped with this application.
+        args.extend([
+            "--no-plugin-dirs".into(),
+            "--plugin-dirs".into(),
+            self.plugins.path().to_string_lossy().into_owned(),
+        ]);
         if let Some(file) = &self.file {
             args.extend([
                 "--cookies".into(),
@@ -210,7 +226,7 @@ pub(crate) async fn collection(
     args.extend(["--".into(), url.into()]);
     let output = process::run(&app.tool("yt-dlp")?, &args, None, &app.shutdown_token, None)
         .await
-        .context("Failed to read collection with yt-dlp")?;
+        .context("Failed to identify media or collection with yt-dlp")?;
     let info: Value = serde_json::from_str(&output.stdout)
         .context("yt-dlp returned invalid collection metadata")?;
     let all = info["entries"]
@@ -1814,8 +1830,16 @@ mod tests {
         let path = PathBuf::from(&args[position + 1]);
         assert_eq!(std::fs::read_to_string(&path)?, text);
         assert!(!args.join(" ").contains("login-secret"));
+        let plugins = args.iter().position(|arg| arg == "--plugin-dirs").unwrap();
+        assert_eq!(args[plugins - 1], "--no-plugin-dirs");
+        let plugin_root = PathBuf::from(&args[plugins + 1]);
+        assert_eq!(
+            std::fs::read(plugin_root.join("huifa/yt_dlp_plugins/extractor/douyin.py"))?,
+            include_bytes!("ytdlp_plugins/yt_dlp_plugins/extractor/douyin.py")
+        );
         drop(cookies);
         assert!(!path.exists());
+        assert!(!plugin_root.exists());
         app.shutdown().await?;
         Ok(())
     }
@@ -1830,7 +1854,7 @@ mod tests {
             tool_dir: None,
         })
         .await?;
-        let cookies = Cookies { file: None };
+        let cookies = Cookies::new(&app, None)?;
         let mut task = crate::tests::paused_task(std::collections::HashMap::new());
         let args = base_args(&app, &task.options, &cookies, Some(&task)).await?;
         ensure!(
@@ -1871,7 +1895,7 @@ mod tests {
         .await?;
         let task = crate::tests::paused_task(crate::tools::freeze(&app)?);
         assert!(task.tools.contains_key("qjs") && !task.tools.contains_key("deno"));
-        let args = base_args(&app, &task.options, &Cookies { file: None }, Some(&task)).await?;
+        let args = base_args(&app, &task.options, &Cookies::new(&app, None)?, Some(&task)).await?;
         assert!(
             args.iter()
                 .any(|arg| arg.starts_with("quickjs:") && arg.contains("frozen"))
@@ -1881,12 +1905,12 @@ mod tests {
             b"deno:fixture",
         )?;
         let old = crate::tests::paused_task(crate::tools::freeze(&app)?);
-        let args = base_args(&app, &old.options, &Cookies { file: None }, Some(&old)).await?;
+        let args = base_args(&app, &old.options, &Cookies::new(&app, None)?, Some(&old)).await?;
         assert!(
             args.iter()
                 .any(|arg| arg.starts_with("deno:") && arg.contains("frozen"))
         );
-        let args = base_args(&app, &task.options, &Cookies { file: None }, Some(&task)).await?;
+        let args = base_args(&app, &task.options, &Cookies::new(&app, None)?, Some(&task)).await?;
         assert!(
             args.iter()
                 .any(|arg| arg.starts_with("quickjs:") && arg.contains("frozen"))

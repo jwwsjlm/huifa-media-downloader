@@ -64,15 +64,14 @@ it('saves browser login as the default identity through the desktop network sett
   const result = { cookie: { id: 'login-id', name: 'Login' }, settings: { downloadOptions: { cookieId: 'auto' } } };
   transport.command.mockImplementation(async command => command === 'browser.login.status' ? { active: true, mode: 'embedded', targetUrl: 'https://example.com/', systemBrowser: 'edge' } : command === 'browser.login.save' ? result : []);
   render(<SettingsPage state={{ ...initialState, view: { ...initialState.view, settingsTab: 'network' } }} dispatch={dispatch} t={(_zh, en) => en} run={run} message={message} />);
-  fireEvent.click(screen.getByRole('button', { name: 'Open browser sign-in' }));
-  const dialog = within(screen.getByRole('dialog'));
-  const save = await dialog.findByRole('button', { name: 'Sync now' });
+  expect(screen.queryByRole('dialog')).toBeNull();
+  const controls = within(screen.getByRole('group', { name: 'Browser sign-in' }));
+  const save = await controls.findByRole('button', { name: 'Sync now' });
   await waitFor(() => expect((save as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(save);
   await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'cookie.saved', id: 'auto' }));
   expect(message).toHaveBeenCalledWith('Cookies saved locally and enabled for new downloads');
-  fireEvent.click(dialog.getByRole('button', { name: 'Done' }));
-  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(screen.queryByRole('dialog')).toBeNull();
 });
 it('offers optional faster Deno parsing only on desktop and explains the size tradeoff', async () => {
   transport.desktop = true; show([{ name: 'qjs', available: true, version: '0.17.0' }]);
@@ -80,17 +79,27 @@ it('offers optional faster Deno parsing only on desktop and explains the size tr
   fireEvent.click(screen.getByRole('button', { name: 'Install Deno for faster parsing' }));
   await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'deno' }));
 });
-it('shows the persisted cookie identity in the browser dialog without changing settings drafts', async () => {
+it('shows automatic sign-in status without exposing cookie records or changing settings drafts', async () => {
   transport.desktop = true;
   const dispatch = vi.fn();
-  transport.command.mockImplementation(async command => command === 'cookies.list' ? [{ id: 'enabled', name: 'Saved login' }, { id: 'draft', name: 'Draft login' }] : { active: false, mode: null, systemBrowser: 'edge' });
+  transport.command.mockImplementation(async command => command === 'cookies.list' ? [{ id: 'enabled', name: 'Saved login', domains: ['youtube.com'] }, { id: 'draft', name: 'Draft login', domains: ['douyin.com'] }] : { active: false, mode: null, systemBrowser: 'edge', preferredUrl: 'https://www.douyin.com/' });
   render(<SettingsPage state={{ ...initialState, settings: { downloadOptions: { cookieId: 'enabled' } }, view: { ...initialState.view, settingsTab: 'network', optionsDraft: { cookieId: 'draft', quality: '720p' } } }} dispatch={dispatch} t={(_zh, en) => en} run={run} message={vi.fn()} />);
-  fireEvent.click(screen.getByRole('button', { name: 'Open browser sign-in' }));
-  const dialog = within(screen.getByRole('dialog'));
-  const select = await dialog.findByLabelText('Select saved cookies') as HTMLSelectElement;
-  expect(select.value).toBe('enabled');
-  expect(dialog.getByRole('option', { name: 'Saved login' })).toBeTruthy();
+  expect(await screen.findByText('Website sign-in data is saved and matched to downloads automatically.')).toBeTruthy();
+  expect(screen.queryByText('Saved login')).toBeNull();
+  expect(screen.queryByText('Draft login')).toBeNull();
+  expect(screen.queryByRole('button', { name: 'View cookies' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
+  expect(screen.queryByLabelText('Cookie name')).toBeNull();
+  const controls = within(screen.getByRole('group', { name: 'Browser sign-in' }));
+  await waitFor(() => expect((controls.getByRole('button', { name: 'Open built-in browser' }) as HTMLButtonElement).disabled).toBe(false));
+  expect((controls.getByLabelText('Sign-in website URL') as HTMLInputElement).value).toBe('https://www.douyin.com/');
+  fireEvent.click(controls.getByRole('button', { name: 'Open built-in browser' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.douyin.com/', mode: 'embedded' }));
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(controls.queryByRole('combobox')).toBeNull();
+  expect(controls.queryByLabelText('Cookie name')).toBeNull();
   expect(screen.queryByRole('combobox', { name: 'Cookie source' })).toBeNull();
+  expect(transport.command.mock.calls.some(([name]) => name === 'cookies.read' || name === 'cookies.delete' || name === 'settings.save')).toBe(false);
   expect(dispatch).not.toHaveBeenCalled();
 });
 it('explains Docker image updates instead of offering a forbidden tool command', async () => {

@@ -21,7 +21,7 @@ pub fn netscape(cookies: &Value) -> Result<String> {
         ensure!(
             !domain.is_empty()
                 && !path.is_empty()
-                && !name.is_empty()
+                && (!name.is_empty() || !value.is_empty())
                 && ![domain, path, name, value]
                     .iter()
                     .any(|s| s.chars().any(char::is_control)),
@@ -257,6 +257,21 @@ mod tests {
         let mut large = cookies.clone();
         large[0]["value"] = "x".repeat(2 * 1024 * 1024).into();
         assert!(netscape(&large).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cookie_export_accepts_nameless_values_but_rejects_empty_or_control_content() -> Result<()> {
+        let mut cookies = json!([
+            {"domain":"www.example.com","path":"/","name":"","value":"anonymous","session":true}
+        ]);
+        assert!(netscape(&cookies)?.contains("www.example.com\tFALSE\t/\tFALSE\t0\t\tanonymous\n"));
+        cookies[0]["value"] = "".into();
+        assert!(netscape(&cookies).is_err());
+        for value in ["bad\nrow", "bad\trow", "bad\rrow", "bad\0row"] {
+            cookies[0]["value"] = value.into();
+            assert!(netscape(&cookies).is_err());
+        }
         Ok(())
     }
 

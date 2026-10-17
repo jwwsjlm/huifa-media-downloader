@@ -197,9 +197,51 @@ impl Database {
     }
 
     pub fn save_settings(&self, value: &Value) -> Result<()> {
-        self.connection.lock().unwrap().execute(
+        let db = self.connection.lock().unwrap();
+        let current: String =
+            db.query_row("SELECT value FROM settings WHERE id=1", [], |r| r.get(0))?;
+        let current: Value = serde_json::from_str(&current)?;
+        let mut value = value.clone();
+        let object = value
+            .as_object_mut()
+            .context("settings must be an object")?;
+        // Full drafts must not roll back the listener or preferences saved independently.
+        for key in ["mcp", "uiPreferences"] {
+            object.remove(key);
+            if let Some(saved) = current.get(key) {
+                object.insert(key.into(), saved.clone());
+            }
+        }
+        db.execute(
             "UPDATE settings SET value=?1 WHERE id=1",
-            [serde_json::to_string(value)?],
+            [serde_json::to_string(&value)?],
+        )?;
+        Ok(())
+    }
+    pub fn save_mcp_settings(&self, config: &Value) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE settings SET value=json_set(value, '$.mcp', json(?1)) WHERE id=1",
+            [serde_json::to_string(config)?],
+        )?;
+        Ok(())
+    }
+    pub fn save_ui_preferences(&self, preferences: &Value) -> Result<()> {
+        let db = self.connection.lock().unwrap();
+        let current: String =
+            db.query_row("SELECT value FROM settings WHERE id=1", [], |r| r.get(0))?;
+        let mut current: Value = serde_json::from_str(&current)?;
+        if !current["uiPreferences"].is_object() {
+            current["uiPreferences"] = json!({});
+        }
+        current["uiPreferences"].as_object_mut().unwrap().extend(
+            preferences
+                .as_object()
+                .context("preferences must be an object")?
+                .clone(),
+        );
+        db.execute(
+            "UPDATE settings SET value=?1 WHERE id=1",
+            [serde_json::to_string(&current)?],
         )?;
         Ok(())
     }

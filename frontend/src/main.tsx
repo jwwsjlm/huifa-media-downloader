@@ -2,6 +2,8 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { App } from './App';
 import { AppProvider } from './state';
+import { BrowserToolbar } from './BrowserToolbar';
 import './styles.css';
 
-ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><AppProvider><App /></AppProvider></React.StrictMode>);
+const loginToolbar = new URLSearchParams(location.search).has('login-toolbar');
+ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode>{loginToolbar ? <BrowserToolbar /> : <AppProvider><App /></AppProvider>}</React.StrictMode>);

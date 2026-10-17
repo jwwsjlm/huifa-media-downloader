@@ -8,7 +8,7 @@ describe('download links', () => {
     expect(() => downloadLinks(Array.from({ length: 1001 }, (_, i) => `https://example.com/${i}`).join('\n'))).toThrow('1000');
   });
   it('distinguishes explicit videos, mixed video/playlist links, collections and redirects', () => {
-    for (const url of ['https://www.youtube.com/watch?v=abcdefghijk&list=PL123', 'https://youtu.be/abcdefghijk', 'https://www.youtube.com/shorts/abcdefghijk', 'https://www.bilibili.com/video/BV1234567890/?p=2', 'https://example.com/video.mp4?token=fixture']) expect(singleVideoLink(url)).toBe(true);
-    for (const url of ['https://www.youtube.com/playlist?list=PL123', 'https://www.youtube.com/@example/videos', 'https://b23.tv/example', 'https://www.youtube.com.evil.test/watch?v=abcdefghijk']) expect(singleVideoLink(url)).toBe(false);
+    for (const url of ['https://www.youtube.com/watch?v=abcdefghijk&list=PL123', 'https://youtu.be/abcdefghijk', 'https://www.youtube.com/shorts/abcdefghijk', 'https://www.bilibili.com/video/BV1234567890/?p=2', 'https://www.douyin.com/video/7695747024182590437', 'https://douyin.com/note/7695747024182590437/?share=fixture', 'https://example.com/video.mp4?token=fixture']) expect(singleVideoLink(url)).toBe(true);
+    for (const url of ['https://www.youtube.com/playlist?list=PL123', 'https://www.youtube.com/@example/videos', 'https://b23.tv/example', 'https://v.douyin.com/L1nHlRt2ohQ', 'https://www.douyin.com/user/example', 'https://www.douyin.com/collection/7695747024182590437', 'https://www.douyin.com/video/not-an-id', 'https://www.douyin.com.evil.test/video/7695747024182590437', 'https://www.youtube.com.evil.test/watch?v=abcdefghijk']) expect(singleVideoLink(url)).toBe(false);
   });
 });

@@ -118,6 +118,38 @@ fn config(root: &Path) -> AppConfig {
         tool_dir: Some(tool_directory()),
     }
 }
+
+#[tokio::test]
+#[ignore = "requires native tools and public Douyin access; downloads the supplied public video anonymously"]
+async fn real_douyin_short_link_identification_and_download() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let app = App::open(config(root.path())).await?;
+    let url = "https://v.douyin.com/L1nHlRt2ohQ";
+    let outcome = async {
+        let identified = app.command("probe.collection", json!({"url":url})).await?;
+        ensure!(identified["kind"] == "video", "Douyin short link was not identified as a video");
+        ensure!(identified["id"] == "7695747024182590437", "Douyin resolved to a different video");
+        let result = app.command("tasks.add", json!({"urls":[url], "options":{"quality":"best","subtitleLanguage":"none","collectionMode":"single"}})).await?;
+        let id = result[0].as_str().context("Download task was not created")?;
+        let task = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                let task = app.db.task(id)?;
+                if matches!(task.status.as_str(), "completed" | "failed" | "processing_failed" | "cancelled") {
+                    return Ok::<_, anyhow::Error>(task);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }).await.context("Douyin task timed out")??;
+        ensure!(task.status == "completed", "Douyin task failed: {}", task.error.as_deref().unwrap_or(&task.stage));
+        let output = task.output_path.context("Douyin result was not published")?;
+        ensure!(output.is_file() && std::fs::metadata(output)?.len() > 0, "Douyin download produced no media file");
+        ensure!(app.db.media()?.len() == 1, "Douyin result was not added to the media library");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    app.shutdown().await?;
+    outcome
+}
+
 async fn fixture(app: &App, root: &Path) -> Result<()> {
     let args = vec![
         "-hide_banner",

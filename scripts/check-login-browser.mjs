@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 
 if (process.platform !== 'win32') throw new Error('This smoke test requires Windows WebView2 and Edge or Chrome');
 const cwd = fileURLToPath(new URL('../', import.meta.url));
+execFileSync(process.execPath, ['node_modules/typescript/bin/tsc', '--noEmit'], { cwd: fileURLToPath(new URL('../frontend/', import.meta.url)), stdio: 'inherit' });
+execFileSync(process.execPath, ['node_modules/vite/bin/vite.js', 'build'], { cwd: fileURLToPath(new URL('../frontend/', import.meta.url)), stdio: 'inherit' });
 mkdirSync(new URL('../runtime-tools/', import.meta.url), { recursive: true });
 execFileSync(process.execPath, ['scripts/prepare-mcp-bridge.mjs', '--debug'], { cwd, stdio: 'inherit' });
 const output = execFileSync('cargo', ['test', '--locked', '-p', 'huifa-desktop', '--features', 'login-smoke', '--no-run', '--message-format=json'], { cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] });

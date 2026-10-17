@@ -6,141 +6,134 @@ const command = vi.hoisted(() => vi.fn());
 vi.mock('./transport', () => ({ host: { command } }));
 const inactive = { active: false, mode: null, systemBrowser: 'edge' };
 const active = { ...inactive, active: true, mode: 'embedded', targetUrl: 'https://www.youtube.com/' };
-beforeEach(() => { command.mockReset().mockImplementation(async name => name === 'cookies.list' ? [] : name === 'browser.login.open' ? active : inactive); });
+beforeEach(() => { command.mockReset().mockImplementation(async name => name === 'browser.login.open' ? active : inactive); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
-function show(cookieId = '') { const close = vi.fn(); const saved = vi.fn(); render(<LoginBrowser t={(_zh, en) => en} run={run} close={close} saved={saved} cookieId={cookieId} />); return { close, saved, dialog: within(screen.getByRole('dialog')) }; }
+function show() { const saved = vi.fn(); render(<LoginBrowser t={(_zh, en) => en} run={run} saved={saved} />); return { saved, controls: within(screen.getByRole('group', { name: 'Browser sign-in' })) }; }
 
-it('opens a native login window and shows automatic cookies after the window closes without a save click', async () => {
+it('opens the native browser directly without a second dialog and syncs after it closes', async () => {
   let status: object = inactive;
   const cookie = { id: 'new', name: 'Download login', count: 3, domains: ['youtube.com'] };
-  command.mockImplementation(async name => name === 'cookies.list' ? 'cookie' in status ? [cookie] : [] : name === 'browser.login.open' ? active : status);
-  const { dialog, saved, close } = show();
-  const open = dialog.getByRole('button', { name: 'Open built-in browser' });
+  command.mockImplementation(async name => name === 'browser.login.open' ? active : status);
+  const { controls, saved } = show();
+  expect(screen.queryByRole('dialog')).toBeNull();
+  const open = controls.getByRole('button', { name: 'Open built-in browser' });
   await waitFor(() => expect((open as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(open);
-  await waitFor(() => expect(command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.youtube.com/', mode: 'embedded', name: 'Download login' }));
+  await waitFor(() => expect(command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.youtube.com/', mode: 'embedded' }));
   status = { ...inactive, cookie };
-  expect(await dialog.findByText('3 cookies saved automatically and matched to each download website.', {}, { timeout: 2500 })).toBeTruthy();
-  expect(await dialog.findByRole('option', { name: 'Download login' })).toBeTruthy();
+  expect(await controls.findByText('3 cookies saved automatically and matched to each download website.', {}, { timeout: 2500 })).toBeTruthy();
+  expect(controls.queryByRole('combobox')).toBeNull();
   expect(command.mock.calls.some(([name]) => name === 'browser.login.save')).toBe(false);
   expect(saved).not.toHaveBeenCalled();
-  fireEvent.click(dialog.getByRole('button', { name: 'Done' }));
-  await waitFor(() => expect(command).toHaveBeenCalledWith('browser.login.close'));
-  expect(close).toHaveBeenCalledOnce();
+  expect(controls.queryByRole('button', { name: 'Close sign-in window' })).toBeNull();
 });
 
-it('keeps the login window and save action available after a failed export', async () => {
-  command.mockImplementation(async name => name === 'cookies.list' ? [] : active);
-  const { dialog, saved, close } = show();
-  const save = await dialog.findByRole('button', { name: 'Sync now' });
+it('restores the saved website and mode without polling over an unsubmitted address', async () => {
+  command.mockResolvedValue({ ...inactive, preferredUrl: 'https://www.douyin.com/', preferredMode: 'system' });
+  const { controls } = show();
+  const input = controls.getByLabelText('Sign-in website URL') as HTMLInputElement;
+  await waitFor(() => expect(input.value).toBe('https://www.douyin.com/'));
+  const local = controls.getByRole('button', { name: 'Local browser sign-in' });
+  expect(local.className).toContain('primary');
+  fireEvent.change(input, { target: { value: 'https://www.bilibili.com/' } });
+  vi.useFakeTimers();
+  try { await act(async () => { vi.advanceTimersByTime(1500); }); } finally { vi.useRealTimers(); }
+  expect(input.value).toBe('https://www.bilibili.com/');
+  fireEvent.click(local);
+  await waitFor(() => expect(command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.bilibili.com/', mode: 'system' }));
+});
+
+it('prefers the active browser address over the saved website', async () => {
+  command.mockResolvedValue({ ...active, preferredUrl: 'https://www.douyin.com/', preferredMode: 'system' });
+  const { controls } = show();
+  await waitFor(() => expect((controls.getByLabelText('Sign-in website URL') as HTMLInputElement).value).toBe('https://www.youtube.com/'));
+});
+
+it('reports preference storage failures separately without disabling browser sign-in', async () => {
+  command.mockResolvedValue({ ...inactive, preferenceError: 'Disk is full' });
+  const { controls } = show();
+  const alert = await controls.findByRole('alert');
+  expect(alert.textContent).toContain('The last address and browser choice could not be saved: Disk is full');
+  expect(alert.textContent).not.toContain('Cookie sync failed');
+  expect((controls.getByRole('button', { name: 'Open built-in browser' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it('keeps the login window and sync retry available after a failed export', async () => {
+  command.mockResolvedValue(active);
+  const { controls, saved } = show();
+  const save = await controls.findByRole('button', { name: 'Sync now' });
   await waitFor(() => expect((save as HTMLButtonElement).disabled).toBe(false));
   command.mockRejectedValueOnce(new Error('No cookies to save'));
   fireEvent.click(save);
-  expect(await dialog.findByRole('alert')).toBeTruthy();
-  expect(saved).not.toHaveBeenCalled(); expect(close).not.toHaveBeenCalled();
-  expect((dialog.getByRole('button', { name: 'Sync now' }) as HTMLButtonElement).disabled).toBe(false);
+  expect(await controls.findByRole('alert')).toBeTruthy();
+  expect(saved).not.toHaveBeenCalled();
+  expect((controls.getByRole('button', { name: 'Sync now' }) as HTMLButtonElement).disabled).toBe(false);
+  expect((controls.getByRole('button', { name: 'Close sign-in window' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it.each([
+  [inactive, 'Reopen the login browser to retry syncing.'],
+  [active, 'Choose Sync now to retry, or close the browser.'],
+])('shows the available sync recovery and close actions (%j)', async (status, retryHint) => {
+  command.mockResolvedValue({ ...status, saveError: 'fixture sync failure' });
+  const { controls } = show();
+  const alert = await controls.findByRole('alert');
+  expect(alert.textContent).toContain(retryHint);
+  expect(alert.textContent).toContain('Previously saved cookies are kept.');
+  expect(alert.textContent).not.toContain('Keep the browser open');
+  expect(Boolean(controls.queryByRole('button', { name: 'Sync now' }))).toBe(status.active);
+  expect(Boolean(controls.queryByRole('button', { name: 'Close sign-in window' }))).toBe(status.active);
 });
 
 it('offers compatible sign-in and prevents duplicate opens while starting', async () => {
-  const { dialog } = show();
-  const open = dialog.getByRole('button', { name: 'Local browser sign-in' });
+  const { controls } = show();
+  const open = controls.getByRole('button', { name: 'Local browser sign-in' });
   await waitFor(() => expect((open as HTMLButtonElement).disabled).toBe(false));
   let resolve!: (value: unknown) => void;
   command.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
   fireEvent.click(open);
-  expect(command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.youtube.com/', mode: 'system', name: 'Download login' });
+  expect(command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.youtube.com/', mode: 'system' });
   expect((open as HTMLButtonElement).disabled).toBe(true);
-  expect(dialog.getByRole('button', { name: 'Opening…' })).toBe(open);
-  expect((dialog.getByRole('button', { name: 'Done' }) as HTMLButtonElement).disabled).toBe(true);
+  expect(controls.getByRole('button', { name: 'Opening…' })).toBe(open);
+  expect((controls.getByRole('button', { name: 'Open built-in browser' }) as HTMLButtonElement).disabled).toBe(true);
   await act(async () => { resolve(active); });
   expect((open as HTMLButtonElement).disabled).toBe(true);
 });
 
-it('closes the managed browser on cancel and disables unavailable compatible mode', async () => {
-  command.mockImplementation(async name => name === 'cookies.list' ? [] : { ...inactive, systemBrowser: null });
-  const { dialog, close } = show();
-  await dialog.findByText(/was not found/);
-  expect((dialog.getByRole('button', { name: 'Local browser sign-in' }) as HTMLButtonElement).disabled).toBe(true);
-  fireEvent.click(dialog.getByRole('button', { name: 'Done' }));
+it('closes only the managed browser and keeps inline controls available', async () => {
+  command.mockResolvedValue(active);
+  const { controls } = show();
+  const close = await controls.findByRole('button', { name: 'Close sign-in window' });
+  command.mockResolvedValue(inactive);
+  fireEvent.click(close);
   await waitFor(() => expect(command).toHaveBeenCalledWith('browser.login.close'));
-  expect(close).toHaveBeenCalledOnce();
+  await waitFor(() => expect((controls.getByRole('button', { name: 'Open built-in browser' }) as HTMLButtonElement).disabled).toBe(false));
 });
 
-const entries = [{ id: 'old', name: 'Bilibili' }, { id: 'current', name: 'YouTube' }];
-const cookieText = '# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tlogin-value\n';
-
-it('shows reading feedback only on the cookie action and keeps explanations collapsed', async () => {
-  let finishRead!: (value: string) => void;
-  command.mockImplementation(name => name === 'cookies.list' ? Promise.resolve(entries) : name === 'cookies.read' ? new Promise<string>(resolve => { finishRead = resolve; }) : Promise.resolve(active));
-  const { dialog } = show('current');
-  await dialog.findByLabelText('Select saved cookies');
-  const disclosure = dialog.getByText('More information').closest('details')!;
-  expect(disclosure.open).toBe(false);
-  fireEvent.click(dialog.getByRole('button', { name: 'View cookies' }));
-  expect((dialog.getByRole('button', { name: 'Reading…' }) as HTMLButtonElement).disabled).toBe(true);
-  expect(dialog.getByRole('button', { name: 'Sync now' })).toBeTruthy();
-  expect(dialog.queryByRole('button', { name: 'Saving…' })).toBeNull();
-  await act(async () => finishRead(cookieText));
-  expect((dialog.getByRole('button', { name: 'View cookies' }) as HTMLButtonElement).disabled).toBe(false);
+it('disables unavailable compatible mode', async () => {
+  command.mockResolvedValue({ ...inactive, systemBrowser: null });
+  const { controls } = show();
+  await controls.findByText(/was not found/);
+  expect((controls.getByRole('button', { name: 'Local browser sign-in' }) as HTMLButtonElement).disabled).toBe(true);
 });
 
-it('selects the enabled identity and only reveals saved cookie values on request', async () => {
-  command.mockImplementation(async name => name === 'cookies.list' ? entries : name === 'cookies.read' ? cookieText : inactive);
-  const { dialog, saved, close } = show('current');
-  const select = await dialog.findByLabelText('Select saved cookies') as HTMLSelectElement;
-  expect(select.value).toBe('current');
-  expect(dialog.getByRole('option', { name: 'YouTube' })).toBeTruthy();
-  expect(dialog.queryByLabelText('Cookie contents (read-only)')).toBeNull();
-  expect(command).not.toHaveBeenCalledWith('cookies.read', expect.anything());
-  fireEvent.click(dialog.getByRole('button', { name: 'View cookies' }));
-  const contents = await dialog.findByLabelText('Cookie contents (read-only)') as HTMLTextAreaElement;
-  expect(command).toHaveBeenCalledWith('cookies.read', { id: 'current' });
-  expect(contents.value).toBe(cookieText);
-  expect(contents.readOnly).toBe(true);
-  expect(saved).not.toHaveBeenCalled(); expect(close).not.toHaveBeenCalled();
-  expect(command.mock.calls.some(([name]) => name === 'settings.save' || name === 'browser.login.open')).toBe(false);
-  fireEvent.click(dialog.getByRole('button', { name: 'Hide cookies' }));
-  expect(dialog.queryByLabelText('Cookie contents (read-only)')).toBeNull();
+it('does not ask users to name or select cookies or read saved cookie values', async () => {
+  command.mockResolvedValue({ ...inactive, cookie: { id: 'saved', name: 'Hidden identity', count: 5 } });
+  const { controls } = show();
+  await controls.findByText('5 cookies saved automatically and matched to each download website.');
+  expect(controls.queryByLabelText('Cookie name')).toBeNull();
+  expect(controls.queryByRole('combobox')).toBeNull();
+  expect(controls.queryByText('Hidden identity')).toBeNull();
+  expect(controls.queryByRole('button', { name: 'View cookies' })).toBeNull();
+  expect(command.mock.calls.some(([name]) => name === 'cookies.list' || name === 'cookies.read')).toBe(false);
 });
 
-it('clears displayed values on selection changes and recovers after a read failure', async () => {
-  command.mockImplementation(async name => name === 'cookies.list' ? entries : name === 'cookies.read' ? cookieText : inactive);
-  const { dialog, saved } = show('current');
-  await dialog.findByLabelText('Select saved cookies');
-  const read = dialog.getByRole('button', { name: 'View cookies' });
-  fireEvent.click(read);
-  await dialog.findByLabelText('Cookie contents (read-only)');
-  await waitFor(() => expect((read as HTMLButtonElement).disabled).toBe(false));
-  fireEvent.change(dialog.getByLabelText('Select saved cookies'), { target: { value: 'old' } });
-  expect(dialog.queryByLabelText('Cookie contents (read-only)')).toBeNull();
-  command.mockRejectedValueOnce(new Error('Credential no longer exists'));
-  fireEvent.click(read);
-  expect((await dialog.findByRole('alert')).textContent).toContain('Credential no longer exists');
-  expect(dialog.queryByLabelText('Cookie contents (read-only)')).toBeNull();
-  expect((read as HTMLButtonElement).disabled).toBe(false);
-  fireEvent.click(read);
-  await dialog.findByLabelText('Cookie contents (read-only)');
-  expect(command).toHaveBeenLastCalledWith('cookies.read', { id: 'old' });
-  expect(saved).not.toHaveBeenCalled();
-});
-
-it('refreshes saved cookies and removes content belonging to a deleted identity', async () => {
-  let stored = entries;
-  command.mockImplementation(async name => name === 'cookies.list' ? stored : name === 'cookies.read' ? cookieText : inactive);
-  const { dialog } = show('current');
-  await dialog.findByLabelText('Select saved cookies');
-  fireEvent.click(dialog.getByRole('button', { name: 'View cookies' }));
-  await dialog.findByLabelText('Cookie contents (read-only)');
-  const refresh = dialog.getByRole('button', { name: 'Refresh saved cookies' });
-  await waitFor(() => expect((refresh as HTMLButtonElement).disabled).toBe(false));
-  stored = [entries[0]];
-  fireEvent.click(refresh);
-  await waitFor(() => expect((dialog.getByLabelText('Select saved cookies') as HTMLSelectElement).value).toBe('old'));
-  expect(dialog.queryByLabelText('Cookie contents (read-only)')).toBeNull();
-  expect(dialog.queryByRole('option', { name: 'YouTube' })).toBeNull();
-  await waitFor(() => expect((refresh as HTMLButtonElement).disabled).toBe(false));
-  stored = [];
-  fireEvent.click(refresh);
-  expect(await dialog.findByText(/No saved cookies yet/)).toBeTruthy();
-  expect(dialog.queryByRole('button', { name: 'View cookies' })).toBeNull();
+it('retries automatic syncing with an internal name and reports the saved settings', async () => {
+  const result = { cookie: { id: 'saved', count: 3 }, settings: { downloadOptions: { cookieId: 'auto' } } };
+  command.mockImplementation(async name => name === 'browser.login.save' ? result : active);
+  const { controls, saved } = show();
+  fireEvent.click(await controls.findByRole('button', { name: 'Sync now' }));
+  await waitFor(() => expect(saved).toHaveBeenCalledWith(result));
+  expect(command).toHaveBeenCalledWith('browser.login.save', { name: 'Download login' });
+  expect(controls.queryByLabelText('Cookie name')).toBeNull();
 });
