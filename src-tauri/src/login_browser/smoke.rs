@@ -21,9 +21,38 @@ struct Fixture {
     denied: Arc<AtomicBool>,
     main_ready: Arc<AtomicBool>,
     toolbar_ready: Arc<AtomicBool>,
+    second_ready: Arc<AtomicUsize>,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
     proxy_embedded: Arc<AtomicBool>,
     proxy_system: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> Result<String> {
+    stream.set_nonblocking(false)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while bytes.len() < 16384 {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .context("HTTP fixture request timed out")?;
+        stream.set_read_timeout(Some(remaining))?;
+        let count = stream.read(&mut buffer)?;
+        ensure!(
+            count > 0,
+            "HTTP fixture client closed before sending complete headers"
+        );
+        bytes.extend_from_slice(&buffer[..count]);
+        ensure!(
+            bytes.len() <= 16384,
+            "HTTP fixture request headers are too large"
+        );
+        if bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+            return Ok(String::from_utf8(bytes)?);
+        }
+    }
+    bail!("HTTP fixture request headers are too large")
 }
 
 impl Fixture {
@@ -35,6 +64,8 @@ impl Fixture {
         let denied = Arc::new(AtomicBool::new(false));
         let main_ready = Arc::new(AtomicBool::new(false));
         let toolbar_ready = Arc::new(AtomicBool::new(false));
+        let second_ready = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let proxy_embedded = Arc::new(AtomicBool::new(false));
         let proxy_system = Arc::new(AtomicBool::new(false));
         let flags = (
@@ -44,16 +75,33 @@ impl Fixture {
             toolbar_ready.clone(),
         );
         let proxy_flags = (proxy_embedded.clone(), proxy_system.clone());
+        let ready_generation = second_ready.clone();
+        let observed_requests = requests.clone();
         let thread = std::thread::spawn(move || {
+            let mut connections = Vec::new();
             while !flags.0.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                let mut buffer = [0; 16384];
-                let count = stream.read(&mut buffer).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buffer[..count]);
+                let flags = (
+                    flags.0.clone(),
+                    flags.1.clone(),
+                    flags.2.clone(),
+                    flags.3.clone(),
+                );
+                let proxy_flags = (proxy_flags.0.clone(), proxy_flags.1.clone());
+                let ready_generation = ready_generation.clone();
+                let observed_requests = observed_requests.clone();
+                connections.push(std::thread::spawn(move || {
+                let request = match read_request(&mut stream) {
+                    Ok(request) => request,
+                    Err(reason) => { observed_requests.lock().unwrap().push(format!("incomplete request: {reason:#}")); return; }
+                };
+                observed_requests
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or("").to_owned());
                 let target = request
                     .lines()
                     .next()
@@ -91,7 +139,7 @@ impl Fixture {
                     );
                     let _ = stream.write_all(header.as_bytes());
                     let _ = stream.write_all(&body);
-                    continue;
+                    return;
                 }
                 if path == "/denied" {
                     flags.1.store(true, Ordering::SeqCst);
@@ -101,6 +149,9 @@ impl Fixture {
                 }
                 if path == "/toolbar-ready" {
                     flags.3.store(true, Ordering::SeqCst);
+                }
+                if path == "/second-ready" {
+                    ready_generation.fetch_add(1, Ordering::SeqCst);
                 }
                 let cookies = match path {
                     "/login" => {
@@ -125,6 +176,8 @@ impl Fixture {
                 };
                 let body = if path == "/" || path == "/login" {
                     "<html><body>Huifa isolated login test<script>function probe(){if(!window.__TAURI_INTERNALS__){setTimeout(probe,50);return}window.__TAURI_INTERNALS__.invoke('upload_asset',{probe:true}).then(()=>fetch('/main-ready'),()=>fetch('/denied'))}probe()</script></body></html>".to_owned()
+                } else if path == "/second" {
+                    "<html><body>Huifa navigation test<script>addEventListener('pageshow',()=>fetch('/second-ready',{cache:'no-store'}))</script></body></html>".into()
                 } else {
                     "<html><body>Huifa isolated login test</body></html>".into()
                 };
@@ -133,6 +186,10 @@ impl Fixture {
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
+                }));
+            }
+            for connection in connections {
+                let _ = connection.join();
             }
         });
         Ok(Self {
@@ -141,6 +198,8 @@ impl Fixture {
             denied,
             main_ready,
             toolbar_ready,
+            second_ready,
+            requests,
             proxy_embedded,
             proxy_system,
             thread: Some(thread),
@@ -155,6 +214,39 @@ impl Drop for Fixture {
             let _ = thread.join();
         }
     }
+}
+
+#[test]
+fn fixture_handles_idle_connections_and_fragmented_headers() -> Result<()> {
+    let fixture = Fixture::start()?;
+    let address = ("127.0.0.1", fixture.port);
+    let mut idle = std::net::TcpStream::connect(address)?;
+    let mut client = std::net::TcpStream::connect(address)?;
+    client.set_read_timeout(Some(Duration::from_millis(900)))?;
+    let started = std::time::Instant::now();
+    client.write_all(b"GET /pop")?;
+    std::thread::sleep(Duration::from_millis(20));
+    client.write_all(b"up HTTP/1.1\r\nHost: localhost\r\n")?;
+    std::thread::sleep(Duration::from_millis(20));
+    client.write_all(b"\r\n")?;
+    let mut response = String::new();
+    client.read_to_string(&mut response)?;
+    ensure!(
+        started.elapsed() < Duration::from_millis(900),
+        "An idle connection blocked another request"
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("Set-Cookie: popup_sid=popup-secret;"));
+    assert!(!fixture.main_ready.load(Ordering::SeqCst));
+    idle.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let mut byte = [0];
+    let error = idle.read(&mut byte).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    drop(idle);
+    Ok(())
 }
 
 async fn wait_cookie(browser: &LoginBrowser, app: &AppHandle, name: &str) -> Result<Value> {
@@ -199,6 +291,16 @@ async fn wait_navigation(toolbar: &Webview, path: &str) -> Result<()> {
     })
     .await
     .context("Browser navigation did not reach the requested page")?
+}
+
+async fn wait_page_ready(generation: &AtomicUsize, previous: usize) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while generation.load(Ordering::SeqCst) <= previous {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("The navigated document did not finish loading")
 }
 
 #[test]
@@ -311,22 +413,31 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                     };
                     let toolbar = handle.get_webview(&format!("{label}-toolbar")).context("Missing navigation toolbar")?;
                     let page = handle.get_webview(&format!("{label}-page")).unwrap();
-                    toolbar.eval("function checkToolbar(){const nav=document.querySelector('.browser-toolbar');if(!nav||nav.querySelectorAll('button').length!==3||Math.abs(nav.getBoundingClientRect().height-44)>1){setTimeout(checkToolbar,50);return}window.__TAURI_INTERNALS__.invoke('login_navigation',{action:'state'}).then(()=>fetch('/toolbar-ready'))}checkToolbar()")?;
                     tokio::time::timeout(Duration::from_secs(10), async {
-                        while !fixture.toolbar_ready.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(20)).await; }
-                    }).await.context("The toolbar could not use its dedicated navigation command")?;
+                        while !fixture.toolbar_ready.load(Ordering::SeqCst) {
+                            toolbar.eval("(()=>{const nav=document.querySelector('.browser-toolbar');if(nav&&nav.querySelectorAll('button').length===3&&Math.abs(nav.getBoundingClientRect().height-44)<=1&&window.__TAURI_INTERNALS__){window.__TAURI_INTERNALS__.invoke('login_navigation',{action:'state'}).then(()=>fetch('/toolbar-ready',{cache:'no-store'}))}})()")?;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        Ok::<_,anyhow::Error>(())
+                    }).await.context("The toolbar could not use its dedicated navigation command")??;
                     ensure!(navigation::command(page.clone(), "state", None).await.is_err(), "The website received navigation access");
                     let second = format!("http://login.huifa.test:{}/second", fixture.port);
+                    let generation = fixture.second_ready.load(Ordering::SeqCst);
                     navigation::command(toolbar.clone(), "navigate", Some(&second)).await?;
                     wait_navigation(&toolbar, "/second").await?;
+                    wait_page_ready(&fixture.second_ready, generation).await?;
                     ensure!(navigation::command(toolbar.clone(), "state", None).await?["canGoBack"] == true, "Back history unavailable after navigation");
                     navigation::command(toolbar.clone(), "back", None).await?;
                     wait_navigation(&toolbar, "/login").await?;
                     ensure!(navigation::command(toolbar.clone(), "state", None).await?["canGoForward"] == true, "Forward history unavailable after going back");
+                    let generation = fixture.second_ready.load(Ordering::SeqCst);
                     navigation::command(toolbar.clone(), "forward", None).await?;
                     wait_navigation(&toolbar, "/second").await?;
+                    wait_page_ready(&fixture.second_ready, generation).await?;
+                    let generation = fixture.second_ready.load(Ordering::SeqCst);
                     navigation::command(toolbar.clone(), "reload", None).await?;
                     wait_navigation(&toolbar, "/second").await?;
+                    wait_page_ready(&fixture.second_ready, generation).await?;
                     let status = browser.command(&handle, &core, "browser.login.status", &json!({})).await?;
                     ensure!(status["preferredUrl"] == second && status["preferredMode"] == "embedded", "Navigation did not update saved browser preferences");
                     let reopened = LoginBrowser::new(browser.directory.clone())?;
@@ -508,6 +619,14 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                 .await
                 .context("Native login smoke test timed out")
                 .and_then(|result| result);
+                if result.is_err() {
+                    if let Some(main) = handle.get_webview_window("main") {
+                        eprintln!("Main diagnostic URL: {:?}; invocations={}; ready={}; denied={}",main.url(),INVOCATIONS.load(Ordering::SeqCst),fixture.main_ready.load(Ordering::SeqCst),fixture.denied.load(Ordering::SeqCst));
+                        let _=main.eval("fetch('/diagnostic?state='+encodeURIComponent(JSON.stringify({url:location.href,ready:document.readyState,invoke:typeof window.__TAURI_INTERNALS__?.invoke,body:document.body?.innerText.slice(0,200)})),{cache:'no-store'})");
+                        let _=tokio::time::timeout(Duration::from_secs(2),async { while !fixture.requests.lock().unwrap().iter().any(|request|request.contains("/diagnostic?")) {tokio::time::sleep(Duration::from_millis(20)).await;} }).await;
+                    }
+                    eprintln!("Fixture request trace: {:#?}",fixture.requests.lock().unwrap());
+                }
                 browser.stop(&handle, &core).await;
                 *report.lock().unwrap() = Some(result);
                 handle.exit(0);

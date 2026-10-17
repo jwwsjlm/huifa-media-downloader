@@ -28,4 +28,4 @@ if (!manifestTool) {
 }
 if (!manifestTool) throw new Error('Windows SDK mt.exe is required to prepare the WebView2 test executable');
 execFileSync(manifestTool, ['-nologo', '-manifest', `${artifact.executable}.manifest`, `-outputresource:${artifact.executable};#1`], { cwd, stdio: 'inherit' });
-execFileSync(artifact.executable, ['real_login_cookie_export_persistence_popups_and_ipc_isolation', '--ignored', '--test-threads=1', '--nocapture'], { cwd, stdio: 'inherit', timeout: 180_000 });
+execFileSync(artifact.executable, ['login_browser::smoke::', '--include-ignored', '--test-threads=1', '--nocapture'], { cwd, stdio: 'inherit', timeout: 180_000 });
