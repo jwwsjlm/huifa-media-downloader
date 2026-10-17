@@ -103,6 +103,17 @@ it('undoes drafts without sending a settings command', async () => {
 });
 
 function show(tools: Tool[] = [{ name: 'yt-dlp', available: true, version: '2026.08.19', platform: 'windows-x86_64', asset: 'yt-dlp.exe' }]) { render(<SettingsPage state={{ ...initialState, tools, view: { ...initialState.view, settingsTab: 'tools' } }} dispatch={vi.fn()} t={(_zh, en) => en} run={run} message={vi.fn()} />); }
+it('opens sign-in with the current proxy draft without implicitly saving settings', async () => {
+  transport.desktop = true;
+  transport.command.mockImplementation(async command => command === 'cookies.list' ? [] : { active: false, systemBrowser: 'edge' });
+  render(<SettingsPage state={{ ...initialState, settings: { hasProxy: true }, view: { ...initialState.view, settingsTab: 'network', optionsDraft: { proxy: 'http://127.0.0.1:7890' } } }} dispatch={vi.fn()} t={(_zh, en) => en} run={run} message={vi.fn()} />);
+  const open = screen.getByRole('button', { name: 'Open built-in browser' });
+  await waitFor(() => expect((open as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(open);
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.youtube.com/', mode: 'embedded', proxy: 'http://127.0.0.1:7890' }));
+  expect(screen.getByText(/Sign-in browsers share the download proxy/)).toBeTruthy();
+  expect(transport.command.mock.calls.some(([name]) => name === 'settings.save')).toBe(false);
+});
 it('saves browser login as the default identity through the desktop network settings', async () => {
   transport.desktop = true;
   const dispatch = vi.fn(); const message = vi.fn();

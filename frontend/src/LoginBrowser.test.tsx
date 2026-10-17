@@ -8,7 +8,23 @@ const inactive = { active: false, mode: null, systemBrowser: 'edge' };
 const active = { ...inactive, active: true, mode: 'embedded', targetUrl: 'https://www.youtube.com/' };
 beforeEach(() => { command.mockReset().mockImplementation(async name => name === 'browser.login.open' ? active : inactive); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
-function show() { const saved = vi.fn(); render(<LoginBrowser t={(_zh, en) => en} run={run} saved={saved} />); return { saved, controls: within(screen.getByRole('group', { name: 'Browser sign-in' })) }; }
+function show(proxy?: string) { const saved = vi.fn(); render(<LoginBrowser t={(_zh, en) => en} run={run} saved={saved} proxy={proxy} />); return { saved, controls: within(screen.getByRole('group', { name: 'Browser sign-in' })) }; }
+
+it.each(['Open built-in browser', 'Local browser sign-in'])('passes the current download proxy to %s', async button => {
+  const { controls } = show('http://127.0.0.1:7890');
+  const open = controls.getByRole('button', { name: button });
+  await waitFor(() => expect((open as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(open);
+  await waitFor(() => expect(command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.youtube.com/', mode: button === 'Open built-in browser' ? 'embedded' : 'system', proxy: 'http://127.0.0.1:7890' }));
+});
+
+it.each([undefined, ''])('preserves an omitted saved proxy or explicitly clears it (%j)', async proxy => {
+  const { controls } = show(proxy);
+  const open = controls.getByRole('button', { name: 'Open built-in browser' });
+  await waitFor(() => expect((open as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(open);
+  await waitFor(() => expect(command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.youtube.com/', mode: 'embedded', ...(proxy === undefined ? {} : { proxy }) }));
+});
 
 it('opens the native browser directly without a second dialog and syncs after it closes', async () => {
   let status: object = inactive;

@@ -187,6 +187,16 @@ async fn release_status(host: State<'_, Host>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn open_project(app: tauri::AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_url(
+            "https://github.com/jwwsjlm/huifa-media-downloader",
+            None::<&str>,
+        )
+        .map_err(error)
+}
+
+#[tauri::command]
 fn open_release(app: tauri::AppHandle, url: String) -> Result<(), String> {
     if !huifa_core::releases::valid_url(&url) {
         return Err("Unsupported release URL".into());
@@ -588,6 +598,7 @@ pub fn run() {
             task_copy_value,
             release_status,
             open_release,
+            open_project,
             login_navigation
         ]);
     let application = builder

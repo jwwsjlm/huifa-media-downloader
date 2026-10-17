@@ -270,6 +270,11 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
 .about-identity .brand-mark{width:54px;height:58px;border-radius:8px}
 .about-identity .brand-mark svg{width:32px;height:32px}
 .about-identity h2{font-size:20px}
+.about-identity-copy{flex:1;min-width:0}
+.about-title{display:flex;align-items:center;gap:12px 24px;flex-wrap:wrap}
+.about-project{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%;font-size:12px;color:var(--accent);text-decoration:none}
+.about-project:hover{text-decoration:underline}
+.about-project span{min-width:0;overflow-wrap:anywhere}
 .about-identity p{margin:8px 0}
 .dependency-row{display:grid;grid-template-columns:200px minmax(0,1fr) 170px;gap:16px;padding:13px 0;border-bottom:1px solid var(--border-soft);font-size:11px;line-height:1.6}
 .dependency-row:last-child{border:0}

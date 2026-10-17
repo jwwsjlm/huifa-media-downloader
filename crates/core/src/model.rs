@@ -172,7 +172,7 @@ impl Default for DownloadOptions {
             proxy: String::new(),
             fragment_concurrent: 4,
             request_delay: 0.0,
-            filename_template: "%(title)s [%(id)s].%(ext)s".into(),
+            filename_template: "%(title)s.%(ext)s".into(),
             convert_cover_jpeg: true,
             cover_jpeg_quality: 90,
         }
@@ -187,6 +187,9 @@ impl DownloadOptions {
             options.fragment_concurrent = 8;
         }
         options.cookie_id = "auto".into();
+        if options.filename_template == "%(title)s [%(id)s].%(ext)s" {
+            options.filename_template = "%(title)s.%(ext)s".into();
+        }
         options.validate()?;
         Ok(options)
     }
@@ -966,6 +969,25 @@ mod tests {
             "https://www.youtube.com/watch"
         );
     }
+    #[test]
+    fn filename_defaults_and_legacy_options_do_not_append_ids() {
+        assert_eq!(
+            DownloadOptions::default().filename_template,
+            "%(title)s.%(ext)s"
+        );
+        let legacy =
+            DownloadOptions::parse(json!({"filenameTemplate":"%(title)s [%(id)s].%(ext)s"}))
+                .unwrap();
+        assert_eq!(legacy.filename_template, "%(title)s.%(ext)s");
+        let custom = "Archive - %(title)s.%(ext)s";
+        assert_eq!(
+            DownloadOptions::parse(json!({"filenameTemplate":custom}))
+                .unwrap()
+                .filename_template,
+            custom
+        );
+    }
+
     #[test]
     fn options_are_frozen_strict_and_compatible() {
         let options=DownloadOptions::parse(json!({"content_mode":"audio","audio_track":"all","audio_format":"flac","section_start":"1:02.5","section_end":"1:10"})).unwrap();

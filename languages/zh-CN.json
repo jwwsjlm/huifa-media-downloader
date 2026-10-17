@@ -7,6 +7,8 @@
     "Huifa Video Downloader contributors"
   ],
   "translations": {
+    "Sign-in browsers share the download proxy. Close and reopen the sign-in browser after changes; save settings to keep them after restarting.": "登录浏览器与下载共用代理。修改后请关闭并重新打开登录浏览器；保存设置后，重启仍生效。",
+    "yt-dlp template, e.g. %(title)s.%(ext)s": "yt-dlp 模板，例如 %(title)s.%(ext)s",
     "Downloaded / total": "已下载 / 总大小",
     "Total size unknown; showing downloaded bytes": "总大小未知，显示已下载大小",
     "Select all tasks in this list": "全选当前列表",

@@ -7,7 +7,7 @@ import type { Run } from './App';
 import type { LoginBrowserMode, LoginBrowserSaved, LoginBrowserStatus } from './types';
 type LoginAction = 'embedded' | 'system' | 'save' | 'close';
 
-export function LoginBrowser({ saved, t, run }: { saved: (result: LoginBrowserSaved) => void; t: Translate; run: Run }) {
+export function LoginBrowser({ saved, t, run, proxy }: { saved: (result: LoginBrowserSaved) => void; t: Translate; run: Run; proxy?: string }) {
   const [url, setUrl] = useState('https://www.youtube.com/');
   const [preferredMode, setPreferredMode] = useState<LoginBrowserMode>('embedded');
   const initialized = useRef(false);
@@ -37,7 +37,7 @@ export function LoginBrowser({ saved, t, run }: { saved: (result: LoginBrowserSa
   const open = (mode: LoginBrowserMode) => operation(mode, async () => {
     const parsed = new URL(url);
     if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error(t('请输入 HTTP / HTTPS 网站地址', 'Enter an HTTP / HTTPS website URL'));
-    setStatus(await host.command<LoginBrowserStatus>('browser.login.open', { url: parsed.href, mode }));
+    setStatus(await host.command<LoginBrowserStatus>('browser.login.open', { url: parsed.href, mode, ...(proxy !== undefined ? { proxy } : {}) }));
     setPreferredMode(mode);
   });
   return <div className="website-sign-in" role="group" aria-label={t('浏览器登录', 'Browser sign-in')}>

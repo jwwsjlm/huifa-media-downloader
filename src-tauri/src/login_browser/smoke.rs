@@ -21,6 +21,8 @@ struct Fixture {
     denied: Arc<AtomicBool>,
     main_ready: Arc<AtomicBool>,
     toolbar_ready: Arc<AtomicBool>,
+    proxy_embedded: Arc<AtomicBool>,
+    proxy_system: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -33,12 +35,15 @@ impl Fixture {
         let denied = Arc::new(AtomicBool::new(false));
         let main_ready = Arc::new(AtomicBool::new(false));
         let toolbar_ready = Arc::new(AtomicBool::new(false));
+        let proxy_embedded = Arc::new(AtomicBool::new(false));
+        let proxy_system = Arc::new(AtomicBool::new(false));
         let flags = (
             stopped.clone(),
             denied.clone(),
             main_ready.clone(),
             toolbar_ready.clone(),
         );
+        let proxy_flags = (proxy_embedded.clone(), proxy_system.clone());
         let thread = std::thread::spawn(move || {
             while !flags.0.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -49,11 +54,22 @@ impl Fixture {
                 let mut buffer = [0; 16384];
                 let count = stream.read(&mut buffer).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..count]);
-                let path = request
+                let target = request
                     .lines()
                     .next()
                     .and_then(|line| line.split_whitespace().nth(1))
                     .unwrap_or("/");
+                let proxy_url = tauri::Url::parse(target).ok().filter(|url| {
+                    url.scheme() == "http" && url.host_str() == Some("proxy-only.invalid")
+                });
+                let path = proxy_url.as_ref().map_or(target, tauri::Url::path);
+                if proxy_url.is_some() {
+                    match path {
+                        "/proxy-embedded" => proxy_flags.0.store(true, Ordering::SeqCst),
+                        "/proxy-system" => proxy_flags.1.store(true, Ordering::SeqCst),
+                        _ => {}
+                    }
+                }
                 let asset_path = path.split('?').next().unwrap_or("");
                 if (asset_path == "/index.html" || asset_path.starts_with("/assets/"))
                     && !asset_path.contains("..")
@@ -93,6 +109,18 @@ impl Fixture {
                     "/popup" => {
                         "Set-Cookie: popup_sid=popup-secret; HttpOnly; Path=/; Max-Age=3600\r\n"
                     }
+                    "/proxy-embedded" => {
+                        "Set-Cookie: proxy_embedded=proxy-secret; HttpOnly; Path=/; Max-Age=3600\r\n"
+                    }
+                    "/proxy-system" => {
+                        "Set-Cookie: proxy_system=proxy-secret; HttpOnly; Path=/; Max-Age=3600\r\n"
+                    }
+                    "/direct-embedded" => {
+                        "Set-Cookie: direct_embedded=direct-secret; HttpOnly; Path=/; Max-Age=3600\r\n"
+                    }
+                    "/direct-system" => {
+                        "Set-Cookie: direct_system=direct-secret; HttpOnly; Path=/; Max-Age=3600\r\n"
+                    }
                     _ => "",
                 };
                 let body = if path == "/" || path == "/login" {
@@ -113,6 +141,8 @@ impl Fixture {
             denied,
             main_ready,
             toolbar_ready,
+            proxy_embedded,
+            proxy_system,
             thread: Some(thread),
         })
     }
@@ -448,6 +478,29 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                     wait_cookie(&browser, &handle, "host_sid")
                         .await
                         .context("Reopened compatible profile lost its cookies")?;
+                    browser.command(&handle, &core, "browser.login.close", &json!({})).await?;
+                    core.command("settings.save", json!({"settings":{"downloadOptions":{"proxy":format!("http://127.0.0.1:{}", fixture.port)}}})).await?;
+                    for (mode, marker, cookie) in [
+                        ("embedded", &fixture.proxy_embedded, "proxy_embedded"),
+                        ("system", &fixture.proxy_system, "proxy_system"),
+                    ] {
+                        let proxy_url = format!("http://proxy-only.invalid/proxy-{mode}");
+                        browser.command(&handle, &core, "browser.login.open", &json!({"url":proxy_url,"mode":mode})).await?;
+                        wait_cookie(&browser, &handle, cookie).await
+                            .with_context(|| format!("{mode} login did not use the saved HTTP proxy"))?;
+                        ensure!(marker.load(Ordering::SeqCst), "{mode} login did not send an absolute HTTP URL to the proxy");
+                        browser.command(&handle, &core, "browser.login.close", &json!({})).await?;
+                    }
+                    core.command("settings.save", json!({"settings":{"downloadOptions":{"proxy":""}}})).await?;
+                    for mode in ["embedded", "system"] {
+                        let direct_url = format!("http://direct-only.invalid:{}/direct-{mode}", fixture.port);
+                        browser.command(&handle, &core, "browser.login.open", &json!({"url":direct_url,"mode":mode})).await?;
+                        wait_cookie(&browser, &handle, &format!("direct_{mode}")).await
+                            .with_context(|| format!("{mode} login did not return to direct connections after clearing the proxy"))?;
+                        wait_cookie(&browser, &handle, "host_sid").await
+                            .with_context(|| format!("{mode} login lost its existing cookies after clearing the proxy"))?;
+                        browser.command(&handle, &core, "browser.login.close", &json!({})).await?;
+                    }
                     browser.stop(&handle, &core).await;
                     core.shutdown().await?;
                     Ok::<_, anyhow::Error>(())

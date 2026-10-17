@@ -238,6 +238,7 @@ async fn queue_conversion_prepared(
     changes: &Value,
     plan: Option<&Value>,
 ) -> Result<Value> {
+    let _adding = app.task_add_lock.lock().await;
     let original = app.db.task(id)?;
     ensure!(
         matches!(original.status.as_str(), "completed" | "retained") && original.kind == "media",
@@ -398,12 +399,7 @@ async fn queue_conversion_prepared(
     task.error = None;
     task.cookie_snapshot = None;
     task.proxy_snapshot = None;
-    task.output_path = Some(path.with_file_name(format!(
-        "{} [converted-{}].{}",
-        path.file_stem().unwrap().to_string_lossy(),
-        &task.id[..8],
-        extension
-    )));
+    task.output_path = Some(conversion_output_path(app, &path, &task.title, &extension)?);
     task.manifest = Some(SourceManifest {
         version: 1,
         directory: path.parent().unwrap().to_path_buf(),
@@ -419,6 +415,46 @@ async fn queue_conversion_prepared(
     app.emit("task.upsert", task.public());
     app.schedule(&task.id)?;
     Ok(task.public())
+}
+
+fn conversion_output_path(
+    app: &App,
+    source: &Path,
+    title: &str,
+    extension: &str,
+) -> Result<PathBuf> {
+    let mut reserved = Vec::new();
+    for task in app.db.tasks_including_retained()? {
+        reserved.extend(task.output_path);
+        if let Some(publication) = task.publication {
+            reserved.push(publication.target);
+            reserved.extend(publication.auxiliary.into_iter().map(|file| file.target));
+        }
+    }
+    let title = sanitize_filename(title);
+    let mut number = 1;
+    loop {
+        let suffix = if number == 1 {
+            String::new()
+        } else {
+            format!(" ({number})")
+        };
+        let candidate = source.with_file_name(bounded_filename(&format!(
+            "{title} [converted]{suffix}.{extension}"
+        )));
+        if !candidate.try_exists()?
+            && !reserved.iter().any(|path| {
+                path == &candidate
+                    || cfg!(windows)
+                        && path
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&candidate.to_string_lossy())
+            })
+        {
+            return Ok(candidate);
+        }
+        number += 1;
+    }
 }
 
 fn conversion_asset_kind(path: &Path) -> &str {
@@ -1299,11 +1335,7 @@ async fn prepare_assets(app: &Arc<App>, mut task: Task, cancel: &CancellationTok
     };
     crate::reject_links(&directory)?;
     std::fs::create_dir_all(&directory)?;
-    let stem = format!(
-        "{} [assets-{}]",
-        sanitize_filename(&task.title),
-        &task.id[..8]
-    );
+    let stem = format!("{} [assets]", sanitize_filename(&task.title));
     let mut outputs = Vec::new();
     task.files.clear();
     for (path, kind, suffix) in assets {
@@ -2629,7 +2661,7 @@ fn output_filename(task: &Task, extension: &str) -> String {
         .as_ref()
         .map(|m| text(&m.metadata, "id"))
         .filter(|v| !v.is_empty())
-        .unwrap_or(&task.id[..8]);
+        .unwrap_or("video");
     let suffix_bytes = task
         .options
         .filename_template
@@ -2758,8 +2790,109 @@ mod tests {
     }
 
     #[test]
+    fn filenames_use_titles_without_generated_task_identifiers() {
+        let mut task = crate::tests::paused_task(Default::default());
+        task.title = "Video [part 2]".into();
+        assert_eq!(output_filename(&task, "mp4"), "Video [part 2].mp4");
+        task.options.filename_template = "%(title)s - %(id)s.%(ext)s".into();
+        assert_eq!(output_filename(&task, "mp4"), "Video [part 2] - video.mp4");
+        task.manifest = Some(SourceManifest {
+            version: 1,
+            directory: PathBuf::new(),
+            files: vec![],
+            metadata: json!({"id":"source-42"}),
+            duration: None,
+            chapters: vec![],
+            sponsor_segments: vec![],
+            output_extension: "mp4".into(),
+        });
+        assert_eq!(
+            output_filename(&task, "mp4"),
+            "Video [part 2] - source-42.mp4"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_conversions_reserve_readable_names_and_preserve_existing_files()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut original = crate::tests::paused_task(Default::default());
+        original.title = "Video [part 2]".into();
+        let source = app
+            .config
+            .download_dir
+            .join("Video [part 2] [source-42].mp4");
+        write_sync(&source, b"original source")?;
+        original.output_path = Some(source.clone());
+        original.stage("completed", "completed", Some(100.0));
+        app.db.insert_task(&original)?;
+        app.db.complete(
+            &original,
+            &Media {
+                media_info: None,
+                id: "original".into(),
+                task_id: original.id.clone(),
+                title: original.title.clone(),
+                filename: source.file_name().unwrap().to_string_lossy().into(),
+                size: 15,
+                duration: 1.0,
+                path: source.clone(),
+                assets: vec![],
+            },
+        )?;
+        let existing = source.with_file_name("Video [part 2] [converted].mp4");
+        write_sync(&existing, b"existing conversion")?;
+        let mut reserved = crate::tests::paused_task(Default::default());
+        reserved.output_path = Some(source.with_file_name("Video [part 2] [converted] (2).mp4"));
+        reserved.publication = Some(Publication {
+            committed: false,
+            temporary: temp.path().join("publication"),
+            target: source.with_file_name("Video [part 2] [converted] (3).mp4"),
+            hash: String::new(),
+            size: 0,
+            duration: 0.0,
+            auxiliary: vec![],
+            backup: None,
+        });
+        app.db.insert_task(&reserved)?;
+        let options = json!({"container":"mp4"});
+        let (first, second) = tokio::join!(
+            queue_conversion_prepared(&app, &original.id, &options, None),
+            queue_conversion_prepared(&app, &original.id, &options, None),
+        );
+        let paths = [first?, second?]
+            .into_iter()
+            .map(|result| {
+                Ok(app
+                    .db
+                    .task(result["id"].as_str().unwrap())?
+                    .output_path
+                    .unwrap())
+            })
+            .collect::<Result<std::collections::HashSet<_>>>()?;
+        assert_eq!(
+            paths,
+            std::collections::HashSet::from([
+                source.with_file_name("Video [part 2] [converted] (4).mp4"),
+                source.with_file_name("Video [part 2] [converted] (5).mp4"),
+            ])
+        );
+        assert_eq!(std::fs::read(&source)?, b"original source");
+        assert_eq!(std::fs::read(&existing)?, b"existing conversion");
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[test]
     fn unicode_filenames_fit_component_limits_and_keep_media_ids_and_extensions() {
         let mut task = crate::tests::paused_task(Default::default());
+        task.options.filename_template = "%(title)s - %(id)s.%(ext)s".into();
         task.title = "多字节😀视频标题".repeat(40);
         task.manifest = Some(SourceManifest {
             version: 1,
@@ -2773,15 +2906,12 @@ mod tests {
         });
         let filename = output_filename(&task, "mp4");
         assert!(filename.len() <= 220, "{filename}");
-        assert!(filename.ends_with(" [7695747024182590437].mp4"));
+        assert!(filename.ends_with(" - 7695747024182590437.mp4"));
         let sidecar = PathBuf::from(&filename).with_extension("info.json");
         assert!(sidecar.file_name().unwrap().len() <= 240);
         assert!(sanitize_filename(&task.title).len() <= 240);
         for name in [
-            format!(
-                "{} [assets-12345678].info.json",
-                sanitize_filename(&task.title)
-            ),
+            format!("{} [assets].info.json", sanitize_filename(&task.title)),
             format!(
                 "{}.chapter-01-{}.mkv",
                 filename,

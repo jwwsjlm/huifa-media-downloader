@@ -38,7 +38,7 @@ export const defaults: DownloadOptions = {
   collectionMode: 'select', collectionOrder: 'original', firstN: 0, playlistItems: '', dateAfter: '', dateBefore: '', durationMin: 0, durationMax: 0,
   liveFilter: 'videos', liveFromStart: false, waitForLive: false, waitMin: 30, waitMax: 120, sectionStart: '', sectionEnd: '', splitChapters: false,
   subtitleLanguage: 'none', subtitleFormat: 'srt', automaticSubtitles: true, embedSubtitles: false, writeThumbnail: true, writeDescription: false, writeComments: false, writeInfoJson: false, embedMetadata: false, embedChapters: false, embedThumbnail: false,
-  sponsorblockMode: 'off', sponsorblockCategories: ['sponsor'], rateLimit: '', encoder: 'original', organizeTaskFolder: true, filenameTemplate: '%(title)s [%(id)s].%(ext)s',
+  sponsorblockMode: 'off', sponsorblockCategories: ['sponsor'], rateLimit: '', encoder: 'original', organizeTaskFolder: true, filenameTemplate: '%(title)s.%(ext)s',
   convertCoverJpeg: true, coverJpegQuality: 90, prependCoverEnabled: false, prependCoverFrames: 3, fragmentConcurrent: 4, requestDelay: 0,
 };
 export function commandOptions(options: DownloadOptions): DownloadOptions {
@@ -62,7 +62,7 @@ export const optionGroups: { key: string; title: [string, string]; fields: Optio
     { key: 'compatibilityTarget', zh: '兼容设备', en: 'Device compatibility', choices: choices(['auto', 'windows', 'macos', 'linux', 'ios', 'android']) },
     { key: 'encoder', zh: '下载后视频编码器', en: 'Video encoder after download', choices: [['original', '保持原编码', 'Keep source codec'], ...choices(encoders.slice(1))], hint: ['硬件编码器需要兼容设备', 'Hardware encoders require compatible devices'] },
     { key: 'organizeTaskFolder', zh: '为每个任务创建文件夹', en: 'Create a folder for each task', type: 'check' },
-    { key: 'filenameTemplate', zh: '文件名模板', en: 'Filename template', hint: ['yt-dlp 模板，例如 %(title)s [%(id)s].%(ext)s', 'yt-dlp template, e.g. %(title)s [%(id)s].%(ext)s'] },
+    { key: 'filenameTemplate', zh: '文件名模板', en: 'Filename template', hint: ['yt-dlp 模板，例如 %(title)s.%(ext)s', 'yt-dlp template, e.g. %(title)s.%(ext)s'] },
   ] },
   { key: 'collection', title: ['合集与筛选', 'Collections and filters'], fields: [
     { key: 'collectionMode', zh: '合集处理', en: 'Collection processing', choices: [['select', '弹出项目选择', 'Choose items'], ['all', '下载全部', 'Download all'], ['single', '仅单个视频', 'Single video only']] },

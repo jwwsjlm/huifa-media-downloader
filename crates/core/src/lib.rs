@@ -121,9 +121,22 @@ impl App {
             commands_done: Notify::new(),
         });
         app.myself.set(Arc::downgrade(&app)).unwrap();
+        let mut settings = app.db.settings()?;
+        if settings["downloadOptions"]["filenameTemplate"] == "%(title)s [%(id)s].%(ext)s" {
+            settings["downloadOptions"]["filenameTemplate"] = json!("%(title)s.%(ext)s");
+            app.db.save_settings(&settings)?;
+        }
         for mut task in app.db.tasks_including_retained()? {
+            let mut changed = false;
             if task.download_dir.is_none() {
                 task.download_dir = Some(app.config.download_dir.clone());
+                changed = true;
+            }
+            if task.options.filename_template == "%(title)s [%(id)s].%(ext)s" {
+                task.options.filename_template = "%(title)s.%(ext)s".into();
+                changed = true;
+            }
+            if changed {
                 app.db.save_task(&task)?;
             }
             if matches!(
@@ -877,6 +890,13 @@ impl App {
         }
         Ok(())
     }
+    pub fn download_proxy(&self) -> Result<String> {
+        Ok(self
+            .credentials
+            .secret("downloadProxy")?
+            .unwrap_or_default())
+    }
+
     fn public_settings(&self) -> Result<Value> {
         let mut value = self.db.settings()?;
         if let Some(object) = value.as_object_mut() {
@@ -1479,10 +1499,7 @@ mod tests {
             app.credentials.secret("aiApiKey")?.as_deref(),
             Some("fixture-api-key")
         );
-        assert_eq!(
-            app.credentials.secret("downloadProxy")?.as_deref(),
-            Some(options.proxy.as_str())
-        );
+        assert_eq!(app.download_proxy()?, options.proxy);
         assert_eq!(
             app.credentials
                 .matching("https://www.example.test/media")?
@@ -1925,6 +1942,60 @@ mod tests {
             download_key("https://example.test/play?id=one")?
         );
         drop(permit);
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_default_filename_migrates_without_renaming_files_or_custom_templates()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        app.db.save_settings(&json!({"downloadOptions":{"filenameTemplate":"%(title)s [%(id)s].%(ext)s","quality":"720p"},"uiLanguage":"en-US"}))?;
+        let mut task = paused_task(Default::default());
+        task.options.filename_template = "%(title)s [%(id)s].%(ext)s".into();
+        let old_path = app
+            .config
+            .download_dir
+            .join("Original title [source-id].mp4");
+        std::fs::write(&old_path, b"existing video")?;
+        task.output_path = Some(old_path.clone());
+        app.db.insert_task(&task)?;
+        let mut custom = paused_task(Default::default());
+        custom.options.filename_template = "custom-%(id)s.%(ext)s".into();
+        app.db.insert_task(&custom)?;
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config.clone()).await?;
+        let settings = app.db.settings()?;
+        assert_eq!(
+            settings["downloadOptions"]["filenameTemplate"],
+            "%(title)s.%(ext)s"
+        );
+        assert_eq!(settings["downloadOptions"]["quality"], "720p");
+        assert_eq!(settings["uiLanguage"], "en-US");
+        assert_eq!(
+            app.db.task(&task.id)?.options.filename_template,
+            "%(title)s.%(ext)s"
+        );
+        assert_eq!(app.db.task(&task.id)?.output_path.as_ref(), Some(&old_path));
+        assert_eq!(
+            app.db.task(&custom.id)?.options.filename_template,
+            custom.options.filename_template
+        );
+        assert_eq!(std::fs::read(&old_path)?, b"existing video");
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        assert_eq!(
+            app.db.settings()?["downloadOptions"]["filenameTemplate"],
+            "%(title)s.%(ext)s"
+        );
         app.shutdown().await?;
         Ok(())
     }

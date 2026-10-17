@@ -85,10 +85,82 @@ struct SyncState {
     name: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct BrowserProxy(Option<tauri::Url>);
+
+impl BrowserProxy {
+    fn parse(text: &str) -> Result<Self> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(Self(None));
+        }
+        let mut url = tauri::Url::parse(text).context("Invalid login browser proxy")?;
+        ensure!(
+            matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+                && url.host_str().is_some()
+                && url.port() != Some(0)
+                && matches!(url.path(), "" | "/")
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "Invalid login browser proxy"
+        );
+        ensure!(
+            url.username().is_empty() && url.password().is_none(),
+            "Login browsers require a proxy without embedded credentials; use a local proxy endpoint"
+        );
+        if url.scheme() == "socks5h" {
+            url.set_scheme("socks5")
+                .map_err(|_| anyhow::anyhow!("Invalid login browser proxy"))?;
+        }
+        Ok(Self(Some(url)))
+    }
+
+    fn arguments(&self) -> Vec<String> {
+        let mut arguments = Vec::new();
+        if let Some(url) = &self.0 {
+            arguments.push(format!(
+                "--proxy-server={}://{}:{}",
+                url.scheme(),
+                url.host().unwrap(),
+                url.port_or_known_default().unwrap_or(1080)
+            ));
+            arguments.extend(
+                [
+                    "--proxy-bypass-list=<-loopback>",
+                    "--disable-quic",
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                ]
+                .map(str::to_owned),
+            );
+        } else {
+            arguments.push("--no-proxy-server".into());
+        }
+        #[cfg(all(test, windows, feature = "login-smoke"))]
+        arguments.extend(["--host-resolver-rules=MAP *.huifa.test 127.0.0.1, MAP direct-only.invalid 127.0.0.1", "--proxy-bypass-list=*.huifa.test"].map(str::to_owned));
+        arguments
+    }
+
+    #[cfg(windows)]
+    fn webview_arguments(&self) -> String {
+        self.arguments()
+            .into_iter()
+            .map(|argument| {
+                if argument.contains(' ') {
+                    format!("\"{argument}\"")
+                } else {
+                    argument
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 enum Session {
     Embedded {
         label: String,
         url: String,
+        proxy: BrowserProxy,
     },
     System {
         child: Box<Child>,
@@ -96,6 +168,7 @@ enum Session {
         cdp: Cdp,
         url: String,
         target_id: std::sync::Mutex<Option<String>>,
+        proxy: BrowserProxy,
     },
 }
 
@@ -135,6 +208,14 @@ impl LoginBrowser {
                 let url = login_url(args["url"].as_str().context("URL must be text")?)?;
                 let mode = args["mode"].as_str().context("Login mode is required")?;
                 ensure!(matches!(mode, "embedded" | "system"), "Invalid login mode");
+                let saved_proxy;
+                let proxy = if let Some(proxy) = args.get("proxy") {
+                    proxy.as_str().context("Proxy must be text")?
+                } else {
+                    saved_proxy = core.download_proxy()?;
+                    &saved_proxy
+                };
+                let proxy = BrowserProxy::parse(proxy)?;
                 let name = args
                     .get("name")
                     .and_then(Value::as_str)
@@ -143,8 +224,10 @@ impl LoginBrowser {
                 ensure!(name.is_none_or(|name| name.len() <= 128 && !name.chars().any(char::is_control)), "Invalid cookie name");
                 if let Some(session) = running.as_ref() {
                     ensure!(
-                        session.mode() == mode && session.url() == url.as_str(),
-                        "Close the active login browser before opening another website or mode"
+                        session.mode() == mode
+                            && session.url() == url.as_str()
+                            && session.proxy() == &proxy,
+                        "Close the active login browser before changing website, mode or proxy"
                     );
                     if let Session::Embedded { label, .. } = session
                         && let Some(window) = app.get_window(label)
@@ -158,8 +241,8 @@ impl LoginBrowser {
                     let profile = self.directory.join("embedded");
                     private_directory(&profile)?;
                     let label = format!("login-{}", uuid::Uuid::new_v4());
-                    let window = embedded_browser(app, &label, &profile)?;
-                    if let Err(reason) = initialize_storage(&window, &profile)
+                    let window = embedded_browser(app, &label, &profile, &proxy)?;
+                    if let Err(reason) = initialize_storage(&window, &profile, &proxy)
                         .await
                         .and_then(|()| window.navigate(url.clone()).map_err(Into::into))
                     {
@@ -169,6 +252,7 @@ impl LoginBrowser {
                     Session::Embedded {
                         label,
                         url: url.to_string(),
+                        proxy,
                     }
                 } else {
                     let (name, executable) = self
@@ -177,7 +261,7 @@ impl LoginBrowser {
                         .context("Install Edge, Chrome or Chromium to use compatible sign-in")?;
                     let profile = self.directory.join(name);
                     private_directory(&profile)?;
-                    launch_system(executable, &profile, url.as_str()).await?
+                    launch_system(executable, &profile, url.as_str(), &proxy).await?
                 };
                 *running = Some(session);
                 let _ = self.remember(url.as_str(), mode);
@@ -413,6 +497,12 @@ impl LoginBrowser {
 }
 
 impl Session {
+    fn proxy(&self) -> &BrowserProxy {
+        match self {
+            Self::Embedded { proxy, .. } | Self::System { proxy, .. } => proxy,
+        }
+    }
+
     fn mode(&self) -> &'static str {
         match self {
             Self::Embedded { .. } => "embedded",
@@ -526,7 +616,12 @@ fn layout_browser(app: &AppHandle, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn embedded_browser(app: &AppHandle, label: &str, profile: &Path) -> Result<Webview> {
+fn embedded_browser(
+    app: &AppHandle,
+    label: &str,
+    profile: &Path,
+    proxy: &BrowserProxy,
+) -> Result<Webview> {
     let window = WindowBuilder::new(app, label)
         .title("Huifa — Website sign-in")
         .inner_size(1100.0, 780.0)
@@ -558,6 +653,7 @@ fn embedded_browser(app: &AppHandle, label: &str, profile: &Path) -> Result<Webv
         let handle = app.clone();
         let root = label.to_owned();
         let popup_profile = profile.to_owned();
+        let popup_proxy = proxy.clone();
         let page = WebviewBuilder::new(
             format!("{label}-page"),
             WebviewUrl::External("about:blank".parse()?),
@@ -571,10 +667,20 @@ fn embedded_browser(app: &AppHandle, label: &str, profile: &Path) -> Result<Webv
         .on_navigation(|url| website(url) || url.as_str() == "about:blank")
         .on_download(|_, _| false)
         .on_new_window(move |url, features| {
-            login_popup(&handle, &root, &popup_profile, url, features)
+            login_popup(&handle, &root, &popup_profile, &popup_proxy, url, features)
         });
-        #[cfg(all(test, windows, feature = "login-smoke"))]
-        let page = page.additional_browser_args("--host-resolver-rules=\"MAP *.huifa.test 127.0.0.1\" --proxy-bypass-list=\"*.huifa.test\"");
+        #[cfg(windows)]
+        let page = page.additional_browser_args(&proxy.webview_arguments());
+        #[cfg(not(windows))]
+        let page = if let Some(url) = &proxy.0 {
+            ensure!(
+                url.scheme() != "https",
+                "Built-in sign-in on this system supports HTTP and SOCKS5 proxies; use local browser sign-in for an HTTPS proxy"
+            );
+            page.proxy_url(url.clone())
+        } else {
+            page
+        };
         let page = window.add_child(
             page,
             tauri::LogicalPosition::new(0.0, TOOLBAR_HEIGHT),
@@ -604,6 +710,7 @@ fn login_popup(
     app: &AppHandle,
     group: &str,
     profile: &Path,
+    proxy: &BrowserProxy,
     url: tauri::Url,
     features: tauri::webview::NewWindowFeatures,
 ) -> tauri::webview::NewWindowResponse<tauri::Wry> {
@@ -620,7 +727,14 @@ fn login_popup(
         return NewWindowResponse::Deny;
     }
     let label = format!("{group}-{}", uuid::Uuid::new_v4());
-    match embedded_window(app, &label, profile.to_owned(), group, Some(features)) {
+    match embedded_window(
+        app,
+        &label,
+        profile.to_owned(),
+        group,
+        proxy,
+        Some(features),
+    ) {
         Ok(window) => NewWindowResponse::Create { window },
         Err(_) => NewWindowResponse::Deny,
     }
@@ -631,11 +745,13 @@ fn embedded_window(
     label: &str,
     profile: PathBuf,
     group: &str,
+    proxy: &BrowserProxy,
     features: Option<tauri::webview::NewWindowFeatures>,
 ) -> Result<WebviewWindow> {
     let handle = app.clone();
     let root = group.to_owned();
     let popup_profile = profile.clone();
+    let popup_proxy = proxy.clone();
     let mut builder =
         WebviewWindowBuilder::new(app, label, WebviewUrl::External("about:blank".parse()?))
             .title("Huifa — Website sign-in")
@@ -649,14 +765,22 @@ fn embedded_window(
             .on_navigation(|url| website(url) || url.as_str() == "about:blank")
             .on_download(|_, _| false)
             .on_new_window(move |url, features| {
-                login_popup(&handle, &root, &popup_profile, url, features)
+                login_popup(&handle, &root, &popup_profile, &popup_proxy, url, features)
             });
     if let Some(features) = features {
         builder = builder.window_features(features);
     }
-    #[cfg(all(test, windows, feature = "login-smoke"))]
+    #[cfg(windows)]
     {
-        builder = builder.additional_browser_args("--host-resolver-rules=\"MAP *.huifa.test 127.0.0.1\" --proxy-bypass-list=\"*.huifa.test\"");
+        builder = builder.additional_browser_args(&proxy.webview_arguments());
+    }
+    #[cfg(not(windows))]
+    if let Some(url) = &proxy.0 {
+        ensure!(
+            url.scheme() != "https",
+            "Built-in sign-in on this system supports HTTP and SOCKS5 proxies; use local browser sign-in for an HTTPS proxy"
+        );
+        builder = builder.proxy_url(url.clone());
     }
     Ok(builder.build()?)
 }
@@ -703,7 +827,12 @@ fn find_browser() -> Option<(String, PathBuf)> {
     candidates.into_iter().find(|(_, path)| path.is_file())
 }
 
-async fn launch_system(executable: &Path, profile: &Path, url: &str) -> Result<Session> {
+async fn launch_system(
+    executable: &Path,
+    profile: &Path,
+    url: &str,
+    proxy: &BrowserProxy,
+) -> Result<Session> {
     let endpoint_file = profile.join("DevToolsActivePort");
     match tokio::fs::remove_file(&endpoint_file).await {
         Ok(()) => {}
@@ -711,11 +840,7 @@ async fn launch_system(executable: &Path, profile: &Path, url: &str) -> Result<S
         Err(reason) => return Err(reason.into()),
     }
     let mut command = Command::new(executable);
-    #[cfg(all(test, windows, feature = "login-smoke"))]
-    command.args([
-        "--host-resolver-rules=MAP *.huifa.test 127.0.0.1",
-        "--proxy-bypass-list=*.huifa.test",
-    ]);
+    command.args(proxy.arguments());
     command
         .args([
             "--no-first-run",
@@ -772,6 +897,7 @@ async fn launch_system(executable: &Path, profile: &Path, url: &str) -> Result<S
             cdp,
             url: url.into(),
             target_id: Default::default(),
+            proxy: proxy.clone(),
         }),
         result => {
             guard.terminate();
@@ -949,21 +1075,29 @@ fn all_cookie_values(
 }
 
 #[cfg(target_os = "linux")]
-async fn initialize_storage(window: &Webview, profile: &Path) -> Result<()> {
+async fn initialize_storage(window: &Webview, profile: &Path, proxy: &BrowserProxy) -> Result<()> {
     use webkit2gtk::{CookieManagerExt, WebViewExt, WebsiteDataManagerExt};
     let path = profile.join("cookies.sqlite");
+    let direct = proxy.0.is_none();
     let (sender, receiver) = tokio::sync::oneshot::channel();
     window.with_webview(move |webview| {
         let result = webview
             .inner()
             .website_data_manager()
-            .and_then(|manager| manager.cookie_manager())
             .context("Browser cookie store is unavailable")
-            .map(|manager| {
-                manager.set_persistent_storage(
+            .and_then(|manager| {
+                // Linux keeps this profile's context alive after closing its last window.
+                if direct {
+                    manager.set_network_proxy_settings(webkit2gtk::NetworkProxyMode::NoProxy, None);
+                }
+                let cookies = manager
+                    .cookie_manager()
+                    .context("Browser cookie store is unavailable")?;
+                cookies.set_persistent_storage(
                     &path.to_string_lossy(),
                     webkit2gtk::CookiePersistentStorage::Sqlite,
                 );
+                Ok(())
             });
         let _ = sender.send(result);
     })?;
@@ -974,7 +1108,7 @@ async fn initialize_storage(window: &Webview, profile: &Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn initialize_storage(_: &Webview, _: &Path) -> Result<()> {
+async fn initialize_storage(_: &Webview, _: &Path, _: &BrowserProxy) -> Result<()> {
     Ok(())
 }
 
@@ -986,6 +1120,38 @@ async fn native_cookies(_: &Webview) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_proxy_uses_explicit_proxy_or_direct_access() -> Result<()> {
+        assert!(
+            BrowserProxy::parse("")?
+                .arguments()
+                .contains(&"--no-proxy-server".into())
+        );
+        for (value, expected) in [
+            ("http://127.0.0.1:7890", "http://127.0.0.1:7890"),
+            ("http://proxy.example.test", "http://proxy.example.test:80"),
+            (
+                "https://proxy.example.test",
+                "https://proxy.example.test:443",
+            ),
+            ("socks5h://[::1]:1081", "socks5://[::1]:1081"),
+        ] {
+            let arguments = BrowserProxy::parse(value)?.arguments();
+            assert_eq!(arguments[0], format!("--proxy-server={expected}"));
+            assert!(!arguments.contains(&"--no-proxy-server".into()));
+        }
+        for invalid in [
+            "file:///tmp/proxy",
+            "http://proxy:0",
+            "http://proxy/path",
+            "http://proxy/?query",
+            "http://user:password@proxy:8080",
+        ] {
+            assert!(BrowserProxy::parse(invalid).is_err(), "{invalid}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn preferences_persist_across_reopening_and_leave_profile_data_alone() -> Result<()> {

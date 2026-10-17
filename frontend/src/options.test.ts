@@ -2,6 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { automaticQuality, commandOptions, defaults, optionGroups, optionLabel } from './options';
 
 describe('download option boundary', () => {
+  it('defaults to the video title without appending a task or source id', () => {
+    expect(defaults.filenameTemplate).toBe('%(title)s.%(ext)s');
+    expect(commandOptions(defaults).filenameTemplate).toBe('%(title)s.%(ext)s');
+    const field = optionGroups.flatMap(group => group.fields).find(value => value.key === 'filenameTemplate');
+    expect(field?.hint).toEqual(['yt-dlp 模板，例如 %(title)s.%(ext)s', 'yt-dlp template, e.g. %(title)s.%(ext)s']);
+  });
   it('removes a public secret marker while preserving omitted and explicitly cleared proxies', () => {
     const saved = { ...defaults, proxyConfigured: true };
     expect(commandOptions(saved)).not.toHaveProperty('proxy');

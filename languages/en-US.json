@@ -7,6 +7,8 @@
     "Huifa Video Downloader contributors"
   ],
   "translations": {
+    "Sign-in browsers share the download proxy. Close and reopen the sign-in browser after changes; save settings to keep them after restarting.": "Sign-in browsers share the download proxy. Close and reopen the sign-in browser after changes; save settings to keep them after restarting.",
+    "yt-dlp template, e.g. %(title)s.%(ext)s": "yt-dlp template, e.g. %(title)s.%(ext)s",
     "Downloaded / total": "Downloaded / total",
     "Downloaded": "Downloaded",
     "Total size unknown; showing downloaded bytes": "Total size unknown; showing downloaded bytes",

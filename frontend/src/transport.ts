@@ -98,6 +98,10 @@ export const host = {
   async checkUpdate(): Promise<{ version?: string; body?: string }> { return invoke('check_update'); },
   async installUpdate(): Promise<void> { await invoke('install_update'); },
   async releaseStatus<T = ReleaseStatus>(): Promise<T> { return desktop ? invoke<T>('release_status') : this.command<T>('app.release_status'); },
+  async openProject(): Promise<void> {
+    if (desktop) await invoke('open_project');
+    else window.open('https://github.com/jwwsjlm/huifa-media-downloader', '_blank', 'noopener,noreferrer');
+  },
   async openRelease(url: string): Promise<void> {
     let release: URL;
     try { release = new URL(url); } catch { throw new Error('Unsupported release URL.'); }

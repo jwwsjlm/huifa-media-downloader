@@ -65,6 +65,13 @@ it('resolves desktop copy values through the native command', async () => {
   expect(writeText).toHaveBeenCalledWith('D:\\downloads\\example.mp4');
 });
 
+it('copies the original title without joining the task id in desktop mode', async () => {
+  const host = await desktop(); tauri.invoke.mockResolvedValue(task.title);
+  await host.copyTask(task, 'title');
+  expect(tauri.invoke).toHaveBeenCalledWith('task_copy_value', { id: task.id, kind: 'title' });
+  expect(writeText.mock.calls).toEqual([[task.title]]);
+});
+
 it('checks release status with the platform host and opens trusted web release pages', async () => {
   const host = await web(); const status = { currentVersion: '0.3.0', latestVersion: '0.3.1', updateAvailable: true, url: 'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.1' };
   fetchMock.mockResolvedValue(new Response(JSON.stringify({ value: status })));

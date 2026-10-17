@@ -6,16 +6,17 @@ import { makeSnapshot } from './test-fixtures';
 import type { CoreEvent } from './types';
 import { version as buildVersion } from '../package.json';
 
-const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), copyTask: vi.fn(), result: vi.fn() }));
+const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), openProject: vi.fn(), copyTask: vi.fn(), result: vi.fn() }));
 vi.mock('./transport', () => ({ host: {
   desktop: false, capabilities: () => ({ browserCookies: false, remoteBrowser: false, updates: false }),
   session: async () => ({ authenticated: true }), subscribe: async (listener: (event: CoreEvent) => void, connection: (value: boolean) => void) => { transport.listener = listener; connection(true); return () => { transport.listener = null; }; },
-  command: transport.command, assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: async () => {}, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, copyTask: transport.copyTask, result: transport.result,
+  command: transport.command, assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: async () => {}, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, openProject: transport.openProject, copyTask: transport.copyTask, result: transport.result,
 } }));
 beforeEach(() => {
   transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true);
   transport.releaseStatus.mockReset().mockResolvedValue({ currentVersion:'0.3.0', latestVersion:'0.3.0', updateAvailable:false, url:'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.0' });
   transport.openRelease.mockReset().mockResolvedValue(undefined);
+  transport.openProject.mockReset().mockResolvedValue(undefined);
   transport.copyTask.mockReset().mockResolvedValue(undefined); transport.result.mockReset().mockResolvedValue(undefined);
 });
 describe('live interface stability', () => {
@@ -507,6 +508,10 @@ describe('live interface stability', () => {
     expect(await screen.findByText('You have the latest stable release.')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Open new release page' })).toBeNull();
     expect(transport.openRelease).not.toHaveBeenCalled();
+    const project = screen.getByRole('link', { name: 'github.com/jwwsjlm/huifa-media-downloader' });
+    expect(project.getAttribute('href')).toBe('https://github.com/jwwsjlm/huifa-media-downloader');
+    fireEvent.click(project);
+    await waitFor(() => expect(transport.openProject).toHaveBeenCalledOnce());
     fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
     await waitFor(() => expect(transport.releaseStatus).toHaveBeenCalledTimes(2));
   });
