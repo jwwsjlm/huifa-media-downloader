@@ -24,22 +24,22 @@
     },
     "ffmpeg": {
       "repository": "BtbN/FFmpeg-Builds",
-      "version": "autobuild-2026-10-17-20-51",
+      "version": "autobuild-2026-10-18-13-01",
       "assets": {
         "windows-x86_64": {
-          "name": "ffmpeg-N-127617-g94cba3150c-win64-gpl-shared.zip",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-17-20-51/ffmpeg-N-127617-g94cba3150c-win64-gpl-shared.zip",
-          "sha256": "2983d719523f01ce9fd3618cd4b511a33df7c1fef8f3a472d75fc4c9051ebe1e"
+          "name": "ffmpeg-N-127650-geceaa54a38-win64-gpl-shared.zip",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-18-13-01/ffmpeg-N-127650-geceaa54a38-win64-gpl-shared.zip",
+          "sha256": "8ebf4def186017a1cf3ac1e0065ad19c405628ec52b50f144b727e8def64928d"
         },
         "linux-x86_64": {
-          "name": "ffmpeg-N-127617-g94cba3150c-linux64-gpl.tar.xz",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-17-20-51/ffmpeg-N-127617-g94cba3150c-linux64-gpl.tar.xz",
-          "sha256": "57df359b805dd512d80f2780057273d708e85753545537859ac84147c5dad841"
+          "name": "ffmpeg-N-127651-gb60ab6c9a4-linux64-gpl.tar.xz",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-18-13-01/ffmpeg-N-127651-gb60ab6c9a4-linux64-gpl.tar.xz",
+          "sha256": "a5f2aed198efa8ef4c12d9112f42e7cefbdf11dced1b59a87503ca689bc52277"
         },
         "linux-aarch64": {
-          "name": "ffmpeg-N-127617-g94cba3150c-linuxarm64-gpl.tar.xz",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-17-20-51/ffmpeg-N-127617-g94cba3150c-linuxarm64-gpl.tar.xz",
-          "sha256": "a61b8ee89958ad59095845cc479a8bfc0081f3e8438fe0305350a7fe9aa76a7b"
+          "name": "ffmpeg-N-127651-gb60ab6c9a4-linuxarm64-gpl.tar.xz",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-18-13-01/ffmpeg-N-127651-gb60ab6c9a4-linuxarm64-gpl.tar.xz",
+          "sha256": "3d1ccdb45b01635e8404da39869f3a0c7a535b9e63470439bc3e677cf12fe266"
         }
       }
     },
