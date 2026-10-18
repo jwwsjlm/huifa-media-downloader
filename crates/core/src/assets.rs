@@ -161,6 +161,7 @@ impl App {
             error: None,
             warnings: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
             options,
             download_dir: Some(self.download_directory()),
             output_path: previous.as_ref().and_then(|task| task.output_path.clone()),

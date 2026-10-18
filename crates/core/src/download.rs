@@ -649,7 +649,7 @@ pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<
     );
     let (_, missing) = subtitle_selection(info, &options.languages(), options.automatic_subtitles);
     ensure!(
-        missing.is_empty(),
+        missing.is_empty() || options.skip_unavailable_subtitles,
         "Requirements unmet: subtitles={}. Adjust the subtitle languages or disable subtitles before retrying",
         missing.join(", ")
     );
@@ -1379,7 +1379,7 @@ async fn download_subtitles(
     let (selected, missing) =
         subtitle_selection(info, &requested, task.options.automatic_subtitles);
     ensure!(
-        missing.is_empty(),
+        missing.is_empty() || task.options.skip_unavailable_subtitles,
         "Requirements unmet: subtitles={}. Adjust the subtitle languages or disable subtitles before retrying",
         missing.join(", ")
     );
@@ -2267,6 +2267,20 @@ mod tests {
         task.options.subtitle_language = "ja".into();
         app.db.insert_task(&task)?;
         let cookies = Cookies::new(&app, None)?;
+        let mut files = Vec::new();
+        download_subtitles(
+            &app,
+            &task,
+            &json!({}),
+            root.path(),
+            &cookies,
+            &CancellationToken::new(),
+            &mut files,
+        )
+        .await?;
+        assert!(files.is_empty());
+        assert!(app.db.task(&task.id)?.warnings.is_empty());
+        task.options.skip_unavailable_subtitles = false;
         let error = download_subtitles(
             &app,
             &task,
@@ -2423,7 +2437,7 @@ mod tests {
             json!({"quality":"4k"}),
             json!({"videoFps":"60"}),
             json!({"audioTrack":"ja"}),
-            json!({"subtitleLanguage":"ja"}),
+            json!({"subtitleLanguage":"ja","skipUnavailableSubtitles":false}),
         ] {
             let options = DownloadOptions::parse(options)?;
             assert!(
@@ -2434,6 +2448,8 @@ mod tests {
             );
         }
         assert_eq!(select_formats(&info, &DownloadOptions::default())?.len(), 2);
+        let optional_subtitles = DownloadOptions::parse(json!({"subtitleLanguage":"ja"}))?;
+        assert_eq!(select_formats(&info, &optional_subtitles)?.len(), 2);
         let portrait = json!({"formats":[
             {"format_id":"video","height":1920,"width":1080,"fps":59.94,"vcodec":"avc1","acodec":"none"},
             {"format_id":"audio","language":"zh-CN","vcodec":"none","acodec":"aac"}

@@ -27,6 +27,15 @@ export function statusLabel(status: string, t: Translate): string {
   return labels[status] ? t(...labels[status]) : status;
 }
 export function statusTone(status: string): string { return status.includes('failed') ? 'danger' : ['completed', 'retained'].includes(status) ? 'success' : ['downloading', 'processing'].includes(status) ? 'accent' : ''; }
+export const DEFAULT_COMPLETED_TIME_FORMAT = 'YYYY-MM-DD HH:mm';
+export function completionTime(value?: string | null, format = DEFAULT_COMPLETED_TIME_FORMAT): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  const two = (value: number) => String(value).padStart(2, '0');
+  const tokens: Record<string, string> = { YYYY: String(date.getFullYear()), YY: two(date.getFullYear() % 100), MM: two(date.getMonth() + 1), DD: two(date.getDate()), HH: two(date.getHours()), mm: two(date.getMinutes()) };
+  return (format.trim() || DEFAULT_COMPLETED_TIME_FORMAT).replace(/YYYY|YY|MM|DD|HH|mm/g, token => tokens[token]);
+}
 export function stageLabel(stage: string, status: string, t: Translate): string {
   if (['completed', 'retained', 'failed', 'processing_failed', 'cancelled'].includes(status)) return statusLabel(status, t);
   if (stage === 'probing') return t('正在确定工序', 'Determining workflow');

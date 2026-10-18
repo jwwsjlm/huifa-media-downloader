@@ -1,6 +1,15 @@
 import { expect, it } from 'vitest';
-import { bytes, dimensions, frameRate, mediaQuality, mediaQualityWithFps, taskSize, taskActions } from './task';
+import { bytes, completionTime, dimensions, frameRate, mediaQuality, mediaQualityWithFps, taskSize, taskActions } from './task';
 import { makeTask } from './test-fixtures';
+
+it('formats real completion times locally to minutes using case-sensitive tokens', () => {
+  const value = new Date(2026, 9, 18, 23, 7, 59).toISOString();
+  expect(completionTime(value)).toBe('2026-10-18 23:07');
+  expect(completionTime(value, 'YYMMDD HH:mm')).toBe('261018 23:07');
+  expect(completionTime(value, 'YYYY年MM月DD日 HH:mm')).toBe('2026年10月18日 23:07');
+  expect(completionTime(value, '')).toBe('2026-10-18 23:07');
+  for (const missing of [undefined, null, '', 'invalid']) expect(completionTime(missing)).toBe('');
+});
 
 it.each([
   [3840, 2160, '4K'], [2160, 3840, '4K'], [3840, 1600, '4K'],

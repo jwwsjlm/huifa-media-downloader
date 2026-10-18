@@ -901,6 +901,7 @@ fn preview(info: &Value, options: &DownloadOptions) -> Result<Value> {
             "subtitleLanguage",
             "subtitleFormat",
             "automaticSubtitles",
+            "skipUnavailableSubtitles",
             "embedSubtitles",
             "writeThumbnail",
             "writeDescription",

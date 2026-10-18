@@ -16,7 +16,7 @@ it('distinguishes parsing from adding tasks and reports failed additions', async
   await act(async () => finishProbe({ entries: [{ url: 'https://example.invalid/video', title: 'Demo video' }] }));
   fireEvent.click(screen.getByRole('button', { name: 'Download selected items' }));
   expect((screen.getByRole('button', { name: 'Adding to queue…' }) as HTMLButtonElement).disabled).toBe(true);
-  expect(command).toHaveBeenCalledWith('tasks.add', { urls: ['https://example.invalid/video'], options: { ...options, cookieId: 'auto', fragmentConcurrent: 4, collectionMode: 'single' }, report: true });
+  expect(command).toHaveBeenCalledWith('tasks.add', { urls: ['https://example.invalid/video'], options: { ...options, cookieId: 'auto', fragmentConcurrent: 4, skipUnavailableSubtitles: true, collectionMode: 'single' }, report: true });
   await act(async () => failAdd(new Error('Queue unavailable')));
   expect(added).toHaveBeenCalledWith(expect.objectContaining({ results: [], issues: [{ url: 'https://example.invalid/video', error: 'Error: Queue unavailable' }] }));
 });

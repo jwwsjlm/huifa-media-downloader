@@ -69,7 +69,8 @@ it('reports preference storage failures separately without disabling browser sig
   command.mockResolvedValue({ ...inactive, preferenceError: 'Disk is full' });
   const { controls } = show();
   const alert = await controls.findByRole('alert');
-  expect(alert.textContent).toContain('The last address and browser choice could not be saved: Disk is full');
+  expect(alert.textContent).toContain('The last address and browser choice could not be saved: There is not enough disk space.');
+  expect(alert.textContent).not.toContain('Disk is full');
   expect(alert.textContent).not.toContain('Cookie sync failed');
   expect((controls.getByRole('button', { name: 'Open built-in browser' }) as HTMLButtonElement).disabled).toBe(false);
 });

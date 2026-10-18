@@ -79,7 +79,8 @@ describe('task list multiple selection', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Delete selected tasks' });
     expect(transport.command.mock.calls.some(([name]) => name === 'tasks.deleteBatch')).toBe(false);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
-    await waitFor(() => expect(within(dialog).getByRole('alert').textContent).toContain('Beta: fixture media busy'));
+    await waitFor(() => expect(within(dialog).getByRole('alert').textContent).toContain('View the logs for details'));
+    expect(within(dialog).getByRole('alert').textContent).not.toContain('fixture media busy');
     expect(transport.command).toHaveBeenCalledWith('tasks.deleteBatch', { ids: ['a', 'b', 'c'], deleteFiles: false });
     expect(within(dialog).getByText('Delete 1 selected tasks? Active work stops first.')).toBeTruthy();
     await waitFor(() => expect((within(dialog).getByRole('button', { name: 'Delete' }) as HTMLButtonElement).disabled).toBe(false));

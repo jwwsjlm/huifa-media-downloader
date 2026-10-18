@@ -94,11 +94,11 @@ MCP **继承软件已保存的 Cookie、代理和下载配置**。仅将地址�
 | 输出格式与转码 | `audioFormat`、`container`、`compatibilityTarget`、`encoder`、`vrMode` |
 | 合集筛选 | `collectionOrder`、`firstN`、`playlistItems`、`dateAfter/dateBefore`、`durationMin/durationMax`、`liveFilter`；合集总入队量仍受本次 `limit` 限制 |
 | 直播与剪辑 | `liveFromStart`、`waitForLive`、`waitMin/waitMax`、`sectionStart/sectionEnd`、`splitChapters` |
-| 字幕与附件 | `subtitleLanguage/subtitleLanguages`、`automaticSubtitles`、`subtitleFormat`、`embedSubtitles`、`writeThumbnail/writeDescription/writeComments/writeInfoJson`、`embedThumbnail/embedMetadata/embedChapters` |
+| 字幕与附件 | `subtitleLanguage/subtitleLanguages`、`automaticSubtitles`、`skipUnavailableSubtitles`（默认 `true`）、`subtitleFormat`、`embedSubtitles`、`writeThumbnail/writeDescription/writeComments/writeInfoJson`、`embedThumbnail/embedMetadata/embedChapters` |
 | 速度与文件 | `fragmentConcurrent`（1–8）、`rateLimit`、`requestDelay`、`filenameTemplate`、`organizeTaskFolder`、`convertCoverJpeg`、`coverJpegQuality` |
 | SponsorBlock | `sponsorblockMode`、`sponsorblockCategories`，仅 YouTube |
 
-单条和批量始终只处理明确的视频；不会继承「整个频道/合集」行为。合集下载先固定来源的 `offset/limit` 窗口，再在这个窗口内应用筛选、源序号交集及排序（`selectionScope: range-local`）；过滤后不足本次数量也不向后补抓，`nextOffset` 仍按来源窗口继续。`waitForLive` 默认关闭，只有本次显式设为 `true` 才等待开播。字幕默认关闭；选定语言后人工优先，缺少人工轨道时按设置回退自动字幕。明确选择的画质、帧率、音轨或字幕缺失时停止该项，保留原要求，由用户调整后重试；不会静默降级。字幕正文查询没有字幕时则明确报错，不进行语音识别。
+单条和批量始终只处理明确的视频；不会继承「整个频道/合集」行为。合集下载先固定来源的 `offset/limit` 窗口，再在这个窗口内应用筛选、源序号交集及排序（`selectionScope: range-local`）；过滤后不足本次数量也不向后补抓，`nextOffset` 仍按来源窗口继续。`waitForLive` 默认关闭，只有本次显式设为 `true` 才等待开播。字幕默认关闭；选定语言后人工优先，缺少人工轨道时按设置回退自动字幕。明确选择的画质、帧率或音轨缺失时停止该项，保留原要求，由用户调整后重试；不会静默降级。`skipUnavailableSubtitles` 默认 `true`，所选字幕缺失时跳过缺失语言并继续下载；设为 `false` 才要求所有字幕语言必须满足。字幕正文查询没有字幕时则明确报错，不进行语音识别。
 
 ### 分页、评论与边界
 

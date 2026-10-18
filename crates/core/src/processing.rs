@@ -79,6 +79,7 @@ pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Resu
     task.source_info = task.media_info.take();
     task.size = None;
     task.transfer_bytes.clear();
+    task.completed_at = None;
     task.steps.clear();
     task.step_index = None;
     task.publication = None;
@@ -390,6 +391,7 @@ async fn queue_conversion_prepared(
     task.size = None;
     task.transfer_bytes.clear();
     task.created_at = chrono::Utc::now().to_rfc3339();
+    task.completed_at = None;
     task.options = options;
     task.conversion = true;
     task.destination = None;
@@ -2047,6 +2049,7 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
     task.previous_outputs.sort();
     task.previous_outputs.dedup();
     task.publication.as_mut().unwrap().committed = true;
+    task.completed_at = Some(chrono::Utc::now().to_rfc3339());
     task.stage("processing", "saving_results", None);
     let media = match app.db.complete(&task, &media) {
         Ok(media) => media,
@@ -3634,6 +3637,7 @@ mod tests {
             output_extension: "mp4".into(),
         });
         task.previous_outputs = vec![obsolete.clone()];
+        task.completed_at = Some("2026-10-18T15:24:00+00:00".into());
         task.stage("processing", "saving_results", None);
         app.db.insert_task(&task)?;
         app.db.complete(
@@ -3671,6 +3675,7 @@ mod tests {
         assert!(!backups[0].exists());
         assert!(app.db.task(&task.id)?.previous_outputs.is_empty());
         assert_eq!(app.db.media_for_task(&task.id)?.unwrap().path, target);
+        assert_eq!(app.db.task(&task.id)?.completed_at, task.completed_at);
         // Cancellation after the result commit must finish cleanup rather than restoring the backup.
         let mut interrupted = app.db.task(&task.id)?;
         write_sync(&obsolete, b"another obsolete output")?;
@@ -4042,6 +4047,10 @@ mod tests {
         let legacy: Task = serde_json::from_value(serialized)?;
         assert_eq!(legacy.kind, "media");
         assert!(legacy.files.is_empty());
+        assert!(task.completed_at.is_some());
+        let queued = queue_conversion(&app, &task.id, "libx264").await?;
+        assert!(queued["completedAt"].is_null());
+        assert!(app.db.task(&task.id)?.completed_at.is_none());
         app.shutdown().await?;
         Ok(())
     }

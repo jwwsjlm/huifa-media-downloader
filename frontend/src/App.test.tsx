@@ -20,6 +20,19 @@ beforeEach(() => {
   transport.copyTask.mockReset().mockResolvedValue(undefined); transport.result.mockReset().mockResolvedValue(undefined);
 });
 describe('live interface stability', () => {
+  it('shows completion time beside the row status using the saved format, only after completion', async () => {
+    const snapshot = makeSnapshot(); snapshot.settings.completedTimeFormat = 'YYMMDD HH:mm';
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const row = screen.getByRole('option', { name: /Alpha/ });
+    const completedAt = new Date(2026, 9, 18, 23, 7, 59).toISOString();
+    expect(row.querySelector('time')).toBeNull();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'completed', stage: 'completed', completedAt } }));
+    expect(row.querySelector('time')?.textContent).toBe(' · 261018 23:07');
+    expect(row.querySelector('time')?.dateTime).toBe(completedAt);
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'queued', completedAt: null } }));
+    expect(row.querySelector('time')).toBeNull();
+  });
   it('updates downloaded sizes through stream changes and pause, then shows the final completed file size', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     const row = within(screen.getByRole('option', { name: /Alpha/ }));
@@ -181,14 +194,15 @@ describe('live interface stability', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Downloads' }));
     expect(screen.queryByRole('option', { name: /Retained video/ })).toBeNull();
   });
-  it('offers retry and a concrete error tooltip for legacy media information', async () => {
+  it('offers retry and a concise error tooltip for legacy media information', async () => {
     const snapshot = makeSnapshot();
     snapshot.media = [{ id: 'old-media', taskId: 'old-task', title: 'Old video', filename: 'old.mp4', size: 10485760, duration: 60 }];
     transport.command.mockImplementation(async command => { if (command === 'snapshot') return snapshot; if (command === 'tasks.info') throw new Error('fixture local file is missing'); return true; });
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     fireEvent.click(screen.getAllByRole('button', { name: 'Completed' })[0]);
     const error = await screen.findByText(/Result information could not be read/);
-    expect(error.getAttribute('title')).toContain('fixture local file is missing');
+    expect(error.getAttribute('title')).toContain('result file is missing');
+    expect(error.getAttribute('title')).not.toContain('fixture');
     expect(screen.queryByRole('alert')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.info')).toHaveLength(2));
@@ -373,7 +387,7 @@ describe('live interface stability', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete task' }));
     const dialog = within(screen.getByRole('dialog')); const checkbox = dialog.getByRole('checkbox') as HTMLInputElement;
     fireEvent.click(checkbox);
-    expect((await dialog.findByRole('alert')).textContent).toContain('Unable to save preference');
+    expect((await dialog.findByRole('alert')).textContent).toContain('previous setting was kept');
     await waitFor(() => expect(checkbox.checked).toBe(false));
     fireEvent.click(dialog.getByRole('button', { name: 'Delete' }));
     await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.delete', { id: 'a', deleteFiles: false }));
@@ -620,7 +634,8 @@ describe('live interface stability', () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: urls.join('\n') } }); fireEvent.click(screen.getByRole('button', { name: 'Add downloads' }));
     expect(await screen.findByRole('heading', { name: 'Batch results' })).toBeTruthy();
-    expect(screen.getByText('2 tasks added or located, 1 issues or decisions needed.')).toBeTruthy(); expect(screen.getByText(/Unreadable source/)).toBeTruthy();
+    expect(screen.getByText('2 tasks added or located, 1 issues or decisions needed.')).toBeTruthy(); expect(screen.getByText(/View the logs for details/)).toBeTruthy();
+    expect(screen.queryByText(/Unreadable source/)).toBeNull();
     expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.add').map(([, args]) => args.urls[0])).toEqual([urls[0], urls[2]]);
     expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe(urls[1]);
   });
@@ -667,7 +682,8 @@ describe('live interface stability', () => {
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'failed', error: 'Requirements unmet: subtitles=ja' } }));
     expect(screen.queryByRole('heading', { name: 'Batch results' })).toBeNull();
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', status: 'completed', stage: 'completed' } }));
-    const report = within(await screen.findByRole('dialog')); expect(report.getByText(/Requirements unmet: subtitles=ja/)).toBeTruthy();
+    const report = within(await screen.findByRole('dialog')); expect(report.getByText(/requested subtitles are unavailable/)).toBeTruthy();
+    expect(report.queryByText(/Requirements unmet: subtitles=ja/)).toBeNull();
     fireEvent.click(report.getByRole('button', { name: 'Close' }));
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', progress: 100 } }));
     expect(screen.queryByRole('heading', { name: 'Batch results' })).toBeNull();
@@ -707,12 +723,16 @@ describe('live interface stability', () => {
     expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ downloadOptions: expect.objectContaining({ quality: 'worst', contentMode: 'audio', audioFormat: 'mp3', formatId: '', videoFormatId: '', audioFormatIds: [] }) }) });
     expect((screen.getByRole('combobox', { name: 'Quality' }) as HTMLSelectElement).value).toBe('worst');
   });
-  it('gives recovery guidance for failed downloads while keeping the diagnostic', async () => {
+  it('gives concise recovery guidance for failed downloads and keeps the raw diagnostic in logs', async () => {
+    const raw = 'yt-dlp.exe exited with code 1: Sign in to confirm you are not a bot';
+    transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'tasks.logs' ? { text: raw, start: 0, end: raw.length, total: raw.length, legacy: false } : true);
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
-    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'failed', error: 'yt-dlp.exe exited with code 1: Sign in to confirm you are not a bot' } }));
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'failed', error: raw } }));
     expect(screen.getByRole('alert').textContent).toContain('Open browser sign-in');
-    expect(screen.getByRole('alert').textContent).toContain('yt-dlp.exe exited with code 1');
+    expect(screen.getByRole('alert').textContent).not.toContain('yt-dlp.exe exited with code 1');
+    fireEvent.click(screen.getByRole('button', { name: 'View logs' }));
+    expect((await screen.findByLabelText('Task log entries')).textContent).toBe(raw);
   });
   it('keeps URL drafts, caret, filter, selected hidden task and virtual viewport during progress updates', async () => {
     render(<AppProvider><App /></AppProvider>);

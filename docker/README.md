@@ -107,9 +107,10 @@ containers and test volumes.
 
 ## Download recovery and upgrades
 
-The web host shares the desktop download workflow: explicit quality, frame rate,
-audio and subtitle requirements must be met; a failed item does not stop the rest
-of a batch. Different sources with the same output filename prompt before
+The web host shares the desktop download workflow: explicit quality, frame rate
+and audio requirements must be met. Missing requested subtitles are skipped by
+default; disable **Continue when subtitles are unavailable** to require them.
+A failed item does not stop the rest of a batch. Different sources with the same output filename prompt before
 transfer, with a second confirmation before replacement. Queue priority persists;
 live capture offers **Stop live capture and save** separately from cancellation.
 

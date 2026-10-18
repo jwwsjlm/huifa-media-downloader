@@ -582,6 +582,7 @@ impl App {
         task.destination = None;
         task.steps.clear();
         task.step_index = None;
+        task.completed_at = None;
         task.error = None;
         task.warnings.clear();
         task.stage("queued", "queued", None);
@@ -771,6 +772,7 @@ impl App {
                         error: None,
                         warnings: vec![],
                         created_at: chrono::Utc::now().to_rfc3339(),
+                        completed_at: None,
                         options: frozen_options,
                         download_dir: Some(self.download_directory()),
                         output_path: previous.as_ref().and_then(|task| task.output_path.clone()),
@@ -1265,6 +1267,17 @@ impl App {
         if let Some(options) = object.get("downloadOptions") {
             DownloadOptions::parse(options.clone())?;
         }
+        if let Some(format) = object.get("completedTimeFormat") {
+            let format = format
+                .as_str()
+                .context("Completion date format must be text")?;
+            ensure!(
+                !format.trim().is_empty()
+                    && format.len() <= 80
+                    && !format.chars().any(char::is_control),
+                "Completion date format must contain between 1 and 80 characters without control characters"
+            );
+        }
         if let Some(options) = object
             .get_mut("downloadOptions")
             .and_then(Value::as_object_mut)
@@ -1641,7 +1654,7 @@ mod tests {
             tool_dir: None,
         };
         let app = App::open(config.clone()).await?;
-        let draft = json!({"uiLanguage":"en-US","appearanceTheme":"light","downloadOptions":{"fragmentConcurrent":6}});
+        let draft = json!({"uiLanguage":"en-US","appearanceTheme":"light","completedTimeFormat":"YYMMDD HH:mm","downloadOptions":{"fragmentConcurrent":6}});
         app.command("settings.save", json!({"settings":draft}))
             .await?;
         let saved = app
@@ -1670,6 +1683,21 @@ mod tests {
         assert_eq!(saved["appearanceTheme"], "dark");
         assert_eq!(saved["downloadOptions"]["fragmentConcurrent"], 6);
         assert_eq!(saved["mcp"]["autoStart"], true);
+        assert_eq!(saved["completedTimeFormat"], "YYMMDD HH:mm");
+        for format in [json!(""), json!("YY\nMM"), json!("Y".repeat(81)), json!(42)] {
+            assert!(
+                app.command(
+                    "settings.save",
+                    json!({"settings":{"completedTimeFormat":format}})
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(
+            app.public_settings()?["completedTimeFormat"],
+            "YYMMDD HH:mm"
+        );
         app.command(
             "settings.preferences",
             json!({"preferences":{"deleteMediaOnTaskDelete":false}}),
@@ -2049,6 +2077,7 @@ mod tests {
             error: None,
             warnings: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
             options: DownloadOptions::default(),
             download_dir: None,
             output_path: None,
@@ -2261,13 +2290,15 @@ mod tests {
         let result_path = app.config.download_dir.join("旧标题 [abcdef12345].mkv");
         std::fs::write(&result_path, b"old valid media")?;
         let mut task = app.db.task(id)?;
-        task.status = "completed".into();
+        task.stage("completed", "completed", Some(100.0));
+        assert!(task.completed_at.is_some());
         task.output_path = Some(result_path.clone());
         app.db.save_task(&task)?;
         let restarted=app.command("tasks.add",json!({"urls":["https://youtu.be/abcdef12345"],"options":{"quality":"worst"},"report":true})).await?;
         assert_eq!(restarted["ids"][0], id);
         assert_eq!(restarted["results"][0]["action"], "restarted");
         assert_eq!(app.db.task(id)?.options.quality, "worst");
+        assert!(app.db.task(id)?.completed_at.is_none());
         assert_eq!(app.db.tasks()?.len(), 1);
         app.stop_task(id, "cancelled").await?;
         assert_eq!(std::fs::read(result_path)?, b"old valid media");

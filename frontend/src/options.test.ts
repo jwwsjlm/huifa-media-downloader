@@ -2,6 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { automaticQuality, commandOptions, defaults, optionGroups, optionLabel } from './options';
 
 describe('download option boundary', () => {
+  it('continues without unavailable subtitles by default and preserves an explicit opt-out', () => {
+    expect(defaults.skipUnavailableSubtitles).toBe(true);
+    expect(commandOptions({ subtitleLanguage: 'zh-Hans' }).skipUnavailableSubtitles).toBe(true);
+    expect(commandOptions({ ...defaults, skipUnavailableSubtitles: false }).skipUnavailableSubtitles).toBe(false);
+  });
   it('defaults to the video title without appending a task or source id', () => {
     expect(defaults.filenameTemplate).toBe('%(title)s.%(ext)s');
     expect(commandOptions(defaults).filenameTemplate).toBe('%(title)s.%(ext)s');

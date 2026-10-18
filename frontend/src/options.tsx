@@ -37,13 +37,13 @@ export const defaults: DownloadOptions = {
   contentMode: 'video', quality: 'best', audioFormat: 'best', audioTrack: 'default', container: 'auto', videoFps: 'best', sourceVideoCodec: 'auto', vrMode: 'any', compatibilityTarget: 'auto',
   collectionMode: 'select', collectionOrder: 'original', firstN: 0, playlistItems: '', dateAfter: '', dateBefore: '', durationMin: 0, durationMax: 0,
   liveFilter: 'videos', liveFromStart: false, waitForLive: false, waitMin: 30, waitMax: 120, sectionStart: '', sectionEnd: '', splitChapters: false,
-  subtitleLanguage: 'none', subtitleFormat: 'srt', automaticSubtitles: true, embedSubtitles: false, writeThumbnail: true, writeDescription: false, writeComments: false, writeInfoJson: false, embedMetadata: false, embedChapters: false, embedThumbnail: false,
+  subtitleLanguage: 'none', subtitleFormat: 'srt', automaticSubtitles: true, skipUnavailableSubtitles: true, embedSubtitles: false, writeThumbnail: true, writeDescription: false, writeComments: false, writeInfoJson: false, embedMetadata: false, embedChapters: false, embedThumbnail: false,
   sponsorblockMode: 'off', sponsorblockCategories: ['sponsor'], rateLimit: '', encoder: 'original', organizeTaskFolder: true, filenameTemplate: '%(title)s.%(ext)s',
   convertCoverJpeg: true, coverJpegQuality: 90, prependCoverEnabled: false, prependCoverFrames: 3, fragmentConcurrent: 4, requestDelay: 0,
 };
 export function commandOptions(options: DownloadOptions): DownloadOptions {
   const { proxyConfigured: _proxyConfigured, ...value } = options;
-  return { ...value, cookieId: 'auto', fragmentConcurrent: Math.min(8, Number(value.fragmentConcurrent ?? 4)) };
+  return { ...value, cookieId: 'auto', skipUnavailableSubtitles: value.skipUnavailableSubtitles ?? true, fragmentConcurrent: Math.min(8, Number(value.fragmentConcurrent ?? 4)) };
 }
 export const optionGroups: { key: string; title: [string, string]; fields: OptionField[] }[] = [
   { key: 'media', title: ['媒体格式与处理', 'Media format and processing'], fields: [
@@ -51,6 +51,7 @@ export const optionGroups: { key: string; title: [string, string]; fields: Optio
     { key: 'quality', zh: '画质选择', en: 'Quality selection', choices: qualityChoices },
     { key: 'subtitleLanguage', zh: '字幕语言', en: 'Subtitle language', choices: [['none', '不下载字幕', 'No subtitles'], ...choices(['zh-Hans', 'zh-Hant', 'en', 'ja', 'ko', 'es', 'fr', 'de', 'ru', 'pt', 'ar', 'hi', 'id', 'vi', 'th', 'tr']), ['all', '全部语言', 'All languages']] },
     { key: 'automaticSubtitles', zh: '字幕来源', en: 'Subtitle source', type: 'boolean', choices: [['true', '人工优先，缺失用自动', 'Manual first, automatic fallback'], ['false', '仅人工字幕', 'Manual subtitles only']] },
+    { key: 'skipUnavailableSubtitles', zh: '无字幕时继续下载', en: 'Continue when subtitles are unavailable', type: 'check' },
     { key: 'subtitleFormat', zh: '字幕文件格式', en: 'Subtitle file format', choices: choices(['srt', 'best', 'vtt', 'ass', 'lrc']) },
     { key: 'embedSubtitles', zh: '嵌入字幕', en: 'Embed subtitles', type: 'check' },
     { key: 'audioFormat', zh: '音频输出格式', en: 'Audio output format', choices: choices(['best', 'aac', 'alac', 'flac', 'm4a', 'mp3', 'opus', 'vorbis', 'wav']) },
@@ -89,7 +90,7 @@ export const optionGroups: { key: string; title: [string, string]; fields: Optio
   ] },
 ];
 export const OptionsForm = memo(function OptionsForm({ options, change, t, quick = false }: { options: DownloadOptions; change: (key: string, value: OptionValue) => void; t: Translate; quick?: boolean }) {
-  const groups = optionGroups.map(group => ({ ...group, fields: group.fields.filter(field => !quick || ['contentMode', 'quality', 'audioFormat', 'container', 'encoder', 'collectionMode', 'subtitleLanguage', 'automaticSubtitles', 'embedSubtitles', 'subtitleFormat', 'prependCoverEnabled'].includes(field.key)) })).filter(group => group.fields.length);
+  const groups = optionGroups.map(group => ({ ...group, fields: group.fields.filter(field => !quick || ['contentMode', 'quality', 'audioFormat', 'container', 'encoder', 'collectionMode', 'subtitleLanguage', 'automaticSubtitles', 'skipUnavailableSubtitles', 'embedSubtitles', 'subtitleFormat', 'prependCoverEnabled'].includes(field.key)) })).filter(group => group.fields.length);
   return <>{groups.map(group => <details key={group.key} className="settings-fold panel" open={group.key === 'media'}><summary><strong>{t(...group.title)}</strong></summary><div className="form-grid">
     {group.fields.map(field => field.key === 'quality' ? <Field key={field.key} label={t(field.zh, field.en)}><QualitySelect options={options} change={quality => { for (const [key, value] of Object.entries(automaticQuality(options, quality))) change(key, value); }} t={t} /></Field> : <OptionControl key={field.key} field={field} value={field.key === 'subtitleLanguage' && Array.isArray(options.subtitleLanguages) && options.subtitleLanguages.length ? options.subtitleLanguages.join(',') : options[field.key] ?? defaults[field.key]} change={(key, value) => { if (key === 'subtitleLanguage') change('subtitleLanguages', []); change(key, value); }} t={t} />)}
   </div>{group.key === 'sponsor' && !quick && <div className="checkbox-grid">{['sponsor', 'intro', 'outro', 'selfpromo', 'interaction', 'preview', 'music_offtopic', 'filler'].map(category => <Check key={category} label={optionLabel(category, t)} checked={Array.isArray(options.sponsorblockCategories) && options.sponsorblockCategories.includes(category)} onChange={event => { const values = new Set(Array.isArray(options.sponsorblockCategories) ? options.sponsorblockCategories : []); event.target.checked ? values.add(category) : values.delete(category); change('sponsorblockCategories', [...values]); }} />)}</div>}</details>)}</>;

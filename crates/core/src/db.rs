@@ -11,9 +11,13 @@ pub(crate) struct Database {
     connection: Mutex<Connection>,
 }
 
-fn task_record(state: &str, media: Option<&str>) -> Result<Task> {
+fn task_record(state: &str, media: Option<&str>, completed: Option<String>) -> Result<Task> {
     let mut task: Task = serde_json::from_str(state)?;
     if matches!(task.status.as_str(), "completed" | "retained") {
+        if task.completed_at.is_none() {
+            task.completed_at =
+                completed.filter(|time| chrono::DateTime::parse_from_rfc3339(time).is_ok());
+        }
         if let Some(record) = media {
             let media: Media = serde_json::from_str(record)?;
             task.size = Some(media.size);
@@ -63,24 +67,28 @@ impl Database {
     }
     pub fn tasks_including_retained(&self) -> Result<Vec<Task>> {
         let db = self.connection.lock().unwrap();
-        let mut query = db.prepare("SELECT tasks.state,media.record FROM tasks LEFT JOIN media ON media.task_id=tasks.id ORDER BY tasks.rowid DESC")?;
+        let mut query = db.prepare("SELECT tasks.state,media.record,(SELECT timestamp FROM task_logs WHERE task_id=tasks.id AND message LIKE 'Task status: completed; stage: %' ORDER BY seq DESC LIMIT 1) FROM tasks LEFT JOIN media ON media.task_id=tasks.id ORDER BY tasks.rowid DESC")?;
         query
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             })?
             .map(|r| {
-                let (state, media) = r?;
-                task_record(&state, media.as_deref())
+                let (state, media, completed) = r?;
+                task_record(&state, media.as_deref(), completed)
             })
             .collect()
     }
     pub fn task(&self, id: &str) -> Result<Task> {
         let db = self.connection.lock().unwrap();
-        let (state, media): (String, Option<String>) = db
-            .query_row("SELECT tasks.state,media.record FROM tasks LEFT JOIN media ON media.task_id=tasks.id WHERE tasks.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?)))
+        let (state, media, completed): (String, Option<String>, Option<String>) = db
+            .query_row("SELECT tasks.state,media.record,(SELECT timestamp FROM task_logs WHERE task_id=tasks.id AND message LIKE 'Task status: completed; stage: %' ORDER BY seq DESC LIMIT 1) FROM tasks LEFT JOIN media ON media.task_id=tasks.id WHERE tasks.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
             .optional()?
             .context("Task does not exist")?;
-        task_record(&state, media.as_deref())
+        task_record(&state, media.as_deref(), completed)
     }
     pub fn insert_task(&self, task: &Task) -> Result<()> {
         let mut db = self.connection.lock().unwrap();
@@ -419,6 +427,31 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_completion_time_uses_only_recorded_completion_events() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.stage("completed", "completed", Some(100.0));
+        task.completed_at = None;
+        db.insert_task(&task)?;
+        let time = "2026-10-18T15:25:00+00:00";
+        db.connection.lock().unwrap().execute(
+            "UPDATE task_logs SET timestamp=?1 WHERE task_id=?2",
+            params![time, task.id],
+        )?;
+        assert_eq!(db.task(&task.id)?.completed_at.as_deref(), Some(time));
+        assert_eq!(db.tasks()?[0].completed_at.as_deref(), Some(time));
+        db.connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM task_logs WHERE task_id=?1", [&task.id])?;
+        assert!(db.task(&task.id)?.completed_at.is_none());
+        task.stage("queued", "queued", None);
+        db.save_task(&task)?;
+        assert!(db.task(&task.id)?.completed_at.is_none());
+        Ok(())
+    }
     #[test]
     fn legacy_completed_task_sizes_follow_media_without_reading_files() -> Result<()> {
         let temp = tempfile::tempdir()?;

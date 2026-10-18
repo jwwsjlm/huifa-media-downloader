@@ -921,6 +921,7 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         error: None,
         warnings: vec![],
         created_at: chrono::Utc::now().to_rfc3339(),
+        completed_at: None,
         options,
         download_dir: Some(app.download_directory()),
         output_path: None,

@@ -4,6 +4,7 @@ export function explainError(message: string, t: Translate): string {
   const missing = message.match(/^Subtitles unavailable for (.+)\. Video download will continue without these subtitles\.$/);
   if (missing) return t(`没有 ${missing[1]} 字幕，视频将继续下载。`, `Subtitles are unavailable for ${missing[1]}. The video will continue downloading.`);
   const hints: [RegExp, string, string][] = [
+    [/Requirements unmet: subtitles=|Requested subtitles.*unavailable/i, '来源没有所选字幕。可在“调整要求重试”中关闭字幕，或开启“无字幕时继续下载”。', 'The requested subtitles are unavailable. Disable subtitles or enable Continue when subtitles are unavailable under Adjust requirements and retry.'],
     [/Requirements unmet:/i, '来源不满足明确的画质、帧率、音轨或字幕要求，已停止此任务。选择“调整要求重试”，由你决定是否放宽。', 'The source does not meet the explicit quality, frame-rate, audio-track, or subtitle requirements. This task stopped. Choose Adjust requirements and retry to decide what to relax.'],
     [/liveFilter is set to videos/i, '当前方案仅下载非直播视频，这个来源正在直播或等待开播。请在“快速选项 → 直播筛选”选择“全部内容”，再重新添加链接。', 'This plan excludes live and upcoming streams. Under Quick options → Live stream filter, select All content and add the link again.'],
     [/liveFilter is set to live/i, '当前方案仅下载直播，这个来源是普通视频或已结束的直播回放。请将“直播筛选”改为“全部内容”，再重新添加链接。', 'This plan only includes live streams. The source is a regular video or finished recording. Select All content under Live stream filter and add the link again.'],
@@ -32,7 +33,7 @@ export function explainError(message: string, t: Translate): string {
     [/incompatible with required application options/i, '此 yt-dlp 版本不支持应用所需参数，已保留原组件。请选择更新的官方版本。', 'This yt-dlp release does not support the required options. The installed component was preserved; choose a newer official release.'],
     [/checksum mismatch/i, '工具或下载包完整性校验失败，已停止执行。请重新下载组件；旧任务需要恢复其原工具版本，或重新添加链接创建新任务。', 'Integrity verification failed and execution stopped. Download the component again; existing tasks need their original tools restored, or add the link as a new task.'],
     [/Runtime download failed/i, '组件下载失败。请检查所选 GitHub / CDN 来源的网络连接，或切换下载来源后重试。', 'The component download failed. Check connectivity to the selected GitHub / CDN source, or switch download sources and retry.'],
-    [/runtime.*(?:github|download failed)|connect to github/i, '组件更新需要连接 GitHub，不读取“下载代理”设置。请检查 GitHub 网络连接后重试。', 'Runtime updates require access to GitHub and do not use the download proxy setting. Check GitHub connectivity and retry.'],
+    [/runtime.*(?:github|download failed)|connect to github/i, '组件更新连接 GitHub 失败。请检查网络和已保存的下载代理后重试。', 'The runtime update could not connect to GitHub. Check the network and saved download proxy, then retry.'],
     [/HTTP(?: Error)? 429|too many requests/i, '来源网站限制了当前出口的请求。请稍后重试；可在网络设置中增大请求间隔后重新添加链接。', 'The source site has limited requests from this connection. Retry later, or increase the request delay in network settings and add the link again.'],
     [/Fresh cookies(?: \(not necessarily logged in\))? are needed/i, '来源网站需要较新的 Cookie，不一定需要登录。请在“网络与 Cookie”的登录浏览器中重新打开目标网页，等待 Cookie 自动同步后重新添加链接；若仍报错，可能是提取器或网站限制。', 'The source site needs fresh cookies, which do not necessarily require sign-in. Under Network, reopen the target webpage in the login browser, let cookies sync automatically, then add the link again. If it still fails, this may be an extractor or site limitation.'],
     [/confirm.*bot|sign[ -]?in|logged[ -]in|login required|authentication required/i, '来源网站要求登录或验证。请在“网络与 Cookie”打开浏览器登录，Cookie 会自动同步，再重新添加链接；已有任务保留原身份。', 'The source site requires sign-in or verification. Open browser sign-in under Network; cookies sync automatically. Add the link again; existing tasks keep their original credentials.'],
@@ -40,8 +41,30 @@ export function explainError(message: string, t: Translate): string {
     [/Selected format .*no longer available|No (?:downloadable|video|audio).*format|No audio stream|Requested subtitles.*unavailable/i, '当前视频没有符合方案的格式或字幕。请重新解析，并调整画质、格式或字幕选择。', 'The video has no matching format or subtitles. Read its formats again and adjust quality, format, or subtitle choices.'],
     [/no such option|unrecognized (?:option|argument)/i, '当前工具不支持应用所需参数。请更新运行时组件后重新添加链接；Docker 需更新镜像。', 'The tool does not support the required options. Update runtime components and add the link again; Docker installations require an updated image.'],
     [/is not installed|Cannot start (?:yt-dlp|ffmpeg|ffprobe|deno|qjs)/i, '运行时组件缺失或无法启动。请在“工具与更新”检查或重新安装组件；Docker 需检查镜像内组件。', 'A runtime component is missing or cannot start. Check or reinstall it under Tools & updates; Docker installations must check the image components.'],
-    [/timed? ?out|timeout|connection refused|unable to download webpage/i, '连接来源网站失败。请检查网络和下载代理后重试。', 'Connection to the source site failed. Check the network and download proxy, then retry.'],
+    [/timed? ?out|timeout|connection refused|connection reset|unable to download webpage|SSL|TLS|unexpected EOF|EOF occurred/i, '连接来源网站失败。请检查网络和下载代理后重试。', 'Connection to the source site failed. Check the network and download proxy, then retry.'],
+    [/Insufficient disk space|No space left on device|disk (?:is )?full/i, '磁盘可用空间不足。请清理空间，或修改下载目录、处理临时目录后重试。', 'There is not enough disk space. Free space or change the download or processing folder, then retry.'],
+    [/not writable|Permission denied|Access is denied/i, '无法写入保存目录。请检查目录权限，或选择其他目录后重试。', 'The folder is not writable. Check its permissions or choose a different folder, then retry.'],
+    [/local file is missing|result file.*(?:missing|not found)/i, '结果文件不存在。请确认文件未被移动或删除，再重试读取。', 'The result file is missing. Check whether it was moved or deleted, then retry reading it.'],
+    [/Unable to save preference/i, '未能保存选项，已保留原设置。请稍后重试。', 'The preference could not be saved. The previous setting was kept. Please retry.'],
+    [/Destination changed|Another active task uses this filename|Confirm replacing these existing files/i, '保存位置已有文件或正在被其他任务使用。请重新确认同名文件的处理方式，或改名保存。', 'The destination has changed or is used by another task. Confirm how to handle existing files again, or save with a different name.'],
+    [/Cannot read the clipboard\. Paste the links manually\./i, '无法读取剪贴板，请手动粘贴链接。', 'Cannot read the clipboard. Paste the links manually.'],
+    [/Cookie file must be at most 2 MiB/i, 'Cookie 文件不能超过 2 MiB。', 'Cookie file must be at most 2 MiB.'],
+    [/Image must be at most 25 MiB/i, '图片不能超过 25 MiB。', 'Image must be at most 25 MiB.'],
+    [/Add at most 1000 URLs at once/i, '一次最多添加 1000 个链接。', 'Add at most 1000 URLs at once.'],
+    [/No HTTP \/ HTTPS download links found|Invalid URL|Only HTTP and HTTPS media URLs|Enter (?:a public |an? )?HTTP \/ HTTPS|URL cannot include login credentials/i, '请输入有效的 HTTP / HTTPS 链接，且不要包含登录凭据。', 'Enter valid HTTP / HTTPS URLs without login credentials.'],
+    [/Section end must follow start/i, '片段结束时间必须晚于开始时间。', 'The section end must follow its start.'],
+    [/Duration range is reversed|Invalid duration filter|Invalid timestamp/i, '请输入有效的时长或时间范围，结束时间不能早于开始时间。', 'Enter a valid duration or time range; its end must not precede its start.'],
+    [/Invalid date:/i, '请输入有效日期，例如 2026-10-18。', 'Enter a valid date, for example 2026-10-18.'],
+    [/Completion date format must/i, '完成时间格式须为 1–80 个字节的文本，且不能包含换行等控制字符。', 'The completion time format must be 1–80 bytes without control characters.'],
+    [/Filename template (?:must be a filename|supports title)|Invalid output filename/i, '请输入有效文件名，不要包含目录或不支持的占位符。', 'Enter a valid filename without directories or unsupported placeholders.'],
+    [/Select subtitle languages before embedding subtitles/i, '嵌入字幕前，请先选择字幕语言。', 'Select subtitle languages before embedding subtitles.'],
+    [/Invalid rate limit|Unsupported proxy scheme/i, '网络设置无效。请检查速度限制或代理地址后重试。', 'The network settings are invalid. Check the speed limit or proxy URL, then retry.'],
+    [/^Invalid \w+:|^Invalid (?:live wait interval|playlist items|format ID|subtitle language|SponsorBlock category)$|^Manual mode requires|^Select at least one SponsorBlock category|^(?:Cover frames|Fragment concurrency|JPEG quality|Request delay) must be|^firstN is too large/i, '下载设置无效，请检查所选选项和输入范围后重试。', 'The download settings are invalid. Check the selected options and input ranges, then retry.'],
   ];
-  const hint = hints.find(([pattern]) => pattern.test(message));
-  return hint ? `${t(hint[1], hint[2])} ${t('详细错误：', 'Details: ')}${message}` : message;
+  const reason = message.replace(/\[debug\][^\r\n]*/gi, '');
+  const hint = hints.find(([pattern]) => pattern.test(reason));
+  if (hint) return t(hint[1], hint[2]);
+  const summary = message.split(/\r?\n|详细错误[：:]|Details:/i)[0].trim();
+  if (summary.length <= 240 && /[\u4e00-\u9fff]/.test(summary) && !/\\|https?:\/\/|\[debug\]|Traceback|Exception|exited with code|failed to|error:/i.test(summary)) return summary;
+  return t('操作未完成，请查看日志了解详情。', 'The operation could not be completed. View the logs for details.');
 }

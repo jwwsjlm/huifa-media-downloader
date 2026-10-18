@@ -73,6 +73,8 @@ pub struct DownloadOptions {
     pub subtitle_language: String,
     pub subtitle_languages: Vec<String>,
     pub automatic_subtitles: bool,
+    #[serde(alias = "skip_unavailable_subtitles")]
+    pub skip_unavailable_subtitles: bool,
     #[serde(alias = "embed_subtitles")]
     pub embed_subtitles: bool,
     #[serde(alias = "write_thumbnail")]
@@ -149,6 +151,7 @@ impl Default for DownloadOptions {
             subtitle_language: "none".into(),
             subtitle_languages: vec![],
             automatic_subtitles: true,
+            skip_unavailable_subtitles: true,
             embed_subtitles: false,
             write_thumbnail: true,
             write_description: false,
@@ -556,6 +559,8 @@ pub(crate) struct Task {
     #[serde(default)]
     pub warnings: Vec<String>,
     pub created_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
     pub options: DownloadOptions,
     #[serde(default)]
     pub download_dir: Option<PathBuf>,
@@ -597,7 +602,7 @@ impl Task {
             .flatten();
         json!({"id":self.id,"kind":self.kind,"files":self.files,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,"priority":self.priority,"live":self.live,"conversion":self.conversion,"destinationConflict":self.destination.as_ref().and_then(|d| d.public_conflict()),
             "progress":self.progress,"stageProgress":self.stage_progress,"stageIndeterminate":self.stage_indeterminate,"stepIndex":self.step_index,"stepCount":self.steps.len(),
-            "speed":self.speed,"eta":self.eta,"size":self.size,"downloadedBytes":downloaded_bytes,"totalBytes":total_bytes,"totalBytesEstimated":total_bytes.is_some() && self.transfer_bytes.iter().any(|item| item.estimated),"sourceInfo":self.source_info,"mediaInfo":self.media_info,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
+            "speed":self.speed,"eta":self.eta,"size":self.size,"downloadedBytes":downloaded_bytes,"totalBytes":total_bytes,"totalBytesEstimated":total_bytes.is_some() && self.transfer_bytes.iter().any(|item| item.estimated),"sourceInfo":self.source_info,"mediaInfo":self.media_info,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"completedAt":self.completed_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
             "outputPath":self.output_path.as_ref().and_then(|p|p.file_name()).map(|p|p.to_string_lossy())})
     }
     pub fn stage(&mut self, status: &str, stage: &str, percent: Option<f64>) {
@@ -611,6 +616,8 @@ impl Task {
         self.speed = None;
         self.eta = None;
         self.progress = if status == "completed" {
+            self.completed_at
+                .get_or_insert_with(|| chrono::Utc::now().to_rfc3339());
             100.0
         } else {
             percent.unwrap_or(0.0).min(99.0)
@@ -849,6 +856,38 @@ pub(crate) fn validate_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completion_time_is_recorded_once_and_old_tasks_remain_unknown() -> Result<()> {
+        let mut task = crate::tests::paused_task(Default::default());
+        let mut legacy = serde_json::to_value(&task)?;
+        legacy.as_object_mut().unwrap().remove("completedAt");
+        let old: Task = serde_json::from_value(legacy)?;
+        assert!(old.completed_at.is_none());
+        assert!(old.public()["completedAt"].is_null());
+        task.stage("completed", "completed", Some(100.0));
+        let completed = task.completed_at.clone().unwrap();
+        chrono::DateTime::parse_from_rfc3339(&completed)?;
+        task.stage("paused", "saving_results", None);
+        task.stage("completed", "completed", Some(100.0));
+        assert_eq!(task.public()["completedAt"], completed);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_subtitle_policy_defaults_on_and_preserves_explicit_false() -> Result<()> {
+        assert!(
+            DownloadOptions::parse(json!({"subtitleLanguage":"zh-Hans"}))?
+                .skip_unavailable_subtitles
+        );
+        let options = DownloadOptions::parse(json!({"skipUnavailableSubtitles":false}))?;
+        assert!(!options.skip_unavailable_subtitles);
+        assert!(
+            !serde_json::from_value::<DownloadOptions>(serde_json::to_value(options)?)?
+                .skip_unavailable_subtitles
+        );
+        assert!(DownloadOptions::parse(json!({"skipUnavailableSubtitles":"true"})).is_err());
+        Ok(())
+    }
     #[test]
     fn finished_live_recordings_are_downloadable_as_regular_videos() {
         let options = DownloadOptions::parse(json!({"liveFilter":"videos"})).unwrap();

@@ -608,6 +608,7 @@ fn download_options_schema() -> Value {
         "sectionStart":text(24),"sectionEnd":text(24),"splitChapters":boolean,
         "subtitleFormat":choice("best vtt srt ass lrc"),"subtitleLanguage":text(40),
         "subtitleLanguages":{"type":"array","maxItems":100,"items":text(40)},"automaticSubtitles":boolean,
+        "skipUnavailableSubtitles":{"type":"boolean","default":true},
         "embedSubtitles":boolean,"writeThumbnail":boolean,"writeDescription":boolean,"writeComments":boolean,"writeInfoJson":boolean,
         "embedMetadata":boolean,"embedChapters":boolean,"embedThumbnail":boolean
     });
@@ -1387,6 +1388,31 @@ mod tests {
             .is_err()
         );
         assert!(validate("start_download",&json!({"url":"https://example.com/","options":{"audioFormat":"flac","sectionStart":"2","fragmentConcurrent":8}})).is_ok());
+        assert!(
+            validate(
+                "start_download",
+                &json!({"url":"https://example.com/","options":{"skipUnavailableSubtitles":false}})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                "start_download",
+                &json!({"url":"https://example.com/","options":{"skipUnavailableSubtitles":"true"}})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            download_options(
+                json!({}),
+                &json!({"options":{"skipUnavailableSubtitles":false}})
+            )?["skipUnavailableSubtitles"],
+            false
+        );
+        assert_eq!(
+            download_options(json!({}), &json!({}))?["skipUnavailableSubtitles"],
+            true
+        );
         let saved = json!({"quality":"worst","fragmentConcurrent":32,"waitForLive":true,"collectionMode":"all","cookieId":"private","proxy":"http://private","processingTempDir":"C:/private","formatId":"old","videoFormatId":"old","audioFormatIds":["old"]});
         let merged = download_options(
             saved.clone(),

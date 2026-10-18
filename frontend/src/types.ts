@@ -27,6 +27,7 @@ export interface Task {
   kind?: 'media' | 'assets';
   files?: { filename: string; kind: string; size: number }[];
   createdAt: string;
+  completedAt?: string | null;
   options: DownloadOptions;
   outputPath?: string;
   size?: number | string | null;

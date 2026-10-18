@@ -5,7 +5,7 @@ import { localeFor, translate, type Translate } from './i18n';
 import { Badge, Button, Check, Empty, Field, Heading, Icon, Modal, Thumbnail } from './components';
 import { VirtualList } from './VirtualList';
 import { OptionsForm, QualitySelect, automaticQuality, commandOptions, defaults, encoders, optionLabel, qualityLabel } from './options';
-import { bytes, dimensions, duration, frameRate, mediaQuality, mediaQualityWithFps, stageLabel, stepLabel, statusLabel, statusTone, taskActions, taskProgress, taskSize } from './task';
+import { bytes, completionTime, dimensions, duration, frameRate, mediaQuality, mediaQualityWithFps, stageLabel, stepLabel, statusLabel, statusTone, taskActions, taskProgress, taskSize } from './task';
 import { SettingsPage } from './SettingsPage';
 import { McpSettings } from './McpSettings';
 import { AddDialog } from './AddDialog';
@@ -207,11 +207,12 @@ const Composer = memo(function Composer({ urls, options, change, changeQuality, 
   </form>;
 });
 function Progress({ task }: { task: Task }) { const progress = taskProgress(task); return <div className={`progress ${progress.indeterminate ? 'indeterminate' : ''}`} role="progressbar" aria-label={task.stage || task.status} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.indeterminate ? undefined : progress.value}><span style={{ width: `${progress.value}%` }} /></div>; }
-const TaskRow = memo(function TaskRow({ task, mediaId, t }: { task: Task; mediaId?: string; t: Translate }) {
+const TaskRow = memo(function TaskRow({ task, mediaId, timeFormat, t }: { task: Task; mediaId?: string; timeFormat?: string; t: Translate }) {
   const progress = taskProgress(task);
   const quality = task.status === 'completed' ? mediaQualityWithFps(task.mediaInfo) : '—';
   const size = taskSize(task, t);
-  return <div className="task-row-content task-columns" title={task.title || task.url}><div className="task-name"><Thumbnail url={task.hasThumbnail ? host.assetUrl(task.id, 'taskThumbnail') : mediaId ? host.assetUrl(mediaId, 'thumbnail') : undefined} /><div className="row-main"><strong className="truncate">{task.title || t('等待获取媒体信息', 'Waiting for media information')}</strong><small className={`task-status ${statusTone(task.status)}`}>{statusLabel(task.status, t)}</small></div></div><div className="task-stage"><div className="task-stage-label"><span className="truncate" title={quality === '—' ? undefined : `${quality} · ${dimensions(task.mediaInfo)}`}>{stepLabel(task)}{stageLabel(task.stage, task.status, t)}{quality !== '—' && <> · {quality}</>}</span><small>{progress.indeterminate ? '—' : `${progress.value.toFixed(1)}%`}</small></div><Progress task={task} /></div><span className="task-speed truncate">{typeof task.speed === 'number' ? `${bytes(task.speed)}/s` : task.speed || '—'}</span><span className="task-eta truncate">{duration(task.eta)}</span><span className="task-size" title={size.title}><span>{size.value}</span>{size.detail && <small>{size.detail}</small>}</span></div>;
+  const completed = ['completed', 'retained'].includes(task.status) ? completionTime(task.completedAt, timeFormat) : '';
+  return <div className="task-row-content task-columns" title={task.title || task.url}><div className="task-name"><Thumbnail url={task.hasThumbnail ? host.assetUrl(task.id, 'taskThumbnail') : mediaId ? host.assetUrl(mediaId, 'thumbnail') : undefined} /><div className="row-main"><strong className="truncate">{task.title || t('等待获取媒体信息', 'Waiting for media information')}</strong><small className={`task-status truncate ${statusTone(task.status)}`}>{statusLabel(task.status, t)}{completed && <time className="task-completed-time" dateTime={task.completedAt!} title={completionTime(task.completedAt)} aria-label={t('完成时间', 'Completed at')}> · {completed}</time>}</small></div></div><div className="task-stage"><div className="task-stage-label"><span className="truncate" title={quality === '—' ? undefined : `${quality} · ${dimensions(task.mediaInfo)}`}>{stepLabel(task)}{stageLabel(task.stage, task.status, t)}{quality !== '—' && <> · {quality}</>}</span><small>{progress.indeterminate ? '—' : `${progress.value.toFixed(1)}%`}</small></div><Progress task={task} /></div><span className="task-speed truncate">{typeof task.speed === 'number' ? `${bytes(task.speed)}/s` : task.speed || '—'}</span><span className="task-eta truncate">{duration(task.eta)}</span><span className="task-size" title={size.title}><span>{size.value}</span>{size.detail && <small>{size.detail}</small>}</span></div>;
 });
 function Downloads({ state, dispatch, options, changeQuality, add, select, action, bulkDelete, quick, run, t, adding, cancelAdding, clipboard }: { state: AppState; dispatch: Dispatch<Action>; options: DownloadOptions; changeQuality: (quality: string) => void; add: (urls: string[]) => void; select: (id: string) => void; action: (task: Task, action: string) => void; bulkDelete: (ids: string[]) => void; quick: () => void; run: Run; t: Translate; adding: string; cancelAdding: () => void; clipboard: () => void }) {
   const { view, tasks } = state;
@@ -232,7 +233,8 @@ function Downloads({ state, dispatch, options, changeQuality, add, select, actio
   useEffect(() => { const visible = new Set(ids); setSelection(current => { const next = current.filter(id => visible.has(id)); return next.length === current.length ? current : next; }); }, [ids]);
   useEffect(() => { if (context && !ids.includes(context.id)) closeContext(); }, [context, ids, closeContext]);
   const hidden = useMemo(() => !ids.includes(selected), [ids, selected]);
-  const row = useCallback((id: string) => <TaskRow task={tasks[id]} mediaId={state.mediaByTask[id]} t={t} />, [tasks, state.mediaByTask, t]);
+  const timeFormat = typeof state.settings.completedTimeFormat === 'string' ? state.settings.completedTimeFormat : undefined;
+  const row = useCallback((id: string) => <TaskRow task={tasks[id]} mediaId={state.mediaByTask[id]} timeFormat={timeFormat} t={t} />, [tasks, state.mediaByTask, timeFormat, t]);
   const urlsChange = useCallback((urls: string) => dispatch({ type: 'view', patch: { urls } }), [dispatch]);
   return <div className="page downloads-page"><Heading title={t('下载任务', 'Downloads')} subtitle={t('下载与处理独立排队，原始媒体先保存到本地。', 'Downloads and processing have separate queues. Source media is saved first.')}>{host.desktop && <Button icon="folder" onClick={() => run(() => host.openDownloadDirectory())}>{t('下载目录', 'Download folder')}</Button>}</Heading>
     <Composer adding={adding} cancelAdding={cancelAdding} clipboard={clipboard} urls={view.urls} options={options} change={urlsChange} changeQuality={changeQuality} add={add} quick={quick} t={t} />

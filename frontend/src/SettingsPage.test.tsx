@@ -8,6 +8,21 @@ const transport = vi.hoisted(() => ({ desktop: false, command: vi.fn(), paths: v
 vi.mock('./transport', () => ({ host: { get desktop() { return transport.desktop; }, command: transport.command, paths: transport.paths, directory: transport.directory, openDownloadDirectory: transport.openDownloadDirectory, capabilities: () => ({ updates: false }) } }));
 beforeEach(() => { transport.desktop = false; transport.command.mockReset().mockResolvedValue([]); transport.paths.mockReset().mockResolvedValue({ downloadDir: '/downloads' }); transport.directory.mockReset().mockResolvedValue(null); transport.openDownloadDirectory.mockReset().mockResolvedValue(undefined); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
+it('edits and saves the completion time format with token guidance', async () => {
+  const dispatch = vi.fn();
+  const props = { state: { ...initialState, view: { ...initialState.view, settingsTab: 'appearance' } }, dispatch, t: (_zh: string, en: string) => en, run, message: vi.fn() };
+  const page = render(<SettingsPage {...props} />);
+  const input = screen.getByRole('textbox', { name: 'Completion time format' }) as HTMLInputElement;
+  expect(input.value).toBe('YYYY-MM-DD HH:mm');
+  expect(input.placeholder).toBe('YYYY-MM-DD HH:mm');
+  expect(screen.getByText(/YY short year, MM month/)).toBeTruthy();
+  fireEvent.change(input, { target: { value: 'YYMMDD HH:mm' } });
+  expect(dispatch).toHaveBeenCalledWith({ type: 'setting', key: 'completedTimeFormat', value: 'YYMMDD HH:mm' });
+  page.rerender(<SettingsPage {...props} state={{ ...props.state, view: { ...props.state.view, settingsDraft: { completedTimeFormat: 'YYMMDD HH:mm' } } }} />);
+  transport.command.mockImplementation(async (command, args) => command === 'settings.save' ? args.settings : []);
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ completedTimeFormat: 'YYMMDD HH:mm' }) }));
+});
 it('saves the selected desktop download folder immediately and reloads its saved value', async () => {
   transport.desktop = true;
   const dispatch = vi.fn(); const message = vi.fn();
