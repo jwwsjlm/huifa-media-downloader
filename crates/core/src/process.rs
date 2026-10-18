@@ -87,8 +87,28 @@ pub async fn run_limited(
         directory,
         (cancel, None),
         None,
-        Some((max_stdout, timeout, false)),
+        Some((max_stdout, Some(timeout), false)),
         None,
+    )
+    .await
+}
+
+pub(crate) async fn run_limited_logged(
+    executable: &Path,
+    args: &[String],
+    cancel: &CancellationToken,
+    max_stdout: usize,
+    timeout: Option<std::time::Duration>,
+    log: Option<crate::task_logs::RawLog>,
+) -> Result<ProcessOutput> {
+    run_inner(
+        executable,
+        args,
+        None,
+        (cancel, None),
+        None,
+        Some((max_stdout, timeout, false)),
+        log,
     )
     .await
 }
@@ -107,7 +127,7 @@ pub async fn run_limited_text(
         None,
         (cancel, None),
         None,
-        Some((max_stdout, timeout, true)),
+        Some((max_stdout, Some(timeout), true)),
         None,
     )
     .await
@@ -119,7 +139,7 @@ async fn run_inner(
     directory: Option<&Path>,
     control: (&CancellationToken, Option<&CancellationToken>),
     callback: Option<LineCallback>,
-    limit: Option<(usize, std::time::Duration, bool)>,
+    limit: Option<(usize, Option<std::time::Duration>, bool)>,
     log: Option<crate::task_logs::RawLog>,
 ) -> Result<ProcessOutput> {
     let (cancel, finish) = control;
@@ -172,14 +192,14 @@ async fn run_inner(
     let out = tokio::spawn(async move {
         match limit {
             Some((max, _, legacy_text)) => {
-                read_limited_output(stdout, max, out_overflow, legacy_text).await
+                read_limited_output(stdout, max, out_overflow, legacy_text, out_log).await
             }
             None => read_lines(stdout, false, out_callback, out_log).await,
         }
     });
     let err = tokio::spawn(async move {
         if limit.is_some() {
-            read_diagnostics(stderr).await
+            read_diagnostics(stderr, err_log).await
         } else {
             read_lines(stderr, true, callback, err_log).await
         }
@@ -196,7 +216,12 @@ async fn run_inner(
         },
         status=child.wait()=>status.context("Cannot wait for supervised tool"),
         _=overflow.cancelled()=> Err(anyhow::anyhow!("Metadata stdout exceeds its byte limit")),
-        _=tokio::time::sleep(limit.map_or(std::time::Duration::from_secs(86400), |(_, timeout, _)| timeout)), if limit.is_some()=> Err(anyhow::anyhow!("Metadata query timed out")),
+        _=async {
+            match limit.and_then(|(_, timeout, _)| timeout) {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => std::future::pending().await,
+            }
+        }=> Err(anyhow::anyhow!("Metadata query timed out")),
     };
     // Descendants must be gone before draining pipes or shutdown can hang forever.
     guard.terminate();
@@ -204,14 +229,8 @@ async fn run_inner(
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
-    let stdout = out
-        .await
-        .context("Tool stdout reader stopped")?
-        .context("Cannot read tool stdout")?;
-    let stderr = err
-        .await
-        .context("Tool stderr reader stopped")?
-        .context("Cannot read tool stderr")?;
+    let stdout = out.await.context("Tool stdout reader stopped");
+    let stderr = err.await.context("Tool stderr reader stopped");
     if let Some(log) = &log {
         log.write(
             "exit",
@@ -223,6 +242,8 @@ async fn run_inner(
         )?;
     }
     let status = status?;
+    let stdout = stdout?.context("Cannot read tool stdout")?;
+    let stderr = stderr?.context("Cannot read tool stderr")?;
     if !status.success() && !stopped_capture {
         bail!(
             "{} exited with code {}: {}",
@@ -247,7 +268,7 @@ async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
     max: usize,
     overflow: CancellationToken,
 ) -> Result<String> {
-    read_limited_output(reader, max, overflow, false).await
+    read_limited_output(reader, max, overflow, false, None).await
 }
 
 async fn read_limited_output<R: tokio::io::AsyncRead + Unpin>(
@@ -255,6 +276,7 @@ async fn read_limited_output<R: tokio::io::AsyncRead + Unpin>(
     max: usize,
     overflow: CancellationToken,
     legacy_text: bool,
+    log: Option<crate::task_logs::RawLog>,
 ) -> Result<String> {
     let mut captured = Vec::new();
     let mut chunk = [0; 8192];
@@ -264,10 +286,18 @@ async fn read_limited_output<R: tokio::io::AsyncRead + Unpin>(
             break;
         }
         if count > max.saturating_sub(captured.len()) {
+            if let Some(log) = &log {
+                captured.reserve_exact(count);
+                captured.extend_from_slice(&chunk[..count]);
+                log.write("stdout", &captured)?;
+            }
             overflow.cancel();
             bail!("Metadata stdout exceeds its byte limit");
         }
         captured.extend_from_slice(&chunk[..count]);
+    }
+    if let Some(log) = &log {
+        log.write("stdout", &captured)?;
     }
     match String::from_utf8(captured) {
         Ok(value) => Ok(value),
@@ -329,16 +359,39 @@ fn ensure_decoded(success: bool) -> Result<()> {
     Ok(())
 }
 
-async fn read_diagnostics<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Result<String> {
+async fn read_diagnostics<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    log: Option<crate::task_logs::RawLog>,
+) -> Result<String> {
+    use std::io::{Seek, Write};
     let mut captured = Vec::new();
+    let mut raw = log
+        .as_ref()
+        .map(|log| tempfile::tempfile_in(&log.directory))
+        .transpose()?;
     let mut chunk = [0; 8192];
     loop {
         let count = reader.read(&mut chunk).await?;
         if count == 0 {
             break;
         }
+        if let (Some(log), Some(raw)) = (&log, &mut raw) {
+            for part in chunk[..count].split_inclusive(|byte| *byte == b'\n') {
+                raw.write_all(part)?;
+                if part.ends_with(b"\n") {
+                    log.write_file("stderr", raw)?;
+                    raw.set_len(0)?;
+                    raw.rewind()?;
+                }
+            }
+        }
         let take = count.min((1024 * 1024_usize).saturating_sub(captured.len()));
         captured.extend_from_slice(&chunk[..take]);
+    }
+    if let (Some(log), Some(mut raw)) = (log, raw)
+        && raw.metadata()?.len() > 0
+    {
+        log.write_file("stderr", &mut raw)?;
     }
     Ok(String::from_utf8_lossy(&captured).into_owned())
 }
@@ -668,20 +721,21 @@ mod tests {
             "sleep 30 & wait",
         );
         for (script, limit, timeout, message) in [
-            (loud, 1024, 3000, "byte limit"),
-            (slow, 1024, 100, "timed out"),
+            (loud, 1024, Some(3000), "byte limit"),
+            (loud, 1024, None, "byte limit"),
+            (slow, 1024, Some(100), "timed out"),
         ] {
             let mut args = prefix.clone();
             args.push(script.into());
             let error = tokio::time::timeout(
                 Duration::from_secs(6),
-                run_limited(
+                run_limited_logged(
                     &exe,
                     &args,
-                    None,
                     &CancellationToken::new(),
                     limit,
-                    Duration::from_millis(timeout),
+                    timeout.map(Duration::from_millis),
+                    None,
                 ),
             )
             .await
@@ -717,11 +771,50 @@ mod tests {
         );
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            run_limited(&exe, &args, None, &cancel, 1024, Duration::from_secs(120)),
+            run_limited_logged(&exe, &args, &cancel, 1024, None, None),
         )
         .await
         .unwrap();
         assert!(result.err().unwrap().to_string().contains("interrupted"));
+    }
+    #[tokio::test]
+    async fn bounded_metadata_journal_keeps_utf8_and_complete_diagnostics() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = crate::App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let task = crate::tests::paused_task(Default::default());
+        app.db.insert_task(&task)?;
+        let payload = format!("{}中文", "x".repeat(8191));
+        assert_eq!(
+            read_limited_output(
+                payload.as_bytes(),
+                16 * 1024,
+                CancellationToken::new(),
+                false,
+                Some(app.raw_task_log(&task.id)?)
+            )
+            .await?,
+            payload
+        );
+        let diagnostics = format!("{payload}\n{}", "尾".repeat(350_000));
+        let captured =
+            read_diagnostics(diagnostics.as_bytes(), Some(app.raw_task_log(&task.id)?)).await?;
+        assert!(captured.len() <= 1024 * 1024 + 3);
+        let raw = std::fs::read_to_string(
+            app.config
+                .data_dir
+                .join("task-logs")
+                .join(format!("{}.log", task.id)),
+        )?;
+        assert!(raw.contains(&format!("stdout\n{payload}\n")));
+        assert!(raw.contains(&format!("stderr\n{payload}\n")));
+        assert!(raw.contains(&format!("stderr\n{}\n", "尾".repeat(350_000))));
+        app.shutdown().await?;
+        Ok(())
     }
     #[tokio::test]
     async fn cancellation_stops_supervised_process() {

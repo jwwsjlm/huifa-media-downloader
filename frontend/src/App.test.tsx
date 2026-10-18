@@ -95,6 +95,7 @@ describe('live interface stability', () => {
     expect(await screen.findByRole('button', { name: `v${buildVersion}` })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'v0.3.0' })).toBeNull();
     const snapshot = makeSnapshot(); snapshot.version = '1.2.3';
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('snapshot', { includeTools: false }));
     await act(async () => finish(snapshot));
     expect(await screen.findByRole('button', { name: 'v1.2.3' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: `v${buildVersion}` })).toBeNull();
@@ -617,6 +618,20 @@ describe('live interface stability', () => {
     expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('https://youtu.be/zyxwvutsrqp');
     expect((button as HTMLButtonElement).disabled).toBe(false);
   });
+  it('adds successive downloads when plain HTTP does not expose randomUUID', async () => {
+    const original = Object.getOwnPropertyDescriptor(crypto, 'randomUUID');
+    Object.defineProperty(crypto, 'randomUUID', { configurable: true, value: undefined });
+    try {
+      render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+      const button = screen.getByRole('button', { name: 'Add downloads' }) as HTMLButtonElement;
+      for (const [index, url] of ['https://youtu.be/abcdefghijk', 'https://youtu.be/zyxwvutsrqp'].entries()) {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: url } });
+        fireEvent.click(button);
+        await waitFor(() => expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.add')).toHaveLength(index + 1));
+        await waitFor(() => expect(screen.queryByRole('button', { name: 'Adding to queue…' })).toBeNull());
+      }
+    } finally { if (original) Object.defineProperty(crypto, 'randomUUID', original); else Reflect.deleteProperty(crypto, 'randomUUID'); }
+  });
   it('recovers from clipboard permission failures without starting a download', async () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText: vi.fn().mockRejectedValue(new Error('Denied')) } });
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox'); fireEvent.click(screen.getByRole('button', { name: 'Download clipboard' }));
@@ -765,6 +780,20 @@ describe('live interface stability', () => {
     await waitFor(() => expect(screen.getAllByText('92.0%').length).toBeGreaterThan(0));
     expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('still editing');
     expect(within(screen.getByRole('listbox')).getByRole('option', { selected: true }).textContent).toContain('Alpha');
+  });
+  it('fetches a new snapshot when more events are missed during an in-flight refresh', async () => {
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    let finish!: (value: unknown) => void;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? new Promise(resolve => { finish = resolve; }) : []);
+    act(() => transport.listener?.({ kind: 'snapshot.required', data: null }));
+    await waitFor(() => expect(typeof finish).toBe('function'));
+    const latest = makeSnapshot(); latest.tasks[0].status = 'completed'; latest.tasks[0].stage = 'completed';
+    transport.command.mockImplementation(async command => command === 'snapshot' ? latest : []);
+    act(() => { transport.listener?.({ kind: 'snapshot.required', data: null }); transport.listener?.({ kind: 'snapshot.required', data: null }); });
+    expect(transport.command.mock.calls.filter(([name]) => name === 'snapshot')).toHaveLength(2);
+    await act(async () => finish(makeSnapshot()));
+    await waitFor(() => expect(screen.getByRole('option', { name: /Alpha/ }).textContent).toContain('Completed'));
+    expect(transport.command.mock.calls.filter(([name]) => name === 'snapshot')).toHaveLength(3);
   });
   it('updates filtered and sorted rows when metadata changes after progress-only events', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');

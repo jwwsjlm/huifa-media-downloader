@@ -10,6 +10,7 @@ import { SettingsPage } from './SettingsPage';
 import { McpSettings } from './McpSettings';
 import { AddDialog } from './AddDialog';
 import { downloadLinks, singleVideoLink } from './links';
+import { newRequestId } from './requestId';
 import { explainError } from './errors';
 import { CoverStudio } from './CoverStudio';
 import { TaskContextMenu } from './TaskContextMenu';
@@ -60,9 +61,9 @@ export function App() {
   useEffect(() => { let active = true; void host.session().then(session => { if (active) setAuthenticated(session.authenticated); }).catch(reason => { if (active) { setError(String(reason)); setAuthenticated(false); } }); return () => { active = false; }; }, []);
   useEffect(() => {
     if (!authenticated) return;
-    let disposed = false; let unlisten: (() => void) | undefined; let initialized = false; let toolsChecked = false; let refreshing: Promise<void> | null = null; const buffered: CoreEvent[] = []; const notified = new Set<string>();
+    let disposed = false; let unlisten: (() => void) | undefined; let initialized = false; let toolsChecked = false; let refreshing: Promise<void> | null = null; let refreshAgain = false; const buffered: CoreEvent[] = []; const notified = new Set<string>();
     const refresh = (): Promise<void> => {
-      if (refreshing) return refreshing;
+      if (refreshing) { refreshAgain = true; return refreshing; }
       initialized = false;
       refreshing = host.command<Snapshot>('snapshot', { includeTools: false }).then(snapshot => {
         if (disposed) return;
@@ -75,6 +76,7 @@ export function App() {
       }).catch(reason => { if (!disposed) setError(String(reason)); }).finally(() => {
         if (!disposed) { for (const event of buffered.splice(0)) dispatch({ type: 'event', event }); initialized = true; }
         refreshing = null;
+        if (refreshAgain && !disposed) { refreshAgain = false; void refresh(); }
       });
       return refreshing;
     };
@@ -113,8 +115,9 @@ export function App() {
   const setQuality = useCallback((quality: string | null) => dispatch({ type: 'view', patch: { quality } }), [dispatch]);
   const add = useCallback((urls: string[], clipboard = false) => {
     if (addingRef.current) return;
+    const operation = { cancelled: false, requestId: newRequestId() };
     addingRef.current = true;
-    const operation = { cancelled: false, requestId: crypto.randomUUID() }; addingOperation.current = operation; setBatchReport(null);
+    addingOperation.current = operation; setBatchReport(null);
     setAdding(clipboard ? t('读取剪贴板…', 'Reading clipboard…') : t('识别链接…', 'Checking links…'));
     run(async () => {
       try {

@@ -13,6 +13,7 @@ fn main() {
             "task_copy_value",
             "release_status",
             "open_release",
+            "open_project",
             "login_navigation",
         ]),
     ))

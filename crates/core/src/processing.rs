@@ -952,11 +952,7 @@ pub(crate) async fn process_task(
             ]);
         }
     }
-    let encoder = if matches!(task.options.encoder.as_str(), "copy" | "original") {
-        if filtering { "libx264" } else { "copy" }
-    } else {
-        task.options.encoder.as_str()
-    };
+    let encoder = video_encoder(&task.options, filtering, extension);
     if video.is_some() {
         args.extend(["-c:v:0".into(), encoder.into()]);
         if encoder != "copy" {
@@ -984,13 +980,7 @@ pub(crate) async fn process_task(
     if !subtitle_indices.is_empty() {
         args.extend([
             "-c:s".into(),
-            if extension == "mp4" {
-                "mov_text".into()
-            } else if task.options.subtitle_format == "ass" {
-                "ass".into()
-            } else {
-                "srt".into()
-            },
+            subtitle_codec(extension, &task.options.subtitle_format).into(),
         ]);
     }
     if task.options.embed_thumbnail && !deferred_mux {
@@ -1113,13 +1103,7 @@ pub(crate) async fn process_task(
         if !subtitle_indices.is_empty() {
             args.extend([
                 "-c:s".into(),
-                if extension == "mp4" {
-                    "mov_text".into()
-                } else if task.options.subtitle_format == "ass" {
-                    "ass".into()
-                } else {
-                    "srt".into()
-                },
+                subtitle_codec(extension, &task.options.subtitle_format).into(),
             ]);
         }
         if task.options.embed_thumbnail {
@@ -1215,6 +1199,7 @@ pub(crate) async fn process_task(
             .unwrap_or_else(|| directory.join(output_filename(&task, extension)))
     };
     let mut auxiliary = Vec::new();
+    let mut staged_files = Vec::new();
     if !task.conversion {
         for source in manifest
             .files
@@ -1229,26 +1214,32 @@ pub(crate) async fn process_task(
                 "description.txt"
             };
             let destination = target.with_extension(suffix);
-            auxiliary.push(make_auxiliary(&source.path, destination, &task.id)?);
+            let (file, staged) = make_auxiliary(&source.path, destination, &task.id)?;
+            auxiliary.push(file);
+            staged_files.push(staged);
         }
         if task.options.write_thumbnail
             && let Some(path) = &thumbnail
         {
-            auxiliary.push(make_auxiliary(
+            let (file, staged) = make_auxiliary(
                 path,
                 target.with_extension(path.extension().unwrap()),
                 &task.id,
-            )?);
+            )?;
+            auxiliary.push(file);
+            staged_files.push(staged);
         }
         for (path, language) in &subtitles {
-            auxiliary.push(make_auxiliary(
+            let (file, staged) = make_auxiliary(
                 path,
                 target.with_extension(format!(
                     "{language}.{}",
                     path.extension().unwrap().to_string_lossy()
                 )),
                 &task.id,
-            )?);
+            )?;
+            auxiliary.push(file);
+            staged_files.push(staged);
         }
         if task.options.split_chapters {
             for (index, chapter) in final_chapters.iter().enumerate() {
@@ -1283,11 +1274,14 @@ pub(crate) async fn process_task(
                     chapter_title,
                     extension
                 ));
-                auxiliary.push(make_auxiliary(&path, directory.join(name), &task.id)?);
+                let (file, staged) = make_auxiliary(&path, directory.join(name), &task.id)?;
+                auxiliary.push(file);
+                staged_files.push(staged);
             }
         }
     }
-    let staged = make_auxiliary(&output, target.clone(), &task.id)?;
+    let (staged, cleanup) = make_auxiliary(&output, target.clone(), &task.id)?;
+    staged_files.push(cleanup);
     let mut prepared = app.db.task(id)?;
     prepared.publication = Some(Publication {
         committed: false,
@@ -1301,6 +1295,10 @@ pub(crate) async fn process_task(
     });
     prepared.stage("processing", "publishing", None);
     app.save_task(&prepared)?;
+    // The saved journal now owns cleanup across retries and restarts.
+    for staged in &mut staged_files {
+        staged.disable_cleanup(true);
+    }
     publish(app, prepared, cancel).await
 }
 
@@ -1371,13 +1369,15 @@ async fn prepare_assets(app: &Arc<App>, mut task: Task, cancel: &CancellationTok
     std::fs::create_dir_all(&directory)?;
     let stem = format!("{} [assets]", sanitize_filename(&task.title));
     let mut outputs = Vec::new();
+    let mut staged_files = Vec::new();
     task.files.clear();
     for (path, kind, suffix) in assets {
         if cancel.is_cancelled() {
             bail!("Operation interrupted");
         }
         let target = directory.join(bounded_filename(&format!("{stem}.{suffix}")));
-        let output = make_auxiliary(&path, target, &task.id)?;
+        let (output, staged) = make_auxiliary(&path, target, &task.id)?;
+        staged_files.push(staged);
         task.files.push(GeneratedFile {
             filename: output
                 .target
@@ -1403,6 +1403,9 @@ async fn prepare_assets(app: &Arc<App>, mut task: Task, cancel: &CancellationTok
     });
     task.stage("processing", "publishing", None);
     app.save_task(&task)?;
+    for staged in &mut staged_files {
+        staged.disable_cleanup(true);
+    }
     publish(app, task, cancel).await
 }
 
@@ -1446,11 +1449,7 @@ async fn split_chapter(
         "-1".into(),
     ];
     if split.video {
-        let encoder = if matches!(task.options.encoder.as_str(), "copy" | "original") {
-            "libx264"
-        } else {
-            task.options.encoder.as_str()
-        };
+        let encoder = video_encoder(&task.options, true, extension);
         args.extend(["-map".into(), "0:v:0".into(), "-c:v".into(), encoder.into()]);
         args.extend(video_encoder_args(encoder));
     }
@@ -1534,13 +1533,7 @@ async fn split_chapter(
     if !subtitles.is_empty() {
         args.extend([
             "-c:s".into(),
-            if extension == "mp4" {
-                "mov_text".into()
-            } else if task.options.subtitle_format == "ass" {
-                "ass".into()
-            } else {
-                "srt".into()
-            },
+            subtitle_codec(extension, &task.options.subtitle_format).into(),
         ]);
     }
     if task.options.embed_thumbnail {
@@ -1584,7 +1577,11 @@ async fn split_chapter(
     Ok(())
 }
 
-fn make_auxiliary(source: &Path, target: PathBuf, task_id: &str) -> Result<AuxiliaryPublication> {
+fn make_auxiliary(
+    source: &Path,
+    target: PathBuf,
+    task_id: &str,
+) -> Result<(AuxiliaryPublication, tempfile::TempPath)> {
     let target = target.with_file_name(bounded_filename(
         &target
             .file_name()
@@ -1609,14 +1606,18 @@ fn make_auxiliary(source: &Path, target: PathBuf, task_id: &str) -> Result<Auxil
         !staged.path().with_extension("before-publication").exists(),
         "Publication backup already exists"
     );
-    let (_, temporary) = staged.keep().map_err(|reason| reason.error)?;
+    let staged = staged.into_temp_path();
+    let temporary = staged.to_path_buf();
     let (hash, size) = hash_file(&temporary)?;
-    Ok(AuxiliaryPublication {
-        temporary,
-        target,
-        hash,
-        size,
-    })
+    Ok((
+        AuxiliaryPublication {
+            temporary,
+            target,
+            hash,
+            size,
+        },
+        staged,
+    ))
 }
 fn copy_sync(source: &Path, target: &Path) -> Result<()> {
     crate::reject_links(source)?;
@@ -2488,6 +2489,32 @@ async fn run_ffmpeg(
     Ok(())
 }
 
+fn video_encoder<'a>(options: &'a DownloadOptions, filtering: bool, extension: &str) -> &'a str {
+    if matches!(options.encoder.as_str(), "copy" | "original") {
+        if filtering {
+            if extension == "webm" {
+                "libvpx-vp9"
+            } else {
+                "libx264"
+            }
+        } else {
+            "copy"
+        }
+    } else {
+        &options.encoder
+    }
+}
+
+fn subtitle_codec(extension: &str, format: &str) -> &'static str {
+    if matches!(extension, "mp4" | "mov") {
+        "mov_text"
+    } else if format == "ass" {
+        "ass"
+    } else {
+        "srt"
+    }
+}
+
 fn video_encoder_args(encoder: &str) -> Vec<String> {
     match encoder {
         "libx264" => vec!["-preset", "medium", "-crf", "23", "-pix_fmt", "yuv420p"],
@@ -2533,7 +2560,11 @@ fn audio_codec<'a>(options: &'a DownloadOptions, filtering: bool, extension: &st
             }
         }
     } else if filtering {
-        "aac"
+        if extension == "webm" {
+            "libopus"
+        } else {
+            "aac"
+        }
     } else {
         "copy"
     }
@@ -2955,6 +2986,246 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dropping_unjournaled_preparations_removes_only_staged_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source.bin");
+        let target = root.path().join("output.bin");
+        write_sync(&source, b"prepared output")?;
+        write_sync(&target, b"existing output")?;
+        let mut temporary = PathBuf::new();
+        let failed = (|| -> Result<()> {
+            let (file, _cleanup) = make_auxiliary(&source, target.clone(), "audit")?;
+            temporary = file.temporary;
+            assert!(temporary.is_file());
+            bail!("Later preparation failed")
+        })();
+        assert!(failed.is_err());
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(&source)?, b"prepared output");
+        assert_eq!(std::fs::read(&target)?, b"existing output");
+
+        let (file, mut cleanup) = make_auxiliary(&source, target, "audit")?;
+        cleanup.disable_cleanup(true);
+        drop(cleanup);
+        assert!(file.temporary.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn transformed_media_and_subtitles_use_container_compatible_codecs() {
+        let mut options = DownloadOptions::default();
+        for encoder in ["copy", "original"] {
+            options.encoder = encoder.into();
+            assert_eq!(video_encoder(&options, true, "webm"), "libvpx-vp9");
+            assert_eq!(audio_codec(&options, true, "webm"), "libopus");
+            assert_eq!(video_encoder(&options, true, "mp4"), "libx264");
+            assert_eq!(audio_codec(&options, true, "mp4"), "aac");
+            assert_eq!(video_encoder(&options, false, "webm"), "copy");
+            assert_eq!(audio_codec(&options, false, "webm"), "copy");
+        }
+        options.encoder = "libsvtav1".into();
+        assert_eq!(video_encoder(&options, true, "webm"), "libsvtav1");
+        for format in ["best", "srt", "ass"] {
+            assert_eq!(subtitle_codec("mov", format), "mov_text");
+            assert_eq!(subtitle_codec("mp4", format), "mov_text");
+        }
+        assert_eq!(subtitle_codec("mkv", "ass"), "ass");
+        assert_eq!(subtitle_codec("mkv", "srt"), "srt");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bundled FFmpeg/FFprobe runtimes"]
+    async fn mov_subtitles_webm_transforms_and_cancelled_chapters() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tool_dir = std::env::var_os("HUIFA_TEST_TOOLS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools")
+            });
+        let app = App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("output"),
+            tool_dir: Some(tool_dir),
+        })
+        .await?;
+        let tools = app.freeze_tools().await?;
+        let fixture = temp.path().join("fixture.mkv");
+        let args: Vec<String> = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=12",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-threads",
+            "1",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .chain([fixture.to_string_lossy().into_owned()])
+        .collect();
+        process::run_limited(
+            &app.tool("ffmpeg")?,
+            &args,
+            None,
+            &CancellationToken::new(),
+            1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .await?;
+
+        for (name, changes) in [
+            (
+                "mov",
+                json!({"container":"mov","embedSubtitles":true,"subtitleLanguage":"en"}),
+            ),
+            (
+                "mov-cut",
+                json!({"container":"mov","embedSubtitles":true,"subtitleLanguage":"en","sectionStart":"0.25","sectionEnd":"1.75","splitChapters":true}),
+            ),
+            (
+                "webm",
+                json!({"container":"webm","sectionStart":"0.25","sectionEnd":"1.75","sponsorblockMode":"remove","sponsorblockCategories":["sponsor"],"prependCoverEnabled":true,"prependCoverFrames":3,"splitChapters":true}),
+            ),
+            ("cancel", json!({"container":"mp4","splitChapters":true})),
+        ] {
+            let mut task = crate::tests::paused_task(tools.clone());
+            task.title = name.into();
+            task.options = DownloadOptions::parse(changes)?;
+            task.options.organize_task_folder = true;
+            task.options.write_thumbnail = false;
+            task.options.write_info_json = false;
+            let directory = app
+                .config
+                .data_dir
+                .join("tasks")
+                .join(&task.id)
+                .join("sources");
+            std::fs::create_dir_all(&directory)?;
+            let video = directory.join("video.mkv");
+            copy_sync(&fixture, &video)?;
+            let subtitle = directory.join("en.srt");
+            write_sync(&subtitle, b"1\n00:00:00,100 --> 00:00:01,500\nSubtitle\n\n")?;
+            let thumbnail = directory.join("cover.jpg");
+            image::RgbImage::from_pixel(16, 16, image::Rgb([50, 20, 80])).save(&thumbnail)?;
+            let mut files = Vec::new();
+            for (path, kind) in [
+                (video, "video"),
+                (subtitle, "subtitle"),
+                (thumbnail, "thumbnail"),
+            ] {
+                let (hash, size) = hash_file(&path)?;
+                files.push(SourceFile {
+                    path,
+                    hash,
+                    size,
+                    kind: kind.into(),
+                    format_id: String::new(),
+                    language: (kind == "subtitle").then(|| "en".into()),
+                });
+            }
+            task.manifest = Some(SourceManifest {
+                version: 1,
+                directory,
+                files,
+                metadata: json!({"title":name}),
+                duration: Some(2.0),
+                chapters: vec![
+                    Chapter {
+                        start: 0.0,
+                        end: 1.0,
+                        title: "First".into(),
+                    },
+                    Chapter {
+                        start: 1.0,
+                        end: 2.0,
+                        title: "Second".into(),
+                    },
+                ],
+                sponsor_segments: vec![Chapter {
+                    start: 0.5,
+                    end: 0.75,
+                    title: "Sponsor".into(),
+                }],
+                output_extension: task.options.container.clone(),
+            });
+            app.db.insert_task(&task)?;
+            let cancel = CancellationToken::new();
+            let observer = if name == "cancel" {
+                let mut events = app.subscribe();
+                let task_id = task.id.clone();
+                let cancel = cancel.clone();
+                Some(tokio::spawn(async move {
+                    while let Ok(event) = events.recv().await {
+                        if event.kind == "task.upsert"
+                            && event.data["id"] == task_id
+                            && event.data["stage"] == "splitting_chapter_2"
+                        {
+                            cancel.cancel();
+                            return;
+                        }
+                    }
+                }))
+            } else {
+                None
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                process_task(&app, &task.id, &cancel),
+            )
+            .await?;
+            if let Some(observer) = observer {
+                observer.abort();
+                assert!(cancel.is_cancelled());
+                assert!(result.is_err());
+                assert!(app.db.task(&task.id)?.publication.is_none());
+                assert!(
+                    std::fs::read_dir(app.config.download_dir.join(name))?.all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".publish"))
+                );
+                continue;
+            }
+            result?;
+            let completed = app.db.task(&task.id)?;
+            let media = app.db.media_for_task(&task.id)?.unwrap();
+            assert_eq!(completed.status, "completed");
+            let outputs = std::iter::once(&media.path).chain(media.assets.iter().filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext == task.options.container.as_str())
+            }));
+            for path in outputs {
+                let probe = probe_file(&app, &completed, path, &cancel).await?;
+                if name == "webm" {
+                    assert!(streams(&probe).any(|stream| text(stream, "codec_name") == "vp9"));
+                    assert!(streams(&probe).any(|stream| text(stream, "codec_name") == "opus"));
+                } else {
+                    assert!(streams(&probe).any(|stream| text(stream, "codec_name") == "mov_text"));
+                }
+            }
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[test]
     fn publication_never_replaces_a_concurrent_file_even_with_identical_bytes() -> Result<()> {
         let root = tempfile::tempdir()?;
         let target = root.path().join("video.mp4");
@@ -3253,8 +3524,8 @@ mod tests {
         write_sync(&target, b"old metadata")?;
         let source = app.config.data_dir.join("source.json");
         write_sync(&source, b"new metadata")?;
-        let output = make_auxiliary(&source, target.clone(), &task.id)?;
-        let other = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (output, _staged_output) = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (other, _staged_other) = make_auxiliary(&source, target.clone(), &task.id)?;
         assert_ne!(output.temporary, other.temporary);
         std::fs::remove_file(other.temporary)?;
         task.previous_outputs = vec![target.clone()];
@@ -3277,7 +3548,7 @@ mod tests {
         prepare_redownload(&app, &task).await?;
         assert_eq!(std::fs::read(&target)?, b"old metadata");
         assert!(!backups[0].exists() && !output.temporary.exists());
-        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (output, _staged_output) = make_auxiliary(&source, target.clone(), &task.id)?;
         task.publication = Some(Publication {
             committed: false,
             temporary: output.temporary.clone(),
@@ -3350,9 +3621,9 @@ mod tests {
         )?;
         let source = app.config.download_dir.join("new-source.bin");
         write_sync(&source, b"new invalid video")?;
-        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (main, _staged_main) = make_auxiliary(&source, target.clone(), &task.id)?;
         write_sync(&source, b"new subtitle")?;
-        let subtitle = make_auxiliary(&source, sidecar.clone(), &task.id)?;
+        let (subtitle, _staged_subtitle) = make_auxiliary(&source, sidecar.clone(), &task.id)?;
         task.publication = Some(Publication {
             committed: false,
             temporary: main.temporary.clone(),
@@ -3395,7 +3666,7 @@ mod tests {
         let source = app.config.download_dir.join("source.bin");
         write_sync(&target, b"user notes")?;
         write_sync(&source, b"downloaded notes")?;
-        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (output, _staged_output) = make_auxiliary(&source, target.clone(), &task.id)?;
         task.publication = Some(Publication {
             committed: false,
             temporary: output.temporary.clone(),
@@ -3440,8 +3711,8 @@ mod tests {
             let source = app.config.download_dir.join("source.bin");
             write_sync(&target, b"old notes")?;
             write_sync(&source, b"new notes")?;
-            let main = make_auxiliary(&source, target.clone(), &task.id)?;
-            let sidecar = make_auxiliary(&source, subtitle.clone(), &task.id)?;
+            let (main, _staged_main) = make_auxiliary(&source, target.clone(), &task.id)?;
+            let (sidecar, _staged_sidecar) = make_auxiliary(&source, subtitle.clone(), &task.id)?;
             task.previous_outputs = vec![target.clone()];
             task.publication = Some(Publication {
                 committed: false,
@@ -3490,7 +3761,7 @@ mod tests {
         task.stage("completed", "completed", Some(100.0));
         let target = app.config.download_dir.join("notes.txt");
         write_sync(&target, b"new notes")?;
-        let main = make_auxiliary(&target, target.clone(), &task.id)?;
+        let (main, _staged_main) = make_auxiliary(&target, target.clone(), &task.id)?;
         task.publication = Some(Publication {
             committed: false,
             temporary: main.temporary.clone(),
@@ -3529,7 +3800,7 @@ mod tests {
         let source = app.config.download_dir.join("source.bin");
         write_sync(&target, b"old notes")?;
         write_sync(&source, b"new notes")?;
-        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (main, _staged_main) = make_auxiliary(&source, target.clone(), &task.id)?;
         task.previous_outputs = vec![target.clone()];
         task.publication = Some(Publication {
             committed: false,
@@ -3573,8 +3844,8 @@ mod tests {
         let sidecar = app.config.download_dir.join("cover.jpg");
         let source = app.config.download_dir.join("source.bin");
         write_sync(&source, b"new notes")?;
-        let main = make_auxiliary(&source, target.clone(), &task.id)?;
-        let cover = make_auxiliary(&source, sidecar.clone(), &task.id)?;
+        let (main, _staged_main) = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (cover, _staged_cover) = make_auxiliary(&source, sidecar.clone(), &task.id)?;
         write_sync(&sidecar, b"user-owned image")?;
         task.publication = Some(Publication {
             committed: false,
@@ -3780,7 +4051,7 @@ mod tests {
         let source = app.config.download_dir.join("source.txt");
         let target = app.config.download_dir.join("current.txt");
         write_sync(&source, b"new notes")?;
-        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (output, _staged_output) = make_auxiliary(&source, target.clone(), &task.id)?;
         task.publication = Some(Publication {
             committed: false,
             temporary: output.temporary,
@@ -3836,7 +4107,7 @@ mod tests {
         task.previous_outputs = vec![target.clone(), obsolete.clone()];
         let source = app.config.download_dir.join("source.bin");
         write_sync(&source, b"updated notes")?;
-        let output = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (output, _staged_output) = make_auxiliary(&source, target.clone(), &task.id)?;
         task.publication = Some(Publication {
             committed: false,
             temporary: output.temporary,
@@ -3877,9 +4148,9 @@ mod tests {
         write_sync(&target, b"old notes")?;
         write_sync(&subtitle, b"old captions")?;
         write_sync(&source, b"new notes")?;
-        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (main, _staged_main) = make_auxiliary(&source, target.clone(), &task.id)?;
         write_sync(&source, b"new captions")?;
-        let sidecar = make_auxiliary(&source, subtitle.clone(), &task.id)?;
+        let (sidecar, _staged_sidecar) = make_auxiliary(&source, subtitle.clone(), &task.id)?;
         task.previous_outputs = vec![target.clone(), subtitle.clone()];
         task.publication = Some(Publication {
             committed: false,
@@ -3905,7 +4176,7 @@ mod tests {
 
         // An externally edited destination must block reset instead of losing its recovery journal.
         write_sync(&source, b"new notes")?;
-        let main = make_auxiliary(&source, target.clone(), &task.id)?;
+        let (main, _staged_main) = make_auxiliary(&source, target.clone(), &task.id)?;
         task.publication.as_mut().unwrap().temporary = main.temporary;
         app.db.save_task(&task)?;
         let (_, backups) = publication_files(task.publication.as_ref().unwrap(), &task.id);
@@ -4402,7 +4673,7 @@ mod tests {
             },
         )?;
         let target = legacy.parent().unwrap().join("original.mp4");
-        let prepared = make_auxiliary(&path, target.clone(), &task.id)?;
+        let (prepared, _staged_prepared) = make_auxiliary(&path, target.clone(), &task.id)?;
         let mut replacement = app.db.task(&task.id)?;
         replacement.stage("processing", "publishing", None);
         replacement.publication = Some(Publication {

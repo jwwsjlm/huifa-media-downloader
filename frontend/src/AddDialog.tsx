@@ -5,6 +5,7 @@ import { VirtualList } from './VirtualList';
 import { bytes, duration } from './task';
 import { commandOptions } from './options';
 import { explainError } from './errors';
+import { newRequestId } from './requestId';
 import type { AddReport, CollectionEntry, CollectionProbe, DownloadOptions, Format, VideoProbe } from './types';
 import type { Translate } from './i18n';
 import type { Run } from './App';
@@ -18,7 +19,7 @@ export function AddDialog({ urls, options, close, added, run, t, initialEntries,
   const requestId = useRef(''); const cancelled = useRef(false); const issues = useRef<NonNullable<AddReport['issues']>>([]);
   const cancel = () => { cancelled.current = true; if (requestId.current) void host.command('probe.cancel', { id: requestId.current }).catch(() => {}); if (!adding) close(); };
   useEffect(() => {
-    let disposed = false; const id = crypto.randomUUID(); requestId.current = id;
+    let disposed = false; const id = newRequestId(); requestId.current = id;
     void (async () => {
       if (!selectItems) return;
       if (initialEntries) { setEntries(initialEntries); setSelected(new Set(initialEntries.filter(entry => entry.available !== false && !entry.error).map(entry => entry.url))); setBusy(false); return; }
@@ -41,7 +42,7 @@ export function AddDialog({ urls, options, close, added, run, t, initialEntries,
   }, [urls, options, t]);
   useEffect(() => {
     if (index < 0 || index >= plans.length) return;
-    let disposed = false; const id = crypto.randomUUID(); requestId.current = id; setBusy(true); setError(''); setProbe(null);
+    let disposed = false; const id = newRequestId(); requestId.current = id; setBusy(true); setError(''); setProbe(null);
     void host.command<VideoProbe>('probe.video', { url: plans[index].url, options: commandOptions(plans[index].options), requestId: id }).then(result => {
       if (disposed) return;
       setProbe(result);

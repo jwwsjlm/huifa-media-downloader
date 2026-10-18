@@ -158,7 +158,7 @@ pub(crate) async fn probe(
     } else {
         app.tool("yt-dlp")?
     };
-    let output = metadata_process(app, &executable, &args, cancel, task)
+    let output = metadata_process(app, &executable, &args, cancel, options.wait_for_live, task)
         .await
         .context("Failed to parse video with yt-dlp")?;
     let info: Value =
@@ -233,7 +233,7 @@ pub(crate) async fn collection(
         args.push("--playlist-random".into());
     }
     args.extend(["--".into(), url.into()]);
-    let output = metadata_process(app, &app.tool("yt-dlp")?, &args, cancel, None)
+    let output = metadata_process(app, &app.tool("yt-dlp")?, &args, cancel, false, None)
         .await
         .context("Failed to identify media or collection with yt-dlp")?;
     let info: Value = serde_json::from_str(&output.stdout)
@@ -301,27 +301,31 @@ async fn metadata_process(
     executable: &Path,
     args: &[String],
     cancel: &CancellationToken,
+    wait_for_live: bool,
     task: Option<&Task>,
 ) -> Result<process::ProcessOutput> {
+    let deadline = (!wait_for_live).then(|| Instant::now() + Duration::from_secs(120));
+    let log = task.map(|task| app.raw_task_log(&task.id)).transpose()?;
     for attempt in 0..3 {
-        let result = match task {
-            Some(task) => {
-                process::run_logged(
-                    executable,
-                    args,
-                    None,
-                    cancel,
-                    None,
-                    app.raw_task_log(&task.id)?,
-                )
-                .await
-            }
-            None => process::run(executable, args, None, cancel, None).await,
-        };
+        let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        ensure!(
+            !timeout.is_some_and(|timeout| timeout.is_zero()),
+            "Metadata query timed out"
+        );
+        let result = process::run_limited_logged(
+            executable,
+            args,
+            cancel,
+            64 * 1024 * 1024,
+            timeout,
+            log.clone(),
+        )
+        .await;
         match result {
             Err(error)
                 if attempt < 2
                     && !cancel.is_cancelled()
+                    && deadline.is_none_or(|deadline| Instant::now() < deadline)
                     && transient_metadata_error(&format!("{error:#}")) =>
             {
                 let seconds = if attempt == 0 { 1 } else { 3 };
@@ -335,7 +339,12 @@ async fn metadata_process(
                         ),
                     )?;
                 }
-                tokio::select! { _=tokio::time::sleep(Duration::from_secs(seconds))=>{}, _=cancel.cancelled()=>bail!("Operation interrupted") }
+                let delay = Duration::from_secs(seconds).min(
+                    deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::MAX),
+                );
+                tokio::select! { _=tokio::time::sleep(delay)=>{}, _=cancel.cancelled()=>bail!("Operation interrupted") }
             }
             result => return result,
         }
@@ -621,13 +630,10 @@ pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<
             .max_by(|a, b| compare_audio(a, b, options));
         if let Some(audio) = audio {
             selected.push(audio.clone());
-        } else if selected.is_empty()
-            && let Some(combined) = formats
-                .iter()
-                .filter(|f| {
-                    has_audio(f) && (!explicit_audio || audio_matches(f, &options.audio_track))
-                })
-                .max_by(|a, b| compare_audio(a, b, options))
+        } else if let Some(combined) = formats
+            .iter()
+            .filter(|f| has_audio(f) && (!explicit_audio || audio_matches(f, &options.audio_track)))
+            .max_by(|a, b| compare_audio(a, b, options))
         {
             selected.push(combined.clone());
         }
@@ -2521,13 +2527,15 @@ mod tests {
             tool_dir: None,
         })
         .await?;
+        let task = crate::tests::paused_task(Default::default());
+        app.db.insert_task(&task)?;
         let counter = root.path().join("attempts");
         #[cfg(windows)]
         let (executable, args) = {
             let script = root.path().join("metadata.ps1");
             std::fs::write(
                 &script,
-                "$count = if (Test-Path -LiteralPath $args[0]) { [int](Get-Content -LiteralPath $args[0]) } else { 0 }; $count++; [IO.File]::WriteAllText($args[0], [string]$count); if ($count -eq 1) { [Console]::Error.WriteLine('ERROR: HTTP Error 429'); exit 1 }; Write-Output '{\"ok\":true}'",
+                "$count = if (Test-Path -LiteralPath $args[0]) { [int](Get-Content -LiteralPath $args[0]) } else { 0 }; $count++; [IO.File]::WriteAllText($args[0], [string]$count); [Console]::Error.WriteLine('Cookie: SID=metadata-log-canary'); if ($count -eq 1) { [Console]::Error.WriteLine('ERROR: HTTP Error 429'); exit 1 }; Write-Output '{\"ok\":true}'",
             )?;
             (
                 PathBuf::from("powershell.exe"),
@@ -2547,7 +2555,7 @@ mod tests {
             let script = root.path().join("metadata.sh");
             std::fs::write(
                 &script,
-                "count=0; if [ -f \"$1\" ]; then count=$(cat \"$1\"); fi; count=$((count + 1)); printf %s \"$count\" > \"$1\"; if [ \"$count\" -eq 1 ]; then echo 'ERROR: HTTP Error 429' >&2; exit 1; fi; echo '{\"ok\":true}'",
+                "count=0; if [ -f \"$1\" ]; then count=$(cat \"$1\"); fi; count=$((count + 1)); printf %s \"$count\" > \"$1\"; echo 'Cookie: SID=metadata-log-canary' >&2; if [ \"$count\" -eq 1 ]; then echo 'ERROR: HTTP Error 429' >&2; exit 1; fi; echo '{\"ok\":true}'",
             )?;
             (
                 PathBuf::from("/bin/sh"),
@@ -2558,16 +2566,68 @@ mod tests {
             )
         };
         let cancel = CancellationToken::new();
-        let output = metadata_process(&app, &executable, &args, &cancel, None).await?;
+        let output =
+            metadata_process(&app, &executable, &args, &cancel, false, Some(&task)).await?;
         assert!(output.stdout.contains("\"ok\":true"));
+        assert!(!output.stderr.contains("metadata-log-canary"));
         assert_eq!(std::fs::read_to_string(&counter)?, "2");
+        let logs = app.command("tasks.logs", json!({"id":task.id})).await?;
+        let logs = logs["text"].as_str().unwrap();
+        for expected in [
+            "command",
+            "stdout\n{\"ok\":true}",
+            "stderr\nCookie: SID=metadata-log-canary",
+            "ERROR: HTTP Error 429",
+            "exit",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
         cancel.cancel();
         assert!(
-            metadata_process(&app, &executable, &args, &cancel, None)
+            metadata_process(&app, &executable, &args, &cancel, false, None)
                 .await
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(counter)?, "2");
+        app.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn ordinary_and_waiting_metadata_reject_a_single_65_mib_line() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        #[cfg(windows)]
+        let (executable, args) = (
+            PathBuf::from("powershell.exe"),
+            vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "$data = [Text.Encoding]::ASCII.GetBytes(('x' * 1048576)); $output = [Console]::OpenStandardOutput(); for ($i=0; $i -lt 65; $i++) { $output.Write($data,0,$data.Length) }".into()],
+        );
+        #[cfg(not(windows))]
+        let (executable, args) = (
+            PathBuf::from("/bin/sh"),
+            vec!["-c".into(), "head -c 68157440 /dev/zero".into()],
+        );
+        for wait_for_live in [false, true] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(10),
+                metadata_process(
+                    &app,
+                    &executable,
+                    &args,
+                    &CancellationToken::new(),
+                    wait_for_live,
+                    None,
+                ),
+            )
+            .await?
+            .err()
+            .context("Oversized metadata must fail")?;
+            assert!(format!("{error:#}").contains("byte limit"), "{error:#}");
+        }
         app.shutdown().await?;
         Ok(())
     }
@@ -2599,6 +2659,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["main", "zh"]
         );
+    }
+    #[test]
+    fn video_only_selection_keeps_audio_from_combined_formats() -> Result<()> {
+        let info = json!({"formats":[
+            {"format_id":"video","height":1080,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"combined-low","height":360,"vcodec":"avc1","acodec":"aac","language":"en","abr":64},
+            {"format_id":"combined","height":720,"vcodec":"avc1","acodec":"aac","language":"en","abr":128}
+        ]});
+        for options in [
+            DownloadOptions::default(),
+            DownloadOptions::parse(json!({"quality":"1080p","audioTrack":"en"}))?,
+        ] {
+            let formats = select_formats(&info, &options)?;
+            assert_eq!(
+                formats
+                    .iter()
+                    .map(|format| text(format, "format_id"))
+                    .collect::<Vec<_>>(),
+                ["video", "combined"]
+            );
+        }
+        let combined = json!({"formats":[info["formats"][2].clone()]});
+        assert_eq!(
+            select_formats(&combined, &DownloadOptions::default())?.len(),
+            1
+        );
+        Ok(())
     }
     #[test]
     fn automatic_quality_selects_real_video_extremes_and_keeps_audio() {

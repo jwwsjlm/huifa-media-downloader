@@ -59,3 +59,18 @@ it('skips an unreadable manual format and still adds the next item with its sele
   expect(command).toHaveBeenCalledWith('tasks.add', { urls: [urls[1]], options: expect.objectContaining({ videoFormatId: 'v' }), report: true });
   expect(command.mock.calls.filter(([name]) => name === 'tasks.add')).toHaveLength(1);
 });
+
+it('probes and adds manual formats when plain HTTP does not expose randomUUID', async () => {
+  const original = Object.getOwnPropertyDescriptor(crypto, 'randomUUID');
+  Object.defineProperty(crypto, 'randomUUID', { configurable: true, value: undefined });
+  try {
+    command.mockImplementation(async name => name === 'probe.video' ? { title: 'Video', formats: [{ formatId: 'v', vcodec: 'h264', acodec: 'none' }] } : name === 'tasks.add' ? { ids: ['video'], results: [{ id: 'video', status: 'queued', action: 'added' }] } : true);
+    const added = vi.fn();
+    render(<AddDialog urls={['https://example.test/video']} selectItems={false} options={{ contentMode: 'manual' }} t={(_zh, en) => en} run={work => { void work(); }} close={vi.fn()} added={added} />);
+    const download = await screen.findByRole('button', { name: 'Download selected items' });
+    await waitFor(() => expect((download as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(download);
+    await waitFor(() => expect(added).toHaveBeenCalledWith(expect.objectContaining({ ids: ['video'] })));
+    expect(command).toHaveBeenCalledWith('probe.video', expect.objectContaining({ requestId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/) }));
+  } finally { if (original) Object.defineProperty(crypto, 'randomUUID', original); else Reflect.deleteProperty(crypto, 'randomUUID'); }
+});

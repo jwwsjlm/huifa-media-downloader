@@ -17,9 +17,28 @@ const PAGE_LIMIT: u64 = 256 * 1024;
 pub(crate) struct RawLog {
     file: Arc<File>,
     lock: Arc<Mutex<()>>,
+    pub(crate) directory: PathBuf,
 }
 
 impl RawLog {
+    pub(crate) fn write_file(&self, source: &str, input: &mut File) -> Result<()> {
+        let mut last = [0];
+        if input.metadata()?.len() > 0 {
+            input.seek(SeekFrom::End(-1))?;
+            input.read_exact(&mut last)?;
+        }
+        input.rewind()?;
+        let _guard = self.lock.lock().unwrap();
+        let mut file = self.file.as_ref();
+        writeln!(file, "[{}] {source}", chrono::Utc::now().to_rfc3339())?;
+        std::io::copy(input, &mut file)?;
+        if last != *b"\n" {
+            writeln!(file)?;
+        }
+        file.flush()?;
+        Ok(())
+    }
+
     pub(crate) fn write(&self, source: &str, bytes: &[u8]) -> Result<()> {
         let _guard = self.lock.lock().unwrap();
         let mut file = self.file.as_ref();
@@ -191,6 +210,7 @@ impl App {
         Ok(RawLog {
             file: Arc::new(file),
             lock: self.task_log_lock.clone(),
+            directory: self.config.data_dir.join("task-logs"),
         })
     }
 

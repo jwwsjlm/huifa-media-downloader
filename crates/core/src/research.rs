@@ -217,7 +217,12 @@ impl App {
                 if let Some(error) = value["error"].as_str() {
                     value["error"] = json!(self.research_error(error));
                 }
-                value["warnings"] = json!(task.warnings);
+                value["warnings"] = json!(
+                    task.warnings
+                        .iter()
+                        .map(|warning| self.research_error(warning))
+                        .collect::<Vec<_>>()
+                );
                 value["files"] = public["files"].clone();
                 value["destinationConflict"] = public["destinationConflict"].clone();
                 value
@@ -1168,6 +1173,15 @@ mod tests {
         task.url = "https://example.test/watch?token=private-source".into();
         task.priority = 42;
         task.live = true;
+        task.warnings.push(format!(
+            "Completed cache cleanup did not finish: Cannot validate owned path {} https://warning.test/media?token=private-warning",
+            app.config.data_dir.join("tasks").display()
+        ));
+        task.warnings.push(format!(
+            "Previous result cleanup did not finish: {}",
+            app.config.download_dir.join("old.mp4").display()
+        ));
+        let original_warnings = task.warnings.clone();
         let target = app.config.download_dir.join("Video.mp4");
         task.destination = Some(crate::destination::Destination {
             target: target.clone(),
@@ -1183,6 +1197,13 @@ mod tests {
         let tasks = app.research_tasks()?;
         assert_eq!(tasks[0]["priority"], 42);
         assert_eq!(tasks[0]["live"], true);
+        assert!(
+            tasks[0]["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("[application storage]")
+        );
+        assert_eq!(app.db.task(&task.id)?.warnings, original_warnings);
         assert_eq!(
             tasks[0]["destinationConflict"],
             json!({"filename":"Video.mp4","files":["Video.mp4"]})
@@ -1193,6 +1214,8 @@ mod tests {
                 && !output.contains("https://example.test")
                 && !output.contains("downloads")
                 && !output.contains("outputPath")
+                && !output.contains("private-warning")
+                && !output.contains(root.path().to_string_lossy().as_ref())
         );
         app.shutdown().await?;
         Ok(())
