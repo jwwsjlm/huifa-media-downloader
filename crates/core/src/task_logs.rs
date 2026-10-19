@@ -639,7 +639,7 @@ mod tests {
             PathBuf::from("sh"),
             vec![
                 "-c".into(),
-                "printf 'raw-final-partial-canary'; printf 'READY\\n' >&2; sleep 30 & wait".into(),
+                "printf 'raw-final-partial-canary'; sleep 30 & printf 'READY\\n' >&2; wait".into(),
             ],
         );
         let error = tokio::time::timeout(

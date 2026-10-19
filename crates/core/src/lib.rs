@@ -1483,6 +1483,15 @@ pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
                     .with_context(|| format!("Cannot validate owned path {}", current.display()));
             }
         };
+        #[cfg(target_os = "macos")]
+        if meta.file_type().is_symlink()
+            && let Some(target) = macos_system_alias(&current, &std::fs::read_link(&current)?)
+        {
+            // Permit only fixed macOS aliases, then validate all remaining user components.
+            reject_links(&target)?;
+            current = target;
+            continue;
+        }
         ensure!(
             !meta.file_type().is_symlink(),
             "Symbolic links cannot be used as owned files"
@@ -1499,9 +1508,77 @@ pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_system_alias(path: &std::path::Path, link: &std::path::Path) -> Option<PathBuf> {
+    let target = if path == std::path::Path::new("/tmp") {
+        std::path::Path::new("/private/tmp")
+    } else if path == std::path::Path::new("/var") {
+        std::path::Path::new("/private/var")
+    } else if path == std::path::Path::new("/etc") {
+        std::path::Path::new("/private/etc")
+    } else {
+        return None;
+    };
+    (path.parent()?.join(link) == target).then(|| target.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_paths_allow_only_exact_macos_system_alias_targets() -> Result<()> {
+        use std::path::Path;
+        for name in ["tmp", "var", "etc"] {
+            let alias = PathBuf::from(format!("/{name}"));
+            let target = PathBuf::from(format!("/private/{name}"));
+            for link in [target.clone(), PathBuf::from(format!("private/./{name}"))] {
+                assert_eq!(macos_system_alias(&alias, &link), Some(target.clone()));
+            }
+            assert!(macos_system_alias(&alias, Path::new("/Users/example/elsewhere")).is_none());
+            assert!(macos_system_alias(&alias.join("user-link"), &target).is_none());
+            assert!(macos_system_alias(Path::new("/owned/var"), &target).is_none());
+        }
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("regular"))?;
+        std::fs::write(root.path().join("regular/file"), b"owned")?;
+        reject_links(&root.path().join("regular/file"))?;
+        reject_links(&root.path().join("not-created/file"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_paths_accept_macos_temp_alias_but_reject_user_symlinks() -> Result<()> {
+        use std::{os::unix::fs::symlink, path::Path};
+        let root = tempfile::Builder::new()
+            .prefix("huifa-owned-")
+            .tempdir_in("/tmp")?;
+        let directory = root.path().join("regular");
+        std::fs::create_dir(&directory)?;
+        let file = directory.join("file");
+        std::fs::write(&file, b"owned")?;
+        reject_links(&file)?;
+        reject_links(&root.path().canonicalize()?.join("regular/file"))?;
+        reject_links(&root.path().join("not-created/file"))?;
+        for name in ["tmp", "var", "etc"] {
+            let alias = PathBuf::from(format!("/{name}"));
+            assert!(std::fs::symlink_metadata(&alias)?.file_type().is_symlink());
+            reject_links(&alias)?;
+        }
+        let directory_link = root.path().join("directory-link");
+        symlink(&directory, &directory_link)?;
+        assert!(reject_links(&directory_link.join("file")).is_err());
+        assert!(reject_links(&directory_link.join("not-created/file")).is_err());
+        let file_link = root.path().join("file-link");
+        symlink(&file, &file_link)?;
+        assert!(reject_links(&file_link).is_err());
+        let broken_link = root.path().join("broken-link");
+        symlink(Path::new("missing"), &broken_link)?;
+        assert!(reject_links(&broken_link).is_err());
+        assert_eq!(std::fs::read(&file)?, b"owned");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn startup_errors_identify_the_failed_stage_and_preserve_existing_data() -> Result<()> {

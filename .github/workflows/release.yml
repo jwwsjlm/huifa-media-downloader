@@ -227,7 +227,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Linux desktop dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev build-essential xvfb unzip
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev build-essential xvfb unzip xdg-utils
       - run: npm ci --prefix frontend
       - uses: actions/download-artifact@v4
         with:
