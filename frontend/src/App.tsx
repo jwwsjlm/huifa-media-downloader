@@ -50,8 +50,9 @@ export function App() {
     else setMessage(t(`批次下载已完成：${finished.reduce((count, batch) => count + batch.ids.length, 0)} 项。`, `Batch downloads completed: ${finished.reduce((count, batch) => count + batch.ids.length, 0)} tasks.`));
   }, [pendingBatches, state.tasks, t]);
   const settingsRef = useRef(state.settings); settingsRef.current = state.settings;
+  const pendingTasksRef = useRef(false); pendingTasksRef.current = state.taskIds.some(id => ['queued', 'probing', 'downloading', 'waiting_processing', 'processing'].includes(state.tasks[id].status));
   const translateRef = useRef(t); translateRef.current = t;
-  const run = useCallback<Run>(operation => { void operation().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))); }, []);
+  const run = useCallback<Run>(operation => { setError(''); void operation().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))); }, []);
   const navigate = useCallback((page: Page) => {
     if (!host.desktop) history.pushState(null, '', page === 'mcp' ? '/mcp' : '/');
     dispatch({ type: 'view', patch: { page } });
@@ -68,9 +69,9 @@ export function App() {
       refreshing = host.command<Snapshot>('snapshot', { includeTools: false }).then(snapshot => {
         if (disposed) return;
         dispatch({ type: 'snapshot', snapshot });
-        for (const task of snapshot.tasks) if (task.status === 'completed') notified.add(task.id);
         if (!toolsChecked) {
           toolsChecked = true;
+          for (const task of snapshot.tasks) if (task.status === 'completed') notified.add(task.id);
           void host.command<Tool[]>('tools.check').then(tools => { if (!disposed) dispatch({ type: 'event', event: { kind: 'tools.updated', data: tools as unknown as Json } }); }).catch(() => { if (!disposed) setMessage(translateRef.current('未能检查运行时组件，可在“工具与更新”重试。', 'Runtime components could not be checked. Retry under Tools & updates.')); });
         }
       }).catch(reason => { if (!disposed) setError(String(reason)); }).finally(() => {
@@ -80,19 +81,22 @@ export function App() {
       });
       return refreshing;
     };
+    const reconcile = () => { if (!disposed && initialized && !refreshing && document.visibilityState === 'visible') void refresh(); };
+    const timer = window.setInterval(() => { if (pendingTasksRef.current) reconcile(); }, 2000);
+    window.addEventListener('focus', reconcile); document.addEventListener('visibilitychange', reconcile);
     void (async () => {
       unlisten = await host.subscribe(event => {
         if (disposed) return;
         if (event.kind === 'snapshot.required' || event.kind === 'host.resync') { void refresh(); return; }
         if (event.kind === 'host.error') { setError(String((event.data as { message: string }).message)); return; }
+        if (event.kind === 'task.upsert') { const task = event.data as unknown as Task; if (task.status === 'completed' && !notified.has(task.id)) { notified.add(task.id); if (settingsRef.current.desktopNotifications === true) run(() => host.notify(translateRef.current('下载完成', 'Download complete'), task.title)); } }
         if (!initialized) { buffered.push(event); return; }
         dispatch({ type: 'event', event });
-        if (event.kind === 'task.upsert') { const task = event.data as unknown as Task; if (task.status === 'completed' && !notified.has(task.id)) { notified.add(task.id); if (settingsRef.current.desktopNotifications === true) run(() => host.notify(translateRef.current('下载完成', 'Download complete'), task.title)); } }
       }, connected => { if (!disposed) { dispatch({ type: 'connection', connected }); if (connected && initialized) void refresh(); } });
       if (disposed) { unlisten(); return; }
       await refresh();
     })().catch(reason => { if (!disposed) setError(String(reason)); });
-    return () => { disposed = true; unlisten?.(); };
+    return () => { disposed = true; window.clearInterval(timer); window.removeEventListener('focus', reconcile); document.removeEventListener('visibilitychange', reconcile); unlisten?.(); };
   }, [authenticated, dispatch]);
   useEffect(() => {
     const theme = String(state.settings.appearanceTheme || 'dark');
@@ -163,8 +167,14 @@ export function App() {
     if (action === 'logs') { setDialog({ kind: 'logs', task }); return; }
     if (action === 'configure') { setDialog({ kind: 'requirements', task }); return; }
     if (action === 'destination') { setDialog({ kind: 'destination', task }); return; }
-    run(() => host.command(`tasks.${action}`, { id: task.id }));
-  }, [run]);
+    run(async () => {
+      const updated = await host.command<Task>(`tasks.${action}`, { id: task.id });
+      if (['retry', 'resume', 'retryCurrent'].includes(action)) {
+        dispatch({ type: 'event', event: { kind: 'task.upsert', data: updated as unknown as Json }, ifTaskUnchanged: task });
+        setMessage(t('请求已受理，任务将按队列执行。', 'Request accepted. The task will follow the queue.'));
+      }
+    });
+  }, [run, dispatch, t]);
   const cover = useCallback((media: Media) => setDialog({ kind: 'cover', media }), []);
   if (authenticated === null) return <div className="web-login"><Empty title={t('连接下载服务', 'Connecting to download service')} /></div>;
   if (!authenticated && host.desktop) return <div className="web-login"><div className="panel web-login-form"><h2>{t('下载服务未能启动', 'Download service could not start')}</h2><p className="notice danger" role="alert">{explainError(error, t)}</p><Button tone="primary" onClick={() => run(async () => { await host.session(); setError(''); setAuthenticated(true); })}>{t('重试连接', 'Retry connection')}</Button></div></div>;

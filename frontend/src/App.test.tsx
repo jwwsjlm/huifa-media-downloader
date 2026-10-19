@@ -1,24 +1,25 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { AppProvider } from './state';
 import { makeSnapshot } from './test-fixtures';
 import type { CoreEvent } from './types';
 import { version as buildVersion } from '../package.json';
 
-const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), openProject: vi.fn(), copyTask: vi.fn(), result: vi.fn() }));
+const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), openProject: vi.fn(), copyTask: vi.fn(), result: vi.fn(), notify: vi.fn() }));
 vi.mock('./transport', () => ({ host: {
   desktop: false, capabilities: () => ({ browserCookies: false, remoteBrowser: false, updates: false }),
   session: async () => ({ authenticated: true }), subscribe: async (listener: (event: CoreEvent) => void, connection: (value: boolean) => void) => { transport.listener = listener; connection(true); return () => { transport.listener = null; }; },
-  command: transport.command, assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: async () => {}, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, openProject: transport.openProject, copyTask: transport.copyTask, result: transport.result,
+  command: transport.command, assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: transport.notify, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, openProject: transport.openProject, copyTask: transport.copyTask, result: transport.result,
 } }));
 beforeEach(() => {
   transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true);
   transport.releaseStatus.mockReset().mockResolvedValue({ currentVersion:'0.3.0', latestVersion:'0.3.0', updateAvailable:false, url:'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.0' });
   transport.openRelease.mockReset().mockResolvedValue(undefined);
   transport.openProject.mockReset().mockResolvedValue(undefined);
-  transport.copyTask.mockReset().mockResolvedValue(undefined); transport.result.mockReset().mockResolvedValue(undefined);
+  transport.copyTask.mockReset().mockResolvedValue(undefined); transport.result.mockReset().mockResolvedValue(undefined); transport.notify.mockReset().mockResolvedValue(undefined);
 });
+afterEach(() => { vi.useRealTimers(); });
 describe('live interface stability', () => {
   it('shows completion time beside the row status using the saved format, only after completion', async () => {
     const snapshot = makeSnapshot(); snapshot.settings.completedTimeFormat = 'YYMMDD HH:mm';
@@ -304,6 +305,50 @@ describe('live interface stability', () => {
     fireEvent.click(within(menu).getByRole('menuitem', { name: 'Pause' }));
     await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tasks.pause', { id: 'b' }));
     expect(screen.queryByRole('menu')).toBeNull();
+  });
+  it('clears a failed retry notice and shows the accepted download queue without waiting for an event', async () => {
+    const snapshot = makeSnapshot(); snapshot.tasks[0].status = 'failed';
+    const queued = { ...snapshot.tasks[0], status: 'queued', stage: 'queued', error: null };
+    let accept!: (value: unknown) => void; let attempts = 0;
+    transport.command.mockImplementation(async command => {
+      if (command === 'snapshot') return snapshot;
+      if (command === 'tasks.retry') {
+        if (++attempts === 1) throw new Error('Unknown retry failure at C:\\Users\\fixture\\token-secret');
+        return new Promise(resolve => { accept = resolve; });
+      }
+      return true;
+    });
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
+    const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
+    fireEvent.click(detail.getByRole('button', { name: 'Retry download' }));
+    expect((await screen.findByRole('alert')).textContent).toBe('The operation could not be completed. View the logs for details.');
+    expect(screen.queryByText(/token-secret/)).toBeNull();
+    fireEvent.click(detail.getByRole('button', { name: 'Retry download' }));
+    await waitFor(() => expect(accept).toBeTypeOf('function'));
+    expect(screen.queryByRole('alert')).toBeNull();
+    await act(async () => accept(queued));
+    expect(detail.getByText('Download queued', { selector: 'strong' })).toBeTruthy();
+    expect(detail.queryByRole('button', { name: 'Retry download' })).toBeNull();
+    expect((await screen.findByRole('status')).textContent).toBe('Request accepted. The task will follow the queue.');
+    expect(transport.command).toHaveBeenCalledWith('tasks.retry', { id: 'a' });
+  });
+  it('keeps a newer running event when the retry response arrives in the same render batch', async () => {
+    const snapshot = makeSnapshot(); snapshot.tasks[0].status = 'failed';
+    const queued = { ...snapshot.tasks[0], status: 'queued', stage: 'queued', error: null };
+    let accept!: (value: unknown) => void;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'tasks.retry' ? new Promise(resolve => { accept = resolve; }) : true);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
+    const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
+    fireEvent.click(detail.getByRole('button', { name: 'Retry download' }));
+    await waitFor(() => expect(accept).toBeTypeOf('function'));
+    await act(async () => {
+      transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'downloading', stage: 'download', error: null } });
+      accept(queued);
+    });
+    expect(detail.getByText('Downloading', { selector: '.badge' })).toBeTruthy();
+    expect(detail.queryByText('Download queued')).toBeNull();
   });
   it('opens logs for the right-clicked task and retains a details entry after closing', async () => {
     transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'tasks.logs' ? { text: 'Fixture warning for Beta', start: 0, end: 24, total: 24, hasMore: false, raw: true, legacy: false } : true);
@@ -780,6 +825,111 @@ describe('live interface stability', () => {
     await waitFor(() => expect(screen.getAllByText('92.0%').length).toBeGreaterThan(0));
     expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('still editing');
     expect(within(screen.getByRole('listbox')).getByRole('option', { selected: true }).textContent).toContain('Alpha');
+  });
+  it('reconciles missed live progress and cleared errors in the list and details every two seconds', async () => {
+    vi.useFakeTimers(); vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    const initial = makeSnapshot(); Object.assign(initial.tasks[0], { progress: 14.7, stageProgress: 14.7, error: 'Previous download failed' });
+    const latest = makeSnapshot(); Object.assign(latest.tasks[0], { progress: 25.9, stageProgress: 25.9, error: null });
+    let snapshots = 0;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? ++snapshots === 1 ? initial : latest : []);
+    render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'still editing' } });
+    const row = within(screen.getByRole('option', { name: /Alpha/ }));
+    const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
+    expect(row.getByText('14.7%')).toBeTruthy(); expect(detail.getByText('14.7%')).toBeTruthy();
+    expect(detail.getByRole('alert')).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1999); });
+    expect(snapshots).toBe(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(row.getByText('25.9%')).toBeTruthy(); expect(detail.getByText('25.9%')).toBeTruthy();
+    expect(detail.queryByRole('alert')).toBeNull();
+    expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('still editing');
+    expect(within(screen.getByRole('listbox')).getByRole('option', { selected: true }).textContent).toContain('Alpha');
+    expect(transport.command.mock.calls.filter(([command]) => command === 'snapshot').every(([, args]) => args.includeTools === false)).toBe(true);
+    expect(transport.command.mock.calls.filter(([command]) => command === 'tools.check')).toHaveLength(1);
+  });
+  it('reconciles on return to the visible app without overlapping refreshes or losing buffered events', async () => {
+    vi.useFakeTimers(); let visibility: DocumentVisibilityState = 'visible';
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+    let snapshots = 0; let finish!: (value: unknown) => void;
+    const complete = makeSnapshot(); for (const task of complete.tasks) Object.assign(task, { status: 'completed', stage: 'completed', error: null, mediaInfo: { width: 1920, height: 1080 } });
+    transport.command.mockImplementation(async command => {
+      if (command !== 'snapshot') return [];
+      if (++snapshots === 1) return makeSnapshot();
+      if (snapshots === 2) return new Promise(resolve => { finish = resolve; });
+      return complete;
+    });
+    const view = render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(snapshots).toBe(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(6000); fireEvent.focus(window); fireEvent(document, new Event('visibilitychange')); });
+    expect(snapshots).toBe(2);
+    const older = makeSnapshot(); Object.assign(older.tasks[0], { progress: 25, stageProgress: 25 });
+    await act(async () => {
+      transport.listener?.({ kind: 'task.upsert', data: { id: 'a', progress: 42, stageProgress: 42 } });
+      finish(older);
+    });
+    expect(within(screen.getByRole('option', { name: /Alpha/ })).getByText('42.0%')).toBeTruthy();
+    expect(within(screen.getByRole('complementary', { name: 'Task details' })).getByText('42.0%')).toBeTruthy();
+    expect(snapshots).toBe(2);
+    visibility = 'hidden'; fireEvent(document, new Event('visibilitychange'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(snapshots).toBe(2);
+    visibility = 'visible'; await act(async () => { fireEvent(document, new Event('visibilitychange')); });
+    expect(snapshots).toBe(3);
+    expect(screen.getByRole('option', { name: /Alpha/ }).textContent).toContain('Completed');
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(snapshots).toBe(3);
+    await act(async () => { fireEvent.focus(window); });
+    expect(snapshots).toBe(4);
+    view.unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); fireEvent.focus(window); fireEvent(document, new Event('visibilitychange')); });
+    expect(snapshots).toBe(4); expect(transport.listener).toBeNull();
+  });
+  it('notifies once for completion during a periodic refresh while leaving initial completed history quiet', async () => {
+    vi.useFakeTimers(); vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    const initial = makeSnapshot(); initial.settings.desktopNotifications = true; initial.tasks[1].status = 'completed';
+    const completed = { ...initial, tasks: initial.tasks.map(task => ({ ...task, status: 'completed' as const, stage: 'completed' })) };
+    let snapshots = 0; let finish!: (value: unknown) => void;
+    transport.command.mockImplementation(async command => {
+      if (command !== 'snapshot') return [];
+      if (++snapshots === 1) return initial;
+      if (snapshots === 2) return new Promise(resolve => { finish = resolve; });
+      return completed;
+    });
+    render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    await act(async () => { transport.listener?.({ kind: 'task.upsert', data: { id: 'b', title: 'Beta', status: 'completed' } }); });
+    expect(transport.notify).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    await act(async () => { transport.listener?.({ kind: 'task.upsert', data: { id: 'a', title: 'Alpha', status: 'completed' } }); });
+    expect(transport.notify).toHaveBeenCalledExactlyOnceWith('Download complete', 'Alpha');
+    await act(async () => {
+      finish(completed);
+      transport.listener?.({ kind: 'task.upsert', data: { id: 'a', title: 'Alpha', status: 'completed' } });
+    });
+    await act(async () => { fireEvent.focus(window); });
+    expect(transport.notify).toHaveBeenCalledTimes(1);
+  });
+  it('still notifies once when a periodic snapshot sees completion before the completion event', async () => {
+    vi.useFakeTimers(); vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    const initial = makeSnapshot(); initial.settings.desktopNotifications = true; initial.tasks[1].status = 'completed';
+    const completed = { ...initial, tasks: initial.tasks.map(task => ({ ...task, status: 'completed' as const, stage: 'completed' })) };
+    let snapshots = 0;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? ++snapshots === 1 ? initial : completed : []);
+    render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    expect(transport.notify).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(screen.getByRole('option', { name: /Alpha/ }).textContent).toContain('Completed');
+    expect(transport.notify).not.toHaveBeenCalled();
+    await act(async () => { transport.listener?.({ kind: 'task.upsert', data: { id: 'a', title: 'Alpha', status: 'completed' } }); });
+    expect(transport.notify).toHaveBeenCalledExactlyOnceWith('Download complete', 'Alpha');
+    await act(async () => {
+      transport.listener?.({ kind: 'task.upsert', data: { id: 'a', title: 'Alpha', status: 'completed' } });
+      fireEvent.focus(window);
+    });
+    expect(transport.notify).toHaveBeenCalledTimes(1);
   });
   it('fetches a new snapshot when more events are missed during an in-flight refresh', async () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');

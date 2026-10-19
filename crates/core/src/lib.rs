@@ -533,6 +533,14 @@ impl App {
     }
     async fn resume(&self, id: &str, retry: bool) -> Result<Value> {
         let mut task = self.db.task(id)?;
+        if retry
+            && matches!(
+                task.status.as_str(),
+                "queued" | "probing" | "downloading" | "waiting_processing" | "processing"
+            )
+        {
+            return Ok(task.public());
+        }
         ensure!(
             if retry {
                 matches!(
@@ -2731,6 +2739,69 @@ mod tests {
 mod queue_tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn retry_is_idempotent_while_queued_or_running() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let _blocked = app.network.clone().acquire_many_owned(3).await?;
+        let mut task = tests::paused_task(Default::default());
+        task.status = "failed".into();
+        task.error = Some("Connection reset by peer".into());
+        app.db.insert_task(&task)?;
+        let queued = app.command("tasks.retry", json!({"id":task.id})).await?;
+        assert_eq!(queued["status"], "queued");
+        assert!(queued["error"].is_null());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if app
+                    .queued_slots
+                    .lock()
+                    .unwrap()
+                    .get("network")
+                    .is_some_and(|queue| queue.contains(&task.id))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let runner = app.runners.lock().unwrap()[&task.id].handle.id();
+        for status in [
+            "queued",
+            "probing",
+            "downloading",
+            "waiting_processing",
+            "processing",
+        ] {
+            let mut current = app.db.task(&task.id)?;
+            current.status = status.into();
+            current.stage = status.into();
+            current.progress = 37.0;
+            current.stage_progress = Some(42.0);
+            current.speed = Some(1024.0);
+            current.eta = Some(60.0);
+            app.db.save_task(&current)?;
+            let expected = serde_json::to_value(&current)?;
+            let retried = app.command("tasks.retry", json!({"id":task.id})).await?;
+            assert_eq!(retried, current.public());
+            assert_eq!(serde_json::to_value(app.db.task(&task.id)?)?, expected);
+            assert_eq!(app.runners.lock().unwrap()[&task.id].handle.id(), runner);
+            assert!(
+                app.command("tasks.resume", json!({"id":task.id}))
+                    .await
+                    .is_err()
+            );
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn priority_changes_real_wait_order_and_survives_restart() -> Result<()> {
