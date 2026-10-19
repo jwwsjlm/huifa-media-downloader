@@ -120,6 +120,95 @@ fn config(root: &Path) -> AppConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed native yt-dlp, FFmpeg and FFprobe; local fixture only"]
+async fn real_transfer_uses_resolved_metadata_without_reextracting_webpage() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let fixtures = root.path().join("fixtures");
+    std::fs::create_dir_all(&fixtures)?;
+    // Transfer stores the source unchanged; this test deliberately does not process or probe it.
+    let input = fixtures.join("resolved.mp4");
+    let payload = (0u8..=255).cycle().take(1024).collect::<Vec<_>>();
+    std::fs::write(&input, &payload)?;
+    let expected = download::hash_file(&input)?;
+    let app = App::open(config(root.path())).await?;
+    let server = LocalServer::start(fixtures).await?;
+    let outcome = async {
+        let webpage = format!("{}/must-not-reextract.html", server.url);
+        let mut task = crate::tests::paused_task(crate::tools::freeze(&app)?);
+        task.url = webpage.clone();
+        task.title = "Resolved metadata fixture".into();
+        task.options.write_thumbnail = false;
+        task.options.write_info_json = false;
+        task.options.format_id = "resolved".into();
+        app.db.insert_task(&task)?;
+        let info = json!({
+            "id": "resolved-fixture",
+            "title": task.title,
+            "extractor": "generic",
+            "extractor_key": "Generic",
+            "webpage_url": webpage,
+            "original_url": task.url,
+            "formats": [{
+                "format_id": "resolved",
+                "url": format!("{}/resolved.mp4", server.url),
+                "ext": "mp4",
+                "protocol": "http",
+                "vcodec": "h264",
+                "acodec": "aac",
+                "filesize": payload.len()
+            }]
+        });
+        let manifest = tokio::time::timeout(
+            Duration::from_secs(30),
+            download::transfer(&app, task, info, &CancellationToken::new()),
+        )
+        .await
+        .context("Resolved metadata transfer did not finish")??;
+        ensure!(
+            manifest.files.len() == 1,
+            "Transfer returned unexpected files"
+        );
+        let source = &manifest.files[0];
+        ensure!(
+            source.size > 0 && (source.hash.clone(), source.size) == expected,
+            "Transfer did not preserve the resolved media bytes"
+        );
+        ensure!(
+            download::hash_file(&source.path)? == expected,
+            "Downloaded source content differs from the local fixture"
+        );
+        let requests = server.requests.lock().unwrap();
+        ensure!(
+            requests.iter().any(|path| path == "/resolved.mp4"),
+            "Transfer did not request the resolved media URL"
+        );
+        ensure!(
+            !requests
+                .iter()
+                .any(|path| path == "/must-not-reextract.html"),
+            "Transfer re-extracted the original webpage instead of using resolved metadata"
+        );
+        drop(requests);
+        ensure!(
+            std::fs::read_dir(&app.config.data_dir)?.all(|entry| {
+                entry.is_ok_and(|entry| {
+                    !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".download-info-")
+                })
+            }),
+            "Transfer left its temporary resolved metadata file behind"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    server.shutdown().await;
+    app.shutdown().await?;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires native FFmpeg and FFprobe; uses only a local generated live fixture"]
 async fn real_live_stop_save_publishes_valid_recording_and_cancel_does_not() -> Result<()> {
     let root = tempfile::tempdir()?;

@@ -983,6 +983,23 @@ pub(crate) async fn transfer(
     std::fs::create_dir_all(&directory)?;
     let cookie_text = app.task_cookies(&task)?;
     let cookies = Cookies::new(app, cookie_text.as_deref())?;
+    // Re-extracting can change CDN URLs behind the selected format and source identity.
+    let info_file = if live {
+        None
+    } else {
+        let mut file = tempfile::Builder::new()
+            .prefix(".download-info-")
+            .tempfile_in(&app.config.data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        serde_json::to_writer(&mut file, &info)?;
+        file.flush()?;
+        Some(file)
+    };
     let finish_capture = if live {
         Some(app.finish_capture_token(&task.id)?)
     } else {
@@ -1001,6 +1018,7 @@ pub(crate) async fn transfer(
             let task = &task;
             let directory = &directory;
             let cookies = &cookies;
+            let info_file = &info_file;
             let runtime_options = &runtime_options;
             let speeds = speeds.clone();
             let finish_capture = &finish_capture;
@@ -1064,7 +1082,11 @@ pub(crate) async fn transfer(
                 if !task.options.rate_limit.is_empty() {
                     args.extend(["--limit-rate".into(), task.options.rate_limit.clone()]);
                 }
-                args.extend(["--".into(), task.url.clone()]);
+                if let Some(file) = info_file {
+                    args.extend(["--load-info-json".into(), file.path().to_string_lossy().into()]);
+                } else {
+                    args.extend(["--".into(), task.url.clone()]);
+                }
                 let app_progress = app.clone();
                 let task_id = task.id.clone();
                 let progress_state = Arc::new(Mutex::new(TransferProgress::default()));
