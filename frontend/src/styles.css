@@ -206,7 +206,7 @@ details[open]>summary::after{transform:rotate(225deg)}
 .empty h3{color:var(--text);font-size:13px}
 .empty p{font-size:12px;max-width:330px}
 .filter-tabs{display:flex;gap:var(--space-sm);flex-shrink:0;flex-wrap:wrap}
-.filter-tab{border:1px solid var(--border-soft);border-radius:var(--control-radius);background:var(--surface);color:var(--muted);font-size:12px;min-height:var(--control-height);padding:6px 12px;line-height:1.4;transition:background .15s,border-color .15s,color .15s}
+.filter-tab{border:1px solid var(--border-soft);border-radius:var(--control-radius);background:var(--surface);color:var(--muted);font-size:12px;min-height:var(--control-height);padding:6px 12px;line-height:1.4;white-space:nowrap;transition:background .15s,border-color .15s,color .15s}
 .filter-tab:hover:enabled{background:var(--hover);color:var(--text)}
 .filter-tab.active,.filter-tab.active:hover:enabled{color:var(--accent);background:var(--accent-surface);border-color:color-mix(in srgb,var(--accent) 30%,var(--border))}
 .filter-tab:active:enabled{background:var(--selection)}
@@ -291,7 +291,7 @@ details[open]>summary::after{transform:rotate(225deg)}
 .toast>span{flex:1;overflow-wrap:anywhere}
 .toast.danger{border-color:color-mix(in srgb,var(--danger) 55%,var(--border))}
 
-.dialog{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--dialog-radius);box-shadow:var(--shadow);padding:0;width:min(700px,calc(100vw - 48px));max-height:calc(100vh - 48px);min-height:0;overflow:hidden}
+.dialog{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--dialog-radius);box-shadow:var(--shadow);padding:0;width:min(700px,calc(100vw - 48px));max-width:none;max-height:calc(100vh - 48px);min-height:0;overflow:hidden}
 .dialog[open]{display:flex;flex-direction:column}
 .dialog::backdrop{background:#080d1699;backdrop-filter:blur(3px)}
 .dialog.wide{width:min(1050px,calc(100vw - 48px))}
@@ -426,7 +426,7 @@ details[open]>summary::after{transform:rotate(225deg)}
 .detail h2{font-size:13px;margin:4px 0}
 .detail-stage{margin:6px 0}
 .settings-tabs{gap:4px;padding:4px}
-.settings-tabs .filter-tab{flex:1}
+.settings-tabs .filter-tab{flex:1 1 auto}
 .checkbox-grid{grid-template-columns:1fr}
 .component-row{gap:10px;flex-wrap:wrap}
 .dialog,.dialog.wide{width:calc(100vw - 12px);max-height:calc(100vh - 12px)}
