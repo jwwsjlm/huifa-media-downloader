@@ -25,6 +25,6 @@ export function DestinationDialog({ task, t, close }: { task: Task; t: Translate
     <p className="notice break-text">{task.destinationConflict?.files.join(' · ')}</p>
     <Field label={t('新文件名', 'New filename')}><input value={filename} onChange={event => { setFilename(event.target.value); setConfirm(false); }} disabled={busy} maxLength={220} /></Field>
     {confirm && <div className="notice danger" role="alert"><p>{t('确认替换上面列出的已有文件？新结果通过验证后才替换；失败或取消会保留旧文件。被替换的旧任务将标记结果已替换。', 'Replace the existing files listed above? Replacement happens only after validation. Failure or cancellation keeps the old files. Previous tasks will indicate their results were replaced.')}</p><Button tone="danger" disabled={busy} onClick={() => void resolve('overwrite')}>{t('确认覆盖并下载', 'Confirm replacement and download')}</Button></div>}
-    {error && <p className="error-text" role="alert">{error}</p>}
+    {error && <p className="notice danger" role="alert">{error}</p>}
   </Modal>;
 }

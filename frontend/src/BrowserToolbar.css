@@ -1,9 +1,10 @@
-.browser-toolbar{height:44px;min-height:44px;display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--surface);border-bottom:1px solid var(--border-soft)}
-.browser-toolbar .button{flex-shrink:0;height:32px;min-height:32px}
-.browser-toolbar .browser-history{font-family:Arial,sans-serif;font-size:27px;font-weight:400;line-height:1}
+.browser-toolbar{--control-height:32px;--control-height-small:32px;height:44px;min-height:44px;display:flex;align-items:center;gap:var(--space-xs);padding:var(--space-xs) var(--space-sm);background:var(--surface);border-bottom:1px solid var(--border-soft)}
+.browser-toolbar .button{flex-shrink:0;height:var(--control-height-small)}
 .browser-toolbar form{flex:1;min-width:0}
-.browser-toolbar input{height:32px!important;min-height:32px!important;padding:4px 10px!important}
-.browser-toolbar .browser-navigation-error{max-width:35%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--danger)}
+.browser-toolbar input:not([type=checkbox]):not([type=radio]):not([type=range]){padding:var(--space-xs) var(--space-md)}
+.browser-toolbar .browser-navigation-error{display:flex;align-items:center;gap:var(--space-xs);max-width:35%;min-width:0;font-size:12px;color:var(--danger)}
+.browser-navigation-error-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .browser-refresh.busy svg{animation:browser-reload 1s linear infinite}
 @keyframes browser-reload{to{transform:rotate(360deg)}}
+@media(max-width:540px){.browser-toolbar .browser-navigation-error{flex-shrink:0;max-width:none}.browser-navigation-error-text{display:none}}
 @media(prefers-reduced-motion:reduce){.browser-refresh.busy svg{animation:none}}

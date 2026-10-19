@@ -33,6 +33,6 @@ export function StoragePanel({ t }: { t: Translate }) {
       </dl><Button icon="trash" size="small" disabled={busy} onClick={() => void refresh(true)}>{t('清理已完成缓存和未引用的旧组件', 'Clean completed caches and unused runtimes')}{value.unusedToolGroups ? ` (${value.unusedToolGroups})` : ''}</Button></div>
     </> : busy && <p className="hint" role="status">{t('正在读取磁盘与缓存…', 'Reading storage and cache…')}</p>}
     <p className="hint storage-retention">{t('成功后自动清理来源和处理中间文件，保留成品、封面预览和日志。暂停或失败的任务保留恢复文件。', 'Successful tasks automatically remove source and processing caches while keeping results, previews and logs. Unfinished tasks keep recovery files.')}</p>
-    {error && <p className="error-text" role="alert">{error}</p>}
+    {error && <p className="notice danger" role="alert">{error}</p>}
   </section>;
 }

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Button } from './components';
+import { Button, Icon } from './components';
 import './BrowserToolbar.css';
 
 type NavigationState = { url: string; canGoBack: boolean; canGoForward: boolean };
@@ -80,8 +80,8 @@ export function BrowserToolbar() {
   };
 
   return <nav className="browser-toolbar" aria-label={t('浏览器导航', 'Browser navigation')} aria-busy={Boolean(pending)}>
-    <Button size="small" tone="icon-only" className="browser-history" aria-label={t('返回', 'Back')} title={t('返回', 'Back')} disabled={!state?.canGoBack || Boolean(pending)} onClick={() => void navigate('back')}><span aria-hidden="true">‹</span></Button>
-    <Button size="small" tone="icon-only" className="browser-history" aria-label={t('前进', 'Forward')} title={t('前进', 'Forward')} disabled={!state?.canGoForward || Boolean(pending)} onClick={() => void navigate('forward')}><span aria-hidden="true">›</span></Button>
+    <Button size="small" tone="icon-only" icon="chevron-left" aria-label={t('返回', 'Back')} title={t('返回', 'Back')} disabled={!state?.canGoBack || Boolean(pending)} onClick={() => void navigate('back')} />
+    <Button size="small" tone="icon-only" icon="chevron-right" aria-label={t('前进', 'Forward')} title={t('前进', 'Forward')} disabled={!state?.canGoForward || Boolean(pending)} onClick={() => void navigate('forward')} />
     <Button size="small" tone="icon-only" icon="refresh" className={pending ? 'browser-refresh busy' : 'browser-refresh'} aria-label={pending ? t('加载中…', 'Loading…') : t('刷新', 'Refresh')} title={t('刷新', 'Refresh')} disabled={!state || Boolean(pending)} onClick={() => void navigate('reload')} />
     <form onSubmit={submit}>
       <input ref={input} type="text" aria-label={t('网站地址', 'Website address')} aria-invalid={Boolean(error)} aria-describedby={error ? 'browser-navigation-error' : undefined} value={address} placeholder={t('输入网站地址，按回车访问', 'Enter a website address and press Enter')} spellCheck={false} autoComplete="off" autoCapitalize="off" onFocus={() => { editing.current = true; }} onBlur={() => { editing.current = false; }} onChange={event => { editing.current = true; setAddress(event.target.value); }} onKeyDown={event => {
@@ -92,6 +92,6 @@ export function BrowserToolbar() {
         }
       }} />
     </form>
-    {error && <span id="browser-navigation-error" className="browser-navigation-error" role="alert" title={error}>{error}</span>}
+    {error && <span id="browser-navigation-error" className="browser-navigation-error" role="alert" aria-label={error} title={error}><Icon name="info" /><span className="browser-navigation-error-text">{error}</span></span>}
   </nav>;
 }
