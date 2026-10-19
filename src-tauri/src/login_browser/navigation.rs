@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(any(windows, target_os = "linux"))]
+use serde_json::json;
 use std::time::Duration;
 use tauri::{Manager, Webview};
 
@@ -24,12 +26,12 @@ pub async fn command(webview: Webview, action: &str, url: Option<&str>) -> Resul
         _ => {}
     }
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    page.with_webview(move |native| {
+    page.with_webview(move |_native| {
         #[cfg(windows)]
         let result = (|| -> Result<Value> {
             use windows::core::{BOOL, PWSTR};
             unsafe {
-                let browser = native.controller().CoreWebView2()?;
+                let browser = _native.controller().CoreWebView2()?;
                 let mut back = BOOL(0);
                 let mut forward = BOOL(0);
                 browser.CanGoBack(&mut back)?;
@@ -48,7 +50,7 @@ pub async fn command(webview: Webview, action: &str, url: Option<&str>) -> Resul
         #[cfg(target_os = "linux")]
         let result = {
             use webkit2gtk::WebViewExt;
-            let browser = native.inner();
+            let browser = _native.inner();
             if action == "back" && browser.can_go_back() {
                 browser.go_back();
             } else if action == "forward" && browser.can_go_forward() {

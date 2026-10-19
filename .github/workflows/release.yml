@@ -187,8 +187,24 @@ jobs:
         include:
           - os: windows-latest
             platform: windows-x86_64
+            bundles: nsis
+            architecture: x64
+          - os: windows-11-arm
+            platform: windows-aarch64
+            bundles: nsis
+            architecture: arm64
           - os: ubuntu-22.04
             platform: linux-x86_64
+            bundles: appimage,deb
+          - os: ubuntu-22.04-arm
+            platform: linux-aarch64
+            bundles: appimage,deb
+          - os: macos-15-intel
+            platform: darwin-x86_64
+            bundles: app,dmg
+          - os: macos-15
+            platform: darwin-aarch64
+            bundles: app,dmg
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -197,6 +213,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: '-'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -229,13 +246,16 @@ jobs:
         shell: bash
         run: |
           node --input-type=module -e 'import fs from "node:fs";fs.mkdirSync(".tmp",{recursive:true});fs.writeFileSync(".tmp/tauri-ci.json",JSON.stringify({build:{beforeBuildCommand:""}}));'
-          node frontend/node_modules/@tauri-apps/cli/tauri.js build --config .tmp/tauri-ci.json
+          node frontend/node_modules/@tauri-apps/cli/tauri.js build --config .tmp/tauri-ci.json --bundles "${{ matrix.bundles }}"
+      - name: Verify signed macOS bundle and isolated startup
+        if: runner.os == 'macOS'
+        run: node scripts/check-macos-bundle.mjs
       - name: Package and sign verified Windows portable ZIP
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           ./scripts/package-windows-portable.ps1
-          node frontend/node_modules/@tauri-apps/cli/tauri.js signer sign "target/release/bundle/portable/HuifaDownloader-$env:RELEASE_VERSION-windows-x64-portable.zip"
+          node frontend/node_modules/@tauri-apps/cli/tauri.js signer sign "target/release/bundle/portable/HuifaDownloader-$env:RELEASE_VERSION-windows-${{ matrix.architecture }}-portable.zip"
           if ($LASTEXITCODE -ne 0) { throw 'Portable archive signing failed' }
       - name: Stage signed artifacts
         run: node scripts/stage-rust-artifacts.mjs

@@ -1,6 +1,6 @@
 # Huifa Media Downloader
 
-Huifa Media Downloader is a Rust media downloader and processing app. The Tauri desktop host and the Docker/NAS web host share one React interface. Official yt-dlp handles extraction, while FFmpeg handles merging, transcoding and cover processing. You can save videos, audio, collections and batches, or expose yt-dlp metadata and the download queue to your own AI client through MCP.
+Huifa Media Downloader is a Rust media downloader and processing app. The Windows, macOS and Linux Tauri desktop hosts and the Docker/NAS web host share one React interface. Official yt-dlp handles extraction, while FFmpeg handles merging, transcoding and cover processing. You can save videos, audio, collections and batches, or expose yt-dlp metadata and the download queue to your own AI client through MCP.
 
 [简体中文](README.md) · [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) · [Issues](https://github.com/jwwsjlm/huifa-media-downloader/issues)
 
@@ -8,11 +8,11 @@ Huifa Media Downloader is a Rust media downloader and processing app. The Tauri 
 
 ## Features
 
-- Official yt-dlp, FFmpeg, FFprobe and lightweight QuickJS-NG for videos, audio, collections, batches and multiple sites; existing tasks keep their frozen Deno runtime when needed.
+- Official yt-dlp, FFmpeg, FFprobe and platform-specific JavaScript runtimes for videos, audio, collections, batches and multiple sites; existing tasks retain their frozen runtimes.
 - Automatic best/worst quality selection, formats and audio tracks, subtitles, chapters, cuts, SponsorBlock, transcoding and audio export.
 - Separate download and processing queues. Each task freezes its plan, runtime versions and input, and supports pause, restart recovery and offline retries after processing failures.
 - Completed media management, JPEG crop/padding exports and AI cover editing based on the original image.
-- Cookies, proxy settings and AI keys stored in ordinary local files; built-in and compatible local browser sign-in plus existing-browser Cookie import on desktop, and disposable remote browser sign-in in Docker.
+- Cookies, proxy settings and AI keys stored in ordinary local files. Windows/Linux offer built-in or compatible local browser sign-in; macOS uses a local Chrome, Edge or Chromium. Cookie import and disposable remote browser sign-in in Docker are also available.
 - Built-in MCP service. An AI client can query metadata, formats, collections, subtitles and comments, then create or control downloads. The service is disabled by default and the page displays copyable JSON configuration.
 - Chinese/English, dark/light themes, virtual task lists, responsive layouts, SHA-256 checksums and signed desktop updates.
 
@@ -30,26 +30,33 @@ These screenshots are from a real Docker container with isolated test data.
 
 ## Install
 
-Choose an artifact from [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest):
+Choose the artifact for your system and processor from the [latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest). Desktop builds cover six platforms: Windows x64/ARM64, Linux x64/ARM64, Intel Mac and Apple silicon:
 
 | Platform | Artifact |
 | --- | --- |
-| Windows 10/11 x64 installer | `HuifaDownloader-<version>-windows-x64-setup.exe` |
-| Windows x64 portable | `HuifaDownloader-<version>-windows-x64-portable.zip` |
+| Windows 10/11 x64 | `HuifaDownloader-<version>-windows-x64-setup.exe` or `HuifaDownloader-<version>-windows-x64-portable.zip` |
+| Windows ARM64 | `HuifaDownloader-<version>-windows-arm64-setup.exe` or `HuifaDownloader-<version>-windows-arm64-portable.zip` |
 | Linux x64 | `HuifaDownloader-<version>-linux-x64.AppImage` |
+| Linux ARM64 | `HuifaDownloader-<version>-linux-arm64.AppImage` |
+| Intel Mac (macOS 15 or later) | `HuifaDownloader-<version>-macos-x64.dmg` |
+| Apple silicon Mac (M series, macOS 15 or later) | `HuifaDownloader-<version>-macos-arm64.dmg` |
 | Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:latest` |
 
-The installer and portable ZIP contain the same application with verified download and processing tools. You do not need a separate Python or FFmpeg install. The Windows installer currently has no Authenticode publisher certificate, but installers, portable archives and update manifests carry signatures and SHA-256 checksums.
+Each desktop package contains download and processing tools for its architecture. You do not need a separate Python or FFmpeg install. The release includes `SHA256SUMS`, and desktop update packages have update signatures. The Windows installer currently has no Authenticode publisher certificate.
 
-Extract a portable ZIP and run `HuifaDownloader.exe`; keep `tools` and `portable.flag` beside it. Microsoft Edge WebView2 Runtime is required. Both Windows editions share system user data and Downloads folders. Close the other edition before switching, and replace the portable directory only while the app is closed.
+For the Windows portable edition, extract the ZIP and run `HuifaDownloader.exe`; keep `tools` and `portable.flag` beside it. Microsoft Edge WebView2 Runtime is required. Both Windows editions share system user data and Downloads folders. Close the other edition before switching, and replace the portable directory only while the app is closed.
+
+On Linux, download the AppImage for your processor and make it executable before running it, for example `chmod +x ./HuifaDownloader-*-linux-x64.AppImage`; use `linux-arm64` for the ARM64 file. Select x64 for `x86_64` and ARM64 for `aarch64`.
+
+Mac builds require macOS 15 or later, matching the bundled FFmpeg requirement. Check the chip in **About This Mac**: choose `macos-x64.dmg` for Intel or `macos-arm64.dmg` for Apple M-series chips. Open the DMG, drag the app into **Applications**, then launch it. The matching `.app.tar.gz` on the release page is an application update package. Mac builds currently use ad-hoc signing and are not notarized by Apple. If the first launch reports an unidentified developer, confirm that the file came from this project's release page, then follow [Apple's instructions](https://support.apple.com/en-us/102445) and select **Open Anyway** in **System Settings → Privacy & Security**.
 
 Startup failures display the error and the location of `startup-error.log`. If the app exits without a message, download `scripts/diagnose-windows-startup.ps1`, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\diagnose-windows-startup.ps1`, and enter the application EXE path. Share the generated `startup-report.txt` with the developer. The script collects system, application and WebView2 versions, the exit code and matching error events, without reading cookies or application configuration.
 
 The application ID is `com.huifa.downloader.rust`. Rust state is stored under `HuifaDownloaderRust` in the system local data directory, with media in the matching Downloads folder. Cookies, proxy settings and AI keys are plaintext files in `credentials`; back up the entire data directory. Older encrypted records migrate automatically at startup and their key is removed after migration. Keep the original `.credentials.key` until that migration completes.
 
-Under desktop **Settings → Network & cookies**, enter the source website and select **Open built-in browser** or **Local browser sign-in** directly, without an intermediate settings dialog. Use the built-in browser (Windows WebView2 / Linux WebKit), or a window from an installed Edge, Chrome or Chromium. The last successfully used address and browser choice are saved automatically. Cookies sync automatically during sign-in and once more before the browser closes. No save click is needed. New downloads and media queries match cookies to the target domain by default and pass them to yt-dlp through its cookie file; existing tasks retain their frozen credentials. Use the local browser for sites such as Google that reject embedded sign-in.
+Under desktop **Settings → Network & cookies**, enter the source website directly, without an intermediate settings dialog. Windows/Linux offer **Open built-in browser** (Windows WebView2 / Linux WebKit) or **Local browser sign-in**. macOS offers only **Local browser sign-in**, using an installed Chrome, Edge or Chromium from `/Applications` or `~/Applications`; Safari is not used for this flow. The last successfully used address and browser choice are saved automatically. Cookies sync automatically during sign-in and once more before the browser closes. No save click is needed. New downloads and media queries match cookies to the target domain by default and pass them to yt-dlp through its cookie file; existing tasks retain their frozen credentials. Use the local browser for sites such as Google that reject embedded sign-in.
 
-The built-in browser has an address bar and Back, Forward and Reload buttons. Press Enter to visit an address; omitted protocols default to HTTPS. The toolbar is isolated from website content, and websites and sign-in popups cannot call application commands. Both desktop sign-in browsers share the download proxy. Close and reopen sign-in windows after changing it, and save settings to keep it across restarts. Sign-in browsers require a proxy URL without embedded credentials; a local proxy endpoint can be used.
+The Windows/Linux built-in browser has an address bar and Back, Forward and Reload buttons. Press Enter to visit an address; omitted protocols default to HTTPS. The toolbar is isolated from website content, and websites and sign-in popups cannot call application commands. Desktop sign-in browsers share the download proxy. Close and reopen sign-in windows after changing it, and save settings to keep it across restarts. Sign-in browsers require a proxy URL without embedded credentials; a local proxy endpoint can be used.
 
 ### Batch recovery and file safety
 
@@ -92,7 +99,7 @@ Version checks first query GitHub's latest-release API. If the API is rate limit
 
 The delete confirmation remembers **Also delete media files managed by this task**, even when deletion is cancelled. It is unchecked on a fresh install, and deletion still requires confirmation. Download options, language, theme, notifications, proxy and AI configuration are written to disk with **Save settings**; quick options use **Save batch plan**. MCP startup and service configuration, the access password, cookies and browser preferences are saved by their respective successful operations. Temporary home-page quality, list filters, tool installation parameters, cookie import sources and unsubmitted cover edits are not automatically saved as global settings.
 
-Sign-in persists in separate profiles under the app data directory's `login-browser` folder. Both desktop sign-in browsers share the saved download proxy; leaving it empty selects a direct connection. Each profile can contain multiple sites, and saving exports that profile's cookies. Deleting a saved cookie entry does not sign the browser out; sign out on the website when needed. Browser profiles contain login information and should be kept private.
+Sign-in persists in separate profiles under the app data directory's `login-browser` folder. Desktop sign-in browsers share the saved download proxy; leaving it empty selects a direct connection. Each profile can contain multiple sites, and saving exports that profile's cookies. Deleting a saved cookie entry does not sign the browser out; sign out on the website when needed. Browser profiles contain login information and should be kept private.
 
 On Windows, run `node scripts/check-login-browser.mjs` for the native regression test (requires WebView2 and Edge / Chrome). It uses isolated temporary profiles and local test pages to check cookie scopes, popups, persistence and IPC isolation, without personal browser profiles or real accounts.
 

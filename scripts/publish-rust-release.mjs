@@ -3,6 +3,8 @@ import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { validateVersion } from './rust-release.mjs';
+import { renderReleaseNotes } from './release-notes.mjs';
+import { releasePlatforms, isReleaseAsset } from './release-platforms.mjs';
 
 function gh(args, optional404 = false) {
   const result = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, shell: false });
@@ -31,6 +33,7 @@ const tag = `v${version}`;
 const portableOnly = process.argv.includes('--portable-only');
 const folder = resolve(process.argv[2] ?? 'rust-release-assets');
 const notesPath = resolve('release-notes', `${version}.md`);
+const rawNotes = readFileSync(notesPath, 'utf8');
 const portable = `HuifaDownloader-${version}-windows-x64-portable.zip`;
 const required = [portable, portable + '.sig'];
 if (portableOnly) {
@@ -40,8 +43,9 @@ if (portableOnly) {
   required.push(portable + '.sha256');
 } else {
   const manifest = JSON.parse(readFileSync(join(folder, 'rust-updates.json'), 'utf8'));
-  if (manifest.version !== version || Object.keys(manifest.platforms ?? {}).length !== 2) throw new Error('Incomplete update manifest');
+  if (manifest.version !== version || Object.keys(releasePlatforms).some(platform => !manifest.platforms?.[platform])) throw new Error('Incomplete update manifest');
   required.push('SHA256SUMS', 'rust-updates.json');
+  required.push(`HuifaDownloader-${version}-windows-arm64-portable.zip`, `HuifaDownloader-${version}-windows-arm64-portable.zip.sig`, `HuifaDownloader-${version}-macos-x64.dmg`, `HuifaDownloader-${version}-macos-arm64.dmg`);
   for (const entry of Object.values(manifest.platforms)) {
     const filename = decodeURIComponent(new URL(entry.url).pathname.split('/').at(-1));
     if (!filename || filename.includes('/') || filename.includes('\\')) throw new Error('Unsafe artifact filename');
@@ -63,13 +67,15 @@ if (portableOnly) {
 
 let release = releaseForTag(repository, tag);
 if (portableOnly && (!release || release.draft)) throw new Error('Portable additions require an existing published release');
+const files = portableOnly ? required : readdirSync(folder).filter(isReleaseAsset);
+const notes = renderReleaseNotes(version, rawNotes, portableOnly ? [...release.assets.map(asset => asset.name), ...files] : files);
 if (!release) {
-  gh(['release', 'create', tag, '--repo', repository, '--target', sha, '--draft', '--title', `Huifa Downloader ${version}`, '--notes-file', notesPath]);
+  const generatedNotes = join(folder, 'release-notes.md');
+  writeFileSync(generatedNotes, notes);
+  gh(['release', 'create', tag, '--repo', repository, '--target', sha, '--draft', '--title', `Huifa Downloader ${version}`, '--notes-file', generatedNotes]);
   release = releaseForTag(repository, tag);
 }
-const notes = readFileSync(notesPath, 'utf8').trim();
-if ((release.body ?? '').trim() !== notes) throw new Error('Existing release notes do not match this build');
-const files = portableOnly ? required : readdirSync(folder).filter(file => /\.(exe|AppImage|zip|sig|json)$/.test(file) || file === 'SHA256SUMS');
+if (![(notes).trim(), rawNotes.trim()].includes((release.body ?? '').trim())) throw new Error('Existing release notes do not match this build');
 for (const file of files) {
   const path = join(folder, file);
   const existing = release.assets.find(asset => asset.name === file);

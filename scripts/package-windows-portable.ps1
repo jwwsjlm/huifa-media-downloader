@@ -11,20 +11,21 @@ if ($LASTEXITCODE -ne 0 -or $taskSourceRevision -notmatch '^[a-f0-9]{40}$') { th
 $taskExecutable = Join-Path $taskMetadata.target_directory 'release/huifa-desktop.exe'
 $taskTools = Join-Path $taskWorkspace 'runtime-tools'
 $taskReceipt = Get-Content -LiteralPath (Join-Path $taskTools 'manifest.json') -Raw | ConvertFrom-Json
-if ($taskReceipt.target -ne 'windows-x86_64') { throw 'Portable packages require Windows x64 tools' }
+if ($taskReceipt.target -notin @('windows-x86_64', 'windows-aarch64')) { throw 'Portable packages require Windows tools' }
+$taskArchitecture = if ($taskReceipt.target -eq 'windows-aarch64') { 'arm64' } else { 'x64' }
 $taskTemporary = [IO.Path]::GetFullPath((Join-Path $taskWorkspace ('.tmp/portable-' + [guid]::NewGuid())))
 if (-not $taskTemporary.StartsWith($taskWorkspace + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Portable staging escapes the workspace' }
 $taskContents = Join-Path $taskTemporary 'package'
 $taskBundle = Join-Path $taskWorkspace 'target/release/bundle/portable'
-$taskArchivePath = Join-Path $taskBundle "HuifaDownloader-$Version-windows-x64-portable.zip"
+$taskArchivePath = Join-Path $taskBundle "HuifaDownloader-$Version-windows-$taskArchitecture-portable.zip"
 New-Item -ItemType Directory -Path $taskContents -Force | Out-Null
 try {
     Copy-Item -LiteralPath $taskExecutable -Destination (Join-Path $taskContents 'HuifaDownloader.exe')
     Copy-Item -LiteralPath (Join-Path $taskMetadata.target_directory 'release/huifa-mcp-bridge.exe') -Destination (Join-Path $taskContents 'huifa-mcp-bridge.exe')
     New-Item -ItemType Directory -Path (Join-Path $taskContents 'tools') -Force | Out-Null
-    if (-not $taskReceipt.files -or @(@('yt-dlp', 'ffmpeg', 'ffprobe', 'qjs') | Where-Object { -not $taskReceipt.tools.$_ }).Count) { throw 'Portable runtime receipt is incomplete' }
+    if (-not $taskReceipt.files -or @(@('yt-dlp', 'ffmpeg', 'ffprobe') | Where-Object { -not $taskReceipt.tools.$_ }).Count -or (-not $taskReceipt.tools.qjs -and -not $taskReceipt.tools.deno)) { throw 'Portable runtime receipt is incomplete' }
     foreach ($taskFile in $taskReceipt.files.PSObject.Properties) {
-        if ($taskFile.Name -notmatch '^(?:(?:yt-dlp|ffmpeg|ffprobe|qjs)\.exe|(?:avcodec|avdevice|avfilter|avformat|avutil|swresample|swscale)-\d+\.dll)$') { throw 'Unexpected runtime payload' }
+        if ($taskFile.Name -notmatch '^(?:(?:yt-dlp|ffmpeg|ffprobe|qjs|deno)\.exe|(?:avcodec|avdevice|avfilter|avformat|avutil|swresample|swscale)-\d+\.dll)$') { throw 'Unexpected runtime payload' }
         $taskSource = Join-Path $taskTools $taskFile.Name
         if ((Get-FileHash -LiteralPath $taskSource -Algorithm SHA256).Hash -ine $taskFile.Value) { throw "Tool checksum mismatch: $($taskFile.Name)" }
         Copy-Item -LiteralPath $taskSource -Destination (Join-Path $taskContents "tools/$($taskFile.Name)")
@@ -32,7 +33,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $taskTools 'manifest.json') -Destination (Join-Path $taskContents 'tools/manifest.json')
     [IO.File]::WriteAllText((Join-Path $taskContents 'portable.flag'), '')
     [IO.File]::WriteAllText((Join-Path $taskContents 'README.txt'), @"
-Huifa Media Downloader $Version - Windows x64 portable
+Huifa Media Downloader $Version - Windows $taskArchitecture portable
 Portable build source: https://github.com/jwwsjlm/huifa-media-downloader/tree/$taskSourceRevision
 
 Extract the whole ZIP and run HuifaDownloader.exe.

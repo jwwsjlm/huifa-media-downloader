@@ -12,6 +12,101 @@ fn executable(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+fn native_executable(bytes: &[u8], platform: &str) -> bool {
+    fn word(bytes: &[u8], offset: usize, little: bool) -> Option<u32> {
+        let value: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+        Some(if little {
+            u32::from_le_bytes(value)
+        } else {
+            u32::from_be_bytes(value)
+        })
+    }
+    fn wide(bytes: &[u8], offset: usize, little: bool) -> Option<usize> {
+        let value: [u8; 8] = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
+        usize::try_from(if little {
+            u64::from_le_bytes(value)
+        } else {
+            u64::from_be_bytes(value)
+        })
+        .ok()
+    }
+    fn thin(bytes: &[u8], cpu: u32) -> bool {
+        bytes.len() >= 32
+            && match word(bytes, 0, false) {
+                Some(0xcffaedfe) => word(bytes, 4, true) == Some(cpu),
+                Some(0xfeedfacf) => word(bytes, 4, false) == Some(cpu),
+                _ => false,
+            }
+    }
+    let arm = platform.ends_with("-aarch64");
+    if platform.starts_with("windows-") {
+        if !bytes.starts_with(b"MZ") {
+            return false;
+        }
+        let Some(offset) = word(bytes, 60, true).map(|value| value as usize) else {
+            return false;
+        };
+        return word(bytes, offset, true) == Some(0x4550)
+            && bytes
+                .get(offset + 4..offset + 6)
+                .is_some_and(|value| value == if arm { [0x64, 0xaa] } else { [0x64, 0x86] });
+    }
+    if platform.starts_with("linux-") {
+        return bytes.starts_with(b"\x7fELF\x02\x01")
+            && bytes
+                .get(18..20)
+                .is_some_and(|value| value == if arm { [183, 0] } else { [62, 0] });
+    }
+    if !platform.starts_with("darwin-") {
+        return false;
+    }
+    let cpu = if arm { 0x0100000c } else { 0x01000007 };
+    if thin(bytes, cpu) {
+        return true;
+    }
+    let Some(magic) = word(bytes, 0, false) else {
+        return false;
+    };
+    let fat64 = matches!(magic, 0xcafebabf | 0xbfbafeca);
+    let little = matches!(magic, 0xbebafeca | 0xbfbafeca);
+    if !matches!(magic, 0xcafebabe | 0xbebafeca | 0xcafebabf | 0xbfbafeca) {
+        return false;
+    }
+    let Some(count) = word(bytes, 4, little).filter(|value| (1..=64).contains(value)) else {
+        return false;
+    };
+    let stride = if fat64 { 32 } else { 20 };
+    let table_end = 8 + count as usize * stride;
+    if table_end > bytes.len() {
+        return false;
+    }
+    for index in 0..count as usize {
+        let entry = 8 + index * stride;
+        if word(bytes, entry, little) != Some(cpu) {
+            continue;
+        }
+        let offset = if fat64 {
+            wide(bytes, entry + 8, little)
+        } else {
+            word(bytes, entry + 8, little).map(|v| v as usize)
+        };
+        let size = if fat64 {
+            wide(bytes, entry + 16, little)
+        } else {
+            word(bytes, entry + 12, little).map(|v| v as usize)
+        };
+        return offset.zip(size).is_some_and(|(offset, size)| {
+            offset >= table_end
+                && size >= 32
+                && offset
+                    .checked_add(size)
+                    .and_then(|end| bytes.get(offset..end))
+                    .is_some_and(|slice| thin(slice, cpu))
+        });
+    }
+    false
+}
+
 fn ffmpeg_dll(name: &str) -> bool {
     [
         "avcodec",
@@ -365,7 +460,13 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
         ("yt-dlp", "stable") => "yt-dlp/yt-dlp",
         ("yt-dlp", "nightly") => "yt-dlp/yt-dlp-nightly-builds",
         ("yt-dlp", _) => bail!("Unknown yt-dlp channel; choose stable or nightly"),
-        ("ffmpeg" | "ffprobe", "stable") if version.is_empty() => "BtbN/FFmpeg-Builds",
+        ("ffmpeg" | "ffprobe", "stable") if version.is_empty() => {
+            if cfg!(target_os = "macos") {
+                "shaka-project/static-ffmpeg-binaries"
+            } else {
+                "BtbN/FFmpeg-Builds"
+            }
+        }
         ("deno", "stable") if version.is_empty() => "denoland/deno",
         ("qjs", "stable") if version.is_empty() => "quickjs-ng/quickjs",
         ("ffmpeg" | "ffprobe" | "deno" | "qjs", _) => {
@@ -448,15 +549,26 @@ fn asset_name(name: &str, platform: &str) -> Result<&'static str> {
         ("yt-dlp", "windows-aarch64") => "yt-dlp_arm64.exe",
         ("yt-dlp", "linux-x86_64") => "yt-dlp_linux",
         ("yt-dlp", "linux-aarch64") => "yt-dlp_linux_aarch64",
+        ("yt-dlp", "darwin-x86_64" | "darwin-aarch64") => "yt-dlp_macos",
         ("ffmpeg" | "ffprobe", "windows-x86_64") => "ffmpeg-master-latest-win64-gpl-shared.zip",
+        ("ffmpeg" | "ffprobe", "windows-aarch64") => "ffmpeg-master-latest-winarm64-gpl-shared.zip",
         ("ffmpeg" | "ffprobe", "linux-x86_64") => "ffmpeg-master-latest-linux64-gpl.tar.xz",
         ("ffmpeg" | "ffprobe", "linux-aarch64") => "ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
+        ("ffmpeg", "darwin-x86_64") => "ffmpeg-osx-x64",
+        ("ffmpeg", "darwin-aarch64") => "ffmpeg-osx-arm64",
+        ("ffprobe", "darwin-x86_64") => "ffprobe-osx-x64",
+        ("ffprobe", "darwin-aarch64") => "ffprobe-osx-arm64",
         ("deno", "windows-x86_64") => "deno-x86_64-pc-windows-msvc.zip",
+        ("deno", "windows-aarch64") => "deno-aarch64-pc-windows-msvc.zip",
         ("deno", "linux-x86_64") => "deno-x86_64-unknown-linux-gnu.zip",
         ("deno", "linux-aarch64") => "deno-aarch64-unknown-linux-gnu.zip",
+        ("deno", "darwin-x86_64") => "deno-x86_64-apple-darwin.zip",
+        ("deno", "darwin-aarch64") => "deno-aarch64-apple-darwin.zip",
         ("qjs", "windows-x86_64") => "qjs-windows-x86_64.exe",
         ("qjs", "linux-x86_64") => "qjs-linux-x86_64",
         ("qjs", "linux-aarch64") => "qjs-linux-aarch64",
+        ("qjs", "darwin-x86_64") => "qjs-darwin-x86_64",
+        ("qjs", "darwin-aarch64") => "qjs-darwin-arm64",
         _ => bail!("Unsupported runtime platform or architecture: {platform}"),
     })
 }
@@ -631,6 +743,44 @@ fn checksum_for(sums: &str, filename: &str) -> Result<String> {
     digest.context("Official runtime checksum is missing for this platform; installation refused")
 }
 
+fn release_asset(
+    release: &Value,
+    repository: &str,
+    filename: &str,
+    latest_download: bool,
+) -> Result<(url::Url, String)> {
+    let asset = release["assets"]
+        .as_array()
+        .context("Malformed runtime release")?
+        .iter()
+        .find(|asset| asset["name"].as_str() == Some(filename))
+        .context("Runtime asset is unavailable for this platform")?;
+    let digest = asset["digest"]
+        .as_str()
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .context("Runtime release lacks a trusted checksum; installation refused")?;
+    anyhow::ensure!(
+        digest.len() == 64 && digest.chars().all(|value| value.is_ascii_hexdigit()),
+        "Invalid runtime checksum"
+    );
+    let url = url::Url::parse(
+        asset["browser_download_url"]
+            .as_str()
+            .context("Runtime download URL is missing")?,
+    )?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && (url
+                .path()
+                .starts_with(&format!("/{repository}/releases/download/"))
+                || latest_download
+                    && url.path() == format!("/{repository}/releases/latest/download/{filename}")),
+        "Unexpected runtime download origin"
+    );
+    Ok((url, digest.to_string()))
+}
+
 async fn update_inner(
     app: &App,
     name: &str,
@@ -641,7 +791,7 @@ async fn update_inner(
     use anyhow::{Context, ensure};
     use std::io::Write;
     let platform = target()?;
-    let asset_name = asset_name(name, &platform)?;
+    let initial_asset_name = asset_name(name, &platform)?;
     let client = runtime_client(&app.download_proxy()?)?;
     let release: Value = if name == "yt-dlp" {
         // Official release checksum assets avoid the unauthenticated GitHub API quota.
@@ -670,8 +820,8 @@ async fn update_inner(
         );
         let sums = String::from_utf8(bounded_response(response, 256 * 1024).await?)
             .context("Invalid official runtime checksum file")?;
-        let digest = checksum_for(&sums, asset_name)?;
-        json!({"assets":[{"name":asset_name,"digest":format!("sha256:{digest}"),"browser_download_url":format!("{base}/{asset_name}")}]})
+        let digest = checksum_for(&sums, initial_asset_name)?;
+        json!({"assets":[{"name":initial_asset_name,"digest":format!("sha256:{digest}"),"browser_download_url":format!("{base}/{initial_asset_name}")}]})
     } else {
         let response = client
             .get(release_url)
@@ -686,41 +836,32 @@ async fn update_inner(
         );
         serde_json::from_slice(&bounded_response(response, 2 * 1024 * 1024).await?)?
     };
-    let asset = release["assets"]
-        .as_array()
-        .context("Malformed runtime release")?
-        .iter()
-        .find(|asset| asset["name"].as_str() == Some(asset_name))
-        .context("Runtime asset is unavailable for this platform")?;
-    let digest = asset["digest"]
-        .as_str()
-        .and_then(|v| v.strip_prefix("sha256:"))
-        .context("Runtime release lacks a trusted checksum; installation refused")?;
-    ensure!(
-        digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()),
-        "Invalid runtime checksum"
-    );
-    let url = url::Url::parse(
-        asset["browser_download_url"]
-            .as_str()
-            .context("Runtime download URL is missing")?,
-    )?;
-    ensure!(
-        url.scheme() == "https"
-            && url.host_str() == Some("github.com")
-            && (url
-                .path()
-                .starts_with(&format!("/{repository}/releases/download/"))
-                || name == "yt-dlp"
-                    && url.path()
-                        == format!("/{repository}/releases/latest/download/{asset_name}")),
-        "Unexpected runtime download origin"
-    );
-    let urls = download_urls(
-        url.as_str(),
-        if name == "yt-dlp" { source } else { "github" },
-    );
-    let archive = verified_download(&client, &urls, digest).await?;
+    let split_ffmpeg = platform.starts_with("darwin-") && matches!(name, "ffmpeg" | "ffprobe");
+    let asset_names = if split_ffmpeg {
+        vec![
+            asset_name("ffmpeg", &platform)?,
+            asset_name("ffprobe", &platform)?,
+        ]
+    } else {
+        vec![initial_asset_name]
+    };
+    let mut downloads = Vec::new();
+    let mut digests = Vec::new();
+    for filename in asset_names {
+        let (url, digest) = release_asset(&release, repository, filename, name == "yt-dlp")?;
+        let urls = download_urls(
+            url.as_str(),
+            if name == "yt-dlp" { source } else { "github" },
+        );
+        let archive = verified_download(&client, &urls, &digest).await?;
+        downloads.push((archive, filename.to_string()));
+        digests.push(digest);
+    }
+    let digest = if digests.len() == 1 {
+        digests.remove(0)
+    } else {
+        hex::encode(Sha256::digest(digests.join("\n")))
+    };
     let directory = app.config.data_dir.join("tools");
     std::fs::create_dir_all(&directory)?;
     let group = if name == "ffprobe" { "ffmpeg" } else { name };
@@ -736,15 +877,23 @@ async fn update_inner(
         .map(|name| format!("{name}{}", std::env::consts::EXE_SUFFIX))
         .collect::<Vec<_>>();
     let extraction_dir = temporary.path().to_path_buf();
-    let format = asset_name.to_string();
     let extracted_names = filenames.clone();
     let extracted = tokio::task::spawn_blocking(move || {
-        extract_archive(&archive, &format, &extracted_names, &extraction_dir)
+        let mut extracted = Vec::new();
+        for (index, (archive, format)) in downloads.into_iter().enumerate() {
+            let wanted = if split_ffmpeg {
+                &extracted_names[index..index + 1]
+            } else {
+                &extracted_names[..]
+            };
+            extracted.extend(extract_archive(&archive, &format, wanted, &extraction_dir)?);
+        }
+        Ok::<_, anyhow::Error>(extracted)
     })
     .await??;
     for filename in extracted.iter().filter(|filename| ffmpeg_dll(filename)) {
         ensure!(
-            std::fs::read(temporary.path().join(filename))?.starts_with(b"MZ"),
+            native_executable(&std::fs::read(temporary.path().join(filename))?, &platform),
             "Runtime DLL is not a native library"
         );
     }
@@ -752,11 +901,7 @@ async fn update_inner(
         let path = temporary.path().join(filename);
         let header = std::fs::read(&path)?;
         ensure!(
-            if cfg!(windows) {
-                header.starts_with(b"MZ")
-            } else {
-                header.starts_with(b"\x7fELF")
-            },
+            native_executable(&header, &platform),
             "Runtime payload is not a native executable"
         );
         #[cfg(unix)]
@@ -833,6 +978,8 @@ fn target() -> Result<String> {
         "windows"
     } else if cfg!(target_os = "linux") {
         "linux"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
     } else {
         bail!("Unsupported runtime platform")
     };
@@ -1031,6 +1178,55 @@ pub(crate) fn mime(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_payload_matches_the_target_cpu() {
+        let mut pe = vec![0; 128];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[60..64].copy_from_slice(&64u32.to_le_bytes());
+        pe[64..68].copy_from_slice(b"PE\0\0");
+        pe[68..70].copy_from_slice(&0xaa64u16.to_le_bytes());
+        assert!(native_executable(&pe, "windows-aarch64"));
+        assert!(!native_executable(&pe, "windows-x86_64"));
+        pe[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!native_executable(&pe, "windows-aarch64"));
+        let mut elf = vec![0; 32];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        assert!(native_executable(&elf, "linux-aarch64"));
+        assert!(!native_executable(&elf, "linux-x86_64"));
+        let mut macho = vec![0; 32];
+        macho[..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        macho[4..8].copy_from_slice(&0x0100000cu32.to_le_bytes());
+        assert!(native_executable(&macho, "darwin-aarch64"));
+        assert!(!native_executable(&macho, "darwin-x86_64"));
+        let mut fat = vec![0; 60];
+        fat[..4].copy_from_slice(&0xcafebabeu32.to_be_bytes());
+        fat[4..8].copy_from_slice(&1u32.to_be_bytes());
+        fat[8..12].copy_from_slice(&0x0100000cu32.to_be_bytes());
+        fat[16..20].copy_from_slice(&28u32.to_be_bytes());
+        fat[20..24].copy_from_slice(&32u32.to_be_bytes());
+        fat[28..].copy_from_slice(&macho);
+        assert!(native_executable(&fat, "darwin-aarch64"));
+        assert!(!native_executable(&fat, "darwin-x86_64"));
+        fat[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(!native_executable(&fat, "darwin-aarch64"));
+    }
+
+    #[test]
+    fn runtime_assets_reject_unexpected_origins() -> Result<()> {
+        let release = |url: &str| json!({"assets":[{"name":"ffmpeg-osx-arm64","digest":format!("sha256:{}", "f".repeat(64)),"browser_download_url":url}]});
+        let repository = "shaka-project/static-ffmpeg-binaries";
+        assert!(release_asset(&release("https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffmpeg-osx-arm64"), repository, "ffmpeg-osx-arm64", false).is_ok());
+        for url in [
+            "https://evil.example/ffmpeg-osx-arm64",
+            "https://github.com/untrusted/ffmpeg/releases/download/1/ffmpeg-osx-arm64",
+            "http://github.com/shaka-project/static-ffmpeg-binaries/releases/download/1/ffmpeg-osx-arm64",
+        ] {
+            assert!(release_asset(&release(url), repository, "ffmpeg-osx-arm64", false).is_err());
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runtime_downloads_use_configured_proxy_connect() -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1120,7 +1316,25 @@ mod tests {
         }
         assert!(asset_name("yt-dlp", "unknown-x86_64").is_err());
         assert!(asset_name("yt-dlp", "linux-riscv64").is_err());
-        assert!(asset_name("ffmpeg", "windows-aarch64").is_err());
+        assert_eq!(
+            asset_name("ffmpeg", "windows-aarch64")?,
+            "ffmpeg-master-latest-winarm64-gpl-shared.zip"
+        );
+        assert_eq!(asset_name("yt-dlp", "darwin-aarch64")?, "yt-dlp_macos");
+        assert_eq!(asset_name("yt-dlp", "darwin-x86_64")?, "yt-dlp_macos");
+        assert_eq!(
+            asset_name("deno", "windows-aarch64")?,
+            "deno-aarch64-pc-windows-msvc.zip"
+        );
+        assert_eq!(
+            asset_name("deno", "darwin-aarch64")?,
+            "deno-aarch64-apple-darwin.zip"
+        );
+        assert_eq!(asset_name("ffmpeg", "darwin-x86_64")?, "ffmpeg-osx-x64");
+        assert_eq!(
+            asset_name("ffprobe", "darwin-aarch64")?,
+            "ffprobe-osx-arm64"
+        );
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 # 汇发媒体下载器
 
-汇发媒体下载器是一个 Rust 媒体下载与处理工具：桌面端使用 Tauri，Docker/NAS 使用同一套 React 网页，下载由官方 yt-dlp 驱动，FFmpeg 负责合并、转码和封面处理。它适合保存视频、音频、合集和批量链接，也可以把 yt-dlp 的资料查询与下载队列开放给自己的 AI 客户端。
+汇发媒体下载器是一个 Rust 媒体下载与处理工具：Windows、macOS 和 Linux 桌面端使用 Tauri，Docker/NAS 使用同一套 React 网页，下载由官方 yt-dlp 驱动，FFmpeg 负责合并、转码和封面处理。它适合保存视频、音频、合集和批量链接，也可以把 yt-dlp 的资料查询与下载队列开放给自己的 AI 客户端。
 
 [English](README_EN.md) · [下载发行版](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) · [问题反馈](https://github.com/jwwsjlm/huifa-media-downloader/issues)
 
@@ -8,11 +8,11 @@
 
 ## 功能
 
-- 使用官方 yt-dlp、FFmpeg、FFprobe 和轻量 QuickJS-NG，支持单个视频、音频、合集、批量链接和多个站点；旧任务仍可使用冻结的 Deno 运行时。
+- 使用官方 yt-dlp、FFmpeg、FFprobe 和对应平台的 JavaScript 运行时，支持单个视频、音频、合集、批量链接和多个站点；旧任务保留冻结的运行时。
 - 支持最高/最低画质自动选择、格式和音轨、字幕、章节、片段裁切、SponsorBlock、转码和音频导出。
 - 下载与本地处理分开排队，提交时冻结处理计划、工具版本和输入；支持暂停、重启恢复、失败后离线重试。
 - 已完成媒体管理、JPEG 封面裁剪与留白、基于原图的 AI 封面编辑。
-- Cookie、代理和 AI 密钥以普通本地文件保存；桌面支持内置浏览器和本机兼容浏览器登录取 Cookie，也可读取已有浏览器 Cookie；Docker 提供一次性远程浏览器登录。
+- Cookie、代理和 AI 密钥以普通本地文件保存；Windows/Linux 支持内置浏览器或本机兼容浏览器登录，macOS 使用 Chrome、Edge 或 Chromium 本机浏览器；也可导入 Cookie，Docker 提供一次性远程浏览器登录。
 - 内置 MCP 服务：AI 可以查询视频资料、格式、合集、字幕、评论，并创建或管理下载任务。服务默认关闭，开启后页面会显示可直接复制的 JSON 配置。
 - 中文/英文、深浅色主题、虚拟任务列表和窄窗口布局；发行版提供 SHA-256 校验与签名桌面更新。
 
@@ -30,26 +30,33 @@
 
 ## 安装
 
-在 [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) 选择对应文件：
+在[最新发行版](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest)下载对应系统和处理器的文件。桌面覆盖 Windows x64/ARM64、Linux x64/ARM64、Mac Intel 和 Apple 芯片六个平台：
 
 | 平台 | 文件 |
 | --- | --- |
-| Windows 10/11 x64 安装版 | `HuifaDownloader-<版本>-windows-x64-setup.exe` |
-| Windows x64 便携版 | `HuifaDownloader-<版本>-windows-x64-portable.zip` |
+| Windows 10/11 x64 | `HuifaDownloader-<版本>-windows-x64-setup.exe` 或 `HuifaDownloader-<版本>-windows-x64-portable.zip` |
+| Windows ARM64 | `HuifaDownloader-<版本>-windows-arm64-setup.exe` 或 `HuifaDownloader-<版本>-windows-arm64-portable.zip` |
 | Linux x64 | `HuifaDownloader-<版本>-linux-x64.AppImage` |
+| Linux ARM64 | `HuifaDownloader-<版本>-linux-arm64.AppImage` |
+| Mac Intel（macOS 15 及以上） | `HuifaDownloader-<版本>-macos-x64.dmg` |
+| Mac Apple 芯片（M 系列，macOS 15 及以上） | `HuifaDownloader-<版本>-macos-arm64.dmg` |
 | Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:latest` |
 
-安装包和便携 ZIP 提供同一套程序，均包含下载与处理工具，用户无需另行安装 Python 或 FFmpeg。Windows 安装包目前没有 Authenticode 发布者证书，但安装包、便携 ZIP 和更新清单均有签名及 SHA-256 校验。
+各桌面包均包含对应架构的下载与处理工具，无需另行安装 Python 或 FFmpeg。发行页提供 `SHA256SUMS`；桌面更新包另有更新签名。Windows 安装包目前没有 Authenticode 发布者证书。
 
-便携版解压后运行 `HuifaDownloader.exe`，保留 `tools` 目录和 `portable.flag`。Windows 需要 Microsoft Edge WebView2 Runtime。安装版和便携版共用系统用户数据与下载目录，切换前关闭另一版本；更新便携版时关闭程序并覆盖程序目录。
+Windows 便携版解压后运行 `HuifaDownloader.exe`，保留 `tools` 目录和 `portable.flag`。Windows 需要 Microsoft Edge WebView2 Runtime。安装版和便携版共用系统用户数据与下载目录，切换前关闭另一版本；更新便携版时关闭程序并覆盖程序目录。
+
+Linux 下载与处理器架构对应的 AppImage，添加执行权限后运行，例如 `chmod +x ./HuifaDownloader-*-linux-x64.AppImage`；ARM64 文件使用 `linux-arm64`。`x86_64` 选 x64，`aarch64` 选 ARM64。
+
+Mac 需要 macOS 15 及以上，与随包 FFmpeg 的系统要求一致。在“关于本机”查看芯片类型：Intel 选 `macos-x64.dmg`，Apple M 系列选 `macos-arm64.dmg`。打开 DMG，将应用拖到“应用程序”后启动；发行页的同架构 `.app.tar.gz` 是应用更新包。当前 Mac 应用使用 ad-hoc 签名，尚未经 Apple 公证。首次打开若提示无法验证开发者，确认文件来自本项目发行页后，可按 [Apple 官方说明](https://support.apple.com/zh-cn/102445)在“系统设置 → 隐私与安全性”选择“仍要打开”。
 
 Windows 启动失败会显示错误及 `startup-error.log` 的位置。如果双击后直接退出且没有提示，可下载 `scripts/diagnose-windows-startup.ps1`，用 Windows PowerShell 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\diagnose-windows-startup.ps1`，按提示输入程序 EXE 路径，将生成的 `startup-report.txt` 发给开发者。脚本采集系统、程序和 WebView2 版本、退出码及本次错误事件，不读取 Cookie 或业务配置。
 
 应用标识为 `com.huifa.downloader.rust`。Rust 数据位于系统本地数据目录的 `HuifaDownloaderRust`，默认下载到系统 Downloads 下的同名目录。Cookie、代理和 AI 密钥在 `credentials` 中以明文文件保存，备份整个数据目录即可。旧版加密记录首次启动时自动迁移，完成后删除旧密钥；迁移前须保留原 `.credentials.key`。
 
-在桌面“设置 → 网络与 Cookie”直接输入来源网站地址，点击“打开内置浏览器”或“本机浏览器登录”，无需经过登录设置弹窗。可选择内置浏览器（Windows WebView2 / Linux WebKit），或已安装的 Edge、Chrome、Chromium 本机浏览器登录窗口。上次成功使用的网址和方式自动保存。登录期间 Cookie 自动同步到本地，关闭浏览器窗口前会再同步一次，无需手动保存。新下载和解析默认按目标网站域名匹配 Cookie，通过 yt-dlp 的 Cookie 文件使用这份身份；已有任务保留原快照。Google 等拒绝内嵌登录的网站可使用本机浏览器。
+在桌面“设置 → 网络与 Cookie”直接输入来源网站地址，无需经过登录设置弹窗。Windows/Linux 可点击“打开内置浏览器”（Windows WebView2 / Linux WebKit）或“本机浏览器登录”；macOS 仅提供“本机浏览器登录”，需要安装 Chrome、Edge 或 Chromium，支持从 `/Applications` 或 `~/Applications` 识别浏览器，Safari 不用于此登录流程。上次成功使用的网址和方式自动保存。登录期间 Cookie 自动同步到本地，关闭浏览器窗口前会再同步一次，无需手动保存。新下载和解析默认按目标网站域名匹配 Cookie，通过 yt-dlp 的 Cookie 文件使用这份身份；已有任务保留原快照。Google 等拒绝内嵌登录的网站可使用本机浏览器。
 
-内置浏览器顶部提供地址栏、返回、前进和刷新；输入网址后按回车访问，未填写协议时使用 HTTPS。导航栏与网站页面隔离，网站及登录弹窗不能调用应用命令。两种桌面登录浏览器与下载共用代理；修改代理后关闭并重新打开登录窗口，保存设置后重启仍生效。登录浏览器需要不含账号密码的代理地址，可使用本地代理端口。
+Windows/Linux 内置浏览器顶部提供地址栏、返回、前进和刷新；输入网址后按回车访问，未填写协议时使用 HTTPS。导航栏与网站页面隔离，网站及登录弹窗不能调用应用命令。桌面登录浏览器与下载共用代理；修改代理后关闭并重新打开登录窗口，保存设置后重启仍生效。登录浏览器需要不含账号密码的代理地址，可使用本地代理端口。
 
 Cookie 不是所有网站的下载前提：没有匹配记录时匿名解析和下载。同步失败会提示原因，仍允许关闭登录窗口，并保留此前保存的 Cookie。抖音旧提取器可能将接口 403 统一报为 `Fresh cookies (not necessarily logged in)`，反复登录不一定有效。本应用临时内置 [yt-dlp 抖音修复 PR #17826](https://github.com/yt-dlp/yt-dlp/pull/17826)（提交 `edf5ca18`，Unlicense），仅加载随应用编译的兼容代码，不加载用户插件目录；捆绑的官方 yt-dlp 文件不作修改。已经通过公开抖音短链的匿名解析、实际下载和应用入库验证；站点变更仍可能导致失效，上游正式合入后会移除此兼容补丁。
 
@@ -79,7 +86,7 @@ Cookie 不是所有网站的下载前提：没有匹配记录时匿名解析和�
 
 删除确认中的“同时删除此任务管理的媒体文件”自动记住上次勾选，取消删除也会保留该选择；新安装默认不勾选，删除仍须确认。设置页的下载参数、语言、主题、通知、代理和 AI 配置点击“保存设置”后写入磁盘；快速选项点击“保存批次方案”后保存。MCP 自启动与服务配置、访问密码、Cookie 和浏览器偏好在各自操作成功后保存。首页临时画质、列表筛选、工具安装参数、Cookie 导入来源及封面编辑中的未提交操作不会作为全局设置自动保存。
 
-登录状态保留在应用数据目录的 `login-browser` 独立配置中，两种桌面登录浏览器共用保存的下载代理，留空直连。每种浏览器配置可登录多个网站，保存时导出该配置内的 Cookie；删除已保存 Cookie 不会退出浏览器账号。需要退出时在网站中操作。浏览器配置包含登录信息，请按敏感数据保管。
+登录状态保留在应用数据目录的 `login-browser` 独立配置中，桌面登录浏览器共用保存的下载代理，留空直连。每种浏览器配置可登录多个网站，保存时导出该配置内的 Cookie；删除已保存 Cookie 不会退出浏览器账号。需要退出时在网站中操作。浏览器配置包含登录信息，请按敏感数据保管。
 
 ### 批量、恢复与文件安全
 

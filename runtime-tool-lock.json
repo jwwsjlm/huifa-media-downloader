@@ -19,6 +19,21 @@
           "name": "yt-dlp_linux_aarch64",
           "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux_aarch64",
           "sha256": "b16e4dab368a816cd05d477d698a605a6ae87ccee1c8ffd38fa21d7254141fcc"
+        },
+        "windows-aarch64": {
+          "name": "yt-dlp_arm64.exe",
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_arm64.exe",
+          "sha256": "05b438997bafc3affdfda9d041353c9d73e04dc842207254b655b0887c4445b0"
+        },
+        "darwin-x86_64": {
+          "name": "yt-dlp_macos",
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
+          "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202"
+        },
+        "darwin-aarch64": {
+          "name": "yt-dlp_macos",
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
+          "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202"
         }
       }
     },
@@ -40,6 +55,25 @@
           "name": "ffmpeg-N-127651-gb60ab6c9a4-linuxarm64-gpl.tar.xz",
           "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-18-13-01/ffmpeg-N-127651-gb60ab6c9a4-linuxarm64-gpl.tar.xz",
           "sha256": "3d1ccdb45b01635e8404da39869f3a0c7a535b9e63470439bc3e677cf12fe266"
+        },
+        "windows-aarch64": {
+          "name": "ffmpeg-N-127651-gb60ab6c9a4-winarm64-gpl-shared.zip",
+          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-18-13-01/ffmpeg-N-127651-gb60ab6c9a4-winarm64-gpl-shared.zip",
+          "sha256": "c0f65aaa13b0bfe9dba2b3d7be2d7a3660c33190a821cd265c77834f5ddcada2"
+        },
+        "darwin-x86_64": {
+          "name": "ffmpeg-osx-x64",
+          "url": "https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffmpeg-osx-x64",
+          "sha256": "62c87854d851f202fc4a29bdda0fe7b6ebcddd37b863482ce1bdc81151b03fe4",
+          "repository": "shaka-project/static-ffmpeg-binaries",
+          "version": "n8.1.2-1"
+        },
+        "darwin-aarch64": {
+          "name": "ffmpeg-osx-arm64",
+          "url": "https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffmpeg-osx-arm64",
+          "sha256": "e7b9fcd97f95f333512d6e8b8ac24d9dbc08f189f36047695499bd7b57214b22",
+          "repository": "shaka-project/static-ffmpeg-binaries",
+          "version": "n8.1.2-1"
         }
       }
     },
@@ -61,6 +95,43 @@
           "name": "qjs-linux-aarch64",
           "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-linux-aarch64",
           "sha256": "3372133484edf50a69f3c67903af41206d22a061e930e3cfb63269272ef56d2e"
+        }
+      }
+    },
+    "ffprobe": {
+      "repository": "shaka-project/static-ffmpeg-binaries",
+      "version": "n8.1.2-1",
+      "assets": {
+        "darwin-x86_64": {
+          "name": "ffprobe-osx-x64",
+          "url": "https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffprobe-osx-x64",
+          "sha256": "d530823f480a3c7eb6334f18a00197d1e9f1070e86172b9aa89c4bf4022bd879"
+        },
+        "darwin-aarch64": {
+          "name": "ffprobe-osx-arm64",
+          "url": "https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffprobe-osx-arm64",
+          "sha256": "ded4c698b8ff38d0bc1fd30fcc5e768dc46f58bc15a8dfd61f98615ba49cde5c"
+        }
+      }
+    },
+    "deno": {
+      "repository": "denoland/deno",
+      "version": "v2.9.7",
+      "assets": {
+        "windows-aarch64": {
+          "name": "deno-aarch64-pc-windows-msvc.zip",
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-pc-windows-msvc.zip",
+          "sha256": "c4c4ac8bfdaa37814bda5c05fc9cdf2154904e2ef8277673a30bdceaaa649807"
+        },
+        "darwin-x86_64": {
+          "name": "deno-x86_64-apple-darwin.zip",
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-apple-darwin.zip",
+          "sha256": "95daaff11c116a52ad54785e7914c8e9c9cdcaba793c5ed929c74ca2d8e6259a"
+        },
+        "darwin-aarch64": {
+          "name": "deno-aarch64-apple-darwin.zip",
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-apple-darwin.zip",
+          "sha256": "5cd46d6268f6f78f5d88bdc7159d20bd44cdaa4b3303474839f87ec6fe7ae25c"
         }
       }
     }

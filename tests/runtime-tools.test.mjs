@@ -5,14 +5,59 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { download, ffmpegRelease, runtimeEntries } from '../scripts/acquire-rust-tools.mjs';
+import { download, ffmpegRelease, runtimeEntries, nativeExecutable, nativeTarget, toolSource, targets } from '../scripts/acquire-rust-tools.mjs';
 
 test('FFmpeg uses dated assets rather than a moving latest URL', () => {
-  const assets = ['win64-gpl-shared.zip', 'linux64-gpl.tar.xz', 'linuxarm64-gpl.tar.xz'].map(suffix => ({ name: `ffmpeg-N-123-gabcdef-${suffix}` }));
+  const assets = ['win64-gpl-shared.zip', 'linux64-gpl.tar.xz', 'linuxarm64-gpl.tar.xz', 'winarm64-gpl-shared.zip'].map(suffix => ({ name: `ffmpeg-N-123-gabcdef-${suffix}` }));
   const stable = { tag_name: 'autobuild-2026-10-13-20-20', assets };
   assert.equal(ffmpegRelease([{ tag_name: 'latest', assets }, stable]).release, stable);
   assert.throws(() => ffmpegRelease([{ tag_name: 'latest', assets }]), /dated/);
   assert.throws(() => ffmpegRelease([{ ...stable, assets: assets.slice(1) }]), /Expected one/);
+});
+
+test('every desktop target has pinned media tools and one native JavaScript runtime', () => {
+  const lock = JSON.parse(readFileSync(new URL('../runtime-tool-lock.json', import.meta.url), 'utf8'));
+  assert.equal(nativeTarget('darwin', 'arm64'), 'darwin-aarch64');
+  assert.equal(nativeTarget('win32', 'arm64'), 'windows-aarch64');
+  assert.throws(() => nativeTarget('android', 'arm64'), /Unsupported/);
+  for (const target of targets) {
+    const javascript = ['qjs', 'deno'].filter(tool => toolSource(tool, target));
+    assert.equal(javascript.length, 1, target);
+    for (const tool of ['yt-dlp', 'ffmpeg', ...javascript, ...(target.startsWith('darwin-') ? ['ffprobe'] : [])]) {
+      const source = toolSource(tool, target), record = lock.tools[tool], asset = record.assets[target];
+      assert.equal(asset.repository ?? record.repository, source.repository);
+      assert.match(asset.sha256, /^[a-f0-9]{64}$/);
+      assert.ok(asset.url.startsWith(`https://github.com/${source.repository}/releases/download/`));
+      if (source.name) assert.equal(asset.name, source.name); else assert.ok(asset.name.endsWith(source.suffix));
+    }
+  }
+  assert.equal(toolSource('qjs', 'windows-aarch64'), null);
+  assert.equal(toolSource('qjs', 'darwin-aarch64'), null);
+});
+
+test('native executable validation rejects the wrong CPU and accepts Mach-O universal slices', () => {
+  const pe = Buffer.alloc(128); pe.write('MZ'); pe.writeUInt32LE(64, 60); pe.write('PE\0\0', 64); pe.writeUInt16LE(0xaa64, 68);
+  assert.ok(nativeExecutable(pe, 'windows-aarch64'));
+  assert.equal(nativeExecutable(pe, 'windows-x86_64'), false);
+  pe.writeUInt32LE(0xfffffff0, 60);
+  assert.equal(nativeExecutable(pe, 'windows-aarch64'), false);
+  const elf = Buffer.alloc(32); Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1]).copy(elf); elf.writeUInt16LE(183, 18);
+  assert.ok(nativeExecutable(elf, 'linux-aarch64'));
+  assert.equal(nativeExecutable(elf, 'linux-x86_64'), false);
+  const macho = cpu => { const bytes = Buffer.alloc(32); bytes.writeUInt32BE(0xcffaedfe); bytes.writeUInt32LE(cpu, 4); return bytes; };
+  const arm = macho(0x0100000c), intel = macho(0x01000007);
+  assert.ok(nativeExecutable(arm, 'darwin-aarch64'));
+  assert.equal(nativeExecutable(arm, 'darwin-x86_64'), false);
+  const fat = Buffer.alloc(112); fat.writeUInt32BE(0xcafebabe); fat.writeUInt32BE(2, 4);
+  for (const [index, [cpu, bytes]] of [[0x01000007, intel], [0x0100000c, arm]].entries()) {
+    const entry = 8 + index * 20, offset = 48 + index * 32;
+    fat.writeUInt32BE(cpu, entry); fat.writeUInt32BE(offset, entry + 8); fat.writeUInt32BE(32, entry + 12); bytes.copy(fat, offset);
+  }
+  assert.ok(nativeExecutable(fat, 'darwin-x86_64'));
+  assert.ok(nativeExecutable(fat, 'darwin-aarch64'));
+  fat.writeUInt32BE(0xfffffff0, 36);
+  assert.equal(nativeExecutable(fat, 'darwin-aarch64'), false);
+  assert.equal(nativeExecutable(Buffer.from('not executable'), 'darwin-aarch64'), false);
 });
 
 test('shared FFmpeg includes every runtime DLL, excludes development files and rejects missing dependencies', () => {

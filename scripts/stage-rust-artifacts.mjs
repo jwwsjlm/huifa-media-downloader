@@ -4,6 +4,7 @@ import { resolve, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { validateVersion } from './rust-release.mjs';
+import { releasePlatforms } from './release-platforms.mjs';
 
 function one(directory, suffix) {
   const files = readdirSync(directory).filter(file => file.endsWith(suffix));
@@ -13,14 +14,15 @@ function one(directory, suffix) {
 
 export function stage(root, platform, version) {
   validateVersion(version);
-  const windows = platform === 'windows-x86_64';
-  if (!windows && platform !== 'linux-x86_64') throw new Error('Unsupported release platform');
-  const bundle = resolve(root, 'target/release/bundle', windows ? 'nsis' : 'appimage');
-  const source = one(bundle, windows ? '.exe' : '.AppImage');
-  const name = `HuifaDownloader-${version}-${windows ? 'windows-x64-setup.exe' : 'linux-x64.AppImage'}`;
+  const target = releasePlatforms[platform];
+  if (!target) throw new Error('Unsupported release platform');
+  const windows = platform.startsWith('windows');
+  const bundle = resolve(root, 'target/release/bundle', target.bundle);
+  const source = one(bundle, target.extension);
+  const name = `HuifaDownloader-${version}-${target.suffix}${windows ? '-setup' : ''}${target.extension}`;
   const artifacts = [[source, name]];
   if (windows) {
-    const filename = `HuifaDownloader-${version}-windows-x64-portable.zip`;
+    const filename = `HuifaDownloader-${version}-${target.suffix}-portable.zip`;
     const file = resolve(root, 'target/release/bundle/portable', filename);
     if (!readFileSync(file).length) throw new Error(`Empty portable archive: ${filename}`);
     artifacts.push([file, filename]);
@@ -35,6 +37,10 @@ export function stage(root, platform, version) {
   for (const [index, [file, filename]] of artifacts.entries()) {
     copyFileSync(file, join(folder, filename));
     writeFileSync(join(folder, filename + '.sig'), signatures[index] + '\n');
+  }
+  if (platform.startsWith('darwin')) {
+    const dmg = one(resolve(root, 'target/release/bundle/dmg'), '.dmg');
+    copyFileSync(dmg, join(folder, `HuifaDownloader-${version}-${target.suffix}.dmg`));
   }
   const info = { platform, filename: name, signature: signatures[0], sha256: createHash('sha256').update(readFileSync(source)).digest('hex') };
   writeFileSync(join(folder, `${platform}.json`), JSON.stringify(info, null, 2) + '\n');

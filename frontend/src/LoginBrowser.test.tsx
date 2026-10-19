@@ -134,6 +134,26 @@ it('disables unavailable compatible mode', async () => {
   expect((controls.getByRole('button', { name: 'Local browser sign-in' }) as HTMLButtonElement).disabled).toBe(true);
 });
 
+it('uses local browser sign-in when the platform does not offer an embedded browser', async () => {
+  command.mockResolvedValue({ ...inactive, embeddedAvailable: false, preferredMode: 'embedded' });
+  const { controls } = show('http://127.0.0.1:7890');
+  await controls.findByText('Sign in with Chrome, Edge or Chromium; cookies save automatically.');
+  expect(controls.queryByRole('button', { name: 'Open built-in browser' })).toBeNull();
+  const local = controls.getByRole('button', { name: 'Local browser sign-in' });
+  expect(local.className).toContain('primary');
+  expect((local as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(local);
+  await waitFor(() => expect(command).toHaveBeenCalledWith('browser.login.open', { url: 'https://www.youtube.com/', mode: 'system', proxy: 'http://127.0.0.1:7890' }));
+});
+
+it('requires a Chromium browser when the platform supports only local sign-in', async () => {
+  command.mockResolvedValue({ ...inactive, embeddedAvailable: false, systemBrowser: null });
+  const { controls } = show();
+  await controls.findByText(/was not found/);
+  expect(controls.queryByRole('button', { name: 'Open built-in browser' })).toBeNull();
+  expect((controls.getByRole('button', { name: 'Local browser sign-in' }) as HTMLButtonElement).disabled).toBe(true);
+});
+
 it('does not ask users to name or select cookies or read saved cookie values', async () => {
   command.mockResolvedValue({ ...inactive, cookie: { id: 'saved', name: 'Hidden identity', count: 5 } });
   const { controls } = show();

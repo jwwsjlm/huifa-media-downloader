@@ -44,7 +44,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             url: "https://www.youtube.com/".into(),
-            mode: "embedded".into(),
+            mode: default_login_mode().into(),
         }
     }
 }
@@ -54,7 +54,12 @@ impl Preferences {
         ensure!(matches!(mode, "embedded" | "system"), "Invalid login mode");
         Ok(Self {
             url: login_url(url)?.to_string(),
-            mode: mode.into(),
+            mode: if mode == "embedded" && !embedded_available() {
+                "system"
+            } else {
+                mode
+            }
+            .into(),
         })
     }
 
@@ -76,6 +81,27 @@ impl Preferences {
         let value: Self = serde_json::from_slice(&bytes)?;
         Self::new(&value.url, &value.mode)
     }
+}
+
+fn embedded_available() -> bool {
+    cfg!(any(windows, target_os = "linux"))
+}
+
+fn default_login_mode() -> &'static str {
+    if embedded_available() {
+        "embedded"
+    } else {
+        "system"
+    }
+}
+
+fn validate_login_mode(mode: &str) -> Result<()> {
+    ensure!(matches!(mode, "embedded" | "system"), "Invalid login mode");
+    ensure!(
+        mode != "embedded" || embedded_available(),
+        "Built-in sign-in is unavailable on this platform; use Chrome, Edge or Chromium"
+    );
+    Ok(())
 }
 
 #[derive(Default)]
@@ -207,7 +233,7 @@ impl LoginBrowser {
             "browser.login.open" => {
                 let url = login_url(args["url"].as_str().context("URL must be text")?)?;
                 let mode = args["mode"].as_str().context("Login mode is required")?;
-                ensure!(matches!(mode, "embedded" | "system"), "Invalid login mode");
+                validate_login_mode(mode)?;
                 let saved_proxy;
                 let proxy = if let Some(proxy) = args.get("proxy") {
                     proxy.as_str().context("Proxy must be text")?
@@ -306,7 +332,7 @@ impl LoginBrowser {
         let synced = self.synced.lock().unwrap();
         let preferred = self.preferred.lock().unwrap();
         let preference_error = self.preference_error.lock().unwrap();
-        json!({"active":running.is_some(),"mode":running.as_ref().map(Session::mode),"targetUrl":running.as_ref().map(|_| preferred.url.as_str()),"preferredUrl":preferred.url,"preferredMode":preferred.mode,"preferenceError":*preference_error,"systemBrowser":self.system.as_ref().map(|(name,_)|name),"cookie":synced.saved.as_ref().map(|value| &value["cookie"]),"saveError":synced.error})
+        json!({"active":running.is_some(),"mode":running.as_ref().map(Session::mode),"targetUrl":running.as_ref().map(|_| preferred.url.as_str()),"preferredUrl":preferred.url,"preferredMode":preferred.mode,"embeddedAvailable":embedded_available(),"preferenceError":*preference_error,"systemBrowser":self.system.as_ref().map(|(name,_)|name),"cookie":synced.saved.as_ref().map(|value| &value["cookie"]),"saveError":synced.error})
     }
 
     fn remember(&self, url: &str, mode: &str) -> Result<()> {
@@ -801,6 +827,14 @@ fn find_browser() -> Option<(String, PathBuf)> {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let mut application_dirs = vec![PathBuf::from("/Applications")];
+        if let Some(home) = std::env::var_os("HOME") {
+            application_dirs.push(PathBuf::from(home).join("Applications"));
+        }
+        candidates.extend(macos_browser_candidates(&application_dirs));
+    }
     if let Some(paths) = std::env::var_os("PATH") {
         for (name, binary) in [
             ("chrome", "google-chrome"),
@@ -825,6 +859,22 @@ fn find_browser() -> Option<(String, PathBuf)> {
         }
     }
     candidates.into_iter().find(|(_, path)| path.is_file())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_browser_candidates(application_dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    application_dirs
+        .iter()
+        .flat_map(|directory| {
+            [
+                ("chrome", "Google Chrome.app/Contents/MacOS/Google Chrome"),
+                ("edge", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                ("chromium", "Chromium.app/Contents/MacOS/Chromium"),
+            ]
+            .into_iter()
+            .map(move |(name, executable)| (name.into(), directory.join(executable)))
+        })
+        .collect()
 }
 
 async fn launch_system(
@@ -1122,6 +1172,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn login_modes_match_platform_support_and_normalize_old_preferences() -> Result<()> {
+        assert!(validate_login_mode("system").is_ok());
+        assert_eq!(
+            validate_login_mode("embedded").is_ok(),
+            embedded_available()
+        );
+        assert!(validate_login_mode("safari").is_err());
+        let saved = Preferences::new("https://www.youtube.com/", "embedded")?;
+        assert_eq!(saved.mode, default_login_mode());
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("preferences.json"),
+            br#"{"url":"https://www.youtube.com/","mode":"embedded"}"#,
+        )?;
+        assert_eq!(Preferences::read(directory.path())?, saved);
+        let browser = LoginBrowser::new(directory.path().into())?;
+        assert_eq!(
+            browser.status(&None)["embeddedAvailable"],
+            embedded_available()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finds_chromium_browsers_in_system_and_user_application_bundles() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let application_dirs = [
+            directory.path().join("Applications"),
+            directory.path().join("Users/example/Applications"),
+        ];
+        let browser = application_dirs[1].join("Google Chrome.app/Contents/MacOS/Google Chrome");
+        std::fs::create_dir_all(browser.parent().unwrap())?;
+        std::fs::write(&browser, b"fixture")?;
+        let candidates = macos_browser_candidates(&application_dirs);
+        assert!(
+            !candidates
+                .iter()
+                .any(|(_, path)| path.to_string_lossy().contains("Safari"))
+        );
+        assert_eq!(
+            candidates.into_iter().find(|(_, path)| path.is_file()),
+            Some(("chrome".into(), browser))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn browser_proxy_uses_explicit_proxy_or_direct_access() -> Result<()> {
         assert!(
             BrowserProxy::parse("")?
@@ -1161,7 +1258,7 @@ mod tests {
             browser.status(&None)["preferredUrl"],
             "https://www.youtube.com/"
         );
-        assert_eq!(browser.status(&None)["preferredMode"], "embedded");
+        assert_eq!(browser.status(&None)["preferredMode"], default_login_mode());
         let profile = directory.path().join("embedded");
         private_directory(&profile)?;
         std::fs::write(profile.join("login-data"), b"keep")?;
@@ -1173,7 +1270,10 @@ mod tests {
             reopened.status(&None)["preferredUrl"],
             "https://www.bilibili.com/video/BV123/"
         );
-        assert_eq!(reopened.status(&None)["preferredMode"], "embedded");
+        assert_eq!(
+            reopened.status(&None)["preferredMode"],
+            default_login_mode()
+        );
         assert_eq!(std::fs::read(profile.join("login-data"))?, b"keep");
         #[cfg(unix)]
         {
