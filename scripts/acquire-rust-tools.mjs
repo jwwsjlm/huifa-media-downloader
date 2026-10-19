@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream, readFileSync, writeFileSync, mkdirSync, mkdtempSync, readdirSync, chmodSync, copyFileSync, openSync, closeSync, rmSync, realpathSync } from 'node:fs';
+import { createReadStream, createWriteStream, readFileSync, writeFileSync, mkdirSync, mkdtempSync, readdirSync, chmodSync, copyFileSync, rmSync, realpathSync } from 'node:fs';
 import { dirname, basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Readable, Transform } from 'node:stream';
@@ -26,6 +26,7 @@ export function toolSource(tool, target) {
   if (tool === 'yt-dlp') return { repository: 'yt-dlp/yt-dlp', name: mac ? 'yt-dlp_macos' : target.startsWith('windows-') ? arm ? 'yt-dlp_arm64.exe' : 'yt-dlp.exe' : arm ? 'yt-dlp_linux_aarch64' : 'yt-dlp_linux' };
   if (tool === 'ffmpeg' || tool === 'ffprobe') {
     if (mac) return { repository: 'shaka-project/static-ffmpeg-binaries', name: `${tool}-osx-${arm ? 'arm64' : 'x64'}` };
+    if (target === 'windows-aarch64') return tool === 'ffprobe' ? null : { repository: 'tordona/ffmpeg-win-arm64', release: '9.0.2', name: 'ffmpeg-9.0.2-essentials-static-win-arm64.7z' };
     if (tool === 'ffprobe') return null; // Included in the BtbN FFmpeg archive.
     return { repository: 'BtbN/FFmpeg-Builds', suffix: ffmpegSuffixes[targets.indexOf(target)] };
   }
@@ -93,7 +94,7 @@ export async function resolveLock() {
     const headers = { 'User-Agent': 'huifa-release', Accept: 'application/vnd.github+json' };
     if (process.env.GH_TOKEN) headers.Authorization = `Bearer ${process.env.GH_TOKEN}`;
     if (!releases.has(repository)) {
-      const response = await fetch(`https://api.github.com/repos/${repository}/releases${repository === 'BtbN/FFmpeg-Builds' ? '?per_page=10' : '/latest'}`, { headers, signal: AbortSignal.timeout(30_000) });
+      const response = await fetch(`https://api.github.com/repos/${repository}/releases${repository === 'BtbN/FFmpeg-Builds' ? '?per_page=10' : source.release ? `/tags/${source.release}` : '/latest'}`, { headers, signal: AbortSignal.timeout(30_000) });
       if (!response.ok) throw new Error(`Cannot resolve ${tool}: HTTP ${response.status}`);
       const payload = await response.json();
       releases.set(repository, repository === 'BtbN/FFmpeg-Builds' ? ffmpegRelease(payload).release : payload);
@@ -144,10 +145,10 @@ export async function download(asset, destination) {
   }
 }
 
-export function runtimeEntries(entries, windows) {
+export function runtimeEntries(entries, windows, shared = true) {
   const filenames = [windows ? 'ffmpeg.exe' : 'ffmpeg', windows ? 'ffprobe.exe' : 'ffprobe'];
   for (const filename of filenames) archiveEntry(entries, filename);
-  if (windows) {
+  if (windows && shared) {
     const libraries = entries.filter(entry => isFfmpegDll(basename(entry))).map(entry => basename(entry));
     for (const prefix of ['avcodec', 'avdevice', 'avfilter', 'avformat', 'avutil', 'swresample', 'swscale']) {
       if (libraries.filter(name => name.startsWith(prefix + '-')).length !== 1) throw new Error(`Expected one ${prefix} runtime DLL`);
@@ -156,20 +157,25 @@ export function runtimeEntries(entries, windows) {
   }
   return filenames;
 }
+function archiveTar(archive) {
+  if (archive.endsWith('.7z')) {
+    if (process.platform !== 'win32' || !process.env.SystemRoot) throw new Error('Windows system tar is required for this verified runtime archive');
+    return join(process.env.SystemRoot, 'System32', 'tar.exe');
+  }
+  return 'tar';
+}
 function entries(archive) {
   const zip = archive.endsWith('.zip') && process.platform !== 'win32';
-  const list = spawnSync(zip ? 'unzip' : 'tar', zip ? ['-Z1', archive] : ['-tf', archive], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, shell: false });
+  const list = spawnSync(zip ? 'unzip' : archiveTar(archive), zip ? ['-Z1', archive] : ['-tf', archive], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 60_000, shell: false, windowsHide: true });
   if (list.status !== 0) throw new Error(`Cannot inspect tool archive: ${list.stderr}`);
   return list.stdout.trim().split(/\r?\n/);
 }
 function extract(archive, filename, destination, members) {
   const zip = archive.endsWith('.zip') && process.platform !== 'win32';
   const entry = archiveEntry(members, filename);
-  const fd = openSync(destination, 'wx');
-  try {
-    const result = spawnSync(zip ? 'unzip' : 'tar', zip ? ['-p', archive, entry] : ['-xOf', archive, entry], { stdio: ['ignore', fd, 'pipe'], shell: false });
-    if (result.status !== 0) throw new Error(`Cannot extract tool: ${result.stderr}`);
-  } finally { closeSync(fd); }
+  const result = spawnSync(zip ? 'unzip' : archiveTar(archive), zip ? ['-p', archive, entry] : ['-xOf', archive, '--', entry], { maxBuffer: 256 * 1024 * 1024, timeout: 60_000, shell: false, windowsHide: true });
+  if (result.status !== 0 || result.error) throw new Error(`Cannot extract tool: ${result.error?.message ?? result.stderr}`);
+  writeFileSync(destination, result.stdout, { flag: 'wx' });
 }
 
 export async function acquire(lock, target, destination) {
@@ -198,7 +204,7 @@ export async function acquire(lock, target, destination) {
       await download(asset, archive);
       const archived = tool === 'ffmpeg' && !target.startsWith('darwin-') || asset.name.endsWith('.zip');
       const members = archived ? entries(archive) : [];
-      const filenames = tool === 'ffmpeg' && !target.startsWith('darwin-') ? runtimeEntries(members, suffix === '.exe') : [tool + suffix];
+      const filenames = tool === 'ffmpeg' && !target.startsWith('darwin-') ? runtimeEntries(members, suffix === '.exe', !asset.name.endsWith('.7z')) : [tool + suffix];
       for (const filename of filenames) {
         const name = filename.replace(/\.exe$/, '');
         const staged = join(temporary, filename);
@@ -214,6 +220,10 @@ export async function acquire(lock, target, destination) {
     if (native === target) for (const name of Object.keys(receipt)) {
       const result = spawnSync(join(temporary, name + suffix), [name === 'ffmpeg' || name === 'ffprobe' ? '-version' : '--version'], { encoding: 'utf8', timeout: 30_000, shell: false });
       if (result.status !== 0) throw new Error(`${name} cannot run on this platform: ${result.stderr}`);
+      if (name === 'ffmpeg') {
+        const encoders = spawnSync(join(temporary, name + suffix), ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: 30_000, shell: false });
+        if (encoders.status !== 0 || ['libx264', 'libvpx-vp9', 'libopus'].some(codec => !encoders.stdout.split(/\r?\n/).some(line => line.trim().split(/\s+/)[1] === codec))) throw new Error('FFmpeg is missing a required H.264, VP9 or Opus encoder');
+      }
     }
     const previous = join(destination, 'manifest.json');
     if (readdirSync(destination).includes('manifest.json')) {

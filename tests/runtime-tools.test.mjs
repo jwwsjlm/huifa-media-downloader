@@ -67,6 +67,7 @@ test('shared FFmpeg includes every runtime DLL, excludes development files and r
   assert.throws(() => runtimeEntries(members.filter(name => !name.endsWith('avcodec-1.dll')), true), /avcodec runtime DLL/);
   assert.throws(() => runtimeEntries([...members, 'other/avcodec-1.dll'], true), /avcodec runtime DLL/);
   assert.deepEqual(runtimeEntries(['build/bin/ffmpeg', 'build/bin/ffprobe'], false), ['ffmpeg', 'ffprobe']);
+  assert.deepEqual(runtimeEntries(['build/bin/ffmpeg.exe', 'build/bin/ffprobe.exe'], true, false), ['ffmpeg.exe', 'ffprobe.exe']);
 });
 
 test('download retries broken connections and still rejects a checksum mismatch', async t => {

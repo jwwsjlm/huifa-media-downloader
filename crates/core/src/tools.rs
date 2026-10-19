@@ -463,6 +463,8 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
         ("ffmpeg" | "ffprobe", "stable") if version.is_empty() => {
             if cfg!(target_os = "macos") {
                 "shaka-project/static-ffmpeg-binaries"
+            } else if cfg!(all(windows, target_arch = "aarch64")) {
+                "tordona/ffmpeg-win-arm64"
             } else {
                 "BtbN/FFmpeg-Builds"
             }
@@ -483,6 +485,9 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
                 format!("download/{version}")
             },
         )
+    } else if repository == "tordona/ffmpeg-win-arm64" {
+        // shortcut: latest includes mutable nightlies; bump this stable tag with the next ARM64 tool update.
+        ("https://api.github.com/repos", "tags/9.0.2".into())
     } else {
         ("https://api.github.com/repos", "latest".into())
     };
@@ -551,7 +556,7 @@ fn asset_name(name: &str, platform: &str) -> Result<&'static str> {
         ("yt-dlp", "linux-aarch64") => "yt-dlp_linux_aarch64",
         ("yt-dlp", "darwin-x86_64" | "darwin-aarch64") => "yt-dlp_macos",
         ("ffmpeg" | "ffprobe", "windows-x86_64") => "ffmpeg-master-latest-win64-gpl-shared.zip",
-        ("ffmpeg" | "ffprobe", "windows-aarch64") => "ffmpeg-master-latest-winarm64-gpl-shared.zip",
+        ("ffmpeg" | "ffprobe", "windows-aarch64") => "ffmpeg-9.0.2-essentials-static-win-arm64.7z",
         ("ffmpeg" | "ffprobe", "linux-x86_64") => "ffmpeg-master-latest-linux64-gpl.tar.xz",
         ("ffmpeg" | "ffprobe", "linux-aarch64") => "ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
         ("ffmpeg", "darwin-x86_64") => "ffmpeg-osx-x64",
@@ -921,6 +926,25 @@ async fn update_inner(
             None,
         )
         .await?;
+        if tool == "ffmpeg" {
+            let encoders = crate::process::run(
+                &path,
+                &["-hide_banner".into(), "-encoders".into()],
+                None,
+                &app.shutdown_token,
+                None,
+            )
+            .await?;
+            ensure!(
+                ["libx264", "libvpx-vp9", "libopus"]
+                    .iter()
+                    .all(|codec| encoders
+                        .stdout
+                        .lines()
+                        .any(|line| line.split_whitespace().nth(1) == Some(codec))),
+                "FFmpeg is missing a required H.264, VP9 or Opus encoder"
+            );
+        }
         if tool == "yt-dlp" {
             let fixture = temporary.path().join("compatibility.json");
             std::fs::write(&fixture, br#"{"id":"compatibility","title":"Compatibility","extractor":"generic","webpage_url":"https://example.invalid/compatibility.mp4","url":"https://example.invalid/compatibility.mp4","ext":"mp4","format_id":"compatibility","protocol":"https","vcodec":"avc1","acodec":"mp4a.40.2"}"#)?;
@@ -1012,6 +1036,9 @@ fn extract_archive(
     destination: &Path,
 ) -> Result<Vec<String>> {
     use std::io::{Read, Write};
+    if name.ends_with(".7z") {
+        return extract_system_archive(archive, wanted, destination);
+    }
     let mut found = std::collections::HashSet::new();
     let mut save = |path: &Path, reader: &mut dyn Read, size: u64| -> Result<()> {
         anyhow::ensure!(
@@ -1103,6 +1130,108 @@ fn extract_archive(
         }
     }
     Ok(found.into_iter().collect())
+}
+
+#[cfg(not(windows))]
+fn extract_system_archive(_: &[u8], _: &[String], _: &Path) -> Result<Vec<String>> {
+    bail!("This runtime archive requires Windows system tar")
+}
+
+#[cfg(windows)]
+fn extract_system_archive(
+    archive: &[u8],
+    wanted: &[String],
+    destination: &Path,
+) -> Result<Vec<String>> {
+    use std::{
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    fn output(tar: &Path, archive: &Path, member: Option<&str>, limit: u64) -> Result<Vec<u8>> {
+        let file = tempfile::NamedTempFile::new()?;
+        let mut command = Command::new(tar);
+        command
+            .arg(if member.is_some() { "-xOf" } else { "-tf" })
+            .arg(archive);
+        if let Some(member) = member {
+            command.args(["--", member]);
+        }
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(file.reopen()?)
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .context("Cannot start Windows system tar")?;
+        let started = Instant::now();
+        loop {
+            if file.as_file().metadata()?.len() > limit
+                || started.elapsed() > Duration::from_secs(60)
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("Runtime archive extraction exceeded its size or time limit");
+            }
+            if let Some(status) = child.try_wait()? {
+                anyhow::ensure!(
+                    status.success(),
+                    "Windows system tar could not read the verified runtime archive"
+                );
+                let size = file.as_file().metadata()?.len();
+                anyhow::ensure!(size <= limit, "Runtime archive output is too large");
+                return Ok(std::fs::read(file.path())?);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let tar = PathBuf::from(
+        std::env::var_os("SystemRoot").context("Windows system directory is unavailable")?,
+    )
+    .join("System32/tar.exe");
+    let mut file = tempfile::Builder::new().suffix(".7z").tempfile()?;
+    file.write_all(archive)?;
+    file.flush()?;
+    let listed = String::from_utf8(output(&tar, file.path(), None, 4 * 1024 * 1024)?)
+        .context("Invalid runtime archive listing")?;
+    let members = listed.lines().collect::<Vec<_>>();
+    let mut found = Vec::new();
+    for filename in wanted {
+        anyhow::ensure!(
+            Path::new(filename).components().count() == 1
+                && matches!(filename.as_str(), "ffmpeg.exe" | "ffprobe.exe"),
+            "Invalid runtime archive payload name"
+        );
+        let matches = members
+            .iter()
+            .filter(|member| {
+                let path = Path::new(member);
+                path.file_name().and_then(|name| name.to_str()) == Some(filename.as_str())
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            matches.len() == 1,
+            "Runtime archive must contain one {filename}"
+        );
+        let member = matches[0];
+        anyhow::ensure!(
+            !member.contains('\\')
+                && member.split('/').all(|part| !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && !part.contains(':')),
+            "Unsafe runtime archive path"
+        );
+        let bytes = output(&tar, file.path(), Some(member), 256 * 1024 * 1024)?;
+        let mut saved = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination.join(filename))?;
+        saved.write_all(&bytes)?;
+        saved.flush()?;
+        found.push(filename.clone());
+    }
+    Ok(found)
 }
 
 pub(crate) async fn check(app: &App) -> Result<Value> {
@@ -1212,6 +1341,40 @@ mod tests {
         assert!(!native_executable(&fat, "darwin-aarch64"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn system_tar_extracts_only_exact_runtime_members_and_rejects_duplicates() -> Result<()> {
+        let fixture = |duplicate: bool| -> Result<Vec<u8>> {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for filename in ["bin/ffmpeg.exe", "bin/ffprobe.exe", "docs/readme.txt"] {
+                writer.start_file(filename, zip::write::SimpleFileOptions::default())?;
+                writer.write_all(filename.as_bytes())?;
+            }
+            if duplicate {
+                writer.start_file("other/ffmpeg.exe", zip::write::SimpleFileOptions::default())?;
+                writer.write_all(b"duplicate")?;
+            }
+            Ok(writer.finish()?.into_inner())
+        };
+        let directory = tempfile::tempdir()?;
+        let wanted = vec!["ffmpeg.exe".into(), "ffprobe.exe".into()];
+        // Windows tar detects the archive format; this local ZIP fixture exercises the same
+        // bounded member-to-stdout path used for the verified upstream 7z asset.
+        assert_eq!(
+            extract_archive(&fixture(false)?, "runtime.7z", &wanted, directory.path())?,
+            wanted
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("ffmpeg.exe"))?,
+            b"bin/ffmpeg.exe"
+        );
+        assert!(!directory.path().join("docs").exists());
+        let duplicate = tempfile::tempdir()?;
+        assert!(extract_archive(&fixture(true)?, "runtime.7z", &wanted, duplicate.path()).is_err());
+        assert_eq!(std::fs::read_dir(duplicate.path())?.count(), 0);
+        Ok(())
+    }
+
     #[test]
     fn runtime_assets_reject_unexpected_origins() -> Result<()> {
         let release = |url: &str| json!({"assets":[{"name":"ffmpeg-osx-arm64","digest":format!("sha256:{}", "f".repeat(64)),"browser_download_url":url}]});
@@ -1318,7 +1481,7 @@ mod tests {
         assert!(asset_name("yt-dlp", "linux-riscv64").is_err());
         assert_eq!(
             asset_name("ffmpeg", "windows-aarch64")?,
-            "ffmpeg-master-latest-winarm64-gpl-shared.zip"
+            "ffmpeg-9.0.2-essentials-static-win-arm64.7z"
         );
         assert_eq!(asset_name("yt-dlp", "darwin-aarch64")?, "yt-dlp_macos");
         assert_eq!(asset_name("yt-dlp", "darwin-x86_64")?, "yt-dlp_macos");

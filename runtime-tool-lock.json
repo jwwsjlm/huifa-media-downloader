@@ -57,9 +57,11 @@
           "sha256": "3d1ccdb45b01635e8404da39869f3a0c7a535b9e63470439bc3e677cf12fe266"
         },
         "windows-aarch64": {
-          "name": "ffmpeg-N-127651-gb60ab6c9a4-winarm64-gpl-shared.zip",
-          "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-18-13-01/ffmpeg-N-127651-gb60ab6c9a4-winarm64-gpl-shared.zip",
-          "sha256": "c0f65aaa13b0bfe9dba2b3d7be2d7a3660c33190a821cd265c77834f5ddcada2"
+          "name": "ffmpeg-9.0.2-essentials-static-win-arm64.7z",
+          "url": "https://github.com/tordona/ffmpeg-win-arm64/releases/download/9.0.2/ffmpeg-9.0.2-essentials-static-win-arm64.7z",
+          "sha256": "5319165d85ecee87360166dc0198b6de7747be6ce7a97a9f59b3920eddb6a3c3",
+          "repository": "tordona/ffmpeg-win-arm64",
+          "version": "9.0.2"
         },
         "darwin-x86_64": {
           "name": "ffmpeg-osx-x64",
