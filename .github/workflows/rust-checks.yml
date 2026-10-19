@@ -56,8 +56,12 @@ jobs:
       - run: cargo clippy --locked -p huifa-core -p huifa-mcp -p huifa-server --all-targets -- -D warnings
   windows-login:
     needs: frontend
-    runs-on: windows-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -71,6 +75,20 @@ jobs:
       - run: node scripts/acquire-rust-tools.mjs windows-x86_64
       - name: Verify native login, cookie sync, IPC isolation and proxy
         run: node scripts/check-login-browser.mjs
+      - name: Build desktop with the packaged frontend
+        run: cargo build --locked --release -p huifa-desktop --features tauri/custom-protocol
+      - name: Verify normal startup and visible initialization failures
+        run: ./scripts/check-windows-startup.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-startup-${{ matrix.os }}
+          path: |
+            output/windows-startup/**/result.txt
+            output/windows-startup/**/stderr.txt
+            output/windows-startup/**/startup-error.log
+            output/windows-startup/**/cleanup.txt
+          if-no-files-found: ignore
   containers:
     needs: frontend
     strategy:

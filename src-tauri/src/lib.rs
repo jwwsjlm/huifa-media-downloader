@@ -17,6 +17,7 @@ use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 
 mod login_browser;
+mod startup;
 
 #[tauri::command]
 async fn login_navigation(
@@ -459,6 +460,7 @@ async fn install_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<
 }
 
 pub fn run() {
+    startup::install();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -525,7 +527,8 @@ pub fn run() {
                 data_dir: base.clone(),
                 download_dir: download_dir.clone(),
                 tool_dir,
-            }))?;
+            }))
+            .map_err(error)?;
             let mut events = core.subscribe();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -542,7 +545,7 @@ pub fn run() {
                 }
             });
             let mcp = huifa_mcp::DesktopMcp::new(core.clone());
-            let config = mcp.status()?;
+            let config = mcp.status().context("Could not read MCP startup settings").map_err(error)?;
             if let Err(reason) = tauri::async_runtime::block_on(mcp.configure(
                     config["autoStart"] == true,
                     true,
@@ -553,7 +556,9 @@ pub fn run() {
                 eprintln!("MCP startup failed: {reason}");
             }
             app.manage(Host {
-                login_browser: login_browser::LoginBrowser::new(base.join("login-browser"))?,
+                login_browser: login_browser::LoginBrowser::new(base.join("login-browser"))
+                    .context("Could not initialize the login browser profile")
+                    .map_err(error)?,
                 mcp,
                 core,
                 data_dir: base,
@@ -625,10 +630,17 @@ pub fn run() {
             open_project,
             login_navigation
         ]);
-    let application = builder
-        .build(tauri::generate_context!())
-        .expect("Could not start Huifa Media Downloader");
+    let application = match builder.build(tauri::generate_context!()) {
+        Ok(application) => application,
+        Err(reason) => {
+            startup::report(&format!("{reason:#}"));
+            std::process::exit(1);
+        }
+    };
     application.run(|app, event| {
+        if matches!(event, tauri::RunEvent::Ready) {
+            startup::ready();
+        }
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
             let host = app.state::<Host>();
             if host.shutdown_done.load(Ordering::Acquire) {

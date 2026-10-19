@@ -92,31 +92,60 @@ pub struct App {
 
 impl App {
     pub async fn open(mut config: AppConfig) -> Result<Arc<Self>> {
-        std::fs::create_dir_all(&config.data_dir)?;
-        config.data_dir = config.data_dir.canonicalize()?;
-        backup::before_upgrade(&config.data_dir)?;
+        std::fs::create_dir_all(&config.data_dir).with_context(|| {
+            format!(
+                "Could not create the application data folder {}",
+                config.data_dir.display()
+            )
+        })?;
+        config.data_dir = config.data_dir.canonicalize().with_context(|| {
+            format!(
+                "Could not resolve the application data folder {}",
+                config.data_dir.display()
+            )
+        })?;
+        backup::before_upgrade(&config.data_dir)
+            .context("Could not prepare the application upgrade backup")?;
         let saved_download_directory = config
             .data_dir
             .join(download_directory::FILE_NAME)
-            .try_exists()?;
+            .try_exists()
+            .context("Could not check the saved download folder configuration")?;
         if !saved_download_directory {
-            std::fs::create_dir_all(&config.download_dir)?;
+            std::fs::create_dir_all(&config.download_dir).with_context(|| {
+                format!(
+                    "Could not create the download folder {}",
+                    config.download_dir.display()
+                )
+            })?;
         }
         config.download_dir = match config.download_dir.canonicalize() {
             Ok(path) => path,
-            Err(_) if saved_download_directory => std::path::absolute(&config.download_dir)?,
-            Err(reason) => return Err(reason.into()),
+            Err(_) if saved_download_directory => std::path::absolute(&config.download_dir)
+                .context("Could not resolve the default download folder")?,
+            Err(reason) => return Err(reason).context("Could not resolve the download folder"),
         };
         if let Some(tool_dir) = &config.tool_dir {
-            config.tool_dir = Some(tool_dir.canonicalize()?);
+            config.tool_dir = Some(tool_dir.canonicalize().with_context(|| {
+                format!(
+                    "Could not resolve the runtime tools folder {}",
+                    tool_dir.display()
+                )
+            })?);
         }
-        std::fs::create_dir_all(config.data_dir.join("tasks"))?;
-        std::fs::create_dir_all(config.data_dir.join("assets"))?;
-        let db = Database::open(&config.data_dir.join("rust-core.sqlite3"))?;
-        let credentials = credentials::CredentialStore::open(&config.data_dir)?;
-        let access = access::Access::open(&config.data_dir)?;
+        std::fs::create_dir_all(config.data_dir.join("tasks"))
+            .context("Could not create task storage")?;
+        std::fs::create_dir_all(config.data_dir.join("assets"))
+            .context("Could not create image storage")?;
+        let db = Database::open(&config.data_dir.join("rust-core.sqlite3"))
+            .context("Could not open the application database")?;
+        let credentials = credentials::CredentialStore::open(&config.data_dir)
+            .context("Could not open or migrate saved credentials")?;
+        let access = access::Access::open(&config.data_dir)
+            .context("Could not open the access password configuration")?;
         let download_directories =
-            download_directory::DownloadDirectories::open(&config.data_dir, &config.download_dir)?;
+            download_directory::DownloadDirectories::open(&config.data_dir, &config.download_dir)
+                .context("Could not read the saved download folders")?;
         let (events, _) = broadcast::channel(1024);
         let app = Arc::new(Self {
             access,
@@ -146,12 +175,17 @@ impl App {
             request_queries: Default::default(),
         });
         app.myself.set(Arc::downgrade(&app)).unwrap();
-        let mut settings = app.db.settings()?;
+        let mut settings = app.db.settings().context("Could not read saved settings")?;
         if settings["downloadOptions"]["filenameTemplate"] == "%(title)s [%(id)s].%(ext)s" {
             settings["downloadOptions"]["filenameTemplate"] = json!("%(title)s.%(ext)s");
-            app.db.save_settings(&settings)?;
+            app.db
+                .save_settings(&settings)
+                .context("Could not migrate saved filename settings")?;
         }
-        let mut restored_tasks = app.db.tasks_including_retained()?;
+        let mut restored_tasks = app
+            .db
+            .tasks_including_retained()
+            .context("Could not read saved tasks for startup recovery")?;
         restored_tasks.sort_by(|left, right| {
             right
                 .priority
@@ -169,7 +203,9 @@ impl App {
                 changed = true;
             }
             if changed {
-                app.db.save_task(&task)?;
+                app.db
+                    .save_task(&task)
+                    .with_context(|| format!("Could not migrate saved task {}", task.id))?;
             }
             if matches!(
                 task.status.as_str(),
@@ -188,8 +224,10 @@ impl App {
                     },
                     None,
                 );
-                app.save_task(&task)?;
-                app.schedule(&task.id)?;
+                app.save_task(&task)
+                    .with_context(|| format!("Could not reset interrupted task {}", task.id))?;
+                app.schedule(&task.id)
+                    .with_context(|| format!("Could not resume interrupted task {}", task.id))?;
             }
         }
         Ok(app)
@@ -1464,6 +1502,27 @@ pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_errors_identify_the_failed_stage_and_preserve_existing_data() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let data_dir = root.path().join("data");
+        std::fs::write(&data_dir, b"existing user data")?;
+        let error = App::open(AppConfig {
+            data_dir: data_dir.clone(),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await
+        .err()
+        .context("A data file cannot be used as the application folder")?;
+        let message = format!("{error:#}");
+        assert!(message.contains("Could not create the application data folder"));
+        assert!(message.contains(data_dir.to_string_lossy().as_ref()));
+        assert!(error.chain().count() >= 2);
+        assert_eq!(std::fs::read(&data_dir)?, b"existing user data");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn quick_snapshot_reads_saved_state_without_executing_runtime_tools() -> Result<()> {

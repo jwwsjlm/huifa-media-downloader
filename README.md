@@ -43,6 +43,8 @@
 
 便携版解压后运行 `HuifaDownloader.exe`，保留 `tools` 目录和 `portable.flag`。Windows 需要 Microsoft Edge WebView2 Runtime。安装版和便携版共用系统用户数据与下载目录，切换前关闭另一版本；更新便携版时关闭程序并覆盖程序目录。
 
+Windows 启动失败会显示错误及 `startup-error.log` 的位置。如果双击后直接退出且没有提示，可下载 `scripts/diagnose-windows-startup.ps1`，用 Windows PowerShell 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\diagnose-windows-startup.ps1`，按提示输入程序 EXE 路径，将生成的 `startup-report.txt` 发给开发者。脚本采集系统、程序和 WebView2 版本、退出码及本次错误事件，不读取 Cookie 或业务配置。
+
 应用标识为 `com.huifa.downloader.rust`。Rust 数据位于系统本地数据目录的 `HuifaDownloaderRust`，默认下载到系统 Downloads 下的同名目录。Cookie、代理和 AI 密钥在 `credentials` 中以明文文件保存，备份整个数据目录即可。旧版加密记录首次启动时自动迁移，完成后删除旧密钥；迁移前须保留原 `.credentials.key`。
 
 在桌面“设置 → 网络与 Cookie”直接输入来源网站地址，点击“打开内置浏览器”或“本机浏览器登录”，无需经过登录设置弹窗。可选择内置浏览器（Windows WebView2 / Linux WebKit），或已安装的 Edge、Chrome、Chromium 本机浏览器登录窗口。上次成功使用的网址和方式自动保存。登录期间 Cookie 自动同步到本地，关闭浏览器窗口前会再同步一次，无需手动保存。新下载和解析默认按目标网站域名匹配 Cookie，通过 yt-dlp 的 Cookie 文件使用这份身份；已有任务保留原快照。Google 等拒绝内嵌登录的网站可使用本机浏览器。
