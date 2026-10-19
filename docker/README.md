@@ -2,34 +2,116 @@
 
 The Rust web host serves the same React build as the desktop app on port 19491.
 Both `linux/amd64` and `linux/arm64` use their corresponding official standalone
-yt-dlp and QuickJS-NG binaries, verified against release checksums; FFmpeg and Chromium
-come from Debian packages. Python application code is not used at runtime.
+yt-dlp and QuickJS-NG binaries. FFmpeg and FFprobe use the pinned compatibility
+build from BtbN. These runtime downloads are verified against the SHA-256 values
+in [`runtime-tool-lock.json`](../runtime-tool-lock.json). Chromium comes from
+Debian packages. Python application code is not used at runtime.
 
-For a source build, prepare the relative host directories and start Compose:
+## Released image
+
+Create a directory and save the following as `compose.yaml`. No repository clone
+is needed. The image automatically selects amd64 or ARM64 for the host:
+
+```yaml
+services:
+  downloader:
+    image: ghcr.io/jwwsjlm/huifa-media-downloader:latest
+    ports:
+      - "19491:19491"
+    environment:
+      HUIFA_ACCOUNT: admin
+      HUIFA_PASSWORD: admin
+      HUIFA_PUBLIC_ORIGIN: http://localhost:19491
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m
+    shm_size: 256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    restart: unless-stopped
+```
+
+Set `HUIFA_PUBLIC_ORIGIN` to the complete origin used by the browser: scheme,
+host and port, with no path. Use `http://localhost:19491` locally,
+`http://192.168.1.10:19491` for a NAS, or `https://download.example.com` for an
+HTTPS reverse proxy. Update it when changing the published host port. HTTPS
+origins give the session cookie its Secure flag; direct HTTP sends login traffic
+without transport encryption.
+
+Create the host directories beside `compose.yaml`:
 
 ```sh
 mkdir -p data downloads
-# Linux/NAS: grant the container user access to these new directories.
+```
+
+On Linux/NAS, both directories must be writable by container UID/GID
+`10001:10001`. For these newly created directories, run:
+
+```sh
+sudo chown 10001:10001 data downloads
+```
+
+Handle existing directories according to their current permissions; avoid
+recursively changing existing user data. Docker Desktop on Windows does not
+require `chown`. Then run from the Compose directory:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+Open [http://localhost:19491](http://localhost:19491), or the configured NAS/domain
+address. The initial account and password are both `admin`. Before allowing
+access from other devices, change the password in **Settings → Access password**
+using the current and new password. It is shared by web login and HTTP MCP;
+changing it invalidates existing sessions, so sign in again and update AI clients.
+
+`HUIFA_ACCOUNT` and `HUIFA_PASSWORD` seed an empty data directory only. An
+explicitly empty initial credential is rejected. Later starts use the persisted
+account and Argon2 password hash in `/data/access.json`; recreating the container
+or changing environment variables does not reset an existing password.
+
+### Update and preserve data
+
+Compose binds `./data` to `/data` and `./downloads` to `/downloads`, relative to the
+directory containing `compose.yaml`. `data` contains configuration, credentials,
+task records and recovery data; `downloads` contains media. Stop the container
+before backing up both directories and `compose.yaml`.
+
+The example's `latest` tag follows the latest stable release. To pin a release,
+replace `latest` with its version number, without a leading `v`. Update from the
+same Compose directory with `docker compose pull` and `docker compose up -d`.
+Keep the data/download directories and their mount paths; deleting them is not
+part of an upgrade. Runtime components are updated with the image and container
+recreation; the web interface offers component checks only.
+
+Existing `rust-data` / `rust-downloads` named volumes are not copied automatically
+when changing mounts. Keep their original mount configuration until their data
+has been migrated. Do not run `docker compose down -v`: it deletes named volumes
+referenced by the configuration.
+
+## Source build
+
+With the repository cloned, run from its root, using the supplied `compose.yaml`:
+
+```sh
+mkdir -p data downloads
+# Linux/NAS only, for newly created directories:
 sudo chown 10001:10001 data downloads
 docker compose up --build -d
 ```
 
-Docker Desktop on Windows does not require `chown`. For a released image, use the
-complete [Compose example in README](../README_EN.md#docker-web-host).
-A new installation defaults to account `admin`
-and password `admin`. Optional `HUIFA_ACCOUNT` and `HUIFA_PASSWORD` seed a new data
-directory only. After initialization the persisted configuration takes precedence.
-An explicitly empty initial credential is rejected. Set
-`HUIFA_PUBLIC_ORIGIN` to the exact URL you open, such as `http://server:19491`.
-The default is `http://localhost:19491`. For an HTTPS reverse proxy, use its public
-HTTPS origin; the session cookie then gains the Secure flag. A direct HTTP URL is
-supported as requested, and its login traffic is plaintext on the network.
+On Windows Docker Desktop, omit `chown`. The source Compose configuration uses
+the same host mounts, credentials and origin settings described above.
 
-Compose binds `./data` to `/data` and `./downloads` to `/downloads`, relative to the
-directory containing `compose.yaml`. Back up those host directories and keep the
-same paths when upgrading. Existing `rust-data` / `rust-downloads` named volumes
-are not copied automatically when changing mounts; retain the old configuration
-until their contents have been migrated, and do not delete them with `down -v`.
+## Container and browser login
+
 Cookies, proxy settings and AI keys are plaintext files under `/data/credentials`.
 Old encrypted records migrate at startup, so retain their `.credentials.key` until
 migration completes. Mounted directories must be writable by UID/GID 10001.
@@ -55,8 +137,6 @@ subresources use the same proxy. Chromium's implicit loopback bypass and direct
 hostname resolution are disabled; QUIC and non-proxied WebRTC UDP are disabled.
 The proxy stops with the disposable browser session. See
 [Chromium's proxy documentation](https://chromium.googlesource.com/chromium/src/+/HEAD/net/docs/proxy.md).
-Runtime components are updated by updating the Docker image and recreating the
-container; the web interface offers component checks only.
 
 ## MCP interface
 
@@ -94,9 +174,15 @@ startup. New installations default off; existing configurations inherit the
 previous enabled state. Manually starting or stopping MCP does not change this
 preference.
 
-`runtime-tool-lock.json` pins the official yt-dlp and QuickJS-NG assets and SHA-256
-checksums for both architectures. Build both architectures with
-`docker buildx build --platform linux/amd64,linux/arm64`.
+See [MCP usage](../docs/MCP.md) for client configuration and tools.
+
+## Build checks
+
+`runtime-tool-lock.json` pins yt-dlp, QuickJS-NG and the compatibility FFmpeg/FFprobe
+pair for both architectures. The installer validates matching FFmpeg/FFprobe
+versions and required encoders before installing the pair. From the repository
+root, build both architectures with
+`docker buildx build --platform linux/amd64,linux/arm64 .`.
 
 Release CI supplies `--build-arg USE_PREBUILT_FRONTEND=1` after placing the shared
 React build in `frontend/dist`. A normal local build runs `npm ci` and builds it.

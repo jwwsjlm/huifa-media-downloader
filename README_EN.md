@@ -1,188 +1,120 @@
 # Huifa Media Downloader
 
-Huifa Media Downloader is a Rust media downloader and processing app. The Windows, macOS and Linux Tauri desktop hosts and the Docker/NAS web host share one React interface. Official yt-dlp handles extraction, while FFmpeg handles merging, transcoding and cover processing. You can save videos, audio, collections and batches, or expose yt-dlp metadata and the download queue to your own AI client through MCP.
+A media downloader and processing app for Windows, macOS, Linux and Docker/NAS.
+One interface handles videos, audio, collections and batches with yt-dlp and
+FFmpeg, with an optional MCP service for your own AI client.
 
-[简体中文](README.md) · [Releases](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) · [Issues](https://github.com/jwwsjlm/huifa-media-downloader/issues)
+[简体中文](README.md) · **English** · [Latest download](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest) · [Report an issue](https://github.com/jwwsjlm/huifa-media-downloader/issues)
 
-![Docker download queue](docs/images/docker-downloads.jpg)
+![Download queue](docs/images/docker-downloads.jpg)
 
-## Features
+## Download and install
 
-- Official yt-dlp, FFmpeg, FFprobe and platform-specific JavaScript runtimes for videos, audio, collections, batches and multiple sites; existing tasks retain their frozen runtimes.
-- Automatic best/worst quality selection, formats and audio tracks, subtitles, chapters, cuts, SponsorBlock, transcoding and audio export.
-- Separate download and processing queues. Each task freezes its plan, runtime versions and input, and supports pause, restart recovery and offline retries after processing failures.
-- Completed media management, JPEG crop/padding exports and AI cover editing based on the original image.
-- Cookies, proxy settings and AI keys stored in ordinary local files. Windows/Linux offer built-in or compatible local browser sign-in; macOS uses a local Chrome, Edge or Chromium. Cookie import and disposable remote browser sign-in in Docker are also available.
-- Built-in MCP service. An AI client can query metadata, formats, collections, subtitles and comments, then create or control downloads. The service is disabled by default and the page displays copyable JSON configuration.
-- Chinese/English, dark/light themes, virtual task lists, responsive layouts, SHA-256 checksums and signed desktop updates.
+Choose the package matching your operating system and processor from the
+[latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest).
 
-## Screenshots
-
-These screenshots are from a real Docker container with isolated test data.
-
-| Download queue | Completed media |
-| --- | --- |
-| ![Docker download queue](docs/images/docker-downloads.jpg) | ![Docker completed media](docs/images/docker-completed.jpg) |
-
-| Settings | AI Media Service (MCP) |
-| --- | --- |
-| ![Docker settings](docs/images/docker-settings.jpg) | ![Docker MCP page](docs/images/mcp-docker.jpg) |
-
-## Install
-
-Choose the artifact for your system and processor from the [latest release](https://github.com/jwwsjlm/huifa-media-downloader/releases/latest). Desktop builds cover six platforms: Windows x64/ARM64, Linux x64/ARM64, Intel Mac and Apple silicon:
-
-| Platform | Artifact |
+| Platform | Release package |
 | --- | --- |
 | Windows 10/11 x64 | `HuifaDownloader-<version>-windows-x64-setup.exe` or `HuifaDownloader-<version>-windows-x64-portable.zip` |
 | Windows ARM64 | `HuifaDownloader-<version>-windows-arm64-setup.exe` or `HuifaDownloader-<version>-windows-arm64-portable.zip` |
 | Linux x64 | `HuifaDownloader-<version>-linux-x64.AppImage` |
 | Linux ARM64 | `HuifaDownloader-<version>-linux-arm64.AppImage` |
-| Intel Mac (macOS 15 or later) | `HuifaDownloader-<version>-macos-x64.dmg` |
-| Apple silicon Mac (M series, macOS 15 or later) | `HuifaDownloader-<version>-macos-arm64.dmg` |
-| Docker amd64 / ARM64 | `ghcr.io/jwwsjlm/huifa-media-downloader:latest` |
+| Intel Mac, macOS 15+ | `HuifaDownloader-<version>-macos-x64.dmg` |
+| Apple silicon Mac, macOS 15+ | `HuifaDownloader-<version>-macos-arm64.dmg` |
 
-Each desktop package contains download and processing tools for its architecture. You do not need a separate Python or FFmpeg install. The release includes `SHA256SUMS`, and desktop update packages have update signatures. The Windows installer currently has no Authenticode publisher certificate.
+Desktop packages include the download and processing tools for their architecture;
+no separate Python or FFmpeg installation is needed. Releases include `SHA256SUMS`
+and signed desktop update packages.
 
-For the Windows portable edition, extract the ZIP and run `HuifaDownloader.exe`; keep `tools` and `portable.flag` beside it. Microsoft Edge WebView2 Runtime is required. Both Windows editions share system user data and Downloads folders. Close the other edition before switching, and replace the portable directory only while the app is closed.
+- **Windows:** WebView2 Runtime is required. For the portable edition, extract the
+  ZIP and run `HuifaDownloader.exe`, keeping `tools` and `portable.flag` beside it.
+  The installer currently has no Authenticode publisher certificate. Installer and
+  portable editions share user data; close the app before switching or replacing files.
+- **Linux:** make the AppImage executable, then run it. Choose x64 for `x86_64` or
+  ARM64 for `aarch64`, for example `chmod +x ./HuifaDownloader-*-linux-x64.AppImage`.
+- **macOS:** drag the app from the DMG into **Applications**. Builds require macOS
+  15+, use ad-hoc signing and are not Apple-notarized. After verifying the download
+  source, use **System Settings → Privacy & Security → Open Anyway** if needed;
+  see [Apple's instructions](https://support.apple.com/en-us/102445).
+  The `.app.tar.gz` files are updater packages.
 
-On Linux, download the AppImage for your processor and make it executable before running it, for example `chmod +x ./HuifaDownloader-*-linux-x64.AppImage`; use `linux-arm64` for the ARM64 file. Select x64 for `x86_64` and ARM64 for `aarch64`.
+For sign-in, recovery, data locations and troubleshooting, see the
+[usage guide](docs/USAGE_EN.md).
 
-Mac builds require macOS 15 or later, matching the bundled FFmpeg requirement. Check the chip in **About This Mac**: choose `macos-x64.dmg` for Intel or `macos-arm64.dmg` for Apple M-series chips. Open the DMG, drag the app into **Applications**, then launch it. The matching `.app.tar.gz` on the release page is an application update package. Mac builds currently use ad-hoc signing and are not notarized by Apple. If the first launch reports an unidentified developer, confirm that the file came from this project's release page, then follow [Apple's instructions](https://support.apple.com/en-us/102445) and select **Open Anyway** in **System Settings → Privacy & Security**.
+## Quick start
 
-Startup failures display the error and the location of `startup-error.log`. If the app exits without a message, download `scripts/diagnose-windows-startup.ps1`, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\diagnose-windows-startup.ps1`, and enter the application EXE path. Share the generated `startup-report.txt` with the developer. The script collects system, application and WebView2 versions, the exit code and matching error events, without reading cookies or application configuration.
+1. Open the app, paste one or more media links, and choose quality or **Quick options**.
+   Automatic mode queues single videos directly; collections and manual formats ask for confirmation.
+2. Start the download. Follow the separate download and processing queues; use the
+   task menu to pause, retry, change pending priority or view logs.
+3. Find the result in **Completed**. Use its context menu to reveal/download the file,
+   convert its format or compress a video. Open the completed item's details to play
+   media or use Cover studio.
 
-The application ID is `com.huifa.downloader.rust`. Rust state is stored under `HuifaDownloaderRust` in the system local data directory, with media in the matching Downloads folder. Cookies, proxy settings and AI keys are plaintext files in `credentials`; back up the entire data directory. Older encrypted records migrate automatically at startup and their key is removed after migration. Keep the original `.credentials.key` until that migration completes.
+If a website requires sign-in, use **Settings → Network & cookies** first.
+The [usage guide](docs/USAGE_EN.md) covers subtitles, batches, recovery and file safety.
 
-Under desktop **Settings → Network & cookies**, enter the source website directly, without an intermediate settings dialog. Windows/Linux offer **Open built-in browser** (Windows WebView2 / Linux WebKit) or **Local browser sign-in**. macOS offers only **Local browser sign-in**, using an installed Chrome, Edge or Chromium from `/Applications` or `~/Applications`; Safari is not used for this flow. The last successfully used address and browser choice are saved automatically. Cookies sync automatically during sign-in and once more before the browser closes. No save click is needed. New downloads and media queries match cookies to the target domain by default and pass them to yt-dlp through its cookie file; existing tasks retain their frozen credentials. Use the local browser for sites such as Google that reject embedded sign-in.
+## Main features
 
-The Windows/Linux built-in browser has an address bar and Back, Forward and Reload buttons. Press Enter to visit an address; omitted protocols default to HTTPS. The toolbar is isolated from website content, and websites and sign-in popups cannot call application commands. Desktop sign-in browsers share the download proxy. Close and reopen sign-in windows after changing it, and save settings to keep it across restarts. Sign-in browsers require a proxy URL without embedded credentials; a local proxy endpoint can be used.
+- **Downloads:** videos, audio, collections and batches, with automatic or manual
+  formats, audio tracks, subtitles, chapters, cuts and SponsorBlock where supported.
+- **Recoverable queues:** separate download and processing work, frozen task plans
+  and runtimes, pause/resume, restart recovery and local processing retries.
+- **Video compression:** target-size or bitrate controls, optional lower resolution
+  and frame rate, HEVC/MKV output, and preservation checks before saving a new file.
+- **GPU and FFmpeg policies:** detected hardware encoders, explicit CPU retry, a
+  default Compatibility build, a newer Efficiency build and exact release-tag selection.
+- **Media management:** actual quality and file size, source-file availability status,
+  format conversion, JPEG crop/padding exports and AI cover editing.
+- **Clipboard downloads:** paste/import links, or opt into desktop background clipboard
+  monitoring; collections and manual formats still ask for confirmation.
+- **Website sign-in:** automatic cookie matching, proxy settings, local browser sign-in
+  and a disposable remote browser for Docker.
+- **MCP and interface:** metadata and queue tools for trusted AI clients, Chinese/English,
+  light/dark themes, virtual lists and responsive layouts.
 
-### Batch recovery and file safety
+Compression is lossy. Hardware support depends on the video, driver and installed
+FFmpeg build; unsupported preservation paths are disabled. See
+[compression limits](docs/USAGE_EN.md#compression-and-format-conversion).
 
-- Mixed batches identify and add links independently, show progress and allow cancelling remaining checks. A broken link does not stop other links. Failed links remain available, and the current session summarizes failed or actionable tasks when a batch finishes; after restarting, use task failure filters.
-- Explicit quality, frame rate and audio language requirements must be available. Otherwise the task stops with the missing requirements and offers **Adjust requirements and retry**. Automatic best/worst quality stays automatic. **Continue when subtitles are unavailable** defaults on: missing requested subtitles are skipped while the video continues. Turn it off to require every requested subtitle language.
-- Transient timeouts, connection failures, HTTP 429 and server errors use bounded retries with backoff. Authentication, permissions and unavailable requirements need user action. Ordinary resume/retry preserves the frozen plan; **Retry with current settings** refreshes options, cookies, proxy and tools. Compatible partial transfers resume; changed source or format identities use separate partial files.
-- Different sources using the same filename prompt before media transfer. Choose a new name, skip, or explicitly confirm replacement twice. Verified new results replace the old result and managed attachments; cancellation or failure preserves old files. Previous task ownership is updated when replacement commits.
-- **Move to front of queue** persistently changes actual pending download, live-capture and processing order without interrupting running work.
-- **Stop live capture and save** validates recorded data and publishes a normal result. Cancel does not publish. Data not yet written at the stopping instant may be lost, and pausing live capture can leave a time gap.
-- Space checks cover application data, processing and result volumes. Unknown-size sources cannot be fully estimated. Successful tasks automatically remove source and processing caches, keeping results, previews and logs; unfinished tasks keep recovery files. **Storage and cache** shows free space and safely cleans completed caches and unreferenced runtimes.
-- Non-live sources compare expected and actual durations; processed results also check duration, required streams and existing hashes. This is not a full frame-by-frame decode and cannot prove the website's source is undamaged.
+## Docker / NAS
 
-Release checks, runtime updates and desktop installer updates share the saved proxy. Version changes, legacy credential migration and installer updates first create a consistent SQLite/configuration/credential backup under `backups`, with checksums and `RESTORE.txt`. Backup failure stops migration or installation. Close the app/container before restoring and preserve the current data directory first. Backups exclude media, tools, task workspaces and browser profiles; restored tasks still depend on their original files.
+Use `ghcr.io/jwwsjlm/huifa-media-downloader:latest` for amd64 or ARM64.
+Follow the [released-image Compose setup](docker/README.md#released-image), then open
+[http://localhost:19491](http://localhost:19491). No repository clone is needed.
 
-Cookies are optional for sites that allow anonymous access. Without a matching record, queries and downloads run anonymously. Sync failures show an error but allow closing the login browser and keep previously saved cookies. The old Douyin extractor can report an API 403 as `Fresh cookies (not necessarily logged in)` even after signing in. The app temporarily embeds [yt-dlp Douyin fix PR #17826](https://github.com/yt-dlp/yt-dlp/pull/17826), commit `edf5ca18`, under the Unlicense. Only this compiled-in compatibility code is loaded; user plugin directories are disabled and the official yt-dlp executable is unchanged. Anonymous short-link identification, downloading and publication into the app's media library have passed. Site changes can still break extraction; the override will be removed after the upstream fix is included in the bundled engine.
+The initial account/password is `admin/admin`; change the access password before
+allowing other devices to connect. Set `HUIFA_PUBLIC_ORIGIN` to the browser's exact
+origin for NAS access or a reverse proxy. Keep both data and download mounts when upgrading.
 
-Website sign-in shows automatic save status without cookie records, account names or a cookie-source selector. Sign in once and new downloads match cookies to their destination website automatically. Expand **Other import methods** when importing existing cookies is needed.
+Directory permissions, HTTPS, remote sign-in, backups and upgrades are covered in the
+[Docker guide](docker/README.md). Container tools update with the image.
 
-Automatic quality queues known single videos directly, including YouTube video URLs with playlist parameters. Unknown URLs are classified first; only actual collections show item selection. Manual mode opens the format picker. **Download clipboard** extracts, deduplicates and queues links. Fragment concurrency defaults to 4, recommends 6 and is capped at 8; existing valid settings are retained. Subtitles are off by default; choose a language to prefer manual tracks with automatic fallback and external SRT output. **Continue when subtitles are unavailable** is enabled by default: missing requested languages are skipped while the video continues without a prompt. Turn it off to require all selected subtitle languages. AI cover settings can fetch model IDs from the configured service or accept a manually entered ID.
+## Connect your AI client with MCP
 
-On desktop, use **Settings → Downloads → Download folder → Choose folder** to select a writable folder. The selection saves immediately and survives restarts. It applies to new or restarted downloads; existing queued, running, paused and processing tasks keep their original folder, and existing files stay in place. Docker continues to use the Compose `./downloads:/downloads` volume mapping; the web interface cannot choose folders on the host computer.
+1. Desktop: open **Settings → AI media service (MCP)**. Docker: open the sidebar's
+   **AI media service (MCP)** page. Enable the service.
+2. Copy the generated configuration into your client and replace the password
+   placeholder with your access password (initially `admin`). Desktop also offers a bundled stdio bridge.
+3. Ask the client to inspect media or manage downloads. Keep the app running;
+   enable automatic MCP startup separately if wanted.
 
-New output defaults to `downloads/title/title.ext`, without a source ID, task ID or short task-ID directory. The previous default filename template is upgraded automatically; existing files are not renamed in bulk. Conversions use `title [converted]` with an increasing number for conflicts and preserve the original file. Adding the same source again selects its queued, running, processing or paused task without starting another download. Completed, failed or cancelled downloads reuse their record with the new settings. Existing results remain until the replacement has been validated; failure or cancellation preserves them. Historical folders are not moved in bulk; a successful replacement cleans only the old managed files and empty ID directory.
+Desktop HTTP defaults to `http://127.0.0.1:19492/mcp`. Docker uses `/mcp-server`
+on its existing web origin and port. Share the endpoint and password only with trusted
+clients; queries inherit saved cookies and may expose private media content to the client.
+See the [MCP guide](docs/MCP.md) for tools, authentication and limits.
 
-Stage prefixes such as `2/6` show the current major step and actual workflow size and disappear on completion. Task menus and details can copy the video title or source; desktop results also provide the full file path including the filename. Format conversion offers MP4, MKV, MOV and WebM, preferring remuxing and transcoding only when needed, with advanced codec controls and preserved input files. The sidebar indicates newer releases and opens their download page; About can recheck manually. Portable builds do not launch an updater installer.
+## Documentation and development
 
-Completed tasks and library entries show actual quality and file size. Details distinguish downloaded source and final output dimensions, frame rate, codecs and size. Quality labels come from media information; a "Highest quality" download plan does not guarantee a 4K source. Older tasks reuse saved local records and inspect existing output files when details are missing, without downloading the video again.
+| Guide | Contents |
+| --- | --- |
+| [Usage](docs/USAGE_EN.md) · [中文](docs/USAGE.md) | Downloads, compression, sign-in, recovery, backups and troubleshooting |
+| [Runtime updates](docs/RUNTIME_UPDATES.md) | yt-dlp channels, FFmpeg policies and component verification |
+| [MCP](docs/MCP.md) | Connection setup, tool schemas and permission boundaries |
+| [Docker](docker/README.md) | Released images, deployment, storage and upgrades |
+| [Development](docs/DEVELOPMENT.md) | Build dependencies, checks and releases |
 
-Task rows show the local completion date and time to the minute beside **Completed**. Customize **Settings → Appearance & covers → Completion time format**, for example `YYYY-MM-DD HH:mm` or `YYMMDD HH:mm`; `MM` means month and `mm` means minute. Older tasks recover the time from recorded completion events when available; otherwise it stays blank.
-
-During downloads, the size column shows cumulative downloaded bytes and the total when available; estimates use `≈`. Completed tasks show final output size. The task list starts with no selection, and background progress updates do not select tasks. Use Shift for ranges, Ctrl to toggle tasks, or Ctrl+A to select the current filtered list. The list header also provides Select all and Delete selected. Batch deletion confirms whether to delete managed media and keeps failed items available for retry.
-
-High-frame-rate results use labels such as `1080p60` and `4K60`. The compact label rounds `59.94 fps` to `60`; details keep the precise frame rate. Missing frame rates are not guessed. Task lists and the media library share thumbnail styling and context menus. Failed or cancelled tasks show their final state while retaining the previous workflow position in task data and logs. The status bar sums all downloading tasks regardless of list filters.
-
-View logs records original yt-dlp arguments, stdout, stderr and progress without redaction or an entry-count cutoff. The window reads pages, refreshes automatically and can copy the complete log. Earlier unrecorded output cannot be reconstructed. Logs may contain cookies, authentication data, local paths and temporary media URLs; check them before sharing. Complete raw logs are available only through the authenticated task-log endpoint and are excluded from ordinary snapshots and MCP tool results.
-
-Finished live recordings match the regular-video filter. Live and upcoming streams still follow the plan's live filter; All content allows both, while waiting for a scheduled stream remains a separate option.
-
-Version checks first query GitHub's latest-release API. If the API is rate limited or unavailable, the app checks the official project release-page redirect instead. If both fail, it shows the specific reason and allows a manual retry.
-
-The delete confirmation remembers **Also delete media files managed by this task**, even when deletion is cancelled. It is unchecked on a fresh install, and deletion still requires confirmation. Download options, language, theme, notifications, proxy and AI configuration are written to disk with **Save settings**; quick options use **Save batch plan**. MCP startup and service configuration, the access password, cookies and browser preferences are saved by their respective successful operations. Temporary home-page quality, list filters, tool installation parameters, cookie import sources and unsubmitted cover edits are not automatically saved as global settings.
-
-Sign-in persists in separate profiles under the app data directory's `login-browser` folder. Desktop sign-in browsers share the saved download proxy; leaving it empty selects a direct connection. Each profile can contain multiple sites, and saving exports that profile's cookies. Deleting a saved cookie entry does not sign the browser out; sign out on the website when needed. Browser profiles contain login information and should be kept private.
-
-On Windows, run `node scripts/check-login-browser.mjs` for the native regression test (requires WebView2 and Edge / Chrome). It uses isolated temporary profiles and local test pages to check cookie scopes, popups, persistence and IPC isolation, without personal browser profiles or real accounts.
-
-## Docker web host
-
-Create a directory and save the following as `compose.yaml`. No repository clone is needed:
-
-```yaml
-services:
-  downloader:
-    image: ghcr.io/jwwsjlm/huifa-media-downloader:latest
-    ports:
-      - "19491:19491"
-    environment:
-      HUIFA_ACCOUNT: admin
-      HUIFA_PASSWORD: admin
-      HUIFA_PUBLIC_ORIGIN: http://localhost:19491
-    volumes:
-      - ./data:/data
-      - ./downloads:/downloads
-    read_only: true
-    tmpfs:
-      - /tmp:rw,exec,nosuid,nodev,size=512m
-    shm_size: 256m
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    stop_grace_period: 30s
-    restart: unless-stopped
-```
-
-`./data` and `./downloads` are relative to the directory containing `compose.yaml`. Create them there before starting:
-
-```sh
-mkdir -p data downloads
-```
-
-On Linux/NAS, the container runs as UID/GID `10001:10001` and needs write access to both directories. For newly created directories, run the command below. Handle existing directories according to their current permissions rather than recursively changing user data. Windows Docker Desktop does not need `chown`.
-
-```sh
-sudo chown 10001:10001 data downloads
-```
-
-Then start the service:
-
-```sh
-docker compose pull
-docker compose up -d
-```
-
-The example uses `latest` to follow the latest stable release. To update, run the same two commands in this directory and keep `./data` and `./downloads`.
-
-Open [http://localhost:19491](http://localhost:19491). For NAS or remote access, set `HUIFA_PUBLIC_ORIGIN` to the complete origin used by the browser (scheme, host and port), such as `http://192.168.1.10:19491`. With an HTTPS reverse proxy, use `https://download.example.com` without a path. Update this origin when changing the published host port. The image supports amd64 and ARM64 and selects the matching architecture automatically.
-
-The initial web account and password are both `admin`. Change the shared web/MCP password under **Settings → Access password** by entering the current and new password. A successful change invalidates old web and MCP sessions; sign in again and update AI clients. Desktop has no added login screen and uses the same settings for its MCP password. `HUIFA_ACCOUNT` and `HUIFA_PASSWORD` seed a new data directory only; later restarts use the password hash in `access.json`. Preserve the `data` directory and change the default before allowing access from other devices.
-
-`data` stores configuration, Cookies and the access password; `downloads` stores media. Stop the container before backing up both directories and `compose.yaml`. To upgrade, edit the `image` version in the original Compose directory and rerun `pull` and `up -d` above. Keep both local directories and their mount paths to reuse existing data; there is no need to delete containers or data first.
-
-If you already use the `rust-data`/`rust-downloads` named volumes, keep the original mount configuration or migrate the data into local directories before switching. Changing mounts does not migrate existing volumes automatically. Do not run `docker compose down -v`, which deletes named volumes referenced by the configuration. See the [Docker guide](docker/README.md) for container hardening, remote browser login, directory permissions and multi-architecture builds.
-
-## MCP: use yt-dlp from your AI client
-
-After signing in, open **AI 媒体服务（MCP）** in the sidebar and enable the single switch. Desktop listens on `127.0.0.1:19492/mcp`. In Docker, `/mcp` is the management page and `/mcp-server` is the protocol endpoint on the same origin and published port:
-
-```json
-{
-  "mcpServers": {
-    "huifa": {
-      "url": "http://localhost:19491/mcp-server",
-      "headers": { "Authorization": "Bearer YOUR_ACCESS_PASSWORD" }
-    }
-  }
-}
-```
-
-The page generates the address for the current origin. Replace `YOUR_ACCESS_PASSWORD` with the access password (`admin` initially). The service switch takes effect immediately; the independent **Start MCP when the app starts** option controls the next launch, defaults off for new installations and inherits the prior enabled state for existing installations. Management actions retain web session and CSRF checks. MCP inherits saved Cookies, proxy and download settings, and returns sanitized metadata, task state and errors without Cookie contents, proxy passwords, internal paths or signed media URLs. Give the endpoint and password only to trusted AI clients. Desktop also offers stdio configuration using the bundled `huifa-mcp-bridge`; set the same password in `HUIFA_MCP_PASSWORD`, with no separate Python or Node install.
-
-See [MCP usage](docs/MCP.md) for the complete tool list and schemas.
-
-## Development and releases
-
-Install Node.js 24, Rust stable and the platform's Tauri build dependencies:
+With Node.js 24, Rust stable and your platform's Tauri dependencies installed:
 
 ```sh
 npm ci --prefix frontend
@@ -190,4 +122,13 @@ node scripts/acquire-rust-tools.mjs
 npm --prefix frontend run tauri -- dev
 ```
 
-See [development and release instructions](docs/DEVELOPMENT.md) for checks, MCP bridge preparation and GitHub publishing. The current Rust implementation is the source of truth for builds and releases.
+<details>
+<summary>More screenshots</summary>
+
+Screenshots use isolated test data in a real Docker container.
+
+| Completed media | Settings | AI media service (MCP) |
+| --- | --- | --- |
+| ![Completed media](docs/images/docker-completed.jpg) | ![Settings](docs/images/docker-settings.jpg) | ![MCP page](docs/images/mcp-docker.jpg) |
+
+</details>

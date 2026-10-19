@@ -43,7 +43,7 @@ node scripts/prepare-mcp-bridge.mjs --debug
 cargo test --locked -p huifa-desktop
 ```
 
-真实媒体测试需要已下载的官方工具；`HUIFA_TEST_TOOLS` 可指定其目录。使用发布构建运行验收，使大型冻结工具的校验耗时与发行程序一致。测试覆盖分离音视频、队列预算、处理失败离线恢复、发布日志恢复、多音轨、字幕重定时、章节切片、封面片头及音频输出。
+真实媒体测试需要已下载的官方工具；`HUIFA_TEST_TOOLS` 可指定其目录。完整的 `--include-ignored` 验收还会下载兼容归档并查询上游 FFmpeg 标签，需要互联网。使用发布构建运行验收，使大型冻结工具的校验耗时与发行程序一致。测试覆盖分离音视频、队列预算、处理失败离线恢复、发布日志恢复、多音轨、字幕重定时、章节切片、封面片头及音频输出。
 
 性能基准、优化前后结果和复现方式见 [2026-10-16 性能审计](PERFORMANCE_AUDIT.md)。
 
@@ -51,18 +51,20 @@ cargo test --locked -p huifa-desktop
 
 ## GitHub Actions 正式发布
 
-从默认分支运行 **Release**，填写 `version`（例如 `0.4.0`）和 Markdown `release_notes`。仓库需要 `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 两个 Secrets；Tauri 配置的公钥必须对应。私钥不可提交到 Git。
+从默认分支运行 **Release**，填写尚未发布的 `version` 和 Markdown `release_notes`。仓库需要非空的 `TAURI_SIGNING_PRIVATE_KEY`，并按私钥设置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；Tauri 配置的公钥必须对应。私钥不可提交到 Git。
+
+将示例中的 `X.Y.Z` 替换为新版本号，并准备对应的发行说明文件：
 
 ```sh
-gh workflow run release.yml --ref main -f version=0.4.0 -F release_notes=@release-notes/0.4.0.md
+gh workflow run release.yml --ref main -f version=X.Y.Z -F release_notes=@release-notes/X.Y.Z.md
 ```
 
-工作流验证版本与说明，生成包含版本、锁文件和工具版本的一个提交；共享前端只构建一次。Windows、Linux 桌面和原生 amd64、ARM64 容器基于同一提交构建并验收。
+工作流验证版本与说明，生成包含版本、锁文件和工具版本的一个提交；共享前端只构建一次。Windows、Linux、macOS 各自的 x64 / ARM64 桌面版，以及原生 amd64 / ARM64 容器，基于同一提交构建并验收。锁文件刷新保留人工审核过的 FFmpeg 兼容构建，不会自动改用最新 FFmpeg。
 
-全部成功后才生成版本标签和 GitHub Release，发布签名 Windows 安装包、Windows 便携 ZIP、Linux AppImage、`rust-updates.json`、`SHA256SUMS`，并发布 Docker 多架构版本及 `latest`。已发布版本不可覆盖。中断时使用 **Re-run failed jobs** 恢复同一个构建；另发版本时重新填写版本号和说明。
+全部成功后才生成版本标签和 GitHub Release，发布 Windows 安装包与便携 ZIP、Linux AppImage、macOS DMG 与 `.app.tar.gz` 更新包、各桌面更新签名、`rust-updates.json`、`SHA256SUMS`，并发布 Docker 多架构版本及 `latest`。Tauri 更新签名不等于操作系统发布者签名：Windows 当前没有 Authenticode 证书，macOS 使用 ad-hoc 签名且未经 Apple 公证，最低要求 macOS 15。已发布版本不可覆盖。中断时使用 **Re-run failed jobs** 恢复同一个构建；另发版本时重新填写版本号和说明。
 
 Windows 构建通过 `scripts/package-windows-portable.ps1` 打包原生程序、MCP 桥接程序及校验过的全部工具，执行隔离启动检查，再用同一 Tauri 密钥签名 ZIP。`portable.flag` 禁用安装包更新入口；便携版沿用系统用户数据目录，更新方式为手动解压覆盖程序。发布门禁要求安装包和便携 ZIP 均有签名，两者都进入 `SHA256SUMS`。
 
-为已有发行版补便携包时，在 **Release** 勾选 `portable_only`，填写当前源码一致的版本号和原有说明。此模式只增加 ZIP、签名和独立的 `.zip.sha256` 校验清单，保留原有产物、更新清单和标签；ZIP 内的说明记录实际构建提交。
+为已有发行版补 Windows x64 便携包时，在 **Release** 勾选 `portable_only`，填写当前源码一致的版本号和原有说明。此模式目前仅构建 x64，只增加 ZIP、签名和独立的 `.zip.sha256` 校验清单，保留原有产物、更新清单和标签；ZIP 内的说明记录实际构建提交。
 
 旧 Python 实现可从 Git 基线 `bf79d1a` 找回。当前源码、检查和发布以 Rust 为准。
