@@ -9,12 +9,21 @@ use std::{
 
 pub(crate) struct Database {
     connection: Mutex<Connection>,
+    #[cfg(test)]
+    task_reads: std::sync::atomic::AtomicUsize,
 }
 
-fn task_record(state: &str, media: Option<&str>, completed: Option<String>) -> Result<Task> {
+fn task_record(db: &Connection, id: &str, state: &str, media: Option<&str>) -> Result<Task> {
     let mut task: Task = serde_json::from_str(state)?;
     if matches!(task.status.as_str(), "completed" | "retained") {
         if task.completed_at.is_none() {
+            let completed: Option<String> = db
+                .query_row(
+                    "SELECT timestamp FROM task_logs WHERE task_id=?1 AND message LIKE 'Task status: completed; stage: %' ORDER BY seq DESC LIMIT 1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             task.completed_at =
                 completed.filter(|time| chrono::DateTime::parse_from_rfc3339(time).is_ok());
         }
@@ -56,6 +65,8 @@ impl Database {
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
+            #[cfg(test)]
+            task_reads: Default::default(),
         })
     }
     pub fn tasks(&self) -> Result<Vec<Task>> {
@@ -67,28 +78,35 @@ impl Database {
     }
     pub fn tasks_including_retained(&self) -> Result<Vec<Task>> {
         let db = self.connection.lock().unwrap();
-        let mut query = db.prepare("SELECT tasks.state,media.record,(SELECT timestamp FROM task_logs WHERE task_id=tasks.id AND message LIKE 'Task status: completed; stage: %' ORDER BY seq DESC LIMIT 1) FROM tasks LEFT JOIN media ON media.task_id=tasks.id ORDER BY tasks.rowid DESC")?;
+        let mut query = db.prepare("SELECT tasks.id,tasks.state,media.record FROM tasks LEFT JOIN media ON media.task_id=tasks.id ORDER BY tasks.rowid DESC")?;
         query
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
                 ))
             })?
             .map(|r| {
-                let (state, media, completed) = r?;
-                task_record(&state, media.as_deref(), completed)
+                let (id, state, media) = r?;
+                task_record(&db, &id, &state, media.as_deref())
             })
             .collect()
     }
     pub fn task(&self, id: &str) -> Result<Task> {
+        #[cfg(test)]
+        self.task_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let db = self.connection.lock().unwrap();
-        let (state, media, completed): (String, Option<String>, Option<String>) = db
-            .query_row("SELECT tasks.state,media.record,(SELECT timestamp FROM task_logs WHERE task_id=tasks.id AND message LIKE 'Task status: completed; stage: %' ORDER BY seq DESC LIMIT 1) FROM tasks LEFT JOIN media ON media.task_id=tasks.id WHERE tasks.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
+        let (state, media): (String, Option<String>) = db
+            .query_row("SELECT tasks.state,media.record FROM tasks LEFT JOIN media ON media.task_id=tasks.id WHERE tasks.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?)))
             .optional()?
             .context("Task does not exist")?;
-        task_record(&state, media.as_deref(), completed)
+        task_record(&db, id, &state, media.as_deref())
+    }
+    #[cfg(test)]
+    pub(crate) fn task_read_count(&self) -> usize {
+        self.task_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn insert_task(&self, task: &Task) -> Result<()> {
         let mut db = self.connection.lock().unwrap();
@@ -428,6 +446,108 @@ impl Database {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "isolated task lookup benchmark; run with --release --ignored --nocapture"]
+    fn active_task_lookup_performance() -> Result<()> {
+        if std::env::var("HUIFA_PERF").ok().as_deref() != Some("1") {
+            return Ok(());
+        }
+        ensure!(!cfg!(debug_assertions), "Run the benchmark with --release");
+        let temp = tempfile::tempdir()?;
+        let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
+        let mut task = crate::tests::paused_task(Default::default());
+        task.stage("downloading", "downloading_video_1", None);
+        db.insert_task(&task)?;
+        {
+            let connection = db.connection.lock().unwrap();
+            connection.execute("DELETE FROM task_logs", [])?;
+            for _ in 0..501 {
+                connection.execute(
+                    "INSERT INTO task_logs(task_id,timestamp,level,message) VALUES(?1,'2026-10-20T00:00:00Z','info','Task status: downloading; stage: downloading_video_1')",
+                    [&task.id],
+                )?;
+            }
+        }
+        let old_lookup = || -> Result<Task> {
+            let connection = db.connection.lock().unwrap();
+            let (state, media, _completed): (String, Option<String>, Option<String>) = connection.query_row(
+                "SELECT tasks.state,media.record,(SELECT timestamp FROM task_logs WHERE task_id=tasks.id AND message LIKE 'Task status: completed; stage: %' ORDER BY seq DESC LIMIT 1) FROM tasks LEFT JOIN media ON media.task_id=tasks.id WHERE tasks.id=?1",
+                [&task.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            task_record(&connection, &task.id, &state, media.as_deref())
+        };
+        assert_eq!(
+            serde_json::to_value(old_lookup()?)?,
+            serde_json::to_value(db.task(&task.id)?)?
+        );
+        let measure = |lookup: &dyn Fn() -> Result<Task>| -> Result<f64> {
+            let mut samples = Vec::new();
+            for sample in 0..6 {
+                let start = std::time::Instant::now();
+                for _ in 0..1000 {
+                    std::hint::black_box(lookup()?);
+                }
+                if sample > 0 {
+                    samples.push(start.elapsed());
+                }
+            }
+            samples.sort_unstable();
+            Ok(samples[2].as_secs_f64() * 1000.0)
+        };
+        println!(
+            "PERF active task lookup: 501 non-completion logs; 1000 lookups/sample; 1 warmup + 5 samples; median old={:.3}ms new={:.3}ms",
+            measure(&old_lookup)?,
+            measure(&|| db.task(&task.id))?,
+        );
+        Ok(())
+    }
+    #[test]
+    fn task_reads_skip_completion_logs_when_recovery_is_unneeded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
+        let time = "2026-10-18T15:25:00+00:00";
+        let mut expected = Vec::new();
+        for status in [
+            "queued",
+            "probing",
+            "downloading",
+            "waiting_processing",
+            "processing",
+            "paused",
+            "failed",
+            "processing_failed",
+            "cancelled",
+            "completed",
+            "retained",
+        ] {
+            let mut task = crate::tests::paused_task(Default::default());
+            task.status = status.into();
+            task.completed_at = matches!(status, "completed" | "retained").then(|| time.into());
+            db.insert_task(&task)?;
+            expected.push(task);
+        }
+        db.connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE task_logs")?;
+        for task in &expected {
+            assert_eq!(
+                serde_json::to_value(db.task(&task.id)?)?,
+                serde_json::to_value(task)?
+            );
+        }
+        let records = db.tasks_including_retained()?;
+        assert_eq!(records.len(), expected.len());
+        for task in &expected {
+            assert_eq!(
+                serde_json::to_value(records.iter().find(|record| record.id == task.id))?,
+                serde_json::to_value(Some(task))?
+            );
+        }
+        assert_eq!(db.tasks()?.len(), expected.len() - 1);
+        Ok(())
+    }
+    #[test]
     fn legacy_completion_time_uses_only_recorded_completion_events() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let db = Database::open(&temp.path().join("catalog.sqlite3"))?;
@@ -442,6 +562,22 @@ mod tests {
         )?;
         assert_eq!(db.task(&task.id)?.completed_at.as_deref(), Some(time));
         assert_eq!(db.tasks()?[0].completed_at.as_deref(), Some(time));
+        task.status = "retained".into();
+        db.connection.lock().unwrap().execute(
+            "UPDATE tasks SET state=?1 WHERE id=?2",
+            params![serde_json::to_string(&task)?, task.id],
+        )?;
+        assert_eq!(db.task(&task.id)?.completed_at.as_deref(), Some(time));
+        assert_eq!(
+            db.tasks_including_retained()?[0].completed_at.as_deref(),
+            Some(time)
+        );
+        db.connection.lock().unwrap().execute(
+            "UPDATE task_logs SET timestamp='invalid timestamp' WHERE task_id=?1",
+            [&task.id],
+        )?;
+        assert!(db.task(&task.id)?.completed_at.is_none());
+        assert!(db.tasks_including_retained()?[0].completed_at.is_none());
         db.connection
             .lock()
             .unwrap()

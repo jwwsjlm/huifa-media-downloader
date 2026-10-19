@@ -235,6 +235,7 @@ fn fixture_task(tools: HashMap<String, PathBuf>) -> Task {
         priority: 0,
         live: false,
         conversion: false,
+        compression: None,
         tools,
     }
 }

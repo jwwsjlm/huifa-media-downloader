@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 
 export const targets = ['windows-x86_64', 'linux-x86_64', 'linux-aarch64', 'windows-aarch64', 'darwin-x86_64', 'darwin-aarch64'];
 const ffmpegSuffixes = ['-win64-gpl-shared.zip', '-linux64-gpl.tar.xz', '-linuxarm64-gpl.tar.xz', '-winarm64-gpl-shared.zip'];
-export const isFfmpegDll = name => /^(?:avcodec|avdevice|avfilter|avformat|avutil|swresample|swscale)-\d+\.dll$/.test(name);
+export const isFfmpegDll = name => /^(?:avcodec|avdevice|avfilter|avformat|avutil|postproc|swresample|swscale)-\d+\.dll$/.test(name);
+const compatibilityTools = JSON.parse(readFileSync(new URL('../runtime-tool-lock.json', import.meta.url), 'utf8')).tools;
 
 export function nativeTarget(platform = process.platform, arch = process.arch) {
   const os = { win32: 'windows', linux: 'linux', darwin: 'darwin' }[platform];
@@ -26,9 +27,9 @@ export function toolSource(tool, target) {
   if (tool === 'yt-dlp') return { repository: 'yt-dlp/yt-dlp', name: mac ? 'yt-dlp_macos' : target.startsWith('windows-') ? arm ? 'yt-dlp_arm64.exe' : 'yt-dlp.exe' : arm ? 'yt-dlp_linux_aarch64' : 'yt-dlp_linux' };
   if (tool === 'ffmpeg' || tool === 'ffprobe') {
     if (mac) return { repository: 'shaka-project/static-ffmpeg-binaries', name: `${tool}-osx-${arm ? 'arm64' : 'x64'}` };
-    if (target === 'windows-aarch64') return tool === 'ffprobe' ? null : { repository: 'tordona/ffmpeg-win-arm64', release: '9.0.2', name: 'ffmpeg-9.0.2-essentials-static-win-arm64.7z' };
+    if (target === 'windows-aarch64') return tool === 'ffprobe' ? null : { repository: 'tordona/ffmpeg-win-arm64', release: compatibilityTools.ffmpeg.assets[target].version, name: compatibilityTools.ffmpeg.assets[target].name };
     if (tool === 'ffprobe') return null; // Included in the BtbN FFmpeg archive.
-    return { repository: 'BtbN/FFmpeg-Builds', suffix: ffmpegSuffixes[targets.indexOf(target)] };
+    return { repository: 'BtbN/FFmpeg-Builds', name: compatibilityTools.ffmpeg.assets[target].name };
   }
   if (tool === 'qjs' && !mac && target !== 'windows-aarch64') return { repository: 'quickjs-ng/quickjs', name: `qjs-${target}${target.startsWith('windows-') ? '.exe' : ''}` };
   // QuickJS NG has no Windows ARM64 binary; its current macOS binaries require macOS 26.
@@ -85,9 +86,11 @@ function assetDescriptor(repository, release, name) {
 }
 
 export async function resolveLock() {
-  const tools = {};
+  // Keep the reviewed compatibility builds when refreshing other runtime components.
+  const tools = { ffmpeg: structuredClone(compatibilityTools.ffmpeg), ffprobe: structuredClone(compatibilityTools.ffprobe) };
   const releases = new Map();
   for (const tool of ['yt-dlp', 'ffmpeg', 'qjs', 'ffprobe', 'deno']) for (const target of targets) {
+    if (tool === 'ffmpeg' || tool === 'ffprobe') continue;
     const source = toolSource(tool, target);
     if (!source) continue;
     const { repository } = source;
@@ -222,7 +225,7 @@ export async function acquire(lock, target, destination) {
       if (result.status !== 0) throw new Error(`${name} cannot run on this platform: ${result.stderr}`);
       if (name === 'ffmpeg') {
         const encoders = spawnSync(join(temporary, name + suffix), ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: 30_000, shell: false });
-        if (encoders.status !== 0 || ['libx264', 'libvpx-vp9', 'libopus'].some(codec => !encoders.stdout.split(/\r?\n/).some(line => line.trim().split(/\s+/)[1] === codec))) throw new Error('FFmpeg is missing a required H.264, VP9 or Opus encoder');
+        if (encoders.status !== 0 || ['libx264', 'libx265', 'libvpx-vp9', 'libopus'].some(codec => !encoders.stdout.split(/\r?\n/).some(line => line.trim().split(/\s+/)[1] === codec))) throw new Error('FFmpeg is missing a required H.264, HEVC, VP9 or Opus encoder');
       }
     }
     const previous = join(destination, 'manifest.json');

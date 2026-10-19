@@ -120,6 +120,512 @@ fn config(root: &Path) -> AppConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed FFmpeg/FFprobe; local fixture only"]
+async fn real_compression_preserves_sources_tracks_chapters_and_honors_size() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let app = App::open(config(root.path())).await?;
+    let token = CancellationToken::new();
+    let source = app.download_directory().join("compression source.mkv");
+    let subtitle = root.path().join("captions.srt");
+    let attachment = root.path().join("fixture.txt");
+    let chapters = root.path().join("chapters.ffmeta");
+    std::fs::write(
+        &subtitle,
+        "1\n00:00:00,000 --> 00:00:07,000\nCompression keeps this subtitle.\n",
+    )?;
+    std::fs::write(&attachment, "preserved attachment bytes")?;
+    std::fs::write(
+        &chapters,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=4000\ntitle=First half\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=4000\nEND=8000\ntitle=Second half\n",
+    )?;
+    let args = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=640x360:rate=30000/1001",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=880:sample_rate=48000",
+        "-i",
+        subtitle.to_str().unwrap(),
+        "-f",
+        "ffmetadata",
+        "-i",
+        chapters.to_str().unwrap(),
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:a",
+        "-map",
+        "3:s",
+        "-map_chapters",
+        "4",
+        "-t",
+        "8",
+        "-c:v",
+        "libx264",
+        "-threads",
+        "2",
+        "-preset",
+        "ultrafast",
+        "-qp",
+        "8",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "64k",
+        "-c:s",
+        "srt",
+        "-metadata:s:a:0",
+        "language=eng",
+        "-metadata:s:a:1",
+        "language=jpn",
+        "-disposition:a:0",
+        "default",
+        "-disposition:a:1",
+        "0",
+        "-metadata:s:s:0",
+        "language=eng",
+        "-disposition:s:0",
+        "forced",
+        "-attach",
+        attachment.to_str().unwrap(),
+        "-metadata:s:t:0",
+        "mimetype=text/plain",
+        source.to_str().unwrap(),
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    crate::process::run(&app.tool("ffmpeg")?, &args, None, &token, None).await?;
+    let original_hash = download::hash_file(&source)?;
+    let mut original = crate::tests::paused_task(app.freeze_tools().await?);
+    original.title = "Compression fixture".into();
+    original.status = "completed".into();
+    original.stage = "completed".into();
+    original.progress = 100.0;
+    original.size = Some(original_hash.1);
+    original.output_path = Some(source.clone());
+    original.download_dir = Some(app.download_directory());
+    app.db.insert_task(&original)?;
+    let media = crate::model::Media {
+        id: uuid::Uuid::new_v4().to_string(),
+        task_id: original.id.clone(),
+        title: original.title.clone(),
+        filename: "compression source.mkv".into(),
+        size: original_hash.1,
+        duration: 8.0,
+        path: source.clone(),
+        assets: vec![],
+        media_info: None,
+    };
+    app.db.complete(&original, &media)?;
+    let original_record = serde_json::to_value(app.db.task(&original.id)?)?;
+    let target = original_hash.1 * 65 / 100;
+    let preview = app.command("tasks.convertPreview", json!({"id":original.id,"compression":{"targetBytes":target},"requestId":"compression-acceptance"})).await?;
+    ensure!(
+        preview["source"]["sizeBytes"] == original_hash.1,
+        "Preview used a stale source size"
+    );
+    ensure!(
+        preview["blockingReasons"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "Compression preview blocked: {}",
+        preview["blockingReasons"]
+    );
+    ensure!(
+        app.command(
+            "tasks.convert",
+            json!({"id":original.id,"compression":{"targetBytes":1}})
+        )
+        .await
+        .is_err(),
+        "An impossible target was accepted"
+    );
+    let queued = app
+        .command(
+            "tasks.convert",
+            json!({"id":original.id,"compression":{"targetBytes":target}}),
+        )
+        .await?;
+    let id = queued["id"]
+        .as_str()
+        .context("Compression did not create a task")?
+        .to_string();
+    ensure!(id != original.id, "Compression replaced the original task");
+    wait_for(&app, std::slice::from_ref(&id), &["completed"]).await?;
+    let compressed = app
+        .db
+        .media_for_task(&id)?
+        .context("Compressed media is absent")?;
+    ensure!(
+        compressed.path != source
+            && compressed
+                .path
+                .extension()
+                .is_some_and(|value| value == "mkv"),
+        "Compression did not publish a separate MKV"
+    );
+    ensure!(
+        compressed.size <= target,
+        "Published compressed file exceeded its target: {} > {target}",
+        compressed.size
+    );
+    ensure!(
+        (compressed.duration - 8.0).abs() < 0.2,
+        "Compression truncated the source duration"
+    );
+    let inspect = |path: &Path| {
+        [
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_chapters",
+            "-of",
+            "json",
+            path.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    };
+    let output = crate::process::run(
+        &app.tool("ffprobe")?,
+        &inspect(&compressed.path),
+        None,
+        &token,
+        None,
+    )
+    .await?;
+    let probe: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    let streams = probe["streams"]
+        .as_array()
+        .context("Output has no streams")?;
+    ensure!(
+        streams
+            .iter()
+            .filter(|stream| stream["codec_type"] == "audio")
+            .count()
+            == 2,
+        "An audio track was dropped"
+    );
+    ensure!(
+        streams
+            .iter()
+            .filter(|stream| stream["codec_type"] == "subtitle")
+            .count()
+            == 1,
+        "Subtitles were dropped"
+    );
+    ensure!(
+        streams
+            .iter()
+            .filter(|stream| stream["codec_type"] == "attachment")
+            .count()
+            == 1,
+        "Attachment was dropped"
+    );
+    ensure!(
+        probe["chapters"]
+            .as_array()
+            .is_some_and(|chapters| chapters.len() == 2),
+        "Chapters were dropped"
+    );
+    ensure!(
+        streams
+            .iter()
+            .any(|stream| stream["codec_type"] == "audio" && stream["tags"]["language"] == "jpn"),
+        "Audio language was dropped"
+    );
+    ensure!(
+        streams.iter().any(
+            |stream| stream["codec_type"] == "subtitle" && stream["disposition"]["forced"] == 1
+        ),
+        "Subtitle disposition was dropped"
+    );
+    let advanced = app.command("tasks.convert", json!({"id":original.id,"compression":{"videoBitrateBps":300_000,"maxWidth":320,"maxHeight":180,"fps":"24000/1001"}})).await?;
+    let advanced_id = advanced["id"].as_str().unwrap().to_string();
+    wait_for(&app, std::slice::from_ref(&advanced_id), &["completed"]).await?;
+    let task = app.db.task(&advanced_id)?;
+    let info = task
+        .media_info
+        .context("Advanced output has no media info")?;
+    ensure!(
+        info.width == Some(320) && info.height == Some(180),
+        "Advanced compression ignored downscaling"
+    );
+    ensure!(
+        info.fps
+            .is_some_and(|fps| (fps - 24000.0 / 1001.0).abs() < 0.01),
+        "Advanced compression ignored the fractional frame rate"
+    );
+    let nvenc = preview["capabilities"].as_array().and_then(|capabilities| {
+        capabilities
+            .iter()
+            .find(|capability| capability["encoder"] == "hevc_nvenc")
+    });
+    let mut expected_media = 3;
+    if nvenc.is_some_and(|capability| capability["available"] == true) {
+        let queued = app.command("tasks.convert", json!({"id":original.id,"compression":{"targetBytes":target,"encoder":"hevc_nvenc"}})).await?;
+        let gpu_id = queued["id"].as_str().unwrap().to_string();
+        wait_for(&app, std::slice::from_ref(&gpu_id), &["completed"]).await?;
+        let gpu = app.db.media_for_task(&gpu_id)?.unwrap();
+        ensure!(
+            gpu.size <= target && (gpu.duration - 8.0).abs() < 0.2,
+            "GPU compression exceeded its target or truncated content"
+        );
+        expected_media += 1;
+        eprintln!(
+            "NVENC full compression verified: {} bytes <= {target} bytes",
+            gpu.size
+        );
+    } else {
+        ensure!(
+            nvenc.is_none_or(|capability| capability["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())),
+            "An unavailable GPU had no explanation"
+        );
+        eprintln!("NVENC unavailable on this test host: {nvenc:?}");
+    }
+    ensure!(
+        download::hash_file(&source)? == original_hash,
+        "Compression changed its source"
+    );
+    ensure!(
+        serde_json::to_value(app.db.task(&original.id)?)? == original_record,
+        "Compression altered the original task record"
+    );
+    ensure!(
+        app.db.media()?.len() == expected_media,
+        "Compression catalog did not retain independent results"
+    );
+    app.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed FFmpeg/FFprobe with libx265; local fixture only"]
+async fn real_compression_preserves_hdr10_and_hlg() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let app = App::open(config(root.path())).await?;
+    let token = CancellationToken::new();
+    let frozen = app.freeze_tools().await?;
+    let inventory = crate::process::run_limited_text(
+        &app.tool("ffmpeg")?,
+        &["-hide_banner".into(), "-h".into(), "encoder=libx265".into()],
+        &token,
+        1024 * 1024,
+        Duration::from_secs(10),
+    )
+    .await?;
+    let cpu_10bit = inventory
+        .stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Supported pixel formats:"))
+        .flat_map(str::split_whitespace)
+        .any(|format| format == "yuv420p10le");
+    for (name, transfer, parameters) in [
+        (
+            "HDR10",
+            "smpte2084",
+            "pools=1:frame-threads=1:log-level=error:colorprim=bt2020:transfer=16:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400",
+        ),
+        (
+            "HLG",
+            "arib-std-b67",
+            "pools=1:frame-threads=1:log-level=error:colorprim=bt2020:transfer=18:colormatrix=bt2020nc",
+        ),
+    ] {
+        let path = app.download_directory().join(format!("{name}.mkv"));
+        let filter = format!(
+            "scale=iw:ih,format=yuv420p10le,setparams=color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc:range=tv"
+        );
+        let mut args = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24",
+            "-t",
+            "2",
+            "-vf",
+            &filter,
+            "-pix_fmt",
+            "+yuv420p10le",
+            "-c:v",
+            if cpu_10bit { "libx265" } else { "ffv1" },
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        if cpu_10bit {
+            args.extend([
+                "-preset".into(),
+                "ultrafast".into(),
+                "-x265-params".into(),
+                parameters.into(),
+            ]);
+        }
+        args.extend(
+            [
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                transfer,
+                "-colorspace",
+                "bt2020nc",
+                "-color_range",
+                "tv",
+                path.to_str().unwrap(),
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        );
+        crate::process::run(&app.tool("ffmpeg")?, &args, None, &token, None).await?;
+        let before = download::hash_file(&path)?;
+        let mut task = crate::tests::paused_task(frozen.clone());
+        task.title = name.into();
+        task.status = "completed".into();
+        task.output_path = Some(path.clone());
+        task.download_dir = Some(app.download_directory());
+        app.db.insert_task(&task)?;
+        app.db.complete(
+            &task,
+            &crate::model::Media {
+                id: uuid::Uuid::new_v4().to_string(),
+                task_id: task.id.clone(),
+                title: name.into(),
+                filename: format!("{name}.mkv"),
+                size: before.1,
+                duration: 2.0,
+                path: path.clone(),
+                assets: vec![],
+                media_info: None,
+            },
+        )?;
+        let original_record = serde_json::to_value(app.db.task(&task.id)?)?;
+        let preview = app
+            .command(
+                "tasks.convertPreview",
+                json!({"id":task.id,"compression":{}}),
+            )
+            .await?;
+        ensure!(
+            preview["source"]["bitDepth"] == 10,
+            "{name} source depth was misidentified"
+        );
+        ensure!(
+            preview["source"]["hdr"] == if name == "HDR10" { "hdr10" } else { "hlg" },
+            "{name} source HDR was misidentified: {}",
+            preview["source"]
+        );
+        if !cpu_10bit {
+            let cpu = preview["capabilities"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|capability| capability["encoder"] == "libx265")
+                .context("CPU capability is missing")?;
+            ensure!(
+                cpu["available"] == false
+                    && cpu["reason"]
+                        .as_str()
+                        .is_some_and(|reason| !reason.is_empty()),
+                "An 8-bit CPU encoder was allowed to reduce {name} bit depth"
+            );
+            let count = app.db.tasks_including_retained()?.len();
+            ensure!(
+                app.command(
+                    "tasks.convert",
+                    json!({"id":task.id,"compression":{"videoBitrateBps":200_000}})
+                )
+                .await
+                .is_err(),
+                "An unsupported 10-bit CPU compression was queued"
+            );
+            ensure!(
+                app.db.tasks_including_retained()?.len() == count,
+                "Rejected HDR compression created a task"
+            );
+            ensure!(
+                serde_json::to_value(app.db.task(&task.id)?)? == original_record
+                    && download::hash_file(&path)? == before,
+                "Rejected HDR compression changed the original"
+            );
+            eprintln!(
+                "{name}: true 10-bit FFV1 source was preserved; this CPU build correctly refuses 10-bit HEVC"
+            );
+            continue;
+        }
+        let queued = app
+            .command(
+                "tasks.convert",
+                json!({"id":task.id,"compression":{"videoBitrateBps":200_000}}),
+            )
+            .await?;
+        let id = queued["id"].as_str().unwrap().to_string();
+        wait_for(&app, std::slice::from_ref(&id), &["completed"]).await?;
+        let output = app.db.media_for_task(&id)?.unwrap();
+        let args = [
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_streams",
+            "-show_frames",
+            "-read_intervals",
+            "%+#2",
+            "-of",
+            "json",
+            output.path.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let probe = crate::process::run(&app.tool("ffprobe")?, &args, None, &token, None).await?;
+        let probe: serde_json::Value = serde_json::from_str(&probe.stdout)?;
+        ensure!(
+            probe["streams"][0]["pix_fmt"] == "yuv420p10le"
+                && probe["streams"][0]["color_transfer"] == transfer,
+            "{name} lost its bit depth or HDR transfer"
+        );
+        if name == "HDR10" {
+            let content = probe.to_string();
+            ensure!(
+                content.contains("Mastering display metadata")
+                    && content.contains("Content light level metadata"),
+                "HDR10 static metadata was dropped"
+            );
+        }
+        ensure!(
+            download::hash_file(&path)? == before,
+            "{name} source changed"
+        );
+    }
+    app.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires installed native yt-dlp, FFmpeg and FFprobe; local fixture only"]
 async fn real_transfer_uses_resolved_metadata_without_reextracting_webpage() -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -204,6 +710,106 @@ async fn real_transfer_uses_resolved_metadata_without_reextracting_webpage() -> 
     }
     .await;
     server.shutdown().await;
+    app.shutdown().await?;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires native yt-dlp; interrupted local HTTP fixture only"]
+async fn real_transfer_retries_disconnected_http_and_resumes_partial_bytes() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let app = App::open(config(root.path())).await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/interrupted.mp4", listener.local_addr()?);
+    let payload = Arc::new(
+        (0u8..=255)
+            .cycle()
+            .take(2 * 1024 * 1024)
+            .collect::<Vec<_>>(),
+    );
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let stop = CancellationToken::new();
+    let (body, requested, shutdown) = (payload.clone(), ranges.clone(), stop.clone());
+    let server = tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! { accepted=listener.accept()=>accepted, _=shutdown.cancelled()=>break };
+            let Ok((mut socket, _)) = accepted else { break };
+            let mut bytes = [0; 16384];
+            let Ok(Ok(size)) =
+                tokio::time::timeout(Duration::from_secs(5), socket.read(&mut bytes)).await
+            else {
+                continue;
+            };
+            let request = String::from_utf8_lossy(&bytes[..size]);
+            if !request.starts_with("GET /interrupted.mp4 ") {
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                continue;
+            }
+            let start = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("range")
+                        .then_some(value.trim())?
+                        .strip_prefix("bytes=")?
+                        .split_once('-')?
+                        .0
+                        .parse::<usize>()
+                        .ok()
+                })
+                .unwrap_or(0);
+            let attempt = {
+                let mut ranges = requested.lock().unwrap();
+                ranges.push(start);
+                ranges.len()
+            };
+            let header = if start > 0 {
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len() - 1,
+                    body.len(),
+                    body.len() - start
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+            };
+            let end = if attempt <= 6 {
+                (start + 64 * 1024).min(body.len())
+            } else {
+                body.len()
+            };
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(&body[start..end]).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    let outcome = async {
+        let mut task = crate::tests::paused_task(crate::tools::freeze(&app)?);
+        task.title = "Interrupted HTTP fixture".into();
+        task.options.write_thumbnail = false;
+        task.options.write_info_json = false;
+        task.options.format_id = "resolved".into();
+        app.db.insert_task(&task)?;
+        let info = json!({"id":"interrupted","title":task.title,"extractor":"generic","extractor_key":"Generic","webpage_url":task.url,"formats":[{"format_id":"resolved","url":url,"ext":"mp4","protocol":"http","vcodec":"h264","acodec":"aac","filesize":payload.len()}]});
+        let manifest = tokio::time::timeout(Duration::from_secs(90), download::transfer(&app, task.clone(), info, &CancellationToken::new())).await??;
+        ensure!(manifest.files.len() == 1);
+        ensure!(std::fs::read(&manifest.files[0].path)? == *payload, "Resumed bytes differ from the fixture");
+        let ranges = ranges.lock().unwrap();
+        ensure!(ranges.len() == 7, "Unexpected HTTP attempt count: {ranges:?}");
+        ensure!(ranges[0] == 0 && ranges.windows(2).all(|pair| pair[1] > pair[0]), "Partial bytes were not resumed: {ranges:?}");
+        drop(ranges);
+        ensure!(app.db.task_logs(&task.id)?.iter().any(|entry| entry.message.contains("Temporary stream download failure; retry 1/2")), "No application retry was recorded");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    stop.cancel();
+    server.await?;
     app.shutdown().await?;
     outcome
 }
@@ -1023,6 +1629,7 @@ async fn real_multiple_audio_cuts_subtitles_chapters_and_cover_processing() -> R
         priority: 0,
         live: false,
         conversion: false,
+        compression: None,
         tools: app.freeze_tools().await?,
     };
     app.db.insert_task(&task)?;

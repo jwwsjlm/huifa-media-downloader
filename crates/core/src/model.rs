@@ -521,6 +521,35 @@ pub fn parse_rate(value: &str) -> Option<u64> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompressionOptions {
+    pub target_bytes: Option<u64>,
+    pub video_bitrate_bps: Option<u64>,
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+    pub fps: Option<String>,
+    #[serde(default = "compression_encoder")]
+    pub encoder: String,
+}
+
+fn compression_encoder() -> String {
+    "libx265".into()
+}
+
+impl Default for CompressionOptions {
+    fn default() -> Self {
+        Self {
+            target_bytes: None,
+            video_bitrate_bps: None,
+            max_width: None,
+            max_height: None,
+            fps: None,
+            encoder: compression_encoder(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Task {
     pub id: String,
@@ -580,6 +609,8 @@ pub(crate) struct Task {
     #[serde(default)]
     pub conversion: bool,
     #[serde(default)]
+    pub compression: Option<CompressionOptions>,
+    #[serde(default)]
     // Private immutable runtime references. Missing snapshots must fail when used, never resolve current tools.
     pub tools: std::collections::HashMap<String, PathBuf>,
 }
@@ -600,7 +631,7 @@ impl Task {
                     .try_fold(0u64, |sum, item| sum.checked_add(item.total?))
             })
             .flatten();
-        json!({"id":self.id,"kind":self.kind,"files":self.files,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,"priority":self.priority,"live":self.live,"conversion":self.conversion,"destinationConflict":self.destination.as_ref().and_then(|d| d.public_conflict()),
+        json!({"id":self.id,"kind":self.kind,"files":self.files,"url":redact_url(&self.url),"title":self.title,"status":self.status,"stage":self.stage,"priority":self.priority,"live":self.live,"conversion":self.conversion,"compression":self.compression,"destinationConflict":self.destination.as_ref().and_then(|d| d.public_conflict()),
             "progress":self.progress,"stageProgress":self.stage_progress,"stageIndeterminate":self.stage_indeterminate,"stepIndex":self.step_index,"stepCount":self.steps.len(),
             "speed":self.speed,"eta":self.eta,"size":self.size,"downloadedBytes":downloaded_bytes,"totalBytes":total_bytes,"totalBytesEstimated":total_bytes.is_some() && self.transfer_bytes.iter().any(|item| item.estimated),"sourceInfo":self.source_info,"mediaInfo":self.media_info,"error":self.error,"warnings":self.warnings,"createdAt":self.created_at,"completedAt":self.completed_at,"options":self.options.public(),"hasThumbnail":self.thumbnail.is_some(),
             "outputPath":self.output_path.as_ref().and_then(|p|p.file_name()).map(|p|p.to_string_lossy())})

@@ -174,6 +174,7 @@ impl App {
             priority: 0,
             live: false,
             conversion: false,
+            compression: None,
             tools,
         };
         if previous.is_some() {

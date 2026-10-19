@@ -7,6 +7,7 @@ export function taskActions(task: Task, t: Translate): { action: string; label: 
   if (task.live && task.status === 'downloading') actions.push({ action: 'finishLive', label: t('结束直播并保存', 'Stop live capture and save'), icon: 'check' });
   if (task.status === 'paused') actions.push({ action: 'resume', label: t('继续', 'Resume'), icon: 'play' });
   else if (['failed', 'processing_failed', 'cancelled'].includes(task.status)) actions.push({ action: 'retry', label: task.status === 'processing_failed' ? t('重试处理', 'Retry processing') : t('重试下载', 'Retry download'), icon: 'refresh' });
+  if (task.compression?.encoder && task.compression.encoder !== 'libx265' && ['failed', 'processing_failed', 'paused', 'cancelled'].includes(task.status)) actions.push({ action: 'compressRetryCpu', label: t('改用 CPU 重试', 'Retry with CPU'), icon: 'refresh' });
   else if (['queued', 'probing', 'downloading', 'processing', 'waiting_processing'].includes(task.status)) actions.push({ action: 'pause', label: t('暂停', 'Pause'), icon: 'pause' });
   if (['failed', 'cancelled', 'paused', 'processing_failed'].includes(task.status) && task.kind !== 'assets' && !task.conversion) actions.push({ action: 'retryCurrent', label: t('使用当前设置重试', 'Retry with current settings'), icon: 'refresh' });
   if (['failed', 'processing_failed'].includes(task.status) && task.error?.includes('Requirements unmet:')) actions.push({ action: 'configure', label: t('调整要求重试', 'Adjust requirements and retry'), icon: 'settings' });
@@ -39,6 +40,9 @@ export function completionTime(value?: string | null, format = DEFAULT_COMPLETED
 export function stageLabel(stage: string, status: string, t: Translate): string {
   if (['completed', 'retained', 'failed', 'processing_failed', 'cancelled'].includes(status)) return statusLabel(status, t);
   if (stage === 'probing') return t('正在确定工序', 'Determining workflow');
+  if (stage === 'compression_analyzing') return t('分析压缩码率', 'Analyzing compression bitrate');
+  if (stage === 'compression_encoding') return t('压缩视频', 'Compressing video');
+  if (stage === 'compression_preparing') return t('保留音轨与字幕', 'Preserving audio and subtitles');
   if (stage.startsWith('downloading_video_')) return t('保存视频画面', 'Saving video stream');
   if (stage.startsWith('downloading_audio_')) return t('保存音轨', 'Saving audio track');
   if (stage.startsWith('converting_subtitle_')) return t('转换字幕文件', 'Converting subtitles');

@@ -12,6 +12,11 @@ it.each([
   ['HTTP Error 429: Too Many Requests', 'request delay'],
   ['Cannot query yt-dlp runtime release from GitHub: HTTP 403', 'GitHub has limited'],
   ['Cannot check latest yt-dlp release from GitHub: HTTP 429', 'GitHub has limited'],
+  ['Cannot query official FFmpeg release: HTTP 403', 'GitHub has limited'],
+  ['Cannot download official FFmpeg checksums: HTTP 429', 'GitHub has limited'],
+  ['Cannot query official FFmpeg release: HTTP 404', 'recommended release'],
+  ['Cannot query official FFmpeg release: timeout', 'official FFmpeg release or checksums'],
+  ['This release has no matching FFmpeg build for the selected mode and platform', 'current system and policy'],
   ['Cannot check latest yt-dlp release from GitHub: timeout', 'failed check does not mean'],
   ['Runtime download failed: ghfast.top: HTTP 502', 'switch download sources'],
   ['Runtime release not found for yt-dlp', 'exact official release tag'],
@@ -23,6 +28,10 @@ it.each([
   ['No video format satisfies the selected resolution', 'adjust quality'],
   ['Requested subtitles zh are unavailable', 'requested subtitles are unavailable'],
   ['no such option: --no-js-runtimes', 'add the link again'],
+  ['GPU compression failed; retry this task on CPU: driver timeout at C:/private/video.mkv', 'Choose Retry with CPU'],
+  ['Compressed output still exceeds the target size; choose a larger target', 'Adjust it and retry'],
+  ['Source changed during compression; the original file was preserved', 'Create a new compression task'],
+  ['Compression lost a subtitle stream', 'It was not published'],
 ])('explains %s without appending diagnostic details', (raw, hint) => {
   const message = explainError(raw, en);
   expect(message).toContain(hint);

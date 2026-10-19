@@ -83,6 +83,11 @@ export const host = {
     if (!navigator.clipboard?.writeText) throw new Error('Clipboard is unavailable. Allow clipboard access and try again.');
     await navigator.clipboard.writeText(value);
   },
+  async readClipboard(): Promise<string> {
+    if (desktop) return invoke('command', { command: 'host.clipboard_read', args: {} });
+    if (!navigator.clipboard?.readText) throw new Error('Clipboard is unavailable. Allow clipboard access and try again.');
+    return navigator.clipboard.readText();
+  },
   async directory(defaultPath = ''): Promise<string | null> { return desktop ? invoke('choose_directory', { defaultPath }) : null; },
   async openDownloadDirectory(): Promise<void> { if (desktop) await invoke('open_download_directory'); },
   async paths(): Promise<{ downloadDir: string }> { return desktop ? invoke('command', { command: 'host.paths', args: {} }) : { downloadDir: '/downloads' }; },

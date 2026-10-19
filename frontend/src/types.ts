@@ -1,7 +1,7 @@
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type OptionValue = string | number | boolean | string[];
 export type DownloadOptions = Record<string, OptionValue>;
-export type Settings = Record<string, Json> & { downloadOptions?: DownloadOptions; uiPreferences?: { deleteMediaOnTaskDelete?: boolean } };
+export type Settings = Record<string, Json> & { ffmpegMode?: 'compatibility' | 'efficiency'; clipboardMonitoring?: boolean; downloadOptions?: DownloadOptions; uiPreferences?: { deleteMediaOnTaskDelete?: boolean } };
 export type TaskStatus = 'queued' | 'probing' | 'downloading' | 'waiting_processing' | 'processing' | 'processing_failed' | 'paused' | 'cancelled' | 'failed' | 'completed' | 'retained';
 export type MediaInfo = { width?: number | null; height?: number | null; fps?: number | null; videoCodec?: string | null; audioCodec?: string | null; container?: string | null; size?: number | null; duration?: number | null };
 export interface Task {
@@ -13,6 +13,7 @@ export interface Task {
   priority?: number;
   live?: boolean;
   conversion?: boolean;
+  compression?: import('./compression').CompressionOptions | null;
   destinationConflict?: { filename: string; files: string[] } | null;
   stepIndex?: number | null;
   stepCount?: number;
@@ -39,8 +40,8 @@ export interface Task {
 }
 export interface TaskLogs { text: string; start: number; end: number; total: number; hasMore: boolean; raw: boolean; legacy: boolean }
 export interface Media { id: string; taskId: string; title: string; filename: string; size: number; duration: number; hasCover?: boolean; mediaInfo?: MediaInfo | null }
-export interface Tool { name: string; available: boolean; version?: string; latest?: string; error?: string; path?: string; platform?: string; asset?: string }
-export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string }
+export interface Tool { name: string; available: boolean; version?: string; latest?: string; error?: string; path?: string; platform?: string; asset?: string; installedMode?: 'compatibility' | 'efficiency' | null; configuredMode?: 'compatibility' | 'efficiency'; releaseTag?: string | null; repository?: string | null }
+export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string; mode?: 'compatibility' | 'efficiency'; repository?: string }
 export interface Snapshot { version: string; tasks: Task[]; media: Media[]; settings: Settings; tools?: Tool[] }
 export interface CoreEvent { kind: string; data: Json }
 export interface AddReport { ids: string[]; results: { id: string; status: TaskStatus; action: 'added' | 'existing' | 'restarted' }[]; issues?: { url: string; error: string }[]; cancelled?: boolean }

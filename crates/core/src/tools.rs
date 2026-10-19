@@ -114,6 +114,7 @@ fn ffmpeg_dll(name: &str) -> bool {
         "avfilter",
         "avformat",
         "avutil",
+        "postproc",
         "swresample",
         "swscale",
     ]
@@ -150,8 +151,13 @@ pub(crate) fn unused_cache(app: &App) -> Result<Vec<PathBuf>> {
     let pointer = root.join("current.json");
     if pointer.exists() {
         crate::reject_links(&pointer)?;
-        let current: HashMap<String, String> = serde_json::from_slice(&std::fs::read(pointer)?)?;
-        for value in current.values() {
+        let current: Value = serde_json::from_slice(&std::fs::read(pointer)?)?;
+        for value in current
+            .as_object()
+            .context("Invalid runtime selection")?
+            .values()
+            .filter_map(Value::as_str)
+        {
             let path = root.join(value);
             crate::reject_links(&path)?;
             if let Some(parent) = path.parent() {
@@ -446,16 +452,7 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
         channel
     };
     let version = version.trim();
-    anyhow::ensure!(
-        version.len() <= 64
-            && (version.is_empty()
-                || version.starts_with(|c: char| c.is_ascii_alphanumeric())
-                    && version
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-                    && !version.contains("..")),
-        "Invalid runtime version; enter an official release tag, not a URL"
-    );
+    validate_version(version)?;
     let repository = match (name, channel) {
         ("yt-dlp", "stable") => "yt-dlp/yt-dlp",
         ("yt-dlp", "nightly") => "yt-dlp/yt-dlp-nightly-builds",
@@ -497,6 +494,229 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
     ))
 }
 
+fn validate_version(version: &str) -> Result<()> {
+    anyhow::ensure!(
+        version.len() <= 64
+            && (version.is_empty()
+                || version.starts_with(|c: char| c.is_ascii_alphanumeric())
+                    && version
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                    && !version.contains("..")),
+        "Invalid runtime version; enter an official release tag, not a URL"
+    );
+    Ok(())
+}
+
+fn ffmpeg_mode(app: &App, args: &Value) -> Result<String> {
+    let settings = app.db.settings()?;
+    let mode = args
+        .get("mode")
+        .or_else(|| settings.get("ffmpegMode"))
+        .map(|value| value.as_str().context("FFmpeg mode must be text"))
+        .transpose()?
+        .unwrap_or("compatibility");
+    anyhow::ensure!(
+        matches!(mode, "compatibility" | "efficiency"),
+        "Unknown FFmpeg mode; choose compatibility or efficiency"
+    );
+    Ok(mode.into())
+}
+
+fn ffmpeg_repository(platform: &str) -> Result<&'static str> {
+    Ok(match platform {
+        "windows-x86_64" | "linux-x86_64" | "linux-aarch64" => "BtbN/FFmpeg-Builds",
+        "windows-aarch64" => "tordona/ffmpeg-win-arm64",
+        "darwin-x86_64" | "darwin-aarch64" => "shaka-project/static-ffmpeg-binaries",
+        _ => bail!("Unsupported runtime platform or architecture: {platform}"),
+    })
+}
+
+fn locked_ffmpeg_release(platform: &str) -> Result<(&'static str, Value)> {
+    let lock: Value = serde_json::from_str(include_str!("../../../runtime-tool-lock.json"))?;
+    let repository = ffmpeg_repository(platform)?;
+    let mut assets = Vec::new();
+    let mut tag = None::<String>;
+    for tool in if platform.starts_with("darwin-") {
+        &["ffmpeg", "ffprobe"][..]
+    } else {
+        &["ffmpeg"][..]
+    } {
+        let entry = &lock["tools"][tool];
+        let asset = &entry["assets"][platform];
+        anyhow::ensure!(
+            asset.is_object(),
+            "Compatibility FFmpeg is unavailable for this platform"
+        );
+        let asset_repository = asset["repository"]
+            .as_str()
+            .or_else(|| entry["repository"].as_str())
+            .context("Compatibility runtime repository is missing")?;
+        anyhow::ensure!(
+            asset_repository == repository,
+            "Unexpected compatibility runtime repository"
+        );
+        let version = asset["version"]
+            .as_str()
+            .or_else(|| entry["version"].as_str())
+            .context("Compatibility runtime tag is missing")?;
+        validate_version(version)?;
+        anyhow::ensure!(
+            tag.as_ref().is_none_or(|tag| tag == version),
+            "Compatibility FFmpeg and FFprobe versions differ"
+        );
+        tag = Some(version.into());
+        let name = asset["name"]
+            .as_str()
+            .context("Compatibility runtime asset name is missing")?;
+        let digest = asset["sha256"]
+            .as_str()
+            .context("Compatibility runtime checksum is missing")?;
+        assets.push(json!({"name":name,"digest":format!("sha256:{digest}"),"browser_download_url":asset["url"]}));
+    }
+    Ok((
+        repository,
+        json!({"tag_name":tag,"assets":assets,"_locked":true}),
+    ))
+}
+
+fn ffmpeg_assets(release: &Value, platform: &str, mode: &str) -> Result<Vec<String>> {
+    let assets = release["assets"]
+        .as_array()
+        .context("Malformed runtime release")?;
+    if release["_locked"].as_bool() == Some(true) {
+        return assets
+            .iter()
+            .map(|asset| {
+                asset["name"]
+                    .as_str()
+                    .map(str::to_string)
+                    .context("Invalid compatibility asset name")
+            })
+            .collect();
+    }
+    if platform.starts_with("darwin-") {
+        return [
+            asset_name("ffmpeg", platform)?,
+            asset_name("ffprobe", platform)?,
+        ]
+        .iter()
+        .map(|name| {
+            anyhow::ensure!(
+                assets
+                    .iter()
+                    .any(|asset| asset["name"].as_str() == Some(name)),
+                "Runtime asset is unavailable for this platform"
+            );
+            Ok(name.to_string())
+        })
+        .collect();
+    }
+    let suffix = match platform {
+        "windows-x86_64" => "-win64-gpl-shared",
+        "linux-x86_64" => "-linux64-gpl",
+        "linux-aarch64" => "-linuxarm64-gpl",
+        "windows-aarch64" => "-essentials-static-win-arm64.7z",
+        _ => bail!("Unsupported runtime platform or architecture: {platform}"),
+    };
+    let mut names = assets
+        .iter()
+        .filter_map(|asset| asset["name"].as_str())
+        .filter(|name| {
+            name.starts_with("ffmpeg-")
+                && name.contains(suffix)
+                && if platform == "windows-aarch64" {
+                    name.ends_with(".7z")
+                } else {
+                    name.ends_with(if platform.starts_with("windows-") {
+                        ".zip"
+                    } else {
+                        ".tar.xz"
+                    }) && !name.contains("-lgpl")
+                        && (!name.contains("-shared") || platform.starts_with("windows-"))
+                }
+        })
+        .collect::<Vec<_>>();
+    if mode == "compatibility" && platform != "windows-aarch64" {
+        names.retain(|name| name.starts_with("ffmpeg-n"));
+    }
+    names.sort_by_key(|name| {
+        let preferred = if mode == "compatibility" {
+            name.starts_with("ffmpeg-n7.1")
+        } else {
+            name.starts_with("ffmpeg-N-") || name.starts_with("ffmpeg-master-")
+        };
+        (!preferred, *name)
+    });
+    Ok(vec![
+        names
+            .first()
+            .context(
+                "This release has no matching FFmpeg build for the selected mode and platform",
+            )?
+            .to_string(),
+    ])
+}
+
+async fn ffmpeg_release(
+    app: &App,
+    args: &Value,
+    client: &reqwest::Client,
+) -> Result<(&'static str, Value, String)> {
+    if let Some(channel) = args.get("channel") {
+        anyhow::ensure!(
+            channel
+                .as_str()
+                .is_some_and(|channel| matches!(channel, "" | "stable")),
+            "Unknown FFmpeg channel; select a mode instead"
+        );
+    }
+    let mode = ffmpeg_mode(app, args)?;
+    let version = args
+        .get("version")
+        .map(|value| value.as_str().context("Runtime version must be text"))
+        .transpose()?
+        .unwrap_or("")
+        .trim();
+    validate_version(version)?;
+    let platform = target()?;
+    if mode == "compatibility" && version.is_empty() {
+        let (repository, release) = locked_ffmpeg_release(&platform)?;
+        return Ok((repository, release, mode));
+    }
+    let repository = ffmpeg_repository(&platform)?;
+    let release = if version.is_empty() {
+        "latest".into()
+    } else {
+        format!("tags/{version}")
+    };
+    let response = client
+        .get(format!(
+            "https://api.github.com/repos/{repository}/releases/{release}"
+        ))
+        .send()
+        .await
+        .map_err(|error| error.without_url())
+        .context("Cannot query official FFmpeg release")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "Cannot query official FFmpeg release: HTTP {}",
+        response.status().as_u16()
+    );
+    let release: Value =
+        serde_json::from_slice(&bounded_response(response, 2 * 1024 * 1024).await?)?;
+    validate_version(
+        release["tag_name"]
+            .as_str()
+            .context("Official FFmpeg release tag is missing")?,
+    )?;
+    anyhow::ensure!(
+        version.is_empty() || release["tag_name"].as_str() == Some(version),
+        "Official FFmpeg release differs from the selected tag"
+    );
+    Ok((repository, release, mode))
+}
+
 pub(crate) async fn update(app: &App, args: &Value) -> Result<Value> {
     let name = args["name"]
         .as_str()
@@ -511,7 +731,16 @@ pub(crate) async fn update(app: &App, args: &Value) -> Result<Value> {
         .map(|v| v.as_str().context("Runtime version must be text"))
         .transpose()?
         .unwrap_or("");
-    let (repository, release_url) = release_source(name, channel, version)?;
+    let ffmpeg = matches!(name, "ffmpeg" | "ffprobe");
+    let selection = if ffmpeg {
+        anyhow::ensure!(
+            matches!(channel, "" | "stable"),
+            "Unknown FFmpeg channel; select a mode instead"
+        );
+        None
+    } else {
+        Some(release_source(name, channel, version)?)
+    };
     let source = args
         .get("downloadSource")
         .map(|v| v.as_str().context("Runtime download source must be text"))
@@ -529,8 +758,14 @@ pub(crate) async fn update(app: &App, args: &Value) -> Result<Value> {
         guard=app.tool_update_lock.lock()=>guard,
         _=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted"),
     };
+    if ffmpeg {
+        let client = runtime_client(&app.download_proxy()?)?;
+        let (repository, release, mode) = tokio::select! {result=ffmpeg_release(app,args,&client)=>result?,_=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted")};
+        return tokio::select! {result=update_inner(app,name,repository,"",source,Some((release,mode)))=>result,_=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted")};
+    }
+    let (repository, release_url) = selection.context("Runtime selection is missing")?;
     tokio::select! {
-        result=update_inner(app,name,repository,&release_url,source)=>result,
+        result=update_inner(app,name,repository,&release_url,source,None)=>result,
         _=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted"),
     }
 }
@@ -638,6 +873,45 @@ pub(crate) async fn latest(app: &App, args: &Value) -> Result<Value> {
     let name = args["name"]
         .as_str()
         .context("Runtime tool name must be text")?;
+    if matches!(name, "ffmpeg" | "ffprobe") {
+        let client = runtime_client(&app.download_proxy()?)?;
+        let (repository, mut release, mode) = tokio::select! {result=ffmpeg_release(app,args,&client)=>result?,_=app.shutdown_token.cancelled()=>bail!("Runtime update check interrupted")};
+        let platform = target()?;
+        let assets = ffmpeg_assets(&release, &platform, &mode)?;
+        fill_ffmpeg_checksums(&client, &mut release, repository, &assets).await?;
+        let fingerprints = assets
+            .iter()
+            .map(|asset| {
+                release_asset(&release, repository, asset, false).map(|(_, digest)| digest)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fingerprint = if fingerprints.len() == 1 {
+            fingerprints[0].clone()
+        } else {
+            hex::encode(Sha256::digest(fingerprints.join("\n")))
+        };
+        let current = if let Ok(path) = resolve(app, name) {
+            crate::process::run(&path, &["-version".into()], None, &app.shutdown_token, None)
+                .await
+                .ok()
+                .and_then(|output| output.stdout.lines().next().map(str::to_string))
+        } else {
+            None
+        };
+        let installed = installed_ffmpeg(app)?;
+        let latest = release["tag_name"]
+            .as_str()
+            .context("Official FFmpeg tag is missing")?;
+        let update_available = current.is_none()
+            || resolve(app, "ffprobe").is_err()
+            || installed["mode"] != mode
+            || installed["repository"] != repository
+            || installed["releaseTag"] != latest
+            || installed["fingerprint"] != fingerprint;
+        return Ok(
+            json!({"name":name,"mode":mode,"current":current,"currentReleaseTag":installed["releaseTag"],"latest":latest,"releaseName":release["name"],"updateAvailable":update_available,"platform":platform,"asset":assets.first(),"assets":assets,"repository":repository}),
+        );
+    }
     anyhow::ensure!(
         name == "yt-dlp",
         "Remote version checks are only supported for yt-dlp"
@@ -768,6 +1042,22 @@ fn release_asset(
         digest.len() == 64 && digest.chars().all(|value| value.is_ascii_hexdigit()),
         "Invalid runtime checksum"
     );
+    let url = release_asset_url(release, repository, filename, latest_download)?;
+    Ok((url, digest.to_string()))
+}
+
+fn release_asset_url(
+    release: &Value,
+    repository: &str,
+    filename: &str,
+    latest_download: bool,
+) -> Result<url::Url> {
+    let asset = release["assets"]
+        .as_array()
+        .context("Malformed runtime release")?
+        .iter()
+        .find(|asset| asset["name"].as_str() == Some(filename))
+        .context("Runtime asset is unavailable for this platform")?;
     let url = url::Url::parse(
         asset["browser_download_url"]
             .as_str()
@@ -783,7 +1073,83 @@ fn release_asset(
                     && url.path() == format!("/{repository}/releases/latest/download/{filename}")),
         "Unexpected runtime download origin"
     );
-    Ok((url, digest.to_string()))
+    if let Some(tag) = release["tag_name"].as_str() {
+        anyhow::ensure!(
+            url.path() == format!("/{repository}/releases/download/{tag}/{filename}"),
+            "Runtime asset does not match its selected official release"
+        );
+    }
+    Ok(url)
+}
+
+async fn fill_ffmpeg_checksums(
+    client: &reqwest::Client,
+    release: &mut Value,
+    repository: &str,
+    assets: &[String],
+) -> Result<()> {
+    if assets.iter().all(|name| {
+        release["assets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|asset| {
+                asset["name"].as_str() == Some(name.as_str())
+                    && asset["digest"]
+                        .as_str()
+                        .is_some_and(|digest| digest.starts_with("sha256:"))
+            })
+    }) {
+        return Ok(());
+    }
+    let checksum = release["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|asset| asset["name"].as_str())
+        .find(|name| {
+            matches!(
+                *name,
+                "checksums.sha256" | "SHA256SUMS" | "sha256sum.txt" | "sha256sums.txt"
+            )
+        })
+        .context("Runtime release lacks official checksums; choose a newer official build")?;
+    let url = release_asset_url(release, repository, checksum, false)?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| error.without_url())
+        .context("Cannot download official FFmpeg checksums")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "Cannot download official FFmpeg checksums: HTTP {}",
+        response.status().as_u16()
+    );
+    let sums = String::from_utf8(bounded_response(response, 1024 * 1024).await?)
+        .context("Invalid official FFmpeg checksums")?;
+    for name in assets {
+        let asset = release["assets"]
+            .as_array_mut()
+            .context("Malformed runtime release")?
+            .iter_mut()
+            .find(|asset| asset["name"].as_str() == Some(name))
+            .context("Runtime asset is unavailable for this platform")?;
+        if asset["digest"].as_str().is_none() {
+            asset["digest"] = json!(format!("sha256:{}", checksum_for(&sums, name)?));
+        }
+    }
+    Ok(())
+}
+
+fn installed_ffmpeg(app: &App) -> Result<Value> {
+    let pointer = app.config.data_dir.join("tools/current.json");
+    if !pointer.exists() {
+        return Ok(Value::Null);
+    }
+    crate::reject_links(&pointer)?;
+    let current: Value = serde_json::from_slice(&std::fs::read(pointer)?)?;
+    Ok(current["_ffmpeg"].clone())
 }
 
 async fn update_inner(
@@ -792,13 +1158,19 @@ async fn update_inner(
     repository: &str,
     release_url: &str,
     source: &str,
+    ffmpeg: Option<(Value, String)>,
 ) -> Result<Value> {
     use anyhow::{Context, ensure};
     use std::io::Write;
     let platform = target()?;
     let initial_asset_name = asset_name(name, &platform)?;
     let client = runtime_client(&app.download_proxy()?)?;
-    let release: Value = if name == "yt-dlp" {
+    let (ffmpeg_release, ffmpeg_mode) = ffmpeg
+        .map(|(release, mode)| (Some(release), Some(mode)))
+        .unwrap_or((None, None));
+    let mut release: Value = if let Some(release) = ffmpeg_release {
+        release
+    } else if name == "yt-dlp" {
         // Official release checksum assets avoid the unauthenticated GitHub API quota.
         let base = if release_url.ends_with("/latest/download") {
             format!(
@@ -842,18 +1214,24 @@ async fn update_inner(
         serde_json::from_slice(&bounded_response(response, 2 * 1024 * 1024).await?)?
     };
     let split_ffmpeg = platform.starts_with("darwin-") && matches!(name, "ffmpeg" | "ffprobe");
-    let asset_names = if split_ffmpeg {
+    let asset_names = if let Some(mode) = &ffmpeg_mode {
+        ffmpeg_assets(&release, &platform, mode)?
+    } else if split_ffmpeg {
         vec![
-            asset_name("ffmpeg", &platform)?,
-            asset_name("ffprobe", &platform)?,
+            asset_name("ffmpeg", &platform)?.to_string(),
+            asset_name("ffprobe", &platform)?.to_string(),
         ]
     } else {
-        vec![initial_asset_name]
+        vec![initial_asset_name.to_string()]
     };
+    if ffmpeg_mode.is_some() {
+        fill_ffmpeg_checksums(&client, &mut release, repository, &asset_names).await?;
+    }
+    let selected_assets = asset_names.clone();
     let mut downloads = Vec::new();
     let mut digests = Vec::new();
     for filename in asset_names {
-        let (url, digest) = release_asset(&release, repository, filename, name == "yt-dlp")?;
+        let (url, digest) = release_asset(&release, repository, &filename, name == "yt-dlp")?;
         let urls = download_urls(
             url.as_str(),
             if name == "yt-dlp" { source } else { "github" },
@@ -902,6 +1280,7 @@ async fn update_inner(
             "Runtime DLL is not a native library"
         );
     }
+    let mut tested_versions = BTreeMap::new();
     for (tool, filename) in wanted.iter().zip(&filenames) {
         let path = temporary.path().join(filename);
         let header = std::fs::read(&path)?;
@@ -914,7 +1293,7 @@ async fn update_inner(
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         }
-        crate::process::run(
+        let version = crate::process::run(
             &path,
             &[if tool == "ffmpeg" || tool == "ffprobe" {
                 "-version".into()
@@ -926,6 +1305,20 @@ async fn update_inner(
             None,
         )
         .await?;
+        if group == "ffmpeg" {
+            tested_versions.insert(
+                tool.as_str(),
+                version
+                    .stdout
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        }
         if tool == "ffmpeg" {
             let encoders = crate::process::run(
                 &path,
@@ -936,14 +1329,44 @@ async fn update_inner(
             )
             .await?;
             ensure!(
-                ["libx264", "libvpx-vp9", "libopus"]
+                ["libx264", "libx265", "libvpx-vp9", "libopus"]
                     .iter()
                     .all(|codec| encoders
                         .stdout
                         .lines()
                         .any(|line| line.split_whitespace().nth(1) == Some(codec))),
-                "FFmpeg is missing a required H.264, VP9 or Opus encoder"
+                "FFmpeg is missing a required H.264, HEVC, VP9 or Opus encoder"
             );
+            crate::process::run(
+                &path,
+                &[
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=black:size=16x16:rate=1",
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libx265",
+                    "-x265-params",
+                    "pools=1:frame-threads=1:log-level=error",
+                    "-f",
+                    "null",
+                    "-",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+                None,
+                &app.shutdown_token,
+                None,
+            )
+            .await
+            .context("This FFmpeg build cannot initialize the required CPU HEVC encoder")?;
         }
         if tool == "yt-dlp" {
             let fixture = temporary.path().join("compatibility.json");
@@ -960,6 +1383,15 @@ async fn update_inner(
             .write(true)
             .open(&path)?
             .sync_all()?;
+    }
+    if group == "ffmpeg" {
+        anyhow::ensure!(
+            tested_versions
+                .get("ffmpeg")
+                .is_some_and(|version| !version.is_empty()
+                    && Some(version) == tested_versions.get("ffprobe")),
+            "FFmpeg and FFprobe versions differ; installation refused"
+        );
     }
     if version_dir.exists() {
         for filename in &extracted {
@@ -983,6 +1415,9 @@ async fn update_inner(
             version_dir.file_name().unwrap().to_string_lossy(),
             filename
         ));
+    }
+    if let Some(mode) = ffmpeg_mode {
+        current["_ffmpeg"] = json!({"mode":mode,"repository":repository,"releaseTag":release["tag_name"],"assets":selected_assets,"fingerprint":digest});
     }
     let mut pointer = tempfile::NamedTempFile::new_in(&directory)?;
     pointer.write_all(&serde_json::to_vec(&current)?)?;
@@ -1108,7 +1543,7 @@ fn extract_archive(
         wanted.iter().all(|name| found.contains(name)),
         "Runtime archive does not contain every required binary"
     );
-    if name.ends_with("-gpl-shared.zip") {
+    if name.contains("-gpl-shared") && name.ends_with(".zip") {
         for prefix in [
             "avcodec",
             "avdevice",
@@ -1236,6 +1671,8 @@ fn extract_system_archive(
 
 pub(crate) async fn check(app: &App) -> Result<Value> {
     let mut tools = Vec::new();
+    let ffmpeg = installed_ffmpeg(app)?;
+    let configured_mode = ffmpeg_mode(app, &json!({}))?;
     let javascript = if resolve(app, "deno").is_ok() {
         "deno"
     } else {
@@ -1265,12 +1702,42 @@ pub(crate) async fn check(app: &App) -> Result<Value> {
                 json!({"name":name,"available":false,"error":crate::process::redact(&format!("{error:#}"))})
             }
         };
-        if name == "yt-dlp"
+        if matches!(name, "yt-dlp" | "ffmpeg" | "ffprobe")
             && let Ok(platform) = target()
             && let Ok(asset) = asset_name(name, &platform)
         {
             tool["platform"] = json!(platform);
             tool["asset"] = json!(asset);
+        }
+        if matches!(name, "ffmpeg" | "ffprobe") {
+            tool["configuredMode"] = json!(configured_mode);
+            tool["installedMode"] = ffmpeg["mode"].clone();
+            tool["releaseTag"] = ffmpeg["releaseTag"].clone();
+            tool["repository"] = ffmpeg["repository"].clone();
+            if let Some(assets) = ffmpeg["assets"].as_array() {
+                if let Some(asset) = assets
+                    .iter()
+                    .find(|asset| {
+                        name == "ffprobe"
+                            && asset
+                                .as_str()
+                                .is_some_and(|name| name.starts_with("ffprobe-"))
+                    })
+                    .or_else(|| assets.first())
+                {
+                    tool["asset"] = asset.clone();
+                }
+            } else if configured_mode == "compatibility"
+                && let Ok((_, release)) = locked_ffmpeg_release(&target()?)
+            {
+                let assets = ffmpeg_assets(&release, &target()?, "compatibility")?;
+                tool["asset"] = json!(
+                    assets
+                        .iter()
+                        .find(|asset| name == "ffprobe" && asset.starts_with("ffprobe-"))
+                        .or_else(|| assets.first())
+                );
+            }
         }
         tools.push(tool);
     }
@@ -1642,6 +2109,10 @@ mod tests {
             json!({"name":"yt-dlp","version":"../latest"}),
             json!({"name":"yt-dlp","downloadSource":"https://untrusted.test/"}),
             json!({"name":"yt-dlp","downloadSource":1}),
+            json!({"name":"ffmpeg","mode":"untrusted"}),
+            json!({"name":"ffmpeg","mode":1}),
+            json!({"name":"ffmpeg","version":"../latest"}),
+            json!({"name":"ffmpeg","channel":"nightly"}),
         ] {
             assert!(update(&app, &args).await.is_err());
             assert_eq!(std::fs::read(&pointer)?, b"{}");
@@ -1699,6 +2170,145 @@ mod tests {
         assert!(release_source("deno", "stable", "2.9.7").is_err());
         Ok(())
     }
+
+    #[test]
+    fn compatibility_lock_supplies_verified_matching_assets_for_every_platform() -> Result<()> {
+        for platform in [
+            "windows-x86_64",
+            "windows-aarch64",
+            "linux-x86_64",
+            "linux-aarch64",
+            "darwin-x86_64",
+            "darwin-aarch64",
+        ] {
+            let (repository, release) = locked_ffmpeg_release(platform)?;
+            let assets = ffmpeg_assets(&release, platform, "compatibility")?;
+            assert_eq!(
+                assets.len(),
+                if platform.starts_with("darwin-") {
+                    2
+                } else {
+                    1
+                }
+            );
+            for asset in assets {
+                let (url, digest) = release_asset(&release, repository, &asset, false)?;
+                assert_eq!(url.host_str(), Some("github.com"));
+                assert_eq!(digest.len(), 64);
+            }
+        }
+        assert!(locked_ffmpeg_release("linux-riscv64").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ffmpeg_modes_select_stable_compatibility_and_master_efficiency_without_crossing_platforms()
+    -> Result<()> {
+        let release = json!({"assets":[{"name":"ffmpeg-N-123-master-win64-gpl-shared.zip"},{"name":"ffmpeg-n7.1.3-42-win64-gpl-shared-7.1.zip"},{"name":"ffmpeg-n8.0.1-linux64-gpl-8.0.tar.xz"},{"name":"ffmpeg-n7.1.3-linuxarm64-gpl-7.1.tar.xz"},{"name":"ffmpeg-N-123-linux64-gpl.tar.xz"}]});
+        assert_eq!(
+            ffmpeg_assets(&release, "windows-x86_64", "compatibility")?,
+            ["ffmpeg-n7.1.3-42-win64-gpl-shared-7.1.zip"]
+        );
+        assert_eq!(
+            ffmpeg_assets(&release, "windows-x86_64", "efficiency")?,
+            ["ffmpeg-N-123-master-win64-gpl-shared.zip"]
+        );
+        assert_eq!(
+            ffmpeg_assets(&release, "linux-x86_64", "efficiency")?,
+            ["ffmpeg-N-123-linux64-gpl.tar.xz"]
+        );
+        assert_eq!(
+            ffmpeg_assets(&release, "linux-aarch64", "compatibility")?,
+            ["ffmpeg-n7.1.3-linuxarm64-gpl-7.1.tar.xz"]
+        );
+        let master_only = json!({"assets":[{"name":"ffmpeg-master-latest-win64-gpl-shared.zip"}]});
+        assert!(ffmpeg_assets(&master_only, "windows-x86_64", "compatibility").is_err());
+        assert!(ffmpeg_assets(&release, "windows-aarch64", "efficiency").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_metadata_is_atomic_with_paths_and_ignored_by_cache_cleanup() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let directory = app.config.data_dir.join("tools");
+        let installed = directory.join("ffmpeg-1111111111111111");
+        let obsolete = directory.join("ffmpeg-2222222222222222");
+        std::fs::create_dir_all(&installed)?;
+        std::fs::create_dir_all(&obsolete)?;
+        std::fs::write(installed.join("ffmpeg"), b"fixture")?;
+        std::fs::write(
+            directory.join("current.json"),
+            serde_json::to_vec(
+                &json!({"ffmpeg":"ffmpeg-1111111111111111/ffmpeg","_ffmpeg":{"mode":"compatibility","repository":"BtbN/FFmpeg-Builds","releaseTag":"test"}}),
+            )?,
+        )?;
+        assert_eq!(installed_ffmpeg(&app)?["mode"], "compatibility");
+        assert_eq!(unused_cache(&app)?, vec![obsolete]);
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "downloads verified official FFmpeg compatibility archive and queries official release metadata"]
+    async fn real_ffmpeg_modes_install_a_verified_pair_and_preserve_frozen_tasks() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools")),
+        })
+        .await?;
+        let previous = app.freeze_tools().await?;
+        let value = update(&app, &json!({"name":"ffmpeg","mode":"compatibility"})).await?;
+        let ffmpeg = value
+            .as_array()
+            .context("Tool status is not a list")?
+            .iter()
+            .find(|tool| tool["name"] == "ffmpeg")
+            .context("FFmpeg status is missing")?;
+        assert_eq!(ffmpeg["installedMode"], "compatibility");
+        assert_eq!(ffmpeg["available"], true);
+        assert_eq!(
+            resolve(&app, "ffmpeg")?.parent(),
+            resolve(&app, "ffprobe")?.parent()
+        );
+        let metadata = installed_ffmpeg(&app)?;
+        let platform = target()?;
+        let (_, locked) = locked_ffmpeg_release(&platform)?;
+        assert_eq!(metadata["releaseTag"], locked["tag_name"]);
+        for name in ["ffmpeg", "ffprobe"] {
+            validate_frozen(&app, &previous[name], name)?;
+        }
+        let current = app.freeze_tools().await?;
+        for name in ["ffmpeg", "ffprobe"] {
+            validate_frozen(&app, &current[name], name)?;
+        }
+        assert_eq!(
+            latest(&app, &json!({"name":"ffmpeg","mode":"compatibility"})).await?["updateAvailable"],
+            false
+        );
+        let explicit = latest(
+            &app,
+            &json!({"name":"ffmpeg","mode":"compatibility","version":metadata["releaseTag"]}),
+        )
+        .await?;
+        assert_eq!(explicit["latest"], metadata["releaseTag"]);
+        let efficiency = latest(&app, &json!({"name":"ffmpeg","mode":"efficiency"})).await?;
+        assert_eq!(efficiency["mode"], "efficiency");
+        assert!(
+            efficiency["latest"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty())
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
     #[test]
     fn managed_tool_references_cannot_escape_storage() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1746,6 +2356,7 @@ mod tests {
                 "avformat-63.dll",
                 "swresample-7.dll",
                 "swscale-10.dll",
+                "postproc-58.dll",
                 "unrelated.dll",
             ] {
                 if missing && name == "swscale-10.dll" {
@@ -1773,7 +2384,8 @@ mod tests {
             &wanted,
             root.path(),
         )?;
-        assert_eq!(files.len(), 9);
+        assert_eq!(files.len(), 10);
+        assert!(files.iter().any(|file| file == "postproc-58.dll"));
         assert!(!root.path().join("unrelated.dll").exists());
         let other = tempfile::tempdir()?;
         assert!(
@@ -1789,7 +2401,7 @@ mod tests {
         assert!(
             extract_archive(
                 &archive(false, true)?,
-                "ffmpeg-gpl-shared.zip",
+                "ffmpeg-n7.1.3-win64-gpl-shared-7.1.zip",
                 &wanted,
                 missing.path()
             )

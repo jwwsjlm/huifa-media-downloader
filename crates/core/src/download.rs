@@ -352,6 +352,98 @@ async fn metadata_process(
     unreachable!()
 }
 
+fn transient_stream_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if [
+        "http error 401",
+        "http error 403",
+        "http error 404",
+        "sign in",
+        "sign-in",
+        "fresh cookies",
+        "private video",
+        "not available",
+        "requirements unmet",
+        "no space left",
+        "disk full",
+        "disk quota",
+        "permission denied",
+        "access is denied",
+        "read-only file system",
+        "unable to open for writing",
+        "unable to write data",
+        "certificate verify failed",
+        "certificate_verify_failed",
+    ]
+    .iter()
+    .any(|value| error.contains(value))
+    {
+        return false;
+    }
+    transient_metadata_error(&error)
+        || [
+            "incompleteread",
+            "bytes read,",
+            "contenttooshorterror",
+            "eof occurred",
+            "unexpected eof",
+            "remotedisconnected",
+            "connection aborted",
+            "connection broken",
+            "broken pipe",
+        ]
+        .iter()
+        .any(|value| error.contains(value))
+        || error.contains("downloaded ") && error.contains(" bytes, expected ")
+}
+
+async fn stream_process(
+    app: &App,
+    task: &Task,
+    executable: &Path,
+    args: &[String],
+    directory: &Path,
+    cancel: &CancellationToken,
+    callback: LineCallback,
+) -> Result<process::ProcessOutput> {
+    let log = app.raw_task_log(&task.id)?;
+    for attempt in 0..3 {
+        let result = process::run_logged(
+            executable,
+            args,
+            Some(directory),
+            cancel,
+            Some(callback.clone()),
+            log.clone(),
+        )
+        .await;
+        match result {
+            Err(error)
+                if attempt < 2
+                    && !cancel.is_cancelled()
+                    && transient_stream_error(&format!("{error:#}")) =>
+            {
+                let seconds = if attempt == 0 { 1 } else { 3 };
+                app.log_task(
+                    &task.id,
+                    "warning",
+                    &format!(
+                        "Temporary stream download failure; retry {}/2 in {seconds}s using saved partial files",
+                        attempt + 1
+                    ),
+                )?;
+                tokio::select! {
+                    biased;
+                    _=cancel.cancelled()=>bail!("Operation interrupted"),
+                    _=tokio::time::sleep(Duration::from_secs(seconds))=>{},
+                }
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
 fn safe_thumbnail(info: &Value) -> Value {
     // Source thumbnails can carry signatures; a public snapshot does not need them.
     let url = text(info, "thumbnail");
@@ -1056,7 +1148,8 @@ pub(crate) async fn transfer(
                     "--output".into(),
                     output_template.to_string_lossy().into(),
                 ]);
-                if live || matches!(text(format, "protocol"), "rtmp" | "rtsp" | "m3u8") {
+                let native = !live && !matches!(text(format, "protocol"), "rtmp" | "rtsp" | "m3u8");
+                if !native {
                     args.extend([
                         "--downloader".into(),
                         "ffmpeg".into(),
@@ -1077,6 +1170,8 @@ pub(crate) async fn transfer(
                         "--downloader".into(),
                         "native".into(),
                         "--hls-prefer-native".into(),
+                        "--continue".into(),
+                        "--part".into(),
                     ]);
                 }
                 if !task.options.rate_limit.is_empty() {
@@ -1115,6 +1210,8 @@ pub(crate) async fn transfer(
                 let process = async {
                     if let Some(finish) = &finish_capture {
                         process::run_capture(&executable, &args, directory, cancel, finish, Some(callback), app.raw_task_log(&task.id)?).await
+                    } else if native {
+                        stream_process(app, task, &executable, &args, directory, cancel, callback).await
                     } else {
                         process::run_logged(&executable, &args, Some(directory), cancel, Some(callback), app.raw_task_log(&task.id)?).await
                     }
@@ -2539,6 +2636,121 @@ mod tests {
         ] {
             assert!(!transient_metadata_error(message), "{message}");
         }
+    }
+    #[test]
+    fn stream_retries_only_temporary_transfer_failures() {
+        for message in [
+            "IncompleteRead: 65536 bytes read, 1709056 more expected",
+            "65536 bytes read, 1709056 more expected. Giving up after 5 retries",
+            "SSL: UNEXPECTED_EOF_WHILE_READING: EOF occurred in violation of protocol",
+            "RemoteDisconnected('Remote end closed connection without response')",
+            "Connection reset by peer",
+            "HTTP Error 503: Service Unavailable",
+            "Downloaded 120 bytes, expected 1000 bytes",
+        ] {
+            assert!(transient_stream_error(message), "{message}");
+        }
+        for message in [
+            "HTTP Error 401: Unauthorized",
+            "Connection reset; HTTP Error 403: Forbidden",
+            "IncompleteRead; HTTP Error 404: Not Found",
+            "Private video. Sign in",
+            "Fresh cookies are needed",
+            "Requested format is not available",
+            "Connection reset; unable to write data: No space left on device",
+            "Connection timed out; Permission denied",
+            "SSL: CERTIFICATE_VERIFY_FAILED",
+            "Cannot start yt-dlp",
+        ] {
+            assert!(!transient_stream_error(message), "{message}");
+        }
+    }
+    #[tokio::test]
+    async fn stream_process_has_bounded_retries_and_cancellable_backoff() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        #[cfg(windows)]
+        let (executable, prefix) = {
+            let script = root.path().join("stream.ps1");
+            std::fs::write(
+                &script,
+                "Add-Content -LiteralPath $args[0] -Value attempt; [Console]::Error.WriteLine($args[1]); exit 1",
+            )?;
+            (
+                PathBuf::from("powershell.exe"),
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    script.to_string_lossy().into(),
+                ],
+            )
+        };
+        #[cfg(not(windows))]
+        let (executable, prefix) = {
+            let script = root.path().join("stream.sh");
+            std::fs::write(
+                &script,
+                "printf 'attempt\\n' >> \"$1\"; printf '%s\\n' \"$2\" >&2; exit 1",
+            )?;
+            (
+                PathBuf::from("/bin/sh"),
+                vec![script.to_string_lossy().into()],
+            )
+        };
+        for (message, attempts, cancel_backoff) in [
+            ("Connection reset by peer", 3, false),
+            ("HTTP Error 403: Forbidden", 1, false),
+            ("IncompleteRead: 20 bytes read, 100 more expected", 1, true),
+        ] {
+            let task = crate::tests::paused_task(Default::default());
+            app.db.insert_task(&task)?;
+            let counter = root.path().join(&task.id);
+            let mut args = prefix.clone();
+            args.extend([counter.to_string_lossy().into(), message.into()]);
+            let cancel = CancellationToken::new();
+            let result = stream_process(
+                &app,
+                &task,
+                &executable,
+                &args,
+                root.path(),
+                &cancel,
+                Arc::new(|_, _| {}),
+            );
+            tokio::pin!(result);
+            if cancel_backoff {
+                tokio::select! {
+                    _ = &mut result => bail!("Transfer ended before backoff cancellation"),
+                    observed = tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if app.db.task_logs(&task.id)?.iter().any(|entry| entry.message.contains("retry 1/2")) {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }) => observed??,
+                }
+                cancel.cancel();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(15), result)
+                .await?
+                .err()
+                .context("Fixture must fail")?;
+            if cancel_backoff {
+                assert!(format!("{error:#}").contains("Operation interrupted"));
+            }
+            assert_eq!(std::fs::read_to_string(counter)?.lines().count(), attempts);
+        }
+        app.shutdown().await?;
+        Ok(())
     }
     #[tokio::test]
     async fn metadata_process_retries_once_then_succeeds_and_obeys_cancellation() -> Result<()> {

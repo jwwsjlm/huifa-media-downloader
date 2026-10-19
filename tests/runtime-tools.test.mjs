@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { download, ffmpegRelease, runtimeEntries, nativeExecutable, nativeTarget, toolSource, targets } from '../scripts/acquire-rust-tools.mjs';
+import { download, ffmpegRelease, runtimeEntries, nativeExecutable, nativeTarget, toolSource, targets, resolveLock } from '../scripts/acquire-rust-tools.mjs';
 
 test('FFmpeg uses dated assets rather than a moving latest URL', () => {
   const assets = ['win64-gpl-shared.zip', 'linux64-gpl.tar.xz', 'linuxarm64-gpl.tar.xz', 'winarm64-gpl-shared.zip'].map(suffix => ({ name: `ffmpeg-N-123-gabcdef-${suffix}` }));
@@ -33,6 +33,27 @@ test('every desktop target has pinned media tools and one native JavaScript runt
   }
   assert.equal(toolSource('qjs', 'windows-aarch64'), null);
   assert.equal(toolSource('qjs', 'darwin-aarch64'), null);
+});
+
+test('refreshing runtime metadata retains the reviewed FFmpeg compatibility builds', async t => {
+  const original = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async url => {
+    const repository = new URL(url).pathname.match(/^\/repos\/(.+)\/releases/)?.[1];
+    requests.push(repository);
+    const names = new Set();
+    for (const tool of ['yt-dlp', 'qjs', 'deno']) for (const target of targets) {
+      const source = toolSource(tool, target);
+      if (source?.repository === repository) names.add(source.name);
+    }
+    return { ok: true, json: async () => ({ tag_name: 'test-release', assets: [...names].map(name => ({ name, digest: 'sha256:' + 'f'.repeat(64), browser_download_url: `https://github.com/${repository}/releases/download/test-release/${name}` })) }) };
+  };
+  t.after(() => { globalThis.fetch = original; });
+  const checkedIn = JSON.parse(readFileSync(new URL('../runtime-tool-lock.json', import.meta.url), 'utf8'));
+  const refreshed = await resolveLock();
+  assert.deepEqual(refreshed.tools.ffmpeg, checkedIn.tools.ffmpeg);
+  assert.deepEqual(refreshed.tools.ffprobe, checkedIn.tools.ffprobe);
+  assert.equal(requests.some(repository => /FFmpeg|ffmpeg/.test(repository)), false);
 });
 
 test('native executable validation rejects the wrong CPU and accepts Mach-O universal slices', () => {
@@ -64,6 +85,7 @@ test('shared FFmpeg includes every runtime DLL, excludes development files and r
   const libraries = ['avcodec', 'avdevice', 'avfilter', 'avformat', 'avutil', 'swresample', 'swscale'].map(name => `${name}-1.dll`);
   const members = ['build/bin/ffmpeg.exe', 'build/bin/ffprobe.exe', ...libraries.map(name => `build/bin/${name}`), 'build/lib/avcodec.lib', 'build/bin/ffplay.exe'];
   assert.deepEqual(runtimeEntries(members, true).sort(), ['ffmpeg.exe', 'ffprobe.exe', ...libraries].sort());
+  assert.deepEqual(runtimeEntries([...members, 'build/bin/postproc-58.dll'], true).sort(), ['ffmpeg.exe', 'ffprobe.exe', ...libraries, 'postproc-58.dll'].sort());
   assert.throws(() => runtimeEntries(members.filter(name => !name.endsWith('avcodec-1.dll')), true), /avcodec runtime DLL/);
   assert.throws(() => runtimeEntries([...members, 'other/avcodec-1.dll'], true), /avcodec runtime DLL/);
   assert.deepEqual(runtimeEntries(['build/bin/ffmpeg', 'build/bin/ffprobe'], false), ['ffmpeg', 'ffprobe']);

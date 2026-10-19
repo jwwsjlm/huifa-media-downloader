@@ -17,6 +17,23 @@ describe('56px virtual lists', () => {
     const rows = screen.getAllByRole('option'); expect(rows[0].getAttribute('aria-posinset')).toBe('997'); expect(rows[0].getAttribute('aria-setsize')).toBe('100000');
     expect((rows[0] as HTMLElement).style.top).toBe('55776px');
   });
+  it('reports the overscanned window only when its IDs change', () => {
+    const ids = Array.from({ length: 100000 }, (_, index) => `media-${index}`);
+    const changed = vi.fn();
+    const props = { ids, selected: ids[0], onSelect: () => {}, renderRow: (id: string) => id, label: 'Media', scrollKey: 'test-visible' };
+    const { rerender } = render(<VirtualList {...props} onVisibleIdsChange={changed} />);
+    expect(changed).toHaveBeenCalledExactlyOnceWith(ids.slice(0, 12));
+    rerender(<VirtualList {...props} ids={[...ids]} onVisibleIdsChange={visible => changed(visible)} />);
+    expect(changed).toHaveBeenCalledTimes(1);
+    const list = screen.getByRole('listbox');
+    Object.defineProperty(list, 'scrollTop', { writable: true, value: 56000 }); fireEvent.scroll(list);
+    expect(changed).toHaveBeenLastCalledWith(ids.slice(996, 1012));
+    expect(changed.mock.calls[1][0]).toHaveLength(screen.getAllByRole('option').length);
+    fireEvent.scroll(list);
+    expect(changed).toHaveBeenCalledTimes(2);
+    rerender(<VirtualList {...props} ids={[]} onVisibleIdsChange={changed} />);
+    expect(changed).toHaveBeenLastCalledWith([]);
+  });
   it('uses keyboard navigation and keeps selection identity after an unrelated progress render', () => {
     function List() { const [selected, setSelected] = useState('b'); return <VirtualList ids={['a', 'b', 'c']} selected={selected} onSelect={setSelected} renderRow={id => <span>{id}</span>} label="Tasks" scrollKey="test-keyboard" />; }
     const { rerender } = render(<List />); const list = screen.getByRole('listbox'); list.focus();

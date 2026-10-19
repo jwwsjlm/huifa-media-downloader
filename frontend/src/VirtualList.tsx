@@ -13,9 +13,9 @@ export function keyboardIndex(key: string, current: number, length: number): num
   if (key === 'ArrowDown') return Math.min(length - 1, current + 1);
   return Math.max(0, current);
 }
-interface Props { ids: string[]; selected: string; onSelect: (id: string) => void; selection?: string[]; onSelectionChange?: (ids: string[]) => void; renderRow: (id: string) => ReactNode; label: string; scrollKey: string; onContextMenu?: (id: string, position: { x: number; y: number }, trigger: HTMLElement) => void }
+interface Props { ids: string[]; selected: string; onSelect: (id: string) => void; selection?: string[]; onSelectionChange?: (ids: string[]) => void; renderRow: (id: string) => ReactNode; label: string; scrollKey: string; onContextMenu?: (id: string, position: { x: number; y: number }, trigger: HTMLElement) => void; onVisibleIdsChange?: (ids: string[]) => void }
 const scrolls = new Map<string, number>();
-export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, selection, onSelectionChange, renderRow, label, scrollKey, onContextMenu }: Props) {
+export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, selection, onSelectionChange, renderRow, label, scrollKey, onContextMenu, onVisibleIdsChange }: Props) {
   const ref = useRef<HTMLDivElement>(null); const idPrefix = useId().replace(/:/g, '');
   const anchor = useRef(selected);
   const multiple = selection !== undefined && onSelectionChange !== undefined;
@@ -44,7 +44,13 @@ export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, 
     return () => resize.disconnect();
   }, [scrollKey]);
   const [start, end] = virtualRange(ids.length, viewport.top, viewport.height);
-  const activeRendered = ids.slice(start, end).includes(selected);
+  const visibleKey = JSON.stringify(ids.slice(start, end));
+  const visibleIds = useMemo<string[]>(() => JSON.parse(visibleKey), [visibleKey]);
+  const visibleCallback = useRef(onVisibleIdsChange); visibleCallback.current = onVisibleIdsChange;
+  const observing = Boolean(onVisibleIdsChange);
+  useEffect(() => { visibleCallback.current?.(visibleIds); }, [visibleIds, observing]);
+  useEffect(() => () => { visibleCallback.current?.([]); }, []);
+  const activeRendered = visibleIds.includes(selected);
   return <div ref={ref} className={`virtual-list${multiple ? ' multi-select-list' : ''}`} tabIndex={0} role="listbox" aria-label={label} aria-multiselectable={multiple || undefined} aria-activedescendant={activeRendered ? `${idPrefix}-${selected}` : undefined}
     onScroll={event => { const top = event.currentTarget.scrollTop; scrolls.set(scrollKey, top); setViewport(value => ({ ...value, top })); }}
     onKeyDown={event => {
@@ -67,7 +73,7 @@ export const VirtualList = memo(function VirtualList({ ids, selected, onSelect, 
       else if (rowTop + ROW_HEIGHT > element.scrollTop + element.clientHeight) element.scrollTop = rowTop + ROW_HEIGHT - element.clientHeight;
     }}>
     <div className="virtual-canvas" style={{ height: ids.length * ROW_HEIGHT }}>
-      {ids.slice(start, end).map((id, offset) => <div key={id} id={`${idPrefix}-${id}`} role="option" aria-selected={selectedIds.has(id)} aria-posinset={start + offset + 1} aria-setsize={ids.length}
+      {visibleIds.map((id, offset) => <div key={id} id={`${idPrefix}-${id}`} role="option" aria-selected={selectedIds.has(id)} aria-posinset={start + offset + 1} aria-setsize={ids.length}
         className={`list-row ${selectedIds.has(id) ? 'selected' : ''}`} style={{ top: (start + offset) * ROW_HEIGHT, height: ROW_HEIGHT }}
         onMouseDown={multiple ? event => { if (!(event.target as HTMLElement).closest('button,input,select,a')) event.preventDefault(); } : undefined}
         onContextMenu={onContextMenu ? event => { event.preventDefault(); if (multiple && selectedIds.has(id)) onSelect(id); else select(id); onContextMenu(id, { x: event.clientX, y: event.clientY }, ref.current!); } : undefined}

@@ -388,6 +388,7 @@ fn allowed_command(command: &str) -> bool {
             | "tasks.resumeAll"
             | "tasks.convert"
             | "tasks.convertPreview"
+            | "tasks.compressRetryCpu"
             | "probe.video"
             | "probe.collection"
             | "probe.cancel"
@@ -407,6 +408,7 @@ fn allowed_command(command: &str) -> bool {
             | "cover.generate"
             | "cover.cancel"
             | "media.list"
+            | "media.availability"
     )
 }
 
@@ -793,6 +795,10 @@ mod tests {
         assert!(allowed_command("tasks.info"));
         assert!(allowed_command("tasks.get"));
         assert!(allowed_command("tasks.logs"));
+        assert!(allowed_command("media.availability"));
+        assert!(allowed_command("tasks.convertPreview"));
+        assert!(allowed_command("tasks.convert"));
+        assert!(allowed_command("tasks.compressRetryCpu"));
         assert!(!allowed_command("media.file"));
         assert!(!allowed_command("host.paths"));
         assert!(!allowed_command("host.download_directory"));

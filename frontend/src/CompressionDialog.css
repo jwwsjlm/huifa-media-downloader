@@ -1,0 +1,10 @@
+.compression-dialog{display:flex;flex-direction:column;gap:16px;min-width:0}
+.compression-source{display:flex;flex-wrap:wrap;gap:12px 24px;margin:0;padding:12px;background:var(--field);border:1px solid var(--border-soft);border-radius:var(--radius)}
+.compression-source div{display:flex;flex-direction:column;gap:3px;min-width:100px}
+.compression-source dt{font-size:12px;color:var(--muted)}
+.compression-source dd{margin:0;font-weight:600;font-variant-numeric:tabular-nums}
+.compression-slider{display:flex;flex-direction:column;gap:6px}
+.compression-slider input[type=range]{width:100%;min-height:36px;padding:0;accent-color:var(--accent)}
+.compression-scale{display:flex;justify-content:space-between;gap:12px}
+.compression-estimate{display:flex;flex-direction:column;gap:4px;padding:12px;background:var(--accent-surface);border-radius:var(--radius);font-variant-numeric:tabular-nums}
+.compression-estimate span{color:var(--muted);font-size:12px}

@@ -6,13 +6,14 @@ import { makeSnapshot } from './test-fixtures';
 import type { CoreEvent } from './types';
 import { version as buildVersion } from '../package.json';
 
-const transport = vi.hoisted(() => ({ listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), openProject: vi.fn(), copyTask: vi.fn(), result: vi.fn(), notify: vi.fn() }));
+const transport = vi.hoisted(() => ({ desktop: false, listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), openProject: vi.fn(), copyTask: vi.fn(), result: vi.fn(), notify: vi.fn(), readClipboard: vi.fn() }));
 vi.mock('./transport', () => ({ host: {
-  desktop: false, capabilities: () => ({ browserCookies: false, remoteBrowser: false, updates: false }),
+  get desktop() { return transport.desktop; }, capabilities: () => ({ browserCookies: false, remoteBrowser: false, updates: false }),
   session: async () => ({ authenticated: true }), subscribe: async (listener: (event: CoreEvent) => void, connection: (value: boolean) => void) => { transport.listener = listener; connection(true); return () => { transport.listener = null; }; },
-  command: transport.command, assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: transport.notify, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, openProject: transport.openProject, copyTask: transport.copyTask, result: transport.result,
+  command: (command: string, args?: { ids?: string[] }) => command === 'media.availability' ? Promise.resolve((args?.ids || []).map(id => ({ id, status: 'available' }))) : args === undefined ? transport.command(command) : transport.command(command, args), assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: transport.notify, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, openProject: transport.openProject, copyTask: transport.copyTask, result: transport.result, readClipboard: transport.readClipboard, paths: async () => ({ downloadDir: 'D:/downloads' }),
 } }));
 beforeEach(() => {
+  transport.desktop = false; transport.readClipboard.mockReset().mockImplementation(async () => navigator.clipboard.readText());
   transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true);
   transport.releaseStatus.mockReset().mockResolvedValue({ currentVersion:'0.3.0', latestVersion:'0.3.0', updateAvailable:false, url:'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.0' });
   transport.openRelease.mockReset().mockResolvedValue(undefined);
@@ -21,6 +22,125 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); });
 describe('live interface stability', () => {
+  it('starts clipboard monitoring only after saving and imports new copied links once using current settings', async () => {
+    vi.useFakeTimers(); transport.desktop = true;
+    const snapshot = makeSnapshot(); snapshot.settings.downloadOptions = { contentMode: 'video', quality: '1080p', collectionMode: 'single' };
+    let copied = 'plain text without a link'; transport.readClipboard.mockImplementation(async () => copied);
+    transport.command.mockImplementation(async (command, args) => command === 'snapshot' ? snapshot : command === 'settings.save' ? (snapshot.settings = args.settings) : command === 'tasks.add' ? { ids: [args.urls[0]], results: [{ id: args.urls[0], status: 'queued', action: 'added' }] } : []);
+    render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(transport.readClipboard).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Automatically download links copied to the clipboard' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(transport.readClipboard).not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save settings' })); });
+    expect(transport.readClipboard).toHaveBeenCalledTimes(1);
+    expect(transport.command.mock.calls.some(([command]) => command === 'tasks.add')).toBe(false);
+    copied = 'Watch https://youtu.be/abcdefghijk and https://youtu.be/zyxwvutsrqp';
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: ['https://youtu.be/abcdefghijk'], options: expect.objectContaining({ quality: '1080p', collectionMode: 'single' }), report: true });
+    expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: ['https://youtu.be/zyxwvutsrqp'], options: expect.objectContaining({ quality: '1080p' }), report: true });
+    copied = 'https://youtu.be/zyxwvutsrqp\nhttps://youtu.be/abcdefghijk\nhttps://youtu.be/abcdefghijk';
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(transport.command.mock.calls.filter(([command]) => command === 'tasks.add')).toHaveLength(2);
+    snapshot.settings = { ...snapshot.settings, downloadOptions: { ...snapshot.settings.downloadOptions, quality: '720p' } };
+    act(() => transport.listener?.({ kind: 'settings.updated', data: snapshot.settings }));
+    copied = 'https://example.test/new.mp4';
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [copied], options: expect.objectContaining({ quality: '720p' }), report: true });
+  });
+  it('keeps a monitored link for a later tick when manual adding or a dialog is busy', async () => {
+    vi.useFakeTimers(); transport.desktop = true;
+    const snapshot = makeSnapshot(); snapshot.settings.clipboardMonitoring = true; snapshot.settings.downloadOptions = { collectionMode: 'single' };
+    const copied = 'https://youtu.be/zyxwvutsrqp'; const manual = 'https://youtu.be/abcdefghijk';
+    let finishRead!: (value: string) => void; let finishAdd!: (value: unknown) => void;
+    transport.readClipboard.mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; })).mockResolvedValue(copied);
+    transport.command.mockImplementation(async (command, args) => command === 'snapshot' ? snapshot : command === 'tasks.add' ? args.urls[0] === manual ? new Promise(resolve => { finishAdd = resolve; }) : { ids: [copied], results: [{ id: copied, status: 'queued', action: 'added' }] } : []);
+    render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(transport.readClipboard).toHaveBeenCalledTimes(1);
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: manual } });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Add downloads' })); finishRead(copied); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(transport.readClipboard).toHaveBeenCalledTimes(1);
+    expect(transport.command.mock.calls.filter(([command]) => command === 'tasks.add')).toHaveLength(1);
+    await act(async () => finishAdd({ ids: ['manual'], results: [{ id: 'manual', status: 'queued', action: 'added' }] }));
+    fireEvent.click(screen.getByRole('button', { name: 'Quick options' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(transport.readClipboard).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(transport.readClipboard).toHaveBeenCalledTimes(2);
+    expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: [copied], options: expect.anything(), report: true });
+  });
+  it.each(['disable', 'unmount'])('discards a pending clipboard read after %s', async action => {
+    vi.useFakeTimers(); transport.desktop = true;
+    const snapshot = makeSnapshot(); snapshot.settings.clipboardMonitoring = true;
+    let finish!: (value: string) => void; transport.readClipboard.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : []);
+    const view = render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    expect(transport.readClipboard).toHaveBeenCalledTimes(1);
+    if (action === 'disable') {
+      snapshot.settings = { ...snapshot.settings, clipboardMonitoring: false };
+      act(() => transport.listener?.({ kind: 'settings.updated', data: snapshot.settings }));
+    } else view.unmount();
+    await act(async () => { finish('https://youtu.be/abcdefghijk'); await vi.advanceTimersByTimeAsync(3000); });
+    expect(transport.command.mock.calls.some(([command]) => command === 'tasks.add')).toBe(false);
+    expect(transport.readClipboard).toHaveBeenCalledTimes(1);
+  });
+  it('reports clipboard read failures once and recovers while the desktop app is in the background', async () => {
+    vi.useFakeTimers(); transport.desktop = true; vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    const snapshot = makeSnapshot(); snapshot.settings.clipboardMonitoring = true;
+    transport.readClipboard.mockRejectedValueOnce(new Error('Permission denied at secret-path')).mockRejectedValueOnce(new Error('Permission denied')).mockResolvedValue('https://youtu.be/abcdefghijk');
+    transport.command.mockImplementation(async (command, args) => command === 'snapshot' ? snapshot : command === 'tasks.add' ? { ids: ['new'], results: [{ id: 'new', status: 'queued', action: 'added' }] } : []);
+    render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    expect(screen.getByRole('status').textContent).toBe('Clipboard monitoring could not read text. Check clipboard access; the app will keep trying.');
+    expect(screen.queryByText(/secret-path/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss message' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(screen.queryByRole('status')).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: ['https://youtu.be/abcdefghijk'], options: expect.anything(), report: true });
+    expect(transport.readClipboard).toHaveBeenCalledTimes(3);
+  });
+  it('does not monitor the clipboard on the web even when the saved setting is enabled', async () => {
+    vi.useFakeTimers(); const snapshot = makeSnapshot(); snapshot.settings.clipboardMonitoring = true;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : []);
+    render(<AppProvider><App /></AppProvider>); await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(transport.readClipboard).not.toHaveBeenCalled();
+  });
+  it('keeps clipboard reads single-flight when monitoring is disabled and enabled before a read finishes', async () => {
+    vi.useFakeTimers(); transport.desktop = true;
+    const snapshot = makeSnapshot(); snapshot.settings.clipboardMonitoring = true;
+    let finish!: (value: string) => void;
+    transport.readClipboard.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue('https://youtu.be/zyxwvutsrqp');
+    transport.command.mockImplementation(async (command, args) => command === 'snapshot' ? snapshot : command === 'tasks.add' ? { ids: ['new'], results: [{ id: 'new', status: 'queued', action: 'added' }] } : []);
+    render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    snapshot.settings = { ...snapshot.settings, clipboardMonitoring: false };
+    act(() => transport.listener?.({ kind: 'settings.updated', data: snapshot.settings }));
+    snapshot.settings = { ...snapshot.settings, clipboardMonitoring: true };
+    act(() => transport.listener?.({ kind: 'settings.updated', data: snapshot.settings }));
+    expect(transport.readClipboard).toHaveBeenCalledTimes(1);
+    await act(async () => finish('https://youtu.be/abcdefghijk'));
+    expect(transport.command.mock.calls.some(([command]) => command === 'tasks.add')).toBe(false);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(transport.readClipboard).toHaveBeenCalledTimes(2);
+    expect(transport.command).toHaveBeenCalledWith('tasks.add', { urls: ['https://youtu.be/zyxwvutsrqp'], options: expect.anything(), report: true });
+  });
+  it('keeps monitored manual formats in the existing confirmation flow and does not reopen a cancelled choice', async () => {
+    vi.useFakeTimers(); transport.desktop = true;
+    const snapshot = makeSnapshot(); snapshot.settings.clipboardMonitoring = true; snapshot.settings.downloadOptions = { contentMode: 'manual' };
+    transport.readClipboard.mockResolvedValue('https://youtu.be/abcdefghijk');
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : command === 'probe.video' ? { title: 'Manual video', formats: [{ formatId: '137', vcodec: 'h264', acodec: 'none' }] } : []);
+    render(<AppProvider><App /></AppProvider>); await act(async () => {});
+    expect(screen.getByRole('dialog', { name: 'Choose download format' })).toBeTruthy();
+    expect(transport.command.mock.calls.some(([command]) => command === 'tasks.add')).toBe(false);
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(transport.command.mock.calls.filter(([command]) => command === 'probe.video')).toHaveLength(1);
+  });
   it('shows completion time beside the row status using the saved format, only after completion', async () => {
     const snapshot = makeSnapshot(); snapshot.settings.completedTimeFormat = 'YYMMDD HH:mm';
     transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : true);

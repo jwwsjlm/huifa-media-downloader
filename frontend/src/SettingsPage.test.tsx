@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { SettingsPage } from './SettingsPage';
 import { initialState } from './state';
@@ -8,6 +8,26 @@ const transport = vi.hoisted(() => ({ desktop: false, command: vi.fn(), paths: v
 vi.mock('./transport', () => ({ host: { get desktop() { return transport.desktop; }, command: transport.command, paths: transport.paths, directory: transport.directory, openDownloadDirectory: transport.openDownloadDirectory, capabilities: () => ({ updates: false }) } }));
 beforeEach(() => { transport.desktop = false; transport.command.mockReset().mockResolvedValue([]); transport.paths.mockReset().mockResolvedValue({ downloadDir: '/downloads' }); transport.directory.mockReset().mockResolvedValue(null); transport.openDownloadDirectory.mockReset().mockResolvedValue(undefined); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
+it('keeps desktop clipboard monitoring off until the changed setting is saved', async () => {
+  transport.desktop = true;
+  const dispatch = vi.fn();
+  const props = { state: { ...initialState, view: { ...initialState.view, settingsTab: 'downloads' } }, dispatch, t: (_zh: string, en: string) => en, run, message: vi.fn() };
+  const page = render(<SettingsPage {...props} />);
+  const monitor = screen.getByRole('checkbox', { name: 'Automatically download links copied to the clipboard' }) as HTMLInputElement;
+  expect(monitor.checked).toBe(false);
+  expect(screen.getByText(/After saving, current and newly copied HTTP/)).toBeTruthy();
+  fireEvent.click(monitor);
+  expect(dispatch).toHaveBeenCalledWith({ type: 'setting', key: 'clipboardMonitoring', value: true });
+  expect(transport.command.mock.calls.some(([command]) => command === 'settings.save')).toBe(false);
+  page.rerender(<SettingsPage {...props} state={{ ...props.state, view: { ...props.state.view, settingsDraft: { clipboardMonitoring: true } } }} />);
+  transport.command.mockImplementation(async (command, args) => command === 'settings.save' ? args.settings : []);
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ clipboardMonitoring: true }) }));
+});
+it('hides clipboard monitoring from the web settings', () => {
+  render(<SettingsPage state={initialState} dispatch={vi.fn()} t={(_zh, en) => en} run={run} message={vi.fn()} />);
+  expect(screen.queryByRole('checkbox', { name: 'Automatically download links copied to the clipboard' })).toBeNull();
+});
 it('edits and saves the completion time format with token guidance', async () => {
   const dispatch = vi.fn();
   const props = { state: { ...initialState, view: { ...initialState.view, settingsTab: 'appearance' } }, dispatch, t: (_zh: string, en: string) => en, run, message: vi.fn() };
@@ -247,4 +267,93 @@ it.each([
   fireEvent.click(screen.getByRole('button', { name: 'Check yt-dlp updates' }));
   expect((await screen.findByRole('status')).textContent).toContain(hint);
   expect(screen.getByRole('status').textContent).not.toContain('An update is available');
+});
+
+it('keeps the default FFmpeg policy as a saved draft on the web without offering runtime installation', async () => {
+  const dispatch = vi.fn();
+  const props = { state: { ...initialState, view: { ...initialState.view, settingsTab: 'tools' } }, dispatch, t: (_zh: string, en: string) => en, run, message: vi.fn() };
+  const page = render(<SettingsPage {...props} />);
+  expect((screen.getByRole('combobox', { name: 'FFmpeg version policy' }) as HTMLSelectElement).value).toBe('compatibility');
+  fireEvent.change(screen.getByRole('combobox', { name: 'FFmpeg version policy' }), { target: { value: 'efficiency' } });
+  expect(dispatch).toHaveBeenCalledWith({ type: 'setting', key: 'ffmpegMode', value: 'efficiency' });
+  expect(transport.command.mock.calls.some(([name]) => name === 'settings.save' || name === 'tools.update')).toBe(false);
+  page.rerender(<SettingsPage {...props} state={{ ...props.state, view: { ...props.state.view, settingsDraft: { ffmpegMode: 'efficiency' } } }} />);
+  transport.command.mockImplementation(async (name, args) => name === 'settings.save' ? args.settings : []);
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ ffmpegMode: 'efficiency' }) }));
+  expect(screen.queryByRole('button', { name: 'Apply FFmpeg version' })).toBeNull();
+  expect(screen.getByText(/Update the Docker image/)).toBeTruthy();
+});
+
+it('queries an exact FFmpeg release for the draft policy and clears the tag when changing policies', async () => {
+  transport.desktop = true; const dispatch = vi.fn();
+  const tools: Tool[] = [{ name: 'ffmpeg', available: true, version: '7.1.1', installedMode: 'compatibility', releaseTag: 'n7.1.1', repository: 'official/compatibility', platform: 'windows-x86_64', asset: 'ffmpeg.zip' }];
+  const props = { state: { ...initialState, tools, settings: { ffmpegMode: 'compatibility' as const }, view: { ...initialState.view, settingsTab: 'tools' } }, dispatch, t: (_zh: string, en: string) => en, run, message: vi.fn() };
+  const page = render(<SettingsPage {...props} />);
+  fireEvent.change(screen.getByRole('combobox', { name: 'FFmpeg version policy' }), { target: { value: 'efficiency' } });
+  page.rerender(<SettingsPage {...props} state={{ ...props.state, view: { ...props.state.view, settingsDraft: { ffmpegMode: 'efficiency' } } }} />);
+  expect((screen.getByRole('button', { name: 'Apply FFmpeg version' }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText('Save the policy before applying an FFmpeg version.')).toBeTruthy();
+  fireEvent.change(screen.getByRole('textbox', { name: /FFmpeg exact release tag/ }), { target: { value: ' n8.0 ' } });
+  transport.command.mockImplementation(async name => name === 'tools.latest' ? { name: 'ffmpeg', channel: 'efficiency', mode: 'efficiency', current: '7.1.1', latest: 'n8.0', updateAvailable: true, platform: 'windows-x86_64', asset: 'ffmpeg-8.zip', repository: 'official/efficiency' } : []);
+  fireEvent.click(screen.getByRole('button', { name: 'Check FFmpeg release' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.latest', { name: 'ffmpeg', mode: 'efficiency', version: 'n8.0' }));
+  const release = await screen.findByLabelText('Selected FFmpeg release');
+  expect(release.textContent).toContain('n8.0'); expect(release.textContent).toContain('official/efficiency'); expect(release.textContent).toContain('windows-x86_64 · ffmpeg-8.zip');
+  expect(screen.getByText('Current 7.1.1')).toBeTruthy();
+  expect(transport.command.mock.calls.some(([name]) => name === 'tools.update')).toBe(false);
+  fireEvent.change(screen.getByRole('combobox', { name: 'FFmpeg version policy' }), { target: { value: 'compatibility' } });
+  page.rerender(<SettingsPage {...props} />);
+  expect((screen.getByRole('textbox', { name: /FFmpeg exact release tag/ }) as HTMLInputElement).value).toBe('');
+  expect(screen.queryByLabelText('Selected FFmpeg release')).toBeNull();
+});
+
+it('applies the saved FFmpeg policy and exact tag without saving unrelated drafts or claiming installation early', async () => {
+  transport.desktop = true; const dispatch = vi.fn(); const message = vi.fn();
+  let finish!: () => void;
+  const tools: Tool[] = [{ name: 'ffmpeg', available: true, version: '7.1.1', installedMode: 'compatibility', releaseTag: 'n7.1.1' }];
+  const updated: Tool[] = [{ name: 'ffmpeg', available: true, version: '8.0', installedMode: 'efficiency', releaseTag: 'n8.0', repository: 'official/efficiency', platform: 'windows-x86_64' }];
+  const props = { state: { ...initialState, tools, settings: { ffmpegMode: 'efficiency' as const }, view: { ...initialState.view, settingsTab: 'tools', optionsDraft: { quality: '720p' } } }, dispatch, t: (_zh: string, en: string) => en, run, message };
+  transport.command.mockImplementation(async name => name === 'tools.update' ? new Promise<void>(resolve => { finish = resolve; }) : name === 'tools.check' ? updated : []);
+  const page = render(<SettingsPage {...props} />);
+  fireEvent.change(screen.getByRole('textbox', { name: /FFmpeg exact release tag/ }), { target: { value: ' n8.0 ' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Apply FFmpeg version' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'ffmpeg', mode: 'efficiency', version: 'n8.0' }));
+  expect(screen.getByText('Current 7.1.1')).toBeTruthy();
+  expect(screen.queryByText('Current 8.0')).toBeNull(); expect(message).not.toHaveBeenCalled();
+  expect((screen.getByRole('combobox', { name: 'FFmpeg version policy' }) as HTMLSelectElement).disabled).toBe(true);
+  await act(async () => finish());
+  await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'event', event: { kind: 'tools.updated', data: updated } }));
+  expect(message).toHaveBeenCalledWith('FFmpeg updated');
+  expect(transport.command.mock.calls.some(([name]) => name === 'settings.save')).toBe(false);
+  page.rerender(<SettingsPage {...props} state={{ ...props.state, tools: updated }} />);
+  expect(screen.getByText('Current 8.0')).toBeTruthy();
+  expect(screen.getByText(/Installed policy: Efficiency/)).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Update / install' })).toBeNull();
+});
+
+it('keeps the active FFmpeg build after a failed install and does not infer a policy for bundled tools', async () => {
+  transport.desktop = true; const dispatch = vi.fn(); const message = vi.fn();
+  transport.command.mockImplementation(async name => { if (name === 'tools.update') throw new Error('FFmpeg download failed'); return []; });
+  render(<SettingsPage state={{ ...initialState, tools: [{ name: 'ffmpeg', available: true, version: 'bundled-7.0' }, { name: 'ffprobe', available: true, version: 'bundled-7.0' }], view: { ...initialState.view, settingsTab: 'tools' } }} dispatch={dispatch} t={(_zh, en) => en} run={run} message={message} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Apply FFmpeg version' }));
+  expect((await screen.findByRole('alert')).textContent).toBeTruthy();
+  expect(screen.getAllByText('Current bundled-7.0')).toHaveLength(2);
+  expect(screen.queryByText(/Installed policy:/)).toBeNull();
+  expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'ffmpeg', mode: 'compatibility' });
+  expect(transport.command.mock.calls.some(([name]) => name === 'tools.check')).toBe(false);
+  expect(dispatch).not.toHaveBeenCalled(); expect(message).not.toHaveBeenCalled();
+  expect((screen.getByRole('button', { name: 'Apply FFmpeg version' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it('discards an old FFmpeg release query when undoing a draft policy while the query is pending', async () => {
+  transport.desktop = true; let finish!: (value: unknown) => void;
+  const props = { state: { ...initialState, settings: { ffmpegMode: 'compatibility' as const }, view: { ...initialState.view, settingsTab: 'tools', settingsDraft: { ffmpegMode: 'efficiency' as const } } }, dispatch: vi.fn(), t: (_zh: string, en: string) => en, run, message: vi.fn() };
+  transport.command.mockImplementation(async name => name === 'tools.latest' ? new Promise(resolve => { finish = resolve; }) : []);
+  const page = render(<SettingsPage {...props} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Check FFmpeg release' }));
+  page.rerender(<SettingsPage {...props} state={{ ...props.state, view: { ...props.state.view, settingsDraft: null } }} />);
+  await act(async () => finish({ name: 'ffmpeg', mode: 'efficiency', current: '7.1.1', latest: 'n8.0', platform: 'windows-x86_64', asset: 'ffmpeg.zip' }));
+  expect(screen.queryByLabelText('Selected FFmpeg release')).toBeNull();
+  expect((screen.getByRole('combobox', { name: 'FFmpeg version policy' }) as HTMLSelectElement).value).toBe('compatibility');
 });

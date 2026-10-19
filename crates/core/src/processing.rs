@@ -2,8 +2,8 @@ use crate::{
     App, DownloadOptions,
     download::{hash_file, write_sync},
     model::{
-        AuxiliaryPublication, Chapter, GeneratedFile, Media, Publication, SourceFile,
-        SourceManifest, Task, parse_time, text,
+        AuxiliaryPublication, Chapter, CompressionOptions, GeneratedFile, Media, Publication,
+        SourceFile, SourceManifest, Task, parse_time, text,
     },
     process::{self, LineCallback},
 };
@@ -74,6 +74,7 @@ pub(crate) async fn queue_conversion(app: &App, id: &str, encoder: &str) -> Resu
     options.content_mode = "video".into();
     task.options = options;
     task.conversion = true;
+    task.compression = None;
     task.destination = None;
     task.live = false;
     task.source_info = task.media_info.take();
@@ -120,7 +121,7 @@ pub(crate) async fn queue_conversion_options(
     id: &str,
     changes: &Value,
 ) -> Result<Value> {
-    queue_conversion_prepared(app, id, changes, None).await
+    queue_conversion_prepared(app, id, changes, None, None).await
 }
 
 pub(crate) async fn preview_conversion(
@@ -159,7 +160,23 @@ pub(crate) async fn queue_conversion_options_with_strategy(
     strategy: &str,
 ) -> Result<Value> {
     let plan = preview_conversion(app, id, changes, strategy).await?;
-    queue_conversion_prepared(app, id, changes, Some(&plan)).await
+    queue_conversion_prepared(app, id, changes, Some(&plan), None).await
+}
+
+pub(crate) async fn queue_compression(
+    app: &App,
+    id: &str,
+    compression: &CompressionOptions,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    queue_conversion_prepared(
+        app,
+        id,
+        &json!({"container":"mkv","encoder":"libx265"}),
+        None,
+        Some((compression, cancel)),
+    )
+    .await
 }
 
 fn conversion_plan(probe: &Value, container: &str, strategy: &str, encoder: &str) -> Result<Value> {
@@ -240,8 +257,12 @@ async fn queue_conversion_prepared(
     id: &str,
     changes: &Value,
     plan: Option<&Value>,
+    compression: Option<(&CompressionOptions, &CancellationToken)>,
 ) -> Result<Value> {
-    let _adding = app.task_add_lock.lock().await;
+    let cancellation = compression
+        .map(|(_, cancel)| cancel)
+        .unwrap_or(&app.shutdown_token);
+    let _adding = tokio::select! {guard=app.task_add_lock.lock()=>guard,_=cancellation.cancelled()=>bail!("Compression cancelled")};
     let original = app.db.task(id)?;
     ensure!(
         matches!(original.status.as_str(), "completed" | "retained") && original.kind == "media",
@@ -305,7 +326,11 @@ async fn queue_conversion_prepared(
         "Conversion contentMode must be video or audio"
     );
     let path = app.owned_path(&media.path)?;
-    let (hash, size) = hash_file(&path)?;
+    let (hash, size) = if compression.is_some() {
+        crate::compression::hash_path(&path, cancellation).await?
+    } else {
+        hash_file(&path)?
+    };
     let mut files = vec![SourceFile {
         path: path.clone(),
         hash,
@@ -386,6 +411,7 @@ async fn queue_conversion_prepared(
     };
     let mut task = original;
     task.id = uuid::Uuid::new_v4().to_string();
+    task.tools = tokio::select! {result=app.freeze_tools()=>result?,_=cancellation.cancelled()=>bail!("Compression cancelled")};
     task.thumbnail = None;
     task.source_info = task.media_info.take();
     task.size = None;
@@ -394,6 +420,8 @@ async fn queue_conversion_prepared(
     task.completed_at = None;
     task.options = options;
     task.conversion = true;
+    ensure!(!cancellation.is_cancelled(), "Compression cancelled");
+    task.compression = compression.map(|(options, _)| options.clone());
     task.destination = None;
     task.live = false;
     task.previous_outputs.clear();
@@ -506,7 +534,11 @@ pub(crate) async fn process_task(
                 "Source manifest contains a file outside its task workspace"
             );
         }
-        let (hash, size) = hash_file(&source.path)?;
+        let (hash, size) = if task.compression.is_some() {
+            crate::compression::hash_path(&source.path, cancel).await?
+        } else {
+            hash_file(&source.path)?
+        };
         ensure!(
             hash == source.hash && size == source.size,
             "Saved source {} changed; local processing cannot continue",
@@ -519,6 +551,43 @@ pub(crate) async fn process_task(
     }
     if task.kind == "assets" {
         return prepare_assets(app, task, cancel).await;
+    }
+    if task.compression.is_some() {
+        let output = crate::compression::encode(app, &task, cancel).await?;
+        let target = task
+            .output_path
+            .clone()
+            .context("Compression output path is missing")?;
+        let output_path = output.path.clone();
+        let staging_id = id.to_string();
+        let staging_cancel = cancel.clone();
+        let (staged, mut cleanup) = tokio::task::spawn_blocking(move || {
+            make_auxiliary_with_cancel(&output_path, target, &staging_id, Some(&staging_cancel))
+        })
+        .await??;
+        for source in &manifest.files {
+            let (hash, size) = crate::compression::hash_path(&source.path, cancel).await?;
+            ensure!(
+                hash == source.hash && size == source.size,
+                "Source changed during compression; the original file was preserved"
+            );
+        }
+        let mut prepared = app.db.task(id)?;
+        prepared.media_info = Some(output.media_info);
+        prepared.publication = Some(Publication {
+            committed: false,
+            temporary: staged.temporary,
+            target: staged.target,
+            hash: staged.hash,
+            size: staged.size,
+            duration: output.duration,
+            auxiliary: vec![],
+            backup: None,
+        });
+        prepared.stage("processing", "publishing", None);
+        app.save_task(&prepared)?;
+        cleanup.disable_cleanup(true);
+        return publish(app, prepared, cancel).await;
     }
     let workspace = workspace(app, &task);
     crate::reject_links(&workspace)?;
@@ -1582,6 +1651,15 @@ fn make_auxiliary(
     target: PathBuf,
     task_id: &str,
 ) -> Result<(AuxiliaryPublication, tempfile::TempPath)> {
+    make_auxiliary_with_cancel(source, target, task_id, None)
+}
+
+fn make_auxiliary_with_cancel(
+    source: &Path,
+    target: PathBuf,
+    task_id: &str,
+    cancel: Option<&CancellationToken>,
+) -> Result<(AuxiliaryPublication, tempfile::TempPath)> {
     let target = target.with_file_name(bounded_filename(
         &target
             .file_name()
@@ -1600,7 +1678,28 @@ fn make_auxiliary(
         .suffix(".publish")
         .rand_bytes(16)
         .tempfile_in(directory)?;
-    std::io::copy(&mut std::fs::File::open(source)?, staged.as_file_mut())?;
+    let copied = if let Some(cancel) = cancel {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Write};
+        let mut input = std::fs::File::open(source)?;
+        let mut buffer = vec![0; 1024 * 1024];
+        let mut hash = Sha256::new();
+        let mut size = 0;
+        loop {
+            ensure!(!cancel.is_cancelled(), "Compression cancelled");
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            staged.as_file_mut().write_all(&buffer[..count])?;
+            hash.update(&buffer[..count]);
+            size += count as u64;
+        }
+        Some((hex::encode(hash.finalize()), size))
+    } else {
+        std::io::copy(&mut std::fs::File::open(source)?, staged.as_file_mut())?;
+        None
+    };
     staged.as_file().sync_all()?;
     ensure!(
         !staged.path().with_extension("before-publication").exists(),
@@ -1608,7 +1707,7 @@ fn make_auxiliary(
     );
     let staged = staged.into_temp_path();
     let temporary = staged.to_path_buf();
-    let (hash, size) = hash_file(&temporary)?;
+    let (hash, size) = copied.map_or_else(|| hash_file(&temporary), Ok)?;
     Ok((
         AuxiliaryPublication {
             temporary,
@@ -1874,7 +1973,11 @@ async fn publish(app: &Arc<App>, mut task: Task, cancel: &CancellationToken) -> 
             "Publication output is missing; saved sources remain available"
         );
         ensure!(
-            hash_file(&entry.temporary)? == (entry.hash.clone(), entry.size),
+            (if task.compression.is_some() {
+                crate::compression::hash_path(&entry.temporary, cancel).await?
+            } else {
+                hash_file(&entry.temporary)?
+            }) == (entry.hash.clone(), entry.size),
             "Prepared output changed after validation"
         );
         if entry.target.exists() {
@@ -3383,13 +3486,32 @@ mod tests {
     async fn concurrent_conversions_reserve_readable_names_and_preserve_existing_files()
     -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime)?;
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "deno"] {
+            std::fs::write(
+                runtime.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+                b"current runtime fixture",
+            )?;
+        }
         let app = App::open(crate::AppConfig {
             data_dir: temp.path().join("data"),
             download_dir: temp.path().join("output"),
-            tool_dir: None,
+            tool_dir: Some(runtime),
         })
         .await?;
-        let mut original = crate::tests::paused_task(Default::default());
+        let old_tools = app.freeze_tools().await?;
+        for name in ["yt-dlp", "ffmpeg", "ffprobe", "deno"] {
+            std::fs::write(
+                app.config
+                    .tool_dir
+                    .as_ref()
+                    .unwrap()
+                    .join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+                b"updated runtime fixture",
+            )?;
+        }
+        let mut original = crate::tests::paused_task(old_tools);
         original.title = "Video [part 2]".into();
         let source = app
             .config
@@ -3430,17 +3552,18 @@ mod tests {
         app.db.insert_task(&reserved)?;
         let options = json!({"container":"mp4"});
         let (first, second) = tokio::join!(
-            queue_conversion_prepared(&app, &original.id, &options, None),
-            queue_conversion_prepared(&app, &original.id, &options, None),
+            queue_conversion_prepared(&app, &original.id, &options, None, None),
+            queue_conversion_prepared(&app, &original.id, &options, None, None),
         );
         let paths = [first?, second?]
             .into_iter()
             .map(|result| {
-                Ok(app
-                    .db
-                    .task(result["id"].as_str().unwrap())?
-                    .output_path
-                    .unwrap())
+                let current = app.db.task(result["id"].as_str().unwrap())?;
+                ensure!(
+                    current.tools != original.tools,
+                    "New conversion reused the original runtime version"
+                );
+                Ok(current.output_path.unwrap())
             })
             .collect::<Result<std::collections::HashSet<_>>>()?;
         assert_eq!(
@@ -3452,6 +3575,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&source)?, b"original source");
         assert_eq!(std::fs::read(&existing)?, b"existing conversion");
+        assert_eq!(app.db.task(&original.id)?.tools, original.tools);
         app.shutdown().await?;
         Ok(())
     }

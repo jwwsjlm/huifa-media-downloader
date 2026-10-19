@@ -2,8 +2,10 @@
 mod acceptance;
 pub mod access;
 mod assets;
+mod availability;
 pub mod backup;
 pub mod browser;
+mod compression;
 mod cover;
 mod credentials;
 mod db;
@@ -25,7 +27,7 @@ mod workflow;
 
 use anyhow::{Context, Result, bail, ensure};
 use db::Database;
-pub use model::{AppConfig, DownloadOptions, Event, redact_url};
+pub use model::{AppConfig, CompressionOptions, DownloadOptions, Event, redact_url};
 use model::{Task, text, validate_url};
 use serde_json::{Value, json};
 use std::{
@@ -86,7 +88,7 @@ pub struct App {
     active_commands: AtomicUsize,
     commands_done: Notify,
     queue_changed: Notify,
-    queued_slots: Mutex<HashMap<&'static str, Vec<String>>>,
+    queued_slots: Mutex<HashMap<&'static str, Vec<(String, u64)>>>,
     request_queries: Mutex<HashMap<String, CancellationToken>>,
 }
 
@@ -359,12 +361,11 @@ impl App {
         semaphore: &Arc<Semaphore>,
         cancel: &CancellationToken,
     ) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        self.queued_slots
-            .lock()
-            .unwrap()
-            .entry(slot)
-            .or_default()
-            .push(id.into());
+        {
+            let mut queues = self.queued_slots.lock().unwrap();
+            let priority = self.db.task(id)?.priority;
+            queues.entry(slot).or_default().push((id.into(), priority));
+        }
         self.queue_changed.notify_waiters();
         let result = loop {
             let changed = self.queue_changed.notified();
@@ -379,13 +380,8 @@ impl App {
                     queue
                         .iter()
                         .enumerate()
-                        .max_by_key(|(index, id)| {
-                            (
-                                self.db.task(id).map_or(0, |task| task.priority),
-                                std::cmp::Reverse(*index),
-                            )
-                        })
-                        .map(|(_, id)| id.clone())
+                        .max_by_key(|(index, (_, priority))| (*priority, std::cmp::Reverse(*index)))
+                        .map(|(_, (id, _))| id.clone())
                 });
             if first.as_deref() == Some(id) {
                 tokio::select! {
@@ -406,7 +402,7 @@ impl App {
             .unwrap()
             .entry(slot)
             .or_default()
-            .retain(|queued| queued != id);
+            .retain(|(queued, _)| queued != id);
         self.queue_changed.notify_waiters();
         result
     }
@@ -834,6 +830,7 @@ impl App {
                         priority: 0,
                         live: false,
                         conversion: false,
+                        compression: None,
                         tools: frozen_tools.as_ref().unwrap().clone(),
                     };
                     if previous.is_some() {
@@ -899,7 +896,17 @@ impl App {
                     .unwrap_or(0)
                     .checked_add(1)
                     .context("Queue priority limit reached")?;
-                self.save_task(&task)?;
+                {
+                    let mut queues = self.queued_slots.lock().unwrap();
+                    self.save_task(&task)?;
+                    for queue in queues.values_mut() {
+                        for (id, priority) in queue {
+                            if *id == task.id {
+                                *priority = task.priority;
+                            }
+                        }
+                    }
+                }
                 self.queue_changed.notify_waiters();
                 Ok(task.public())
             }
@@ -983,7 +990,16 @@ impl App {
                 Ok(json!({"deleted":deleted,"failed":results.len() - deleted,"results":results}))
             }
             "tasks.convert" => {
-                if let Some(options) = args.get("options") {
+                if let Some(compression) = args.get("compression") {
+                    let query = self.probe_query(&args)?;
+                    compression::queue(
+                        self,
+                        required_id(&args)?,
+                        serde_json::from_value(compression.clone())?,
+                        &query.token,
+                    )
+                    .await
+                } else if let Some(options) = args.get("options") {
                     processing::queue_conversion_options_with_strategy(
                         self,
                         required_id(&args)?,
@@ -997,14 +1013,31 @@ impl App {
                 }
             }
             "tasks.convertPreview" => {
-                processing::preview_conversion(
-                    self,
-                    required_id(&args)?,
-                    &args["options"],
-                    text(&args, "strategy"),
-                )
-                .await
+                if let Some(compression) = args.get("compression") {
+                    let query = self.probe_query(&args)?;
+                    let options = if compression
+                        .as_object()
+                        .is_some_and(|value| value.is_empty())
+                    {
+                        None
+                    } else {
+                        Some(serde_json::from_value::<CompressionOptions>(
+                            compression.clone(),
+                        )?)
+                    };
+                    compression::preview(self, required_id(&args)?, options.as_ref(), &query.token)
+                        .await
+                } else {
+                    processing::preview_conversion(
+                        self,
+                        required_id(&args)?,
+                        &args["options"],
+                        text(&args, "strategy"),
+                    )
+                    .await
+                }
             }
+            "tasks.compressRetryCpu" => compression::retry_cpu(self, required_id(&args)?).await,
             "probe.video" | "probe.collection" => {
                 let url = text(&args, "url");
                 validate_url(url)?;
@@ -1088,6 +1121,7 @@ impl App {
             "cover.preview" | "cover.export" | "cover.generate" | "cover.cancel" => {
                 cover::command(self, command, args).await
             }
+            "media.availability" => availability::check(self, &args).await,
             "media.list" => Ok(json!(
                 self.db
                     .media()?
@@ -1206,6 +1240,7 @@ impl App {
     fn public_settings(&self) -> Result<Value> {
         let mut value = self.db.settings()?;
         if let Some(object) = value.as_object_mut() {
+            object.entry("ffmpegMode").or_insert(json!("compatibility"));
             object.remove("apiKey");
             object.remove("aiApiKey");
             object.remove("proxyPassword");
@@ -1312,6 +1347,18 @@ impl App {
             .context("settings must be an object")?;
         if let Some(options) = object.get("downloadOptions") {
             DownloadOptions::parse(options.clone())?;
+        }
+        if let Some(enabled) = object.get("clipboardMonitoring") {
+            ensure!(
+                enabled.is_boolean(),
+                "clipboardMonitoring must be a boolean"
+            );
+        }
+        if let Some(mode) = object.get("ffmpegMode") {
+            ensure!(
+                matches!(mode.as_str(), Some("compatibility" | "efficiency")),
+                "ffmpegMode must be compatibility or efficiency"
+            );
         }
         if let Some(format) = object.get("completedTimeFormat") {
             let format = format
@@ -1606,6 +1653,85 @@ mod tests {
         assert!(message.contains(data_dir.to_string_lossy().as_ref()));
         assert!(error.chain().count() >= 2);
         assert_eq!(std::fs::read(&data_dir)?, b"existing user data");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_mode_defaults_to_compatibility_and_persists_only_valid_choices() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        assert_eq!(app.public_settings()?["ffmpegMode"], "compatibility");
+        app.command(
+            "settings.save",
+            json!({"settings":{"ffmpegMode":"efficiency"}}),
+        )
+        .await?;
+        for mode in [json!(null), json!(true), json!("latest"), json!([])] {
+            assert!(
+                app.command("settings.save", json!({"settings":{"ffmpegMode":mode}}))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(app.public_settings()?["ffmpegMode"], "efficiency");
+        }
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        assert_eq!(app.public_settings()?["ffmpegMode"], "efficiency");
+        app.command(
+            "settings.save",
+            json!({"settings":{"ffmpegMode":"compatibility"}}),
+        )
+        .await?;
+        assert_eq!(app.public_settings()?["ffmpegMode"], "compatibility");
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clipboard_monitoring_is_opt_in_validated_and_persistent() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        assert_ne!(app.public_settings()?["clipboardMonitoring"], true);
+        let saved = app
+            .command(
+                "settings.save",
+                json!({"settings":{"clipboardMonitoring":true}}),
+            )
+            .await?;
+        assert_eq!(saved["clipboardMonitoring"], true);
+        for value in [json!(null), json!("true"), json!(1), json!([])] {
+            assert!(
+                app.command(
+                    "settings.save",
+                    json!({"settings":{"clipboardMonitoring":value}})
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(app.public_settings()?["clipboardMonitoring"], true);
+        }
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        assert_eq!(app.public_settings()?["clipboardMonitoring"], true);
+        app.command(
+            "settings.save",
+            json!({"settings":{"clipboardMonitoring":false}}),
+        )
+        .await?;
+        assert_eq!(app.public_settings()?["clipboardMonitoring"], false);
+        app.shutdown().await?;
         Ok(())
     }
 
@@ -2234,6 +2360,7 @@ mod tests {
             priority: 0,
             live: false,
             conversion: false,
+            compression: None,
             tools,
         }
     }
@@ -2741,6 +2868,150 @@ mod queue_tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn queue_errors_do_not_leave_waiting_entries() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let slots = Arc::new(Semaphore::new(0));
+        let cancel = CancellationToken::new();
+        assert!(
+            app.task_permit("missing", "test", &slots, &cancel)
+                .await
+                .is_err()
+        );
+        assert!(app.queued_slots.lock().unwrap().is_empty());
+        let task = tests::paused_task(Default::default());
+        app.db.insert_task(&task)?;
+        cancel.cancel();
+        assert!(
+            app.task_permit(&task.id, "test", &slots, &cancel)
+                .await
+                .is_err()
+        );
+        assert!(app.queued_slots.lock().unwrap()["test"].is_empty());
+        slots.close();
+        assert!(
+            app.task_permit(&task.id, "test", &slots, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(app.queued_slots.lock().unwrap()["test"].is_empty());
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_wakeups_do_not_read_tasks_and_keep_fifo() -> Result<()> {
+        let mut wake_read_counts = Vec::new();
+        for count in [25, 50, 100] {
+            let root = tempfile::tempdir()?;
+            let app = App::open(AppConfig {
+                data_dir: root.path().join("data"),
+                download_dir: root.path().join("output"),
+                tool_dir: None,
+            })
+            .await?;
+            let slots = Arc::new(Semaphore::new(0));
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(count);
+            let mut ids = Vec::new();
+            let mut handles = Vec::new();
+            let mut cancellations = Vec::new();
+            for _ in 0..count {
+                let task = tests::paused_task(Default::default());
+                app.db.insert_task(&task)?;
+                ids.push(task.id.clone());
+                let cancel = CancellationToken::new();
+                cancellations.push(cancel.clone());
+                let (runner, slots, sender, id) =
+                    (app.clone(), slots.clone(), sender.clone(), task.id);
+                handles.push(tokio::spawn(async move {
+                    if let Ok(permit) = runner.task_permit(&id, "test", &slots, &cancel).await {
+                        let _ = sender.send((id, permit)).await;
+                    }
+                }));
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while app
+                        .queued_slots
+                        .lock()
+                        .unwrap()
+                        .get("test")
+                        .map_or(0, Vec::len)
+                        != ids.len()
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+            }
+            app.command("tasks.prioritize", json!({"id":ids[count - 1]}))
+                .await?;
+            let mut progress_task = tests::paused_task(Default::default());
+            progress_task.status = "downloading".into();
+            app.db.insert_task(&progress_task)?;
+            let reads = app.db.task_read_count();
+            let start = std::time::Instant::now();
+            let progress_app = app.clone();
+            let progress_writer = tokio::task::spawn_blocking(move || -> Result<Vec<f64>> {
+                let mut latencies = Vec::new();
+                for percent in 1..=20 {
+                    progress_task.progress = f64::from(percent);
+                    let start = std::time::Instant::now();
+                    progress_app.save_task(&progress_task)?;
+                    latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                Ok(latencies)
+            });
+            cancellations[0].cancel();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while app
+                    .queued_slots
+                    .lock()
+                    .unwrap()
+                    .get("test")
+                    .map_or(0, Vec::len)
+                    != count - 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            app.queue_changed.notify_waiters();
+            slots.add_permits(1);
+            for expected in std::iter::once(&ids[count - 1]).chain(ids[1..count - 1].iter()) {
+                let (id, permit) = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                    .await?
+                    .context("No queued task started")?;
+                assert_eq!(&id, expected);
+                drop(permit);
+            }
+            for handle in handles {
+                handle.await?;
+            }
+            let drain_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let mut progress_ms = progress_writer.await??;
+            progress_ms.sort_by(f64::total_cmp);
+            let wake_reads = app.db.task_read_count() - reads;
+            println!(
+                "queue_waiters={count} wake_task_reads={wake_reads} drain_ms={drain_ms:.3} concurrent_progress_p95_ms={:.3}",
+                progress_ms[18]
+            );
+            wake_read_counts.push(wake_reads);
+            assert!(app.queued_slots.lock().unwrap()["test"].is_empty());
+            app.shutdown().await?;
+        }
+        assert_eq!(
+            wake_read_counts,
+            vec![0; 3],
+            "queue comparisons must not query task records"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn retry_is_idempotent_while_queued_or_running() -> Result<()> {
         let root = tempfile::tempdir()?;
         let app = App::open(AppConfig {
@@ -2764,7 +3035,7 @@ mod queue_tests {
                     .lock()
                     .unwrap()
                     .get("network")
-                    .is_some_and(|queue| queue.contains(&task.id))
+                    .is_some_and(|queue| queue.iter().any(|(id, _)| id == &task.id))
                 {
                     break;
                 }

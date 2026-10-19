@@ -10,6 +10,7 @@ use std::{
     },
 };
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
@@ -52,6 +53,16 @@ async fn command(
     args: Value,
     host: State<'_, Host>,
 ) -> Result<Value, String> {
+    if command == "host.clipboard_read" {
+        if host.closing.load(Ordering::Acquire) {
+            return Err("Application is shutting down".into());
+        }
+        return tauri::async_runtime::spawn_blocking(move || {
+            clipboard_text(app.clipboard().read_text()).map(Value::String)
+        })
+        .await
+        .map_err(|_| "Clipboard is temporarily unavailable".to_string())?;
+    }
     if command.starts_with("browser.login.") {
         if host.closing.load(Ordering::Acquire) {
             return Err("Application is shutting down".into());
@@ -155,6 +166,22 @@ async fn command(
         return Ok(value);
     }
     host.core.command(&command, args).await.map_err(error)
+}
+
+fn clipboard_text(
+    result: tauri_plugin_clipboard_manager::Result<String>,
+) -> Result<String, String> {
+    match result {
+        Ok(text) if text.len() > 3 * 1024 * 1024 => Err("Clipboard text is too large".into()),
+        Ok(text) => Ok(text),
+        Err(tauri_plugin_clipboard_manager::Error::Clipboard(message))
+            if message
+                == "The clipboard contents were not available in the requested format or the clipboard is empty." =>
+        {
+            Ok(String::new())
+        }
+        Err(_) => Err("Clipboard is temporarily unavailable".into()),
+    }
 }
 
 #[tauri::command]
@@ -466,6 +493,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 let handle = window.app_handle().clone();
@@ -685,6 +713,38 @@ fn begin_shutdown(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_reads_preserve_text_skip_other_formats_and_hide_errors() {
+        assert_eq!(
+            clipboard_text(Ok("https://example.test/video".into())).unwrap(),
+            "https://example.test/video"
+        );
+        assert_eq!(clipboard_text(Ok(String::new())).unwrap(), "");
+        assert_eq!(clipboard_text(Err(tauri_plugin_clipboard_manager::Error::Clipboard("The clipboard contents were not available in the requested format or the clipboard is empty.".into()))).unwrap(), "");
+        assert_eq!(
+            clipboard_text(Err(tauri_plugin_clipboard_manager::Error::Clipboard(
+                "temporary busy: private clipboard diagnostic".into()
+            )))
+            .unwrap_err(),
+            "Clipboard is temporarily unavailable"
+        );
+    }
+
+    #[test]
+    fn clipboard_reads_reject_text_over_command_payload_limit() {
+        let limit = 3 * 1024 * 1024;
+        assert_eq!(clipboard_text(Ok("a".repeat(limit))).unwrap().len(), limit);
+        assert_eq!(
+            clipboard_text(Ok("a".repeat(limit + 1))).unwrap_err(),
+            "Clipboard text is too large"
+        );
+        assert_eq!(
+            clipboard_text(Ok("中".repeat(limit / 3 + 1))).unwrap_err(),
+            "Clipboard text is too large"
+        );
+    }
+
     #[test]
     fn command_errors_keep_the_cause_without_signed_urls() {
         let reason = anyhow::anyhow!("HTTP 403 https://example.test/file?token=secret")

@@ -6,10 +6,11 @@ import { host } from './transport';
 import type { Translate } from './i18n';
 import type { Run } from './App';
 import type { Media, Task } from './types';
+import type { MediaAvailability } from './useMediaAvailability';
 
-export function TaskContextMenu({ task, media, position, trigger, close, action, run, t }: {
+export function TaskContextMenu({ task, media, availability, position, trigger, close, action, run, t }: {
   task: Task; media?: Media; position: { x: number; y: number }; trigger: HTMLElement;
-  close: () => void; action: (task: Task, action: string) => void; run: Run; t: Translate;
+  close: () => void; action: (task: Task, action: string) => void; run: Run; t: Translate; availability?: MediaAvailability;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [location, setLocation] = useState(position);
@@ -26,6 +27,9 @@ export function TaskContextMenu({ task, media, position, trigger, close, action,
     };
   }, [position.x, position.y, trigger, close]);
   const perform = (operation: () => void) => { close(); operation(); };
+  const unavailable = availability === 'missing' || availability === 'unknown';
+  const info = task.mediaInfo || media?.mediaInfo;
+  const video = task.kind !== 'assets' && (!info || Boolean(info.videoCodec || info.width));
   return createPortal(<div ref={ref} role="menu" aria-label={t('任务操作', 'Task actions')} className="task-context-menu" style={{ left: location.x, top: location.y }} onContextMenu={event => event.preventDefault()} onKeyDown={event => {
     if (event.key === 'Escape' || event.key === 'Tab') { if (event.key === 'Escape') event.preventDefault(); close(); return; }
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
@@ -36,8 +40,8 @@ export function TaskContextMenu({ task, media, position, trigger, close, action,
     <span className="task-menu-title truncate">{task.title || task.url}</span>
     {taskActions(task, t).map(item => <button type="button" role="menuitem" tabIndex={-1} key={item.action} onClick={() => perform(() => action(task, item.action))}><Icon name={item.icon} />{item.label}</button>)}
     <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => action(task, 'logs'))}><Icon name="info" />{t('查看日志', 'View logs')}</button>
-    {media && <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => run(() => host.result(media.id, host.desktop ? 'reveal' : 'download')))}><Icon name={host.desktop ? 'folder' : 'download'} />{host.desktop ? t('定位结果文件', 'Reveal result file') : t('下载结果文件', 'Download result file')}</button>}
-    {media && ['completed', 'retained'].includes(task.status) && <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => action(task, 'convert'))}><Icon name="refresh" />{t('转换格式', 'Convert format')}</button>}
+    {media && <button type="button" role="menuitem" tabIndex={-1} disabled={unavailable} onClick={() => perform(() => run(() => host.result(media.id, host.desktop ? 'reveal' : 'download')))}><Icon name={host.desktop ? 'folder' : 'download'} />{host.desktop ? t('定位结果文件', 'Reveal result file') : t('下载结果文件', 'Download result file')}</button>}
+    {media && ['completed', 'retained'].includes(task.status) && <><button type="button" role="menuitem" tabIndex={-1} disabled={unavailable} onClick={() => perform(() => action(task, 'convert'))}><Icon name="refresh" />{t('转换格式', 'Convert format')}</button>{video && <button type="button" role="menuitem" tabIndex={-1} disabled={unavailable} onClick={() => perform(() => action(task, 'compress'))}><Icon name="video" />{t('压缩视频', 'Compress video')}</button>}</>}
     <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => run(() => host.copyTask(task, 'title')))}><Icon name="copy" />{t('复制视频名', 'Copy video title')}</button>
     <button type="button" role="menuitem" tabIndex={-1} onClick={() => perform(() => run(() => host.copyTask(task, 'source')))}><Icon name="copy" />{t('复制来源', 'Copy source')}</button>
     {host.desktop && <button type="button" role="menuitem" tabIndex={-1} disabled={!media} onClick={() => perform(() => run(() => host.copyTask(task, 'path')))}><Icon name="copy" />{t('复制完整路径', 'Copy full path')}</button>}

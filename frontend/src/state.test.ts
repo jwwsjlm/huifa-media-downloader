@@ -114,6 +114,16 @@ describe('task delta state', () => {
     state = reducer(state, { type: 'snapshot', snapshot: makeSnapshot() });
     expect(state.activeTaskCount).toBe(2);
   });
+  it('adds a compression command result only when a newer task event has not arrived', () => {
+    const queued = { ...makeTask('compressed'), status: 'waiting_processing' as const };
+    let state = reducer(initialState, { type: 'event', event: { kind: 'task.upsert', data: { ...queued } }, onlyIfTaskAbsent: true });
+    expect(state.tasks.compressed.status).toBe('waiting_processing');
+    state = reducer(state, { type: 'event', event: { kind: 'task.upsert', data: { id: 'compressed', status: 'processing', stageProgress: 42 } } });
+    const updated = state;
+    state = reducer(state, { type: 'event', event: { kind: 'task.upsert', data: { ...queued } }, onlyIfTaskAbsent: true });
+    expect(state).toBe(updated);
+    expect(state.tasks.compressed.stageProgress).toBe(42);
+  });
   it('sums only measured downloading speeds across updates, filtering, removal and resync', () => {
     let state = reducer(initialState, { type: 'snapshot', snapshot: makeSnapshot() });
     expect(state.downloadSpeed).toBe(2048);

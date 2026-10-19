@@ -55,3 +55,20 @@ it('offers live save separately from cancel, current settings retry and real que
   expect(actions({ status: 'failed', kind: 'assets' })).not.toContain('retryCurrent');
   expect(actions({ status: 'failed', error: 'Requirements unmet: missing subtitles' })).toContain('configure');
 });
+
+it.each(['failed', 'processing_failed', 'paused', 'cancelled'] as const)('offers an explicit CPU retry for a stopped GPU compression task in %s', status => {
+  const actions = taskActions({ ...makeTask('gpu'), status, conversion: true, compression: { videoBitrateBps: 8000000, encoder: 'hevc_nvenc' } }, (_zh, en) => en);
+  expect(actions.find(item => item.action === 'compressRetryCpu')?.label).toBe('Retry with CPU');
+  expect(actions.map(item => item.action)).not.toContain('retryCurrent');
+});
+
+it('does not offer CPU retry for CPU compression or active and finished GPU tasks, preserving pause actions', () => {
+  const actions = (patch: Partial<ReturnType<typeof makeTask>>) => taskActions({ ...makeTask('a'), ...patch }, (_zh, en) => en).map(item => item.action);
+  expect(actions({ status: 'processing_failed', compression: { encoder: 'libx265', targetBytes: 2000000 } })).not.toContain('compressRetryCpu');
+  expect(actions({ status: 'failed', compression: { targetBytes: 2000000 } })).not.toContain('compressRetryCpu');
+  for (const status of ['queued', 'probing', 'downloading', 'processing', 'waiting_processing', 'completed', 'retained'] as const) {
+    const available = actions({ status, conversion: true, compression: { encoder: 'hevc_nvenc', targetBytes: 2000000 } });
+    expect(available).not.toContain('compressRetryCpu');
+    expect(available.includes('pause')).toBe(!['completed', 'retained'].includes(status));
+  }
+});

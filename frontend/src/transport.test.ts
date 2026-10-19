@@ -58,6 +58,26 @@ it('copies only a title or source URL in web mode', async () => {
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
+it('reads clipboard text through the native host on desktop', async () => {
+  const readText = vi.fn();
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText } });
+  const host = await desktop(); tauri.invoke.mockResolvedValue('https://youtu.be/abcdefghijk');
+  await expect(host.readClipboard()).resolves.toBe('https://youtu.be/abcdefghijk');
+  expect(tauri.invoke).toHaveBeenCalledWith('command', { command: 'host.clipboard_read', args: {} });
+  expect(readText).not.toHaveBeenCalled();
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+it('reads clipboard text locally in web mode and reports unavailable access', async () => {
+  const readText = vi.fn().mockResolvedValue('https://example.test/video.mp4');
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText } });
+  const host = await web();
+  await expect(host.readClipboard()).resolves.toBe('https://example.test/video.mp4');
+  expect(fetchMock).not.toHaveBeenCalled();
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+  await expect(host.readClipboard()).rejects.toThrow('Clipboard is unavailable');
+});
+
 it('resolves desktop copy values through the native command', async () => {
   const host = await desktop(); tauri.invoke.mockResolvedValue('D:\\downloads\\example.mp4');
   await host.copyTask(task, 'path');

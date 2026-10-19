@@ -8,7 +8,7 @@ export const initialState: AppState = {
   loaded: false, connected: false, version: buildVersion, tasks: {}, taskIds: [], taskListVersion: 0, activeTaskCount: 0, downloadSpeed: 0, media: {}, mediaIds: [], mediaByTask: {}, settings: {}, tools: [],
   view: { page: /^\/mcp\/?$/.test(window.location.pathname) ? 'mcp' : 'downloads', urls: '', quality: null, taskSearch: '', taskStatus: 'all', taskSort: 'newest', taskSelection: '', mediaSearch: '', mediaSelection: '', settingsDraft: null, optionsDraft: null, settingsTab: 'downloads' },
 };
-export type Action = { type: 'snapshot'; snapshot: Snapshot } | { type: 'event'; event: CoreEvent; ifTaskUnchanged?: Task } | { type: 'connection'; connected: boolean } | { type: 'view'; patch: Partial<ViewState> } | { type: 'setting'; key: string; value: Json } | { type: 'option'; key: string; value: DownloadOptions[string] } | { type: 'saved'; settings: Settings } | { type: 'cookie.saved'; id: string };
+export type Action = { type: 'snapshot'; snapshot: Snapshot } | { type: 'event'; event: CoreEvent; ifTaskUnchanged?: Task; onlyIfTaskAbsent?: boolean } | { type: 'connection'; connected: boolean } | { type: 'view'; patch: Partial<ViewState> } | { type: 'setting'; key: string; value: Json } | { type: 'option'; key: string; value: DownloadOptions[string] } | { type: 'saved'; settings: Settings } | { type: 'cookie.saved'; id: string };
 const active = (task?: Task): number => task && ['downloading', 'probing', 'processing'].includes(task.status) ? 1 : 0;
 const speed = (task?: Task): number => task?.status === 'downloading' && typeof task.speed === 'number' && Number.isFinite(task.speed) && task.speed > 0 ? task.speed : 0;
 export function reducer(state: AppState, action: Action): AppState {
@@ -29,6 +29,7 @@ export function reducer(state: AppState, action: Action): AppState {
     const task = data as unknown as Task; const id = String(task.id);
     if (!id || id === 'undefined') return state;
     if (action.ifTaskUnchanged && state.tasks[id] !== action.ifTaskUnchanged) return state;
+    if (action.onlyIfTaskAbsent && state.tasks[id]) return state;
     const previous = state.tasks[id]; const next = { ...previous, ...task, id };
     const listChanged = !previous || (['title', 'url', 'status', 'createdAt'] as const).some(key => previous[key] !== next[key]);
     return { ...state, tasks: { ...state.tasks, [id]: next }, taskIds: previous ? state.taskIds : [...state.taskIds, id], taskListVersion: state.taskListVersion + Number(listChanged), activeTaskCount: state.activeTaskCount + active(next) - active(previous), downloadSpeed: Math.max(0, state.downloadSpeed + speed(next) - speed(previous)) };

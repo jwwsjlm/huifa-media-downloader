@@ -25,7 +25,7 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $taskContents 'tools') -Force | Out-Null
     if (-not $taskReceipt.files -or @(@('yt-dlp', 'ffmpeg', 'ffprobe') | Where-Object { -not $taskReceipt.tools.$_ }).Count -or (-not $taskReceipt.tools.qjs -and -not $taskReceipt.tools.deno)) { throw 'Portable runtime receipt is incomplete' }
     foreach ($taskFile in $taskReceipt.files.PSObject.Properties) {
-        if ($taskFile.Name -notmatch '^(?:(?:yt-dlp|ffmpeg|ffprobe|qjs|deno)\.exe|(?:avcodec|avdevice|avfilter|avformat|avutil|swresample|swscale)-\d+\.dll)$') { throw 'Unexpected runtime payload' }
+        if ($taskFile.Name -notmatch '^(?:(?:yt-dlp|ffmpeg|ffprobe|qjs|deno)\.exe|(?:avcodec|avdevice|avfilter|avformat|avutil|postproc|swresample|swscale)-\d+\.dll)$') { throw 'Unexpected runtime payload' }
         $taskSource = Join-Path $taskTools $taskFile.Name
         if ((Get-FileHash -LiteralPath $taskSource -Algorithm SHA256).Hash -ine $taskFile.Value) { throw "Tool checksum mismatch: $($taskFile.Name)" }
         Copy-Item -LiteralPath $taskSource -Destination (Join-Path $taskContents "tools/$($taskFile.Name)")

@@ -66,6 +66,9 @@ pub(crate) fn position(stage: &str, steps: &[String]) -> Option<usize> {
                 | "encoding"
                 | "merge"
                 | "transcode"
+                | "compression_analyzing"
+                | "compression_encoding"
+                | "compression_preparing"
         )
     {
         "process"
@@ -101,5 +104,9 @@ mod tests {
         plan(&mut conversion);
         assert_eq!(conversion.steps.len(), 4);
         assert!(!conversion.steps.iter().any(|step| step == "download"));
+        conversion.stage("processing", "compression_analyzing", Some(10.0));
+        assert_eq!(conversion.step_index, Some(2));
+        conversion.stage("processing", "compression_encoding", Some(20.0));
+        assert_eq!(conversion.step_index, Some(2));
     }
 }

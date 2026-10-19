@@ -12,6 +12,32 @@ pub struct ProcessOutput {
     pub stderr: String,
 }
 
+#[derive(Clone, Copy)]
+enum OutputMode {
+    Lines,
+    Streamed,
+    Limited(usize, Option<std::time::Duration>, bool),
+}
+
+pub(crate) async fn run_streamed(
+    executable: &Path,
+    args: &[String],
+    cancel: &CancellationToken,
+    callback: LineCallback,
+) -> Result<()> {
+    run_inner(
+        executable,
+        args,
+        None,
+        (cancel, None),
+        Some(callback),
+        OutputMode::Streamed,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
 pub async fn run(
     executable: &Path,
     args: &[String],
@@ -25,7 +51,7 @@ pub async fn run(
         directory,
         (cancel, None),
         callback,
-        None,
+        OutputMode::Lines,
         None,
     )
     .await
@@ -45,7 +71,7 @@ pub(crate) async fn run_logged(
         directory,
         (cancel, None),
         callback,
-        None,
+        OutputMode::Lines,
         Some(log),
     )
     .await
@@ -66,7 +92,7 @@ pub(crate) async fn run_capture(
         Some(directory),
         (cancel, Some(finish)),
         callback,
-        None,
+        OutputMode::Lines,
         Some(log),
     )
     .await
@@ -87,7 +113,7 @@ pub async fn run_limited(
         directory,
         (cancel, None),
         None,
-        Some((max_stdout, Some(timeout), false)),
+        OutputMode::Limited(max_stdout, Some(timeout), false),
         None,
     )
     .await
@@ -107,7 +133,7 @@ pub(crate) async fn run_limited_logged(
         None,
         (cancel, None),
         None,
-        Some((max_stdout, timeout, false)),
+        OutputMode::Limited(max_stdout, timeout, false),
         log,
     )
     .await
@@ -127,7 +153,7 @@ pub async fn run_limited_text(
         None,
         (cancel, None),
         None,
-        Some((max_stdout, Some(timeout), true)),
+        OutputMode::Limited(max_stdout, Some(timeout), true),
         None,
     )
     .await
@@ -139,7 +165,7 @@ async fn run_inner(
     directory: Option<&Path>,
     control: (&CancellationToken, Option<&CancellationToken>),
     callback: Option<LineCallback>,
-    limit: Option<(usize, Option<std::time::Duration>, bool)>,
+    mode: OutputMode,
     log: Option<crate::task_logs::RawLog>,
 ) -> Result<ProcessOutput> {
     let (cancel, finish) = control;
@@ -190,18 +216,27 @@ async fn run_inner(
     let overflow = CancellationToken::new();
     let out_overflow = overflow.clone();
     let out = tokio::spawn(async move {
-        match limit {
-            Some((max, _, legacy_text)) => {
+        match mode {
+            OutputMode::Limited(max, _, legacy_text) => {
                 read_limited_output(stdout, max, out_overflow, legacy_text, out_log).await
             }
-            None => read_lines(stdout, false, out_callback, out_log).await,
+            OutputMode::Lines | OutputMode::Streamed => {
+                read_lines(
+                    stdout,
+                    false,
+                    out_callback,
+                    out_log,
+                    matches!(mode, OutputMode::Lines),
+                )
+                .await
+            }
         }
     });
     let err = tokio::spawn(async move {
-        if limit.is_some() {
+        if matches!(mode, OutputMode::Limited(..)) {
             read_diagnostics(stderr, err_log).await
         } else {
-            read_lines(stderr, true, callback, err_log).await
+            read_lines(stderr, true, callback, err_log, true).await
         }
     });
     let mut stopped_capture = false;
@@ -217,9 +252,9 @@ async fn run_inner(
         status=child.wait()=>status.context("Cannot wait for supervised tool"),
         _=overflow.cancelled()=> Err(anyhow::anyhow!("Metadata stdout exceeds its byte limit")),
         _=async {
-            match limit.and_then(|(_, timeout, _)| timeout) {
-                Some(timeout) => tokio::time::sleep(timeout).await,
-                None => std::future::pending().await,
+            match mode {
+                OutputMode::Limited(_, Some(timeout), _) => tokio::time::sleep(timeout).await,
+                _ => std::future::pending().await,
             }
         }=> Err(anyhow::anyhow!("Metadata query timed out")),
     };
@@ -401,6 +436,7 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
     is_error: bool,
     callback: Option<LineCallback>,
     log: Option<crate::task_logs::RawLog>,
+    capture: bool,
 ) -> Result<String> {
     let mut reader = BufReader::new(reader);
     let mut bytes = Vec::new();
@@ -424,7 +460,7 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
         if let Some(callback) = &callback {
             callback(is_error, &line);
         }
-        if captured.len() < 64 * 1024 * 1024 {
+        if capture && captured.len() < 64 * 1024 * 1024 {
             captured.push_str(&line);
             captured.push('\n');
         }
@@ -676,11 +712,119 @@ mod tests {
     }
     #[tokio::test]
     async fn invalid_utf8_metadata_is_still_rejected() {
-        assert!(
-            read_lines(&b"{\"title\":\"\xff\"}\n"[..], false, None, None)
-                .await
-                .is_err()
+        for capture in [true, false] {
+            assert!(
+                read_lines(&b"{\"title\":\"\xff\"}\n"[..], false, None, None, capture)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_packet_callbacks_continue_past_the_capture_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let records = 65 * 1024;
+        let mut record = vec![b'x'; 1023];
+        record.push(b'\n');
+        let mut bytes = record.repeat(records);
+        bytes.extend_from_slice(b"last packet\r\nunterminated packet");
+        let observed = Arc::new(AtomicUsize::new(0));
+        let count = observed.clone();
+        let callback: LineCallback = Arc::new(move |is_error, line| {
+            assert!(!is_error);
+            let index = count.fetch_add(1, Ordering::Relaxed);
+            if index < records {
+                assert_eq!(line.len(), 1023);
+            } else if index == records {
+                assert_eq!(line, "last packet");
+            } else {
+                assert_eq!(line, "unterminated packet");
+            }
+        });
+        let captured = read_lines(&bytes[..], false, Some(callback), None, false)
+            .await
+            .unwrap();
+        assert!(captured.is_empty());
+        assert_eq!(observed.load(Ordering::Relaxed), records + 2);
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_failure_keeps_diagnostics_and_redacts_secrets() {
+        #[cfg(windows)]
+        let (exe, args) = (
+            std::path::PathBuf::from("powershell.exe"),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "[Console]::Out.WriteLine('packet-hash'); [Console]::Error.WriteLine('encode failed https://example.test/video?token=stream-secret'); exit 7".into(),
+            ],
         );
+        #[cfg(unix)]
+        let (exe, args) = (
+            std::path::PathBuf::from("sh"),
+            vec!["-c".into(), "printf 'packet-hash\\n'; printf 'encode failed https://example.test/video?token=stream-secret\\n' >&2; exit 7".into()],
+        );
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = lines.clone();
+        let callback: LineCallback = Arc::new(move |is_error, line| {
+            observed.lock().unwrap().push((is_error, line.to_string()));
+        });
+        let error = run_streamed(&exe, &args, &CancellationToken::new(), callback)
+            .await
+            .err()
+            .unwrap();
+        let error = format!("{error:#}");
+        assert!(error.contains("code 7"), "{error}");
+        assert!(error.contains("encode failed"), "{error}");
+        assert!(!error.contains("stream-secret"), "{error}");
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|(is_error, line)| !is_error && line == "packet-hash")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(is_error, line)| *is_error && line.starts_with("encode failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_cancellation_closes_the_supervised_pipes() {
+        #[cfg(windows)]
+        let (exe, args) = (
+            std::path::PathBuf::from("powershell.exe"),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "[Console]::Out.WriteLine('ready'); Start-Sleep -Seconds 30".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (exe, args) = (
+            std::path::PathBuf::from("sh"),
+            vec!["-c".into(), "sleep 30 & printf 'ready\\n'; wait".into()],
+        );
+        let cancel = CancellationToken::new();
+        let stopped = cancel.clone();
+        let callback: LineCallback = Arc::new(move |is_error, line| {
+            if !is_error && line == "ready" {
+                stopped.cancel();
+            }
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_streamed(&exe, &args, &cancel, callback),
+        )
+        .await
+        .expect("Stream cancellation must close the process pipes promptly")
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("interrupted"), "{error:#}");
     }
     #[tokio::test]
     async fn metadata_limit_rejects_a_single_oversized_line() {
