@@ -68,23 +68,42 @@ $process.StartInfo.UseShellExecute = $false
 $process.StartInfo.RedirectStandardError = $true
 try {
     if (-not $process.Start()) { throw 'Windows did not start the process.' }
-    $stderr = $process.StandardError.ReadToEndAsync()
+    $stderr = New-Object System.Text.StringBuilder
+    $stderrRead = $process.StandardError.ReadLineAsync()
+    $captureTimer = [Diagnostics.Stopwatch]::StartNew()
+    $exitDrainDeadline = $null
     [void]$report.AppendLine("Process ID: $($process.Id)")
-    if ($process.WaitForExit(15000)) {
+    while ($captureTimer.ElapsedMilliseconds -lt 15000) {
+        if ($stderrRead -and $stderrRead.IsCompleted) {
+            $line = $stderrRead.GetAwaiter().GetResult()
+            if ($null -eq $line) {
+                $stderrRead = $null
+            } else {
+                [void]$stderr.AppendLine($line)
+                $stderrRead = $process.StandardError.ReadLineAsync()
+                continue
+            }
+        }
+        if ($process.HasExited) {
+            if ($null -eq $exitDrainDeadline) { $exitDrainDeadline = $captureTimer.ElapsedMilliseconds + 1000 }
+            if (-not $stderrRead -or $captureTimer.ElapsedMilliseconds -ge $exitDrainDeadline) { break }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    if ($process.HasExited) {
         $exitCode = $process.ExitCode
         $unsignedCode = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$exitCode), 0)
         [void]$report.AppendLine(('Exited: {0} (0x{1:X8})' -f $exitCode, $unsignedCode))
-        [void]$report.AppendLine('Standard error:')
-        if ($stderr.Wait(1000)) {
-            [void]$report.AppendLine($stderr.GetAwaiter().GetResult())
-        } else {
+        if ($stderrRead) {
             [void]$report.AppendLine('Capture did not close after the application exited.')
         }
         $process.Dispose()
     } else {
         [void]$report.AppendLine('Still running after 15 seconds. The application was left open.')
-        [void]$report.AppendLine('Standard error capture is incomplete while the application is running.')
+        [void]$report.AppendLine('Standard error contains completed lines captured so far; capture is incomplete while the application is running.')
     }
+    [void]$report.AppendLine('Standard error:')
+    [void]$report.Append($stderr.ToString())
 } catch {
     [void]$report.AppendLine("Launch/capture error: $($_.Exception.Message)")
 }

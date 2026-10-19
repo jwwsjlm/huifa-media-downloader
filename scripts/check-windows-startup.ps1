@@ -43,8 +43,8 @@ public static class HuifaStartupWindows {
         }, IntPtr.Zero);
         return found.ToArray();
     }
-    public static bool Accept(IntPtr window) {
-        return PostMessage(window, 0x0111, new IntPtr(1), IntPtr.Zero);
+    public static bool CloseErrorDialog(IntPtr window) {
+        return PostMessage(window, 0x0010, IntPtr.Zero, IntPtr.Zero);
     }
 }
 '@
@@ -132,7 +132,7 @@ try {
     $taskLogText = [IO.File]::ReadAllText($taskLog)
     if ($taskLogText -notmatch 'Could not create the application data folder') { throw 'Startup log did not preserve the data-folder failure context' }
     if ((Get-FileHash -LiteralPath $taskBlocked -Algorithm SHA256).Hash -ne $taskOriginalHash) { throw 'Startup failure modified the original data-path file' }
-    if (-not [HuifaStartupWindows]::Accept($taskDialog)) { throw 'Could not acknowledge the target error dialog' }
+    if (-not [HuifaStartupWindows]::CloseErrorDialog($taskDialog)) { throw 'Could not close the target error dialog' }
     if (-not $taskFailure.Process.WaitForExit(10000)) { throw 'Desktop did not exit after its startup error was acknowledged' }
     if ($taskFailure.Process.ExitCode -eq 0) { throw 'Startup failure reported a successful exit code' }
     'PASS: native error dialog, fallback startup log, preserved original data and nonzero exit' | Add-Content -LiteralPath $taskReport
