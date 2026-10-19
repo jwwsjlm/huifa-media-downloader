@@ -574,8 +574,15 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                             }
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let status = browser.command(&handle, &core, "browser.login.status", &json!({})).await?;
+                    let status = tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let status = browser.command(&handle, &core, "browser.login.status", &json!({})).await?;
+                            if status["active"] == false {
+                                return Ok::<_, anyhow::Error>(status);
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }).await.context("Compatible browser process survived its last visible window")??;
                     ensure!(status["cookie"]["count"].as_u64().is_some_and(|count| count >= 2), "Closing the compatible browser lost its cookies before automatic saving");
                     ensure!(status["active"] == false, "Compatible browser process survived its last visible window");
                     browser
