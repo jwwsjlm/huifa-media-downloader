@@ -36,11 +36,12 @@ it('stops the initial loading message after a failed check and can retry the bac
   await waitFor(() => expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(false));
 });
 
-it('uses the actual source size as the accessible slider maximum and submits exact decimal target bytes', async () => {
+it('explains the approximate target, keeps the actual source size as the slider maximum and submits decimal target bytes', async () => {
   render(<CompressionDialog {...props} />);
   const target = await screen.findByRole('textbox', { name: 'Target size' });
   const slider = screen.getByRole('slider', { name: 'Target size percentage' });
   expect(slider.getAttribute('aria-valuetext')).toContain('4 GB');
+  expect(screen.getByText(/The target is approximate; actual output size may vary\./)).toBeTruthy();
   fireEvent.change(target, { target: { value: '4.1GB' } });
   expect(screen.getByRole('alert').textContent).toContain('cannot exceed');
   expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(true);
@@ -91,7 +92,7 @@ it('debounces changing targets, cancels the obsolete probe and never accepts its
   await act(async () => { await vi.advanceTimersByTimeAsync(249); });
   expect(command.mock.calls.some(([name, args]) => name === 'tasks.convertPreview' && args.compression.targetBytes === 1000000000)).toBe(false);
   await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-  expect(screen.getByText('Target limit · 1 GB')).toBeTruthy();
+  expect(screen.getByText('Approximate target size · 1 GB')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Start compression' }));
   await act(async () => {});
   expect(command).toHaveBeenCalledWith('tasks.convert', { id: 'local', requestId: expect.any(String), compression: { targetBytes: 1000000000, encoder: 'libx265' } });

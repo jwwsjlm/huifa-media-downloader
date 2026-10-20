@@ -65,26 +65,31 @@ and a successful concurrent encoder probe. High resolution, HDR, 10-bit video, o
 unknown resources use serial admission. Full scans and disk verification are limited
 separately, preserving priority and FIFO within each priority. Eligible 8-bit SDR
 video up to 4K, without scaling or frame-rate reduction, can use NVIDIA hardware
-decoding after matching decoded pixels and timestamps; failed checks retain the
-selected encoder with software decoding.
+decoding after matching decoded pixels and timestamps. Eligible frames stay in GPU
+memory through encoding; failed checks retain the selected encoder with software decoding.
 The task list and details show progress for source verification, full video analysis
 and encoding. Each progress bar represents the current stage. Cancel from the task actions.
+GPU compression starts with a quick check, then overlaps the complete source analysis
+with encoding when resources permit. All checks must pass before the result is published.
 
 | Mode | Controls and limits |
 | --- | --- |
-| **Simple** | Enter a target size or drag the percentage slider. Keeps source resolution and frame rate. The target cannot exceed the actual source file size. |
+| **Simple** | Enter an approximate target size or drag the percentage slider. Keeps source resolution and frame rate. The target cannot exceed the actual source file size; actual output size may vary. |
 | **Advanced** | Set video bitrate and optionally lower resolution or frame rate. Output size is an estimate, not a maximum. |
 
 Size inputs accept `4MB`, `4GB`, `4G`, `MiB` and `GiB`; bare numbers mean MB.
 MB/GB use decimal units, while MiB/GiB use binary units. Bitrate accepts `8Mbps`
 or `800Kbps`; bare numbers mean Mbps. Simple and Advanced keep their own input
 drafts while switching modes. Choosing a fixed frame rate changes a variable-frame-rate
-source's timing. Smaller size or bitrate targets reduce picture quality.
+source's timing. Smaller size or bitrate targets reduce picture quality. Simple mode
+does not re-encode an output to make its size match the target.
 
-Audio tracks, subtitles, attachments, chapters and supported metadata are retained
-and checked before publication. A target that leaves too little space for those
+The complete source is analyzed, the output is fully verified, and source integrity,
+audio tracks, subtitles, attachments, chapters and supported metadata are checked
+before publication. A target that leaves too little space for those
 streams fails rather than silently removing them. Unsupported features such as
-Dolby Vision/dynamic HDR, certain pixel formats or uncopyable streams block compression.
+Dolby Vision/dynamic HDR, certain pixel formats or uncopyable streams stop the task
+when detected and prevent publication. Overlapping checks with encoding never skips them.
 Changed source files or failed preservation checks stop the task and keep the original.
 
 Opening the compression dialog checks encoders for the current video. **GPU encoding

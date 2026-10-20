@@ -430,6 +430,239 @@ async fn real_gpu_jobs_overlap_and_release_processing_resources() -> Result<()> 
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires HUIFA_GPU_AUDIT=1, HUIFA_GPU_AUDIT_SOURCE (120s 4K VP9) and NVIDIA Windows"]
+async fn real_gpu_compression_overlaps_source_audit_and_cancels() -> Result<()> {
+    use tokio_util::sync::CancellationToken;
+    if std::env::var("HUIFA_GPU_AUDIT").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let fixture = std::env::var_os("HUIFA_GPU_AUDIT_SOURCE")
+        .map(PathBuf::from)
+        .context("Set HUIFA_GPU_AUDIT_SOURCE to a 120-second 4K VP9 sample")?;
+    async fn command_lines(children: &[(u32, String)]) -> Result<Vec<Value>> {
+        let filter = children
+            .iter()
+            .filter(|(_, name)| {
+                name.eq_ignore_ascii_case("ffmpeg.exe") || name.eq_ignore_ascii_case("ffprobe.exe")
+            })
+            .map(|(pid, _)| format!("ProcessId = {pid}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        if filter.is_empty() {
+            return Ok(vec![]);
+        }
+        let output = crate::process::run_limited(
+            Path::new("powershell.exe"),
+            &[
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!("Get-CimInstance Win32_Process -Filter '{filter}' | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"),
+            ],
+            None,
+            &CancellationToken::new(),
+            64 * 1024,
+            Duration::from_secs(10),
+        )
+        .await?;
+        if output.stdout.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let value: Value = serde_json::from_str(&output.stdout)?;
+        Ok(value.as_array().cloned().unwrap_or_else(|| vec![value]))
+    }
+    let root = tempfile::tempdir()?;
+    let app = App::open(AppConfig {
+        data_dir: root.path().join("data"),
+        download_dir: root.path().join("downloads"),
+        tool_dir: Some(
+            std::env::var_os("HUIFA_TEST_TOOLS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools")
+                }),
+        ),
+    })
+    .await?;
+    app.command("settings.save", json!({"settings":{"analysisThreads":2}}))
+        .await?;
+    let source = app.download_directory().join("audit-complete-source.mkv");
+    // The short H264 fixture can finish its audit before decoder validation starts encoding.
+    let args = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        "-i".into(),
+        fixture.to_string_lossy().into_owned(),
+        "-t".into(),
+        "120".into(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-c".into(),
+        "copy".into(),
+        source.to_string_lossy().into_owned(),
+    ];
+    crate::process::run(
+        &app.tool("ffmpeg")?,
+        &args,
+        None,
+        &CancellationToken::new(),
+        None,
+    )
+    .await?;
+    let source_hash = crate::download::hash_file(&source)?;
+    let cancelled_source = app.download_directory().join("audit-cancel-source.mkv");
+    std::fs::hard_link(&source, &cancelled_source)?;
+    let mut originals = Vec::new();
+    for (index, source) in [source, cancelled_source].into_iter().enumerate() {
+        let mut task = fixture_task(Default::default());
+        task.id = task_id(index);
+        task.title = format!("Concurrent source audit {}", index + 1);
+        task.stage("completed", "completed", Some(100.0));
+        task.output_path = Some(source.clone());
+        task.download_dir = Some(app.download_directory());
+        app.db.insert_task(&task)?;
+        app.db.complete(
+            &task,
+            &Media {
+                id: media_id(index),
+                task_id: task.id.clone(),
+                title: task.title.clone(),
+                filename: source.file_name().unwrap().to_string_lossy().into_owned(),
+                size: source_hash.1,
+                duration: 120.0,
+                path: source,
+                assets: vec![],
+                media_info: None,
+            },
+        )?;
+        originals.push(task.id);
+    }
+    let acceptance = async {
+        let mut results = Vec::new();
+        for (index, original) in originals.iter().enumerate() {
+            let cancel_during_overlap = index == 1;
+            let queued = app.command("tasks.convert", json!({"id":original,"compression":{"targetBytes":source_hash.1 * 7 / 10,"encoder":"hevc_nvenc"}})).await?;
+            let id = queued["id"].as_str().context("GPU task did not queue")?;
+            let source_media = app.db.media_for_task(original)?.unwrap();
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(300);
+            let mut pair = None;
+            let mut evidence = Vec::new();
+            let mut overlap_since = None;
+            let mut maximum_overlap = Duration::ZERO;
+            let mut cancelled_pids = Vec::new();
+            let mut output_bytes = None;
+            let mut samples = Vec::new();
+            let mut queries = Vec::new();
+            loop {
+                ensure!(Instant::now() < deadline, "GPU source-audit acceptance timed out");
+                let task = app.db.task(id)?;
+                ensure!(
+                    !matches!(task.status.as_str(), "failed" | "processing_failed"),
+                    "GPU source-audit task failed: {} {:?}", task.stage, task.error
+                );
+                let children = app_cycle_windows::children()?;
+                samples.push(json!({"elapsed_ms":started.elapsed().as_millis(),"stage":task.stage,"progress":task.stage_progress,"children":children}));
+                if pair.is_none() && task.stage == "compression_encoding"
+                    && children.iter().any(|(_, name)| name.eq_ignore_ascii_case("ffmpeg.exe"))
+                    && children.iter().any(|(_, name)| name.eq_ignore_ascii_case("ffprobe.exe"))
+                {
+                    let commands = command_lines(&children).await?;
+                    queries.push(json!({"elapsed_ms":started.elapsed().as_millis(),"commands":commands}));
+                    let encoder = commands.iter().find(|entry| {
+                        let command = entry["CommandLine"].as_str().unwrap_or("");
+                        command.contains("hevc_nvenc") && command.contains("compressed.mkv")
+                    });
+                    let audit = commands.iter().find(|entry| {
+                        let command = entry["CommandLine"].as_str().unwrap_or("");
+                        command.contains("-show_frames") && !command.contains("-read_intervals")
+                            && command.contains(source_media.filename.as_str())
+                    });
+                    if let (Some(encoder), Some(audit)) = (encoder, audit) {
+                        pair = encoder["ProcessId"].as_u64().zip(audit["ProcessId"].as_u64());
+                        evidence = vec![encoder.clone(), audit.clone()];
+                    }
+                }
+                if let Some((encoder, audit)) = pair {
+                    if [encoder, audit].iter().all(|expected| children.iter().any(|(pid, _)| *pid as u64 == *expected)) {
+                        let since = *overlap_since.get_or_insert_with(Instant::now);
+                        maximum_overlap = maximum_overlap.max(since.elapsed());
+                    } else {
+                        overlap_since = None;
+                    }
+                }
+                if cancel_during_overlap && maximum_overlap >= Duration::from_millis(500) {
+                    cancelled_pids = children.iter().map(|(pid, _)| *pid).collect();
+                    app.command("tasks.cancel", json!({"id":id})).await?;
+                    ensure!(app.db.task(id)?.status == "cancelled", "GPU cancellation did not finish");
+                    ensure!(app.db.media_for_task(id)?.is_none(), "Cancelled GPU task published media");
+                    ensure!(!app.db.task(id)?.output_path.is_some_and(|path| path.exists()), "Cancelled GPU task published a file");
+                    break;
+                }
+                if task.status == "completed" {
+                    ensure!(!cancel_during_overlap, "GPU task completed before overlapping cancellation");
+                    let output = app.db.media_for_task(id)?.context("Completed GPU task published no media")?;
+                    ensure!(output.path.is_file() && output.size > 0, "GPU output is missing");
+                    ensure!(output.media_info.as_ref().is_some_and(|info| info.width == Some(3840) && info.height == Some(2160) && info.video_codec.as_deref() == Some("hevc")), "GPU output properties were not verified");
+                    output_bytes = Some(output.size);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let observations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../output/performance-20261020/gpu-source-audit-observation-{index}.json"));
+            std::fs::create_dir_all(observations.parent().unwrap())?;
+            std::fs::write(&observations, serde_json::to_vec_pretty(&json!({"maximum_continuous_overlap_ms":maximum_overlap.as_millis(),"samples":samples,"command_queries":queries}))?)?;
+            ensure!(maximum_overlap >= Duration::from_millis(500), "Source audit did not overlap actual GPU encoding for 500 ms");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !app.runners.lock().unwrap().is_empty() || !app_cycle_windows::children()?.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            }).await??;
+            app.task_log_writer.flush()?;
+            let journal = std::fs::read_to_string(app.config.data_dir.join("task-logs").join(format!("{id}.log")))?;
+            let encodes = journal.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|entry| {
+                entry["args"].as_array().is_some_and(|args| args.last().and_then(Value::as_str).is_some_and(|path| path.ends_with("compressed.mkv")) && args.iter().any(|arg| arg == "hevc_nvenc"))
+            }).count();
+            ensure!(encodes == 1, "GPU task launched {encodes} complete encodes");
+            ensure!(!journal.contains("compression-fixed.mkv") && !journal.contains("compression-stats"), "Approximate GPU compression prepared strict-size pass files");
+            ensure!(crate::download::hash_file(&source_media.path)? == source_hash, "GPU source changed");
+            let frozen = app.db.task(id)?;
+            for phase in ["scan", "cpu", "disk"] {
+                drop(tokio::time::timeout(Duration::from_secs(2), app.resource_permit(original, phase, &CancellationToken::new())).await??);
+            }
+            drop(tokio::time::timeout(Duration::from_secs(2), app.gpu_permit(original, false, &frozen, &CancellationToken::new())).await??);
+            ensure!(app.processor.available_permits() == 2 && app.queued_slots.lock().unwrap().values().all(Vec::is_empty), "GPU source-audit resources were not released");
+            results.push(json!({"kind":if cancel_during_overlap {"cancel"} else {"complete"},"elapsed_ms":started.elapsed().as_millis(),"maximum_continuous_overlap_ms":maximum_overlap.as_millis(),"overlapping_commands":evidence,"full_encode_commands":encodes,"output_bytes":output_bytes,"cancelled_child_pids":cancelled_pids,"all_owned_children_exited":true,"resource_permits_reusable":true,"source_unchanged":true}));
+            app.command("tasks.delete", json!({"id":id,"deleteFiles":true})).await?;
+        }
+        ensure!(app.db.tasks_including_retained()?.len() == 2 && app.db.media()?.len() == 2, "GPU acceptance left catalog outputs");
+        Ok::<_, anyhow::Error>(results)
+    }.await;
+    app.shutdown().await?;
+    let results = acceptance?;
+    ensure!(
+        app_cycle_windows::children()?.is_empty(),
+        "GPU acceptance left owned children after shutdown"
+    );
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../output/performance-20261020/gpu-source-audit.json");
+    std::fs::create_dir_all(output.parent().unwrap())?;
+    std::fs::write(
+        &output,
+        serde_json::to_vec_pretty(
+            &json!({"platform":"windows","profile":if cfg!(debug_assertions){"debug"}else{"release"},"source":"120s 3840x2160 SDR VP9, video only","analysis_threads":2,"target_fraction":0.7,"source_sha256":source_hash.0,"source_bytes":source_hash.1,"results":results}),
+        )?,
+    )?;
+    println!("GPU source audit acceptance: {}", output.display());
+    Ok(())
+}
+
 async fn measure_scheduler_delay(app: Arc<App>, task: Task) -> Result<Value> {
     // A separate single-worker runtime makes blocking observable without relying
     // on how many spare workers happen to be available in this test's runtime.

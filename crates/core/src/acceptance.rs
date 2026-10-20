@@ -245,7 +245,7 @@ async fn real_compression_previews_existing_media_with_bounded_analysis() -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires installed FFmpeg/FFprobe; local fixture only"]
-async fn real_compression_preserves_sources_tracks_chapters_and_honors_size() -> Result<()> {
+async fn real_compression_preserves_sources_tracks_chapters_and_estimates_size() -> Result<()> {
     let root = tempfile::tempdir()?;
     let app = App::open(config(root.path())).await?;
     let token = CancellationToken::new();
@@ -404,9 +404,8 @@ async fn real_compression_preserves_sources_tracks_chapters_and_honors_size() ->
         "Compression did not publish a separate MKV"
     );
     ensure!(
-        compressed.size <= target,
-        "Published compressed file exceeded its target: {} > {target}",
-        compressed.size
+        compressed.size > 0 && compressed.size < original_hash.1,
+        "Compression did not reduce the local fixture size"
     );
     ensure!(
         (compressed.duration - 8.0).abs() < 0.2,
@@ -508,12 +507,12 @@ async fn real_compression_preserves_sources_tracks_chapters_and_honors_size() ->
         wait_for(&app, std::slice::from_ref(&gpu_id), &["completed"]).await?;
         let gpu = app.db.media_for_task(&gpu_id)?.unwrap();
         ensure!(
-            gpu.size <= target && (gpu.duration - 8.0).abs() < 0.2,
-            "GPU compression exceeded its target or truncated content"
+            gpu.size > 0 && gpu.size < original_hash.1 && (gpu.duration - 8.0).abs() < 0.2,
+            "GPU compression did not reduce size or truncated content"
         );
         expected_media += 1;
         eprintln!(
-            "NVENC full compression verified: {} bytes <= {target} bytes",
+            "NVENC full compression verified: {} bytes, approximate target {target} bytes",
             gpu.size
         );
     } else {

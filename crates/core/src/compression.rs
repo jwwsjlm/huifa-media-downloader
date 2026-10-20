@@ -761,6 +761,7 @@ async fn source(
     id: &str,
     cancel: &CancellationToken,
     complete: bool,
+    report_progress: bool,
 ) -> Result<(Task, Arc<Source>)> {
     // A full pre-compression check must not hold up another dialog's short preview.
     let _analysis = if complete {
@@ -771,8 +772,8 @@ async fn source(
         None
     };
     let mut task = app.db.task(id)?;
-    let processing =
-        complete && task.status == "processing" && task.compression.is_some() && task.conversion;
+    let processing = task.status == "processing" && task.compression.is_some() && task.conversion;
+    let report_progress = processing && report_progress;
     ensure!(
         (matches!(task.status.as_str(), "completed" | "retained") || processing)
             && task.kind == "media",
@@ -813,10 +814,10 @@ async fn source(
     {
         return Ok((task, source));
     }
-    if processing {
+    if report_progress {
         app.set_stage(id, "processing", "compression_scanning", Some(0.0))?;
     }
-    let probe = probe(app, &task, &key.path, cancel, complete, processing).await?;
+    let probe = probe(app, &task, &key.path, cancel, complete, report_progress).await?;
     let video = main_video(&probe)?;
     dimensions(&video)?;
     let duration = duration(&probe)?;
@@ -827,7 +828,7 @@ async fn source(
     let stats = Arc::new(Mutex::new((HashMap::<u64, u64>::new(), None::<f64>, false)));
     let observed = stats.clone();
     let duration_tolerance = fraction(text(&video, "time_base")).unwrap_or(0.000001) * 2.01;
-    let progress = processing.then(|| analysis_progress(app, &task, duration, 80.0, 100.0));
+    let progress = report_progress.then(|| analysis_progress(app, &task, duration, 80.0, 100.0));
     let callback: LineCallback = Arc::new(move |is_error, line| {
         if is_error {
             return;
@@ -1125,7 +1126,7 @@ async fn preview_with_analysis(
     if let Some(options) = options {
         options.validate(false)?;
     }
-    let (task, source) = source(app, id, cancel, complete).await?;
+    let (task, source) = source(app, id, cancel, complete, true).await?;
     let planning = options
         .filter(|options| options.target_bytes.is_some() || options.video_bitrate_bps.is_some())
         .map(|options| plan(&source, options))
@@ -1273,7 +1274,10 @@ fn filters(plan: &Plan) -> Option<String> {
     (!filters.is_empty()).then(|| filters.join(","))
 }
 
-fn encoder_args(encoder: &str, plan: &Plan) -> Vec<String> {
+fn encoder_args(encoder: &str, plan: &Plan, hardware_decode: bool) -> Vec<String> {
+    if hardware_decode {
+        return vec!["-pix_fmt:v:0".into(), "+cuda".into()];
+    }
     let pixel = if encoder == "libx265" {
         plan.pixel_format.as_str()
     } else if depth(&plan.pixel_format) > 8 {
@@ -1335,7 +1339,6 @@ fn input_args(encoder: &str, path: &Path) -> Vec<String> {
 fn cuda_decode_eligible(source: &Source, plan: &Plan) -> bool {
     !cfg!(target_os = "macos")
         && plan.encoder == "hevc_nvenc"
-        && source.complete
         && source.blocking.is_empty()
         && matches!(text(&source.video, "codec_name"), "h264" | "hevc" | "vp9")
         && text(&source.video, "pix_fmt") == "yuv420p"
@@ -1356,7 +1359,6 @@ fn with_cuda_decode(mut args: Vec<String>) -> Vec<String> {
         .iter()
         .position(|arg| arg == "-i")
         .unwrap_or(args.len());
-    // Keep the software filter graph and output format unchanged; only decoding moves to CUDA.
     args.splice(
         input..input,
         [
@@ -1369,14 +1371,20 @@ fn with_cuda_decode(mut args: Vec<String>) -> Vec<String> {
     args
 }
 
-fn without_cuda_decode(args: &[String]) -> Vec<String> {
+fn without_cuda_decode(args: &[String], plan: &Plan) -> Vec<String> {
     let mut result = Vec::with_capacity(args.len());
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if matches!(arg.as_str(), "-hwaccel" | "-hwaccel_output_format") {
             let _ = args.next();
-        } else if let Some(filter) = arg.strip_prefix("hwdownload,format=nv12,") {
-            result.push(filter.into());
+        } else if arg == "-pix_fmt:v:0" {
+            if let Some(pixel) = args.next() {
+                if pixel == "+cuda" {
+                    result.extend(encoder_args("hevc_nvenc", plan, false));
+                } else {
+                    result.extend([arg.clone(), pixel.clone()]);
+                }
+            }
         } else {
             result.push(arg.clone());
         }
@@ -1431,10 +1439,16 @@ async fn verified_cuda_decode(
             "-threads:v".into(),
             "1".into(),
         ]);
-        let mut filters = encoder_args(&plan.encoder, plan);
-        if hardware && let Some(index) = filters.iter().position(|arg| arg == "-vf:v:0") {
-            filters[index + 1] = format!("hwdownload,format=nv12,{}", filters[index + 1]);
-        }
+        let filters = if hardware {
+            vec![
+                "-pix_fmt:v:0".into(),
+                "+nv12".into(),
+                "-vf:v:0".into(),
+                "hwdownload,format=nv12".into(),
+            ]
+        } else {
+            encoder_args(&plan.encoder, plan, false)
+        };
         args.extend(filters);
         args.extend([
             "-fps_mode:v:0".into(),
@@ -1656,7 +1670,7 @@ async fn capabilities(
                 "-b:v".into(),
                 plan.bitrate.to_string(),
             ]);
-            args.extend(encoder_args(encoder, plan));
+            args.extend(encoder_args(encoder, plan, false));
             if encoder == "libx265" {
                 let mut params = vec![format!(
                     "pools={}:frame-threads=1:log-level=error",
@@ -1781,6 +1795,161 @@ async fn run_encode(
     Ok(())
 }
 
+async fn encode_video(
+    app: &Arc<App>,
+    task: &Task,
+    source: &Source,
+    plan: &Plan,
+    cancel: &CancellationToken,
+) -> Result<PathBuf> {
+    let path = &source.key.path;
+    ensure!(
+        capabilities(app, task, source, plan, cancel, Some(&plan.encoder))
+            .await?
+            .iter()
+            .any(|capability| capability.encoder == plan.encoder && capability.available),
+        "The selected encoder cannot preserve this video's format and features; choose an available encoder"
+    );
+    let hardware_decode = verified_cuda_decode(app, task, source, plan, cancel).await?;
+    let mut encoding_permit = Some(if plan.encoder == "libx265" {
+        app.resource_permit(&task.id, "cpu", cancel).await?
+    } else {
+        app.gpu_permit(&task.id, hardware_decode, task, cancel)
+            .await?
+    });
+    let workspace = crate::processing::workspace(app, task);
+    crate::reject_links(&workspace)?;
+    std::fs::create_dir_all(&workspace)?;
+    let video_index = source.video["index"].as_u64().unwrap();
+    let fixed_streams = streams(&source.probe)
+        .filter(|stream| stream["index"].as_u64() != Some(video_index))
+        .collect::<Vec<_>>();
+    let mut base = input_args(&plan.encoder, path);
+    let output = workspace.join("compressed.mkv");
+    if hardware_decode {
+        base = with_cuda_decode(base);
+    }
+    base.extend(["-map".into(), format!("0:{video_index}")]);
+    let mut args = base;
+    for stream in &fixed_streams {
+        args.extend(["-map".into(), format!("0:{}", stream["index"])]);
+    }
+    args.extend([
+        "-c".into(),
+        "copy".into(),
+        "-map_metadata".into(),
+        "0".into(),
+        "-map_chapters".into(),
+        "0".into(),
+    ]);
+    for (output_index, stream) in std::iter::once(&source.video)
+        .chain(fixed_streams.iter().copied())
+        .enumerate()
+    {
+        let flags = stream["disposition"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, value)| value.as_u64() == Some(1))
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>();
+        args.extend([
+            format!("-disposition:{output_index}"),
+            if flags.is_empty() {
+                "0".into()
+            } else {
+                flags.join("+")
+            },
+            format!("-map_metadata:s:{output_index}"),
+            format!("0:s:{}", stream["index"]),
+        ]);
+    }
+    args.extend([
+        "-c:v:0".into(),
+        plan.encoder.clone(),
+        "-b:v:0".into(),
+        plan.bitrate.to_string(),
+        "-threads".into(),
+        ThreadBudget::detected(plan.encoder == "libx265")
+            .encoder
+            .to_string(),
+    ]);
+    args.extend(encoder_args(&plan.encoder, plan, hardware_decode));
+    args.extend(["-fps_mode:v:0".into(), "passthrough".into()]);
+    args.extend(color_args(source));
+    if plan.encoder == "libx265" {
+        let mut params = vec![
+            format!("pools={}", ThreadBudget::detected(true).encoder),
+            "frame-threads=1".into(),
+        ];
+        params.extend(hdr_params(source));
+        params.extend(x265_colors(source));
+        args.extend([
+            "-preset".into(),
+            "medium".into(),
+            "-x265-params".into(),
+            params.join(":"),
+        ]);
+    }
+    args.extend(["-progress".into(), "pipe:1".into(), "-nostats".into()]);
+    args.push(output.to_string_lossy().into());
+    app.set_stage(&task.id, "processing", "compression_encoding", None)?;
+    let mut result = run_encode(app, task, &args, source.duration, cancel).await;
+    if result.as_ref().is_err_and(gpu_capacity_failure)
+        && plan.encoder != "libx265"
+        && !cancel.is_cancelled()
+    {
+        drop(encoding_permit.take());
+        encoding_permit = Some(app.gpu_permit(&task.id, false, task, cancel).await?);
+        let _ = app.log_task(
+            &task.id,
+            "info",
+            "Retrying the same GPU encoder with exclusive GPU access after a capacity failure",
+        );
+        result = run_encode(app, task, &args, source.duration, cancel).await;
+    }
+    if result.is_err() && hardware_decode && !cancel.is_cancelled() {
+        // Retry decoding in software while retaining the same selected encoder and plan.
+        let _ = app.log_task(
+            &task.id,
+            "info",
+            "NVIDIA decoding failed; retrying with software decoding and the same NVIDIA encoder",
+        );
+        result = run_encode(
+            app,
+            task,
+            &without_cuda_decode(&args, plan),
+            source.duration,
+            cancel,
+        )
+        .await;
+    }
+    if plan.encoder != "libx265" {
+        result.context("GPU compression failed; retry this task on CPU")?;
+    } else {
+        result?;
+    }
+    drop(encoding_permit.take());
+    Ok(output)
+}
+
+fn verify_source_analysis(initial: &Source, complete: &Source) -> Result<()> {
+    ensure!(
+        complete.complete && initial.key == complete.key,
+        "The source changed during compression analysis; analyze it again"
+    );
+    ensure!(
+        complete.blocking.is_empty(),
+        "{}",
+        complete.blocking.join("; ")
+    );
+    ensure!(
+        color_args(initial) == color_args(complete) && hdr_params(initial) == hdr_params(complete),
+        "Source color or HDR metadata changed after the initial check; analyze it again before compression"
+    );
+    Ok(())
+}
+
 pub(crate) async fn encode(
     app: &Arc<App>,
     task: &Task,
@@ -1791,227 +1960,45 @@ pub(crate) async fn encode(
         .as_ref()
         .context("Compression options are missing")?;
     options.validate(true)?;
-    let manifest = task
-        .manifest
-        .as_ref()
-        .context("Compression source is missing")?;
-    let input = manifest
-        .files
-        .first()
-        .context("Compression source is missing")?;
-    let path = app.owned_path(&input.path)?;
     app.set_stage(&task.id, "processing", "compression_scanning", Some(0.0))?;
-    let (_, source) = source(app, &task.id, cancel, true).await?;
-    ensure!(source.blocking.is_empty(), "{}", source.blocking.join("; "));
-    let mut plan = plan(&source, options)?;
+    let (_, initial) = source(app, &task.id, cancel, options.encoder == "libx265", true).await?;
     ensure!(
-        capabilities(app, task, &source, &plan, cancel, Some(&plan.encoder))
-            .await?
-            .iter()
-            .any(|capability| capability.encoder == plan.encoder && capability.available),
-        "The selected encoder cannot preserve this video's format and features; choose an available encoder"
+        initial.blocking.is_empty(),
+        "{}",
+        initial.blocking.join("; ")
     );
-    let mut hardware_decode = verified_cuda_decode(app, task, &source, &plan, cancel).await?;
-    let mut encoding_permit = Some(if plan.encoder == "libx265" {
-        app.resource_permit(&task.id, "cpu", cancel).await?
+    let plan = plan(&initial, options)?;
+    let (output, source) = if initial.complete {
+        (
+            encode_video(app, task, &initial, &plan, cancel).await?,
+            initial,
+        )
     } else {
-        app.gpu_permit(&task.id, hardware_decode, task, cancel)
-            .await?
-    });
-    let mut exclusive_retry = false;
-    let workspace = crate::processing::workspace(app, task);
-    crate::reject_links(&workspace)?;
-    std::fs::create_dir_all(&workspace)?;
-    let fixed = workspace.join("compression-fixed.mkv");
-    let video_index = source.video["index"].as_u64().unwrap();
-    let fixed_streams = streams(&source.probe)
-        .filter(|stream| stream["index"].as_u64() != Some(video_index))
-        .collect::<Vec<_>>();
-    let mut base = input_args(&plan.encoder, &path);
-    let fixed_bytes = if fixed_streams.is_empty() || options.target_bytes.is_none() {
-        0
-    } else {
-        let mut args = base.clone();
-        for stream in &fixed_streams {
-            args.extend(["-map".into(), format!("0:{}", stream["index"])]);
-        }
-        args.extend([
-            "-c".into(),
-            "copy".into(),
-            "-map_metadata".into(),
-            "0".into(),
-            "-map_chapters".into(),
-            "0".into(),
-            fixed.to_string_lossy().into(),
-        ]);
-        app.set_stage(&task.id, "processing", "compression_preparing", None)?;
-        run_encode(app, task, &args, source.duration, cancel).await?;
-        std::fs::metadata(&fixed)?.len()
-    };
-    if let Some(target) = options.target_bytes {
-        plan.bitrate = bitrate(
-            target,
-            fixed_bytes,
-            video_duration(&source).unwrap_or(source.duration),
-        )?;
-    }
-    let output = workspace.join("compressed.mkv");
-    if hardware_decode {
-        base = with_cuda_decode(base);
-    }
-    base.extend(["-map".into(), format!("0:{video_index}")]);
-    for correction in 0..3 {
-        let passes = if plan.encoder == "libx265" && options.target_bytes.is_some() {
-            2
-        } else {
-            1
+        let work = cancel.child_token();
+        let encoding = encode_video(app, task, &initial, &plan, &work);
+        let audit = async {
+            let (_, full) = source(app, &task.id, &work, true, false).await?;
+            verify_source_analysis(&initial, &full)?;
+            Ok::<_, anyhow::Error>(full)
         };
-        for pass in 1..=passes {
-            let analysis = passes == 2 && pass == 1;
-            let mut args = base.clone();
-            if !analysis {
-                for stream in &fixed_streams {
-                    args.extend(["-map".into(), format!("0:{}", stream["index"])]);
-                }
-                args.extend([
-                    "-c".into(),
-                    "copy".into(),
-                    "-map_metadata".into(),
-                    "0".into(),
-                    "-map_chapters".into(),
-                    "0".into(),
-                ]);
-                for (output_index, stream) in std::iter::once(&source.video)
-                    .chain(fixed_streams.iter().copied())
-                    .enumerate()
-                {
-                    let flags = stream["disposition"]
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .filter(|(_, value)| value.as_u64() == Some(1))
-                        .map(|(key, _)| key.as_str())
-                        .collect::<Vec<_>>();
-                    args.extend([
-                        format!("-disposition:{output_index}"),
-                        if flags.is_empty() {
-                            "0".into()
-                        } else {
-                            flags.join("+")
-                        },
-                        format!("-map_metadata:s:{output_index}"),
-                        format!("0:s:{}", stream["index"]),
-                    ]);
-                }
+        tokio::pin!(encoding, audit);
+        // Cancel the sibling on failure and await both so their subprocesses are reaped.
+        tokio::select! {
+            encoded = &mut encoding => {
+                if encoded.is_err() { work.cancel(); }
+                else { let _ = app.set_stage(&task.id, "processing", "compression_scanning", None); }
+                let checked = audit.await;
+                (encoded?, checked?)
             }
-            args.extend([
-                "-c:v:0".into(),
-                plan.encoder.clone(),
-                "-b:v:0".into(),
-                plan.bitrate.to_string(),
-                "-threads".into(),
-                ThreadBudget::detected(plan.encoder == "libx265")
-                    .encoder
-                    .to_string(),
-            ]);
-            let mut filters = encoder_args(&plan.encoder, &plan);
-            if hardware_decode && let Some(index) = filters.iter().position(|arg| arg == "-vf:v:0")
-            {
-                filters[index + 1] = format!("hwdownload,format=nv12,{}", filters[index + 1]);
-            }
-            args.extend(filters);
-            args.extend(["-fps_mode:v:0".into(), "passthrough".into()]);
-            args.extend(color_args(&source));
-            if plan.encoder == "libx265" {
-                let mut params = vec![
-                    format!("pools={}", ThreadBudget::detected(true).encoder),
-                    "frame-threads=1".into(),
-                ];
-                if passes == 2 {
-                    params.push(format!("pass={pass}"));
-                    params.push("stats=compression-stats".into());
-                }
-                params.extend(hdr_params(&source));
-                params.extend(x265_colors(&source));
-                args.extend([
-                    "-preset".into(),
-                    "medium".into(),
-                    "-x265-params".into(),
-                    params.join(":"),
-                ]);
-            }
-            args.extend(["-progress".into(), "pipe:1".into(), "-nostats".into()]);
-            if analysis {
-                args.extend([
-                    "-an".into(),
-                    "-sn".into(),
-                    "-f".into(),
-                    "null".into(),
-                    "-".into(),
-                ]);
-            } else {
-                args.push(output.to_string_lossy().into());
-            }
-            app.set_stage(
-                &task.id,
-                "processing",
-                if analysis {
-                    "compression_analyzing"
-                } else {
-                    "compression_encoding"
-                },
-                None,
-            )?;
-            let mut result = run_encode(app, task, &args, source.duration, cancel).await;
-            if result.as_ref().is_err_and(gpu_capacity_failure)
-                && plan.encoder != "libx265"
-                && !exclusive_retry
-                && !cancel.is_cancelled()
-            {
-                drop(encoding_permit.take());
-                encoding_permit = Some(app.gpu_permit(&task.id, false, task, cancel).await?);
-                exclusive_retry = true;
-                let _ = app.log_task(&task.id, "info", "Retrying the same GPU encoder with exclusive GPU access after a capacity failure");
-                result = run_encode(app, task, &args, source.duration, cancel).await;
-            }
-            if result.is_err() && hardware_decode && !cancel.is_cancelled() {
-                // Retry decoding in software while retaining the same selected encoder and plan.
-                hardware_decode = false;
-                base = without_cuda_decode(&base);
-                let _ = app.log_task(&task.id, "info", "NVIDIA decoding failed; retrying with software decoding and the same NVIDIA encoder");
-                result = run_encode(
-                    app,
-                    task,
-                    &without_cuda_decode(&args),
-                    source.duration,
-                    cancel,
-                )
-                .await;
-            }
-            if plan.encoder != "libx265" {
-                result.context("GPU compression failed; retry this task on CPU")?;
-            } else {
-                result?;
+            checked = &mut audit => {
+                if checked.is_err() { work.cancel(); }
+                let encoded = encoding.await;
+                let complete = checked?;
+                (encoded?, complete)
             }
         }
-        let size = std::fs::metadata(&output)?.len();
-        if options.target_bytes.is_none_or(|target| size <= target) {
-            break;
-        }
-        ensure!(
-            correction < 2,
-            "Compressed output still exceeds the target size; choose a larger target"
-        );
-        let target = options.target_bytes.unwrap();
-        let allowed = target
-            .checked_sub(fixed_bytes + reserve(target))
-            .context("The target is too small to preserve fixed streams")?;
-        let actual = size.saturating_sub(fixed_bytes).max(1);
-        plan.bitrate = ((plan.bitrate as f64 * allowed as f64 / actual as f64 * 0.97).floor()
-            as u64)
-            .max(1000);
-    }
-    drop(encoding_permit.take());
+    };
+    let path = &source.key.path;
     app.set_stage(&task.id, "processing", "verifying_output", None)?;
     let output_probe = probe(app, task, &output, cancel, true, false).await?;
     let output_duration = duration(&output_probe)?;
@@ -2020,17 +2007,14 @@ pub(crate) async fn encode(
         app,
         task,
         &source.probe,
-        &path,
+        path,
         &output_probe,
         &output,
         cancel,
     )
     .await?;
     let size = std::fs::metadata(&output)?.len();
-    ensure!(
-        size > 0 && options.target_bytes.is_none_or(|target| size <= target),
-        "Compressed output exceeds the target size"
-    );
+    ensure!(size > 0, "Compressed output is empty");
     Ok(Prepared {
         path: output,
         duration: output_duration,
@@ -2461,6 +2445,51 @@ mod tests {
     }
 
     #[test]
+    fn background_analysis_rejects_changed_sources_and_late_metadata() -> Result<()> {
+        let mut initial = fixture();
+        initial.complete = false;
+        initial.probe["compressionFrames"]["count"] = json!(64);
+        let mut full = fixture();
+        verify_source_analysis(&initial, &full)?;
+
+        full.complete = false;
+        assert!(verify_source_analysis(&initial, &full).is_err());
+        full.complete = true;
+        full.key.size += 1;
+        assert!(
+            verify_source_analysis(&initial, &full)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
+
+        for (property, reason) in [("dynamicHdr", "dynamic HDR"), ("unsupported", "Interlaced")] {
+            let mut full = fixture();
+            full.probe["compressionFrames"][property] = json!(true);
+            full.blocking = blocking_reasons(&full.probe, &full.video);
+            assert!(
+                verify_source_analysis(&initial, &full)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(reason)
+            );
+        }
+
+        let mut full = fixture();
+        full.probe["frames"] = json!([{"side_data_list":[{"side_data_type":"Content light level metadata","max_content":1000,"max_average":400}]}]);
+        assert!(
+            verify_source_analysis(&initial, &full)
+                .unwrap_err()
+                .to_string()
+                .contains("color or HDR metadata changed")
+        );
+        let mut full = fixture();
+        full.video["color_primaries"] = json!("bt709");
+        assert!(verify_source_analysis(&initial, &full).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn thread_budgets_share_cpu_capacity() {
         for cores in [1, 2, 4, 8, 16, 32, 128] {
             for cpu in [true, false] {
@@ -2491,6 +2520,14 @@ mod tests {
                 !cfg!(target_os = "macos")
             );
         }
+        source.complete = false;
+        assert_eq!(
+            cuda_decode_eligible(&source, &plan),
+            !cfg!(target_os = "macos")
+        );
+        source.blocking.push("Unsupported source".into());
+        assert!(!cuda_decode_eligible(&source, &plan));
+        source.blocking.clear();
         for (field, value) in [
             ("codec_name", json!("av1")),
             ("codec_name", json!("vp8")),
@@ -2508,19 +2545,22 @@ mod tests {
         plan.resize = false;
         plan.fps = Some("24".into());
         assert!(!cuda_decode_eligible(&source, &plan));
-        let args = vec![
-            "-hwaccel".into(),
-            "cuda".into(),
-            "-hwaccel_output_format".into(),
-            "cuda".into(),
-            "-i".into(),
-            "source.mkv".into(),
-            "-c:v:0".into(),
-            "hevc_nvenc".into(),
-            "-vf:v:0".into(),
-            "hwdownload,format=nv12,scale=iw:ih:flags=lanczos,format=nv12".into(),
-        ];
-        let software = without_cuda_decode(&args);
+        plan.fps = None;
+        let input = input_args("hevc_nvenc", Path::new("source.mkv"));
+        let mut args = with_cuda_decode(input.clone());
+        args.extend(["-c:v:0".into(), "hevc_nvenc".into()]);
+        args.extend(encoder_args("hevc_nvenc", &plan, true));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-pix_fmt:v:0", "+cuda"])
+        );
+        assert!(!args.contains(&"-vf:v:0".into()));
+        let software = without_cuda_decode(&args, &plan);
+        let mut expected = input;
+        expected.extend(["-c:v:0".into(), "hevc_nvenc".into()]);
+        expected.extend(encoder_args("hevc_nvenc", &plan, false));
+        assert_eq!(software, expected);
+        assert_eq!(without_cuda_decode(&software, &plan), software);
         assert!(
             !software
                 .iter()
@@ -2823,13 +2863,13 @@ mod tests {
                 ..direct_options()
             },
         )?;
-        let args = encoder_args("hevc_vaapi", &plan);
+        let args = encoder_args("hevc_vaapi", &plan, false);
         assert!(args.iter().any(|arg| arg == "+vaapi"));
         assert!(args.iter().any(|arg| arg.contains("scale=320:180")
             && arg.contains("fps=24000/1001")
             && arg.ends_with("hwupload")));
         assert!(
-            encoder_args("libx265", &plan)
+            encoder_args("libx265", &plan, false)
                 .iter()
                 .any(|arg| arg == "+yuv420p10le")
         );
@@ -2905,6 +2945,7 @@ mod tests {
         let audio_only = root.path().join("audio-only");
         let survived = root.path().join("survived-timeout");
         let expected_threads = root.path().join("expected-threads");
+        let approximate_size = root.path().join("approximate-size");
         let auto_threads = crate::resources::analysis_threads(
             std::thread::available_parallelism().map_or(1, usize::from),
             None,
@@ -2944,7 +2985,7 @@ fn main() {{
         if args.iter().any(|arg| arg == "-show_frames") {{
             let pixel = if args.last().unwrap().ends_with("nvenc-nv12.mkv") {{ "nv12" }} else {{ "yuv420p" }};
             println!("width=160|height=90|pix_fmt={{pixel}}|interlaced_frame=0|best_effort_timestamp_time=0|duration_time=0.04");
-            if full {{
+            if full && !std::path::Path::new({approximate_size:?}).exists() {{
                 if std::path::Path::new({static_hdr:?}).exists() {{ println!("side_data_type=Content light level metadata|max_content=1000|max_average=400"); }}
                 else {{ println!("width=160|height=90|pix_fmt=yuv420p|side_data_type=HDR10+"); }}
             }}
@@ -2955,11 +2996,13 @@ fn main() {{
         }} else if !full && std::path::Path::new({audio_only:?}).exists() {{ println!("stream_index=1|size=1000|duration_time=0.04"); }}
         else {{ println!("stream_index=0|size=1000|duration_time=0.04"); }}
     }} else if args.iter().any(|arg| arg == "-show_format") {{
-        let codec = if args.last().unwrap().ends_with("probe.mkv") {{ "hevc" }} else {{ "h264" }};
+        let codec = if args.last().unwrap().ends_with("probe.mkv") || args.last().unwrap().ends_with("compressed.mkv") {{ "hevc" }} else {{ "h264" }};
         let pixel = if args.last().unwrap().ends_with("nvenc-nv12.mkv") {{ "nv12" }} else {{ "yuv420p" }};
         println!("{{{{\"format\":{{{{\"duration\":\"3600\"}}}},\"streams\":[{{{{\"index\":0,\"codec_type\":\"video\",\"codec_name\":\"{{}}\",\"width\":160,\"height\":90,\"pix_fmt\":\"{{}}\",\"bit_rate\":\"1000000\",\"avg_frame_rate\":\"25/1\",\"r_frame_rate\":\"25/1\",\"time_base\":\"1/1000\"}}}}]}}}}", codec, pixel);
     }} else if args.iter().any(|arg| arg == "libx265" || arg.starts_with("hevc_")) {{
-        std::fs::write(args.last().unwrap(), b"encoded fixture").unwrap();
+        if args.last().unwrap().ends_with("compressed.mkv") && std::path::Path::new({approximate_size:?}).exists() {{
+            std::fs::write(args.last().unwrap(), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        }} else {{ std::fs::write(args.last().unwrap(), b"encoded fixture").unwrap(); }}
     }} else {{ std::process::exit(1); }}
 }}
 "#,
@@ -2969,6 +3012,7 @@ fn main() {{
                 audio_only = audio_only.to_string_lossy(),
                 survived = survived.to_string_lossy(),
                 expected_threads = expected_threads.to_string_lossy(),
+                approximate_size = approximate_size.to_string_lossy(),
             ),
         )?;
         let executable = runtime.join(format!("ffprobe{}", std::env::consts::EXE_SUFFIX));
@@ -3056,7 +3100,8 @@ fn main() {{
 
         let mut probe_task = task.clone();
         probe_task.tools = current_tools(&app, &CancellationToken::new()).await?;
-        let (_, preview_source) = source(&app, &task.id, &CancellationToken::new(), false).await?;
+        let (_, preview_source) =
+            source(&app, &task.id, &CancellationToken::new(), false, true).await?;
         CAPABILITIES
             .get_or_init(Default::default)
             .lock()
@@ -3238,6 +3283,27 @@ fn main() {{
         assert_eq!(app.db.task(queued_id)?.status, "cancelled");
         assert!(!survived.exists(), "Cancelled scan process survived");
         std::fs::write(full_scan, b"allow complete validation")?;
+
+        // A background audit keeps encoder progress and still checks every source frame.
+        let cancelled = app.db.task(queued_id)?;
+        let mut auditing = cancelled.clone();
+        auditing.stage("processing", "compression_encoding", Some(42.0));
+        app.save_task(&auditing)?;
+        let (_, sampled) = source(&app, queued_id, &CancellationToken::new(), false, false).await?;
+        assert!(!sampled.complete);
+        let (_, audited) = source(&app, queued_id, &CancellationToken::new(), true, false).await?;
+        assert!(audited.complete);
+        assert!(
+            audited
+                .blocking
+                .iter()
+                .any(|reason| reason.contains("dynamic HDR"))
+        );
+        let unchanged = app.db.task(queued_id)?;
+        assert_eq!(unchanged.stage, "compression_encoding");
+        assert_eq!(unchanged.stage_progress, Some(42.0));
+        app.save_task(&cancelled)?;
+
         let rejected = app
             .command(
                 "tasks.convert",
@@ -3352,6 +3418,58 @@ fn main() {{
             compressed_preview["source"]["sizeBytes"],
             512 * 1024,
             "Preview read the previous compression's input instead of its published output"
+        );
+
+        std::fs::write(&approximate_size, b"accept approximate output size")?;
+        SOURCES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .retain(|source| source.key.path != path);
+        let before = std::fs::read_to_string(&calls)?
+            .lines()
+            .filter(|line| line.contains("-c:v:0 libx265"))
+            .count();
+        let approximate = app
+            .command(
+                "tasks.convert",
+                json!({"id":task.id,"compression":{"targetBytes":128 * 1024}}),
+            )
+            .await?;
+        let approximate_id = approximate["id"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = app.db.task(approximate_id)?;
+                ensure!(
+                    current.status != "processing_failed",
+                    "Approximate output was rejected: {:?}",
+                    current.error
+                );
+                if current.status == "completed" {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        assert_eq!(
+            app.db.media_for_task(approximate_id)?.unwrap().size,
+            2 * 1024 * 1024
+        );
+        let recorded = std::fs::read_to_string(&calls)?;
+        assert_eq!(
+            recorded
+                .lines()
+                .filter(|line| line.contains("-c:v:0 libx265"))
+                .count()
+                - before,
+            1,
+            "Approximate size caused another full encode"
+        );
+        assert!(
+            !recorded.contains("compression-fixed.mkv")
+                && !recorded.contains("pass=1")
+                && !recorded.contains("pass=2")
         );
 
         let slot = app.processor.clone().acquire_many_owned(2).await?;
