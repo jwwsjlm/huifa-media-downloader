@@ -137,13 +137,27 @@ pub async fn download(
     } else {
         StatusCode::OK
     };
-    let filename: String = path
+    let original: String = path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .chars()
-        .filter(|c| c.is_ascii() && !c.is_control() && !matches!(c, '"' | '\\'))
+        .filter(|c| !c.is_control())
         .take(200)
+        .collect();
+    let filename: String = original
+        .chars()
+        .filter(|c| c.is_ascii() && !matches!(c, '"' | '\\'))
+        .collect();
+    let encoded: String = original
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&byte) {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
         .collect();
     let response_headers = response.headers_mut();
     response_headers.insert(
@@ -154,7 +168,10 @@ pub async fn download(
     response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response_headers.insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("inline; filename=\"{filename}\"")).unwrap(),
+        HeaderValue::from_str(&format!(
+            "inline; filename=\"{filename}\"; filename*=UTF-8''{encoded}"
+        ))
+        .unwrap(),
     );
     if partial {
         response_headers.insert(
@@ -189,6 +206,32 @@ fn parse_range(range: &str, length: u64) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn download_headers_preserve_unicode_and_escape_unsafe_filename_bytes() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        for (name, expected) in [
+            ("中文😀.mp4", "%E4%B8%AD%E6%96%87%F0%9F%98%80.mp4"),
+            ("a space%'*.mp4", "a%20space%25%27%2A.mp4"),
+            ("name\"\r\nInjected:yes.mp4", "name%22Injected%3Ayes.mp4"),
+        ] {
+            let response = download(
+                file.reopen()?,
+                Path::new(name),
+                "video/mp4",
+                &HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+            let disposition = response.headers()[header::CONTENT_DISPOSITION].to_str()?;
+            assert!(disposition.ends_with(&format!("filename*=UTF-8''{expected}")));
+            assert!(!disposition.contains(['\r', '\n']));
+            assert_eq!(disposition.matches('"').count(), 2);
+            assert!(!response.headers().contains_key("injected"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn owned_paths_and_ranges() -> Result<()> {
         let owned = tempfile::tempdir()?;

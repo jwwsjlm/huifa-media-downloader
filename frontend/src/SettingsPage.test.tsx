@@ -9,9 +9,9 @@ const transport = vi.hoisted(() => ({ desktop: false, command: vi.fn(), paths: v
 vi.mock('./transport', () => ({ host: { get desktop() { return transport.desktop; }, command: transport.command, paths: transport.paths, directory: transport.directory, openDownloadDirectory: transport.openDownloadDirectory, capabilities: () => ({ updates: false }) } }));
 beforeEach(() => { transport.desktop = false; transport.command.mockReset().mockResolvedValue([]); transport.paths.mockReset().mockResolvedValue({ downloadDir: '/downloads' }); transport.directory.mockReset().mockResolvedValue(null); transport.openDownloadDirectory.mockReset().mockResolvedValue(undefined); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
-function AnalysisSettings({ settings = {} }: { settings?: Settings }) {
+function AnalysisSettings({ settings = {}, visible = true }: { settings?: Settings; visible?: boolean }) {
   const [state, dispatch] = useReducer(reducer, { ...initialState, settings, view: { ...initialState.view, settingsTab: 'downloads' } });
-  return <SettingsPage state={state} dispatch={dispatch} t={(_zh, en) => en} run={run} message={vi.fn()} />;
+  return visible ? <SettingsPage state={state} dispatch={dispatch} t={(_zh, en) => en} run={run} message={vi.fn()} /> : null;
 }
 it.each([false, true])('uses host detection for automatic analysis threads on desktop=%s', desktop => {
   transport.desktop = desktop;
@@ -44,6 +44,59 @@ it('keeps a manual analysis draft across tabs, saves it without host metadata an
   expect(screen.queryByRole('spinbutton', { name: 'Manual analysis threads' })).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
   await waitFor(() => expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ analysisThreads: 0 }) }));
+});
+it.each([false, true])('keeps newer settings, download options and API key across a delayed save (reopen=%s)', async reopen => {
+  let finish!: (settings: Settings) => void;
+  let submitted!: Settings;
+  transport.command.mockImplementation(async (name, args) => {
+    if (name !== 'settings.save') return [];
+    submitted = args.settings;
+    return new Promise<Settings>(resolve => { finish = resolve; });
+  });
+  const settings = { hasAiApiKey: true };
+  const view = render(<AnalysisSettings settings={settings} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Appearance & covers' }));
+  fireEvent.change(screen.getByRole('textbox', { name: 'Completion time format' }), { target: { value: 'YYMMDD HH:mm' } });
+  fireEvent.change(screen.getByLabelText(/OpenAI API key/), { target: { value: 'submitted-key' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await waitFor(() => expect(submitted.aiApiKey).toBe('submitted-key'));
+  if (reopen) {
+    view.rerender(<AnalysisSettings settings={settings} visible={false} />);
+    view.rerender(<AnalysisSettings settings={settings} />);
+  }
+  fireEvent.change(screen.getByRole('textbox', { name: 'Completion time format' }), { target: { value: 'YYYY-MM-DD' } });
+  fireEvent.change(screen.getByLabelText(/OpenAI API key/), { target: { value: 'newer-key' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Downloads' }));
+  fireEvent.change(screen.getByRole('combobox', { name: 'Concurrent fragments per task' }), { target: { value: '6' } });
+  const { aiApiKey: _key, ...saved } = submitted;
+  await act(async () => finish(saved));
+  expect(screen.getByText('Unsaved changes')).toBeTruthy();
+  expect((screen.getByRole('combobox', { name: 'Concurrent fragments per task' }) as HTMLSelectElement).value).toBe('6');
+  fireEvent.click(screen.getByRole('button', { name: 'Appearance & covers' }));
+  expect((screen.getByRole('textbox', { name: 'Completion time format' }) as HTMLInputElement).value).toBe('YYYY-MM-DD');
+  expect((screen.getByLabelText(/OpenAI API key/) as HTMLInputElement).value).toBe('newer-key');
+  transport.command.mockImplementation(async (name, args) => name === 'settings.save' ? args.settings : []);
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ completedTimeFormat: 'YYYY-MM-DD', aiApiKey: 'newer-key', downloadOptions: expect.objectContaining({ fragmentConcurrent: 6 }) }) }));
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true));
+  expect((screen.getByLabelText(/OpenAI API key/) as HTMLInputElement).value).toBe('');
+});
+it('clears the saved API key without dropping a replacement typed while the request is pending', async () => {
+  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  let finish!: () => void;
+  transport.command.mockImplementation(async (name, args) => name === 'settings.save'
+    ? new Promise<Settings>(resolve => { finish = () => resolve({ ...args.settings, hasAiApiKey: false }); }) : []);
+  render(<AnalysisSettings settings={{ hasAiApiKey: true }} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Appearance & covers' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Clear saved key' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ aiApiKey: '' }) }));
+  expect((screen.getByRole('button', { name: 'Clear saved key' }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.change(screen.getByLabelText(/OpenAI API key/), { target: { value: 'replacement-key' } });
+  await act(async () => finish());
+  expect((screen.getByLabelText(/OpenAI API key/) as HTMLInputElement).value).toBe('replacement-key');
+  expect(screen.getByText('Unsaved changes')).toBeTruthy();
+  expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(false);
+  confirm.mockRestore();
 });
 it.each(['', '0', '-1', '1.5', '257'])('rejects invalid manual analysis threads %s without switching to automatic mode', value => {
   render(<AnalysisSettings settings={{ analysisThreads: 4, detectedAnalysisThreads: 20 }} />);

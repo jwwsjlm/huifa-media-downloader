@@ -182,7 +182,10 @@ pub(crate) fn status(app: &App) -> Result<Value> {
 
 pub(crate) async fn cleanup(app: &App) -> Result<Value> {
     let _adding = app.task_add_lock.lock().await;
-    let _tools = app.tool_update_lock.lock().await;
+    let _tools = app
+        .tool_update_lock
+        .try_lock()
+        .context("Runtime tools are in use or updating; try cleaning up again shortly")?;
     let _publication = app.publication_lock.lock().await;
     let mut cleaned = 0;
     let mut failures = Vec::new();
@@ -199,14 +202,65 @@ pub(crate) async fn cleanup(app: &App) -> Result<Value> {
         remove_cache_directory(&path)?;
         tool_groups += 1;
     }
+    let unused_assets = crate::cover::clean_unused_assets(app)?;
     Ok(
-        json!({"cleaned":cleaned,"toolGroups":tool_groups,"failedTaskIds":failures,"storage":status(app)?}),
+        json!({"cleaned":cleaned,"toolGroups":tool_groups,"unusedAssets":unused_assets,"failedTaskIds":failures,"storage":status(app)?}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn busy_runtime_cleanup_preserves_caches_and_does_not_block_cancellation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let mut completed = crate::tests::paused_task(Default::default());
+        completed.status = "completed".into();
+        app.db.insert_task(&completed)?;
+        for path in cache_paths(&app, &completed) {
+            std::fs::create_dir_all(&path)?;
+            std::fs::write(path.join("cached"), b"cached media")?;
+        }
+        let obsolete = app.config.data_dir.join("tools/yt-dlp-2222222222222222");
+        std::fs::create_dir_all(&obsolete)?;
+        std::fs::write(obsolete.join("payload"), b"runtime")?;
+        let task = crate::tests::paused_task(Default::default());
+        app.db.insert_task(&task)?;
+        let tools = app.tool_update_lock.lock().await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.command("storage.cleanup", json!({})),
+        )
+        .await?
+        .unwrap_err();
+        assert!(error.to_string().contains("try cleaning up again"));
+        assert!(
+            cache_paths(&app, &completed)
+                .iter()
+                .all(|path| path.join("cached").exists())
+        );
+        assert_eq!(std::fs::read(obsolete.join("payload"))?, b"runtime");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.command("tasks.cancel", json!({"id":task.id})),
+        )
+        .await??;
+        assert_eq!(app.db.task(&task.id)?.status, "cancelled");
+        drop(tools);
+        let report = cleanup(&app).await?;
+        assert_eq!(report["storage"]["completedCacheBytes"], 0);
+        assert!(!obsolete.exists());
+        app.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn completed_cleanup_keeps_results_previews_and_failed_sources() -> Result<()> {
         let root = tempfile::tempdir()?;

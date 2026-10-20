@@ -210,6 +210,11 @@ pub(crate) async fn collection(
     cancel: &CancellationToken,
 ) -> Result<Value> {
     let _permit = tokio::select! { permit=app.network.acquire()=>permit?, _=cancel.cancelled()=>bail!("Operation interrupted") };
+    let _tools = tokio::select! {
+        guard = app.tool_update_lock.lock() => guard,
+        _ = cancel.cancelled() => bail!("Operation interrupted"),
+        _ = app.shutdown_token.cancelled() => bail!("Application is shutting down"),
+    };
     let cookies = Cookies::new(app, cookie_text)?;
     let mut args = base_args(app, options, &cookies, None).await?;
     args.extend([
@@ -580,6 +585,51 @@ fn compare_audio(a: &Value, b: &Value, options: &DownloadOptions) -> Ordering {
 }
 
 pub(crate) fn select_formats(info: &Value, options: &DownloadOptions) -> Result<Vec<Value>> {
+    let selected = select_formats_inner(info, options)?;
+    if !is_live(info) || selected.len() <= 1 || shared_live_clock(&selected) {
+        return Ok(selected);
+    }
+    if options.format_id.is_empty()
+        && options.video_format_id.is_empty()
+        && options.audio_format_ids.is_empty()
+        && options.audio_track != "all"
+    {
+        let mut combined = info.clone();
+        combined["formats"] = json!(
+            all_formats(info)
+                .into_iter()
+                .filter(|format| has_video(format) && has_audio(format))
+                .collect::<Vec<_>>()
+        );
+        if let Ok(formats) = select_formats_inner(&combined, options)
+            && formats.len() == 1
+        {
+            return Ok(formats);
+        }
+    }
+    bail!(
+        "Requirements unmet: separate live streams have no verified shared manifest clock; choose a combined live format before recording"
+    )
+}
+
+fn shared_live_clock(formats: &[Value]) -> bool {
+    let family = |format: &Value| match text(format, "protocol") {
+        "m3u8" | "m3u8_native" => "hls",
+        "http_dash_segments" => "dash",
+        _ => "",
+    };
+    let Some(first) = formats.first() else {
+        return false;
+    };
+    let manifest = text(first, "manifest_url");
+    !manifest.is_empty()
+        && !family(first).is_empty()
+        && formats.iter().all(|format| {
+            text(format, "manifest_url") == manifest && family(format) == family(first)
+        })
+}
+
+fn select_formats_inner(info: &Value, options: &DownloadOptions) -> Result<Vec<Value>> {
     let formats = all_formats(info);
     let mut selected = Vec::new();
     let explicit_audio = options.audio_format_ids.is_empty()
@@ -798,6 +848,8 @@ where
 pub(crate) fn is_live(info: &Value) -> bool {
     info["is_live"].as_bool().unwrap_or(false) || text(info, "live_status") == "is_live"
 }
+
+pub(crate) const LIVE_TIMESTAMP_ARGS: &str = "-copyts -mpegts_copyts 1 -avoid_negative_ts disabled";
 
 pub(crate) fn chapters(info: &Value) -> Vec<Chapter> {
     info["chapters"]
@@ -1053,6 +1105,7 @@ pub(crate) async fn transfer(
         .collect();
     app.save_task(&task)?;
     let live = is_live(&info);
+    let shared_live = live && formats.len() > 1;
     let directory = app
         .config
         .data_dir
@@ -1163,7 +1216,8 @@ pub(crate) async fn transfer(
                         args.push("--live-from-start".into());
                     }
                     if live {
-                        args.extend(["--downloader-args".into(), "ffmpeg_o:-f mpegts".into()]);
+                        let timing = if shared_live { LIVE_TIMESTAMP_ARGS } else { "" };
+                        args.extend(["--downloader-args".into(), format!("ffmpeg_o:-f mpegts {timing}")]);
                     }
                 } else {
                     args.extend([
@@ -1356,7 +1410,14 @@ pub(crate) async fn transfer(
             });
         }
     }
-    let metadata = sanitized_metadata(&info);
+    let mut metadata = sanitized_metadata(&info);
+    metadata
+        .as_object_mut()
+        .unwrap()
+        .remove("_liveSharedTimestamps");
+    if shared_live {
+        metadata["_liveSharedTimestamps"] = json!(true);
+    }
     if task.options.write_info_json {
         let path = directory.join("metadata.info.json");
         write_sync(&path, &serde_json::to_vec_pretty(&metadata)?)?;
@@ -1813,6 +1874,51 @@ impl App {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn collection_waiting_for_tool_update_remains_cancellable_and_releases_network()
+    -> Result<()> {
+        for shutdown in [false, true] {
+            let root = tempfile::tempdir()?;
+            let app = App::open(crate::AppConfig {
+                data_dir: root.path().join("data"),
+                download_dir: root.path().join("output"),
+                tool_dir: None,
+            })
+            .await?;
+            let guard = app.tool_update_lock.lock().await;
+            let cancel = CancellationToken::new();
+            let options = DownloadOptions::default();
+            let query = collection(
+                &app,
+                "https://example.test/playlist",
+                &options,
+                None,
+                &cancel,
+            );
+            tokio::pin!(query);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut query)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(app.network.available_permits(), 2);
+            if shutdown {
+                app.shutdown_token.cancel();
+            } else {
+                cancel.cancel();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), query)
+                    .await?
+                    .is_err()
+            );
+            assert_eq!(app.network.available_permits(), 3);
+            drop(guard);
+            app.shutdown().await?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn partial_transfer_identity_reuses_only_the_same_source_and_format() -> Result<()> {
         let info =
@@ -2034,6 +2140,36 @@ mod tests {
         assert!(is_live(
             &json!({"live_status":"is_live","formats":[{"protocol":"https"}]})
         ));
+    }
+
+    #[test]
+    fn separate_live_formats_require_a_common_manifest_or_a_compatible_combined_format()
+    -> Result<()> {
+        let mut info = json!({"is_live":true,"formats":[
+            {"format_id":"v","width":1920,"height":1080,"vcodec":"h264","acodec":"none","protocol":"m3u8_native","manifest_url":"https://example.test/master.m3u8"},
+            {"format_id":"a","vcodec":"none","acodec":"aac","protocol":"m3u8","manifest_url":"https://example.test/master.m3u8"}
+        ]});
+        let options = DownloadOptions::parse(json!({"quality":"1080p"}))?;
+        assert_eq!(select_formats(&info, &options)?.len(), 2);
+        info["formats"][1]["manifest_url"] = json!("https://example.test/another.m3u8");
+        assert!(
+            select_formats(&info, &options)
+                .unwrap_err()
+                .to_string()
+                .contains("shared manifest clock")
+        );
+        info["formats"].as_array_mut().unwrap().push(json!({"format_id":"combined","width":1920,"height":1080,"vcodec":"h264","acodec":"aac","protocol":"m3u8"}));
+        assert_eq!(
+            text(&select_formats(&info, &options)?[0], "format_id"),
+            "combined"
+        );
+        let exact = DownloadOptions::parse(json!({"videoFormatId":"v","audioFormatIds":["a"]}))?;
+        assert!(select_formats(&info, &exact).is_err());
+        info["formats"][2]["height"] = json!(720);
+        assert!(select_formats(&info, &options).is_err());
+        info["is_live"] = json!(false);
+        assert_eq!(select_formats(&info, &options)?.len(), 2);
+        Ok(())
     }
 
     #[tokio::test]

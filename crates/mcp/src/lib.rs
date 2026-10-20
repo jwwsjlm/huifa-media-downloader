@@ -121,16 +121,30 @@ fn router_at(app: Arc<App>, config: StreamableHttpServerConfig, path: &str) -> R
     // Tauri enables reqwest's provider-free TLS; use the core's existing ring backend.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let stop = config.cancellation_token.clone();
+    let sessions = Arc::new(LocalSessionManager::default());
+    let shutdown_sessions = sessions.clone();
+    let shutdown = stop.clone();
+    tokio::spawn(async move {
+        shutdown.cancelled().await;
+        // Legacy sessions otherwise outlive the HTTP listener's cancellation.
+        let sessions = std::mem::take(&mut *shutdown_sessions.sessions.write().await);
+        for (_, session) in sessions {
+            let _ = session.close().await;
+        }
+    });
     let handler_app = app.clone();
     let service = StreamableHttpService::new(
         move || {
+            if stop.is_cancelled() {
+                return Err(std::io::Error::other("MCP is disabled or stopping"));
+            }
             Ok(Handler {
                 generation: handler_app.access.generation(),
                 app: handler_app.clone(),
                 stop: stop.clone(),
             })
         },
-        Arc::new(LocalSessionManager::default()),
+        sessions,
         config,
     );
     Router::new()
@@ -219,6 +233,21 @@ struct Handler {
     generation: u64,
 }
 impl ServerHandler for Handler {
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        // A pending request can insert its session after the shutdown drain.
+        if self.stop.is_cancelled() {
+            return Err(ErrorData::invalid_request(
+                "MCP is disabled or stopping",
+                None,
+            ));
+        }
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
+    }
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
@@ -1130,6 +1159,48 @@ fn validate_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stopping_http_listener_closes_abandoned_sessions_and_releases_core() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = huifa_core::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let host = DesktopMcp::new(app.clone());
+        let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = socket.local_addr()?.port();
+        drop(socket);
+        host.configure(true, false, port, None).await?;
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth("admin")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"shutdown-test","version":"1"}}}"#)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("mcp-session-id"));
+        assert!(response.text().await?.contains("serverInfo"));
+        let core = Arc::downgrade(&app);
+        host.shutdown().await;
+        drop(host);
+        app.shutdown().await?;
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while core.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let reopened = App::open(config).await?;
+        reopened.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn auto_start_migrates_legacy_enabled_and_stays_independent() -> Result<()> {
         let root = tempfile::tempdir()?;

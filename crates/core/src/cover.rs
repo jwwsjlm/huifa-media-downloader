@@ -9,12 +9,12 @@ use image::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Cursor, Write},
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -25,6 +25,92 @@ const MAX_PIXELS: u64 = 50_000_000;
 #[derive(Default)]
 pub(crate) struct CoverState {
     jobs: Mutex<HashMap<String, CancellationToken>>,
+    uploads: Mutex<HashMap<String, Instant>>,
+}
+
+impl App {
+    pub fn store_cover_upload(&self, name: &str, image: &DynamicImage) -> Result<Value> {
+        let mut uploads = self.cover_state.uploads.lock().unwrap();
+        let directory = self.config.data_dir.join("assets");
+        crate::reject_links(&directory)?;
+        fs::create_dir_all(&directory)?;
+        let id = Uuid::new_v4().to_string();
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        image.write_to(&mut temporary, image::ImageFormat::Png)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist_noclobber(directory.join(format!("{id}.png")))
+            .map_err(|error| error.error)?;
+        uploads.insert(id.clone(), Instant::now());
+        Ok(
+            json!({"id":id,"name":Path::new(name).file_name().unwrap_or_default().to_string_lossy(),"kind":"image"}),
+        )
+    }
+}
+
+fn release_upload(app: &App, id: &str) -> Result<()> {
+    ensure!(
+        Uuid::parse_str(id)?.to_string() == id,
+        "Invalid cover asset ID"
+    );
+    let mut uploads = app.cover_state.uploads.lock().unwrap();
+    if uploads.contains_key(id) {
+        let path = app.config.data_dir.join("assets").join(format!("{id}.png"));
+        crate::reject_links(&path)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        uploads.remove(id);
+    }
+    Ok(())
+}
+
+pub(crate) fn clean_unused_assets(app: &App) -> Result<usize> {
+    let mut uploads = app.cover_state.uploads.lock().unwrap();
+    uploads.retain(|_, used| used.elapsed() < Duration::from_secs(24 * 60 * 60));
+    let mut referenced = app
+        .db
+        .media()?
+        .into_iter()
+        .flat_map(|media| std::iter::once(media.path).chain(media.assets))
+        .collect::<HashSet<_>>();
+    for task in app.db.tasks_including_retained()? {
+        referenced.extend(task.output_path);
+        referenced.extend(task.previous_outputs);
+        if let Some(publication) = task.publication {
+            referenced.extend([publication.target, publication.temporary]);
+            referenced.extend(publication.backup);
+            for file in publication.auxiliary {
+                referenced.extend([file.target, file.temporary]);
+            }
+        }
+    }
+    let directory = app.config.data_dir.join("assets");
+    crate::reject_links(&directory)?;
+    let mut removed = 0;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(id) = path.file_stem().and_then(|id| id.to_str()) else {
+            continue;
+        };
+        if !entry.file_type()?.is_file()
+            || !matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("png" | "jpg")
+            )
+            || !Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
+            || uploads.contains_key(id)
+            || referenced.contains(&path)
+        {
+            continue;
+        }
+        fs::remove_file(path)?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 #[derive(Clone, Deserialize)]
@@ -92,6 +178,10 @@ impl Request {
 
 pub(crate) async fn command(app: &App, command: &str, args: Value) -> Result<Value> {
     let request: Request = serde_json::from_value(args)?;
+    if command == "cover.release_upload" {
+        release_upload(app, &request.asset_id)?;
+        return Ok(json!(true));
+    }
     if command == "cover.cancel" {
         if let Some(token) = app.cover_state.jobs.lock().unwrap().get(&request.media_id) {
             token.cancel();
@@ -158,6 +248,15 @@ fn source_path(app: &App, media: &Media, request: &Request) -> Result<PathBuf> {
             Uuid::parse_str(&request.asset_id)?.to_string() == request.asset_id,
             "Invalid cover asset ID"
         );
+        if let Some(used) = app
+            .cover_state
+            .uploads
+            .lock()
+            .unwrap()
+            .get_mut(&request.asset_id)
+        {
+            *used = Instant::now();
+        }
         ["png", "jpg"]
             .into_iter()
             .map(|ext| {
@@ -301,6 +400,8 @@ fn png_bytes(image: &DynamicImage) -> Result<Vec<u8>> {
     Ok(bytes.into_inner())
 }
 fn save_asset(app: &App, media_id: &str, extension: &str, bytes: &[u8]) -> Result<String> {
+    // Keep orphan cleanup from racing the file write and database reference.
+    let _uploads = app.cover_state.uploads.lock().unwrap();
     let directory = app.config.data_dir.join("assets");
     fs::create_dir_all(&directory)?;
     ensure!(
@@ -545,6 +646,83 @@ async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn uploads_release_and_orphan_cleanup_preserve_active_and_exported_images() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let config = crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let image = DynamicImage::new_rgb8(2, 2);
+        let upload = app.store_cover_upload("upload.png", &image)?;
+        let id = upload["id"].as_str().unwrap();
+        let directory = app.config.data_dir.join("assets");
+        let path = directory.join(format!("{id}.png"));
+        let mut task = crate::tests::paused_task(HashMap::new());
+        let previous = directory.join(format!("{}.png", Uuid::new_v4()));
+        fs::write(&previous, b"preserve pending publication cleanup")?;
+        task.previous_outputs.push(previous.clone());
+        app.db.insert_task(&task)?;
+        let main = directory.join(format!("{}.jpg", Uuid::new_v4()));
+        image.save(&main)?;
+        let media = Media {
+            media_info: None,
+            id: Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            title: "Cover upload".into(),
+            filename: "video.mp4".into(),
+            size: 1,
+            duration: 1.0,
+            path: main.clone(),
+            assets: vec![],
+        };
+        app.db.complete(&task, &media)?;
+        let export = app
+            .command("cover.export", json!({"mediaId":media.id,"assetId":id}))
+            .await?;
+        let exported = directory.join(format!("{}.jpg", export["assetId"].as_str().unwrap()));
+        let orphan = directory.join(format!("{}.png", Uuid::new_v4()));
+        fs::write(&orphan, b"old abandoned upload")?;
+        let report = crate::storage::cleanup(&app).await?;
+        assert_eq!(report["unusedAssets"], 1);
+        assert!(!orphan.exists());
+        assert!(path.is_file() && exported.is_file() && main.is_file() && previous.is_file());
+        app.command("cover.release_upload", json!({"assetId":id}))
+            .await?;
+        app.command("cover.release_upload", json!({"assetId":id}))
+            .await?;
+        app.command("cover.release_upload", json!({"assetId":export["assetId"]}))
+            .await?;
+        assert!(!path.exists());
+        assert!(exported.is_file());
+        assert!(
+            app.command("cover.release_upload", json!({"assetId":"../video"}))
+                .await
+                .is_err()
+        );
+        let expired = app.store_cover_upload("expired.png", &image)?;
+        let expired_id = expired["id"].as_str().unwrap();
+        app.cover_state.uploads.lock().unwrap().insert(
+            expired_id.into(),
+            Instant::now() - Duration::from_secs(24 * 60 * 60),
+        );
+        assert_eq!(clean_unused_assets(&app)?, 1);
+        assert!(!directory.join(format!("{expired_id}.png")).exists());
+        let abandoned = app.store_cover_upload("crashed-editor.png", &image)?;
+        let abandoned_path = directory.join(format!("{}.png", abandoned["id"].as_str().unwrap()));
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        assert_eq!(clean_unused_assets(&app)?, 1);
+        assert!(!abandoned_path.exists());
+        assert!(exported.is_file());
+        app.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn model_discovery_uses_drafts_without_changing_saved_settings_and_handles_errors()
     -> Result<()> {

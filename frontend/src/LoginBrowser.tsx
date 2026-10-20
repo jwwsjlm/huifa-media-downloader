@@ -13,27 +13,39 @@ export function LoginBrowser({ saved, t, run, proxy }: { saved: (result: LoginBr
   const initialized = useRef(false);
   const [status, setStatus] = useState<LoginBrowserStatus | null>(null);
   const [pending, setPending] = useState<LoginAction | null>(null);
+  const pendingAction = useRef<LoginAction | null>(null); const statusEpoch = useRef(0);
+  const statusRequest = useRef<Promise<LoginBrowserStatus> | null>(null);
   const busy = pending !== null;
   const [error, setError] = useState('');
   useEffect(() => {
-    let disposed = false;
-    const refresh = () => host.command<LoginBrowserStatus>('browser.login.status').then(value => {
-      if (!disposed) {
-        setStatus(value);
-        if (value.active && value.targetUrl) setUrl(value.targetUrl);
-        else if (!initialized.current && value.preferredUrl) setUrl(value.preferredUrl);
-        if (value.embeddedAvailable === false) setPreferredMode('system');
-        else if (!initialized.current && value.preferredMode) setPreferredMode(value.preferredMode);
-        initialized.current = true;
-      }
-    }).catch(reason => { if (!disposed) setError(String(reason)); });
+    let disposed = false; let refreshing = false;
+    const refresh = async () => {
+      if (disposed || refreshing || pendingAction.current) return;
+      refreshing = true;
+      const epoch = statusEpoch.current;
+      const request = statusRequest.current ??= host.command<LoginBrowserStatus>('browser.login.status');
+      try {
+        const value = await request;
+        if (!disposed && epoch === statusEpoch.current) {
+          setStatus(value);
+          if (value.active && value.targetUrl) setUrl(value.targetUrl);
+          else if (!initialized.current && value.preferredUrl) setUrl(value.preferredUrl);
+          if (value.embeddedAvailable === false) setPreferredMode('system');
+          else if (!initialized.current && value.preferredMode) setPreferredMode(value.preferredMode);
+          initialized.current = true;
+        }
+      } catch (reason) { if (!disposed && epoch === statusEpoch.current) setError(String(reason)); }
+      finally { if (statusRequest.current === request) statusRequest.current = null; refreshing = false; }
+    };
     void refresh();
     const timer = window.setInterval(() => { void refresh(); }, 1500);
     return () => { disposed = true; window.clearInterval(timer); };
   }, []);
   const operation = (action: LoginAction, work: () => Promise<void>) => {
+    if (pendingAction.current) return;
+    pendingAction.current = action; statusEpoch.current++;
     setPending(action); setError('');
-    run(async () => { try { await work(); } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setPending(null); } });
+    run(async () => { try { await work(); } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { pendingAction.current = null; setPending(null); } });
   };
   const open = (mode: LoginBrowserMode) => operation(mode, async () => {
     const parsed = new URL(url);

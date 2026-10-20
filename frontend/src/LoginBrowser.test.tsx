@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { LoginBrowser } from './LoginBrowser';
 
@@ -9,6 +10,48 @@ const active = { ...inactive, active: true, mode: 'embedded', targetUrl: 'https:
 beforeEach(() => { command.mockReset().mockImplementation(async name => name === 'browser.login.open' ? active : inactive); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
 function show(proxy?: string) { const saved = vi.fn(); render(<LoginBrowser t={(_zh, en) => en} run={run} saved={saved} proxy={proxy} />); return { saved, controls: within(screen.getByRole('group', { name: 'Browser sign-in' })) }; }
+
+it('keeps one slow status poll across StrictMode, retries after settlement and stops on unmount', async () => {
+  vi.useFakeTimers();
+  try {
+    let finish!: (value: unknown) => void;
+    command.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue(inactive);
+    const view = render(<StrictMode><LoginBrowser t={(_zh, en) => en} run={run} saved={vi.fn()} /></StrictMode>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(command).toHaveBeenCalledTimes(1);
+    await act(async () => finish(active));
+    expect(screen.getByRole('button', { name: 'Close sign-in window' })).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    expect(command).toHaveBeenCalledTimes(2);
+    view.unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(command).toHaveBeenCalledTimes(2);
+  } finally { vi.useRealTimers(); }
+});
+
+it('does not let an old poll reopen the UI or overwrite a close result, and skips polls during close', async () => {
+  vi.useFakeTimers();
+  try {
+    let finishPoll!: (value: unknown) => void;
+    let finishClose!: (value: unknown) => void;
+    command.mockResolvedValueOnce(active)
+      .mockImplementationOnce(() => new Promise(resolve => { finishPoll = resolve; }))
+      .mockImplementationOnce(() => new Promise(resolve => { finishClose = resolve; }))
+      .mockResolvedValue(inactive);
+    show();
+    await act(async () => {});
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    fireEvent.click(screen.getByRole('button', { name: 'Close sign-in window' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    expect(command).toHaveBeenCalledTimes(3);
+    await act(async () => finishClose(true));
+    expect(command).toHaveBeenCalledTimes(4);
+    expect(screen.queryByRole('button', { name: 'Close sign-in window' })).toBeNull();
+    await act(async () => finishPoll(active));
+    expect(screen.queryByRole('button', { name: 'Close sign-in window' })).toBeNull();
+    expect((screen.getByRole('button', { name: 'Open built-in browser' }) as HTMLButtonElement).disabled).toBe(false);
+  } finally { vi.useRealTimers(); }
+});
 
 it.each(['Open built-in browser', 'Local browser sign-in'])('passes the current download proxy to %s', async button => {
   const { controls } = show('http://127.0.0.1:7890');

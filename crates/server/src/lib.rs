@@ -408,6 +408,7 @@ fn allowed_command(command: &str) -> bool {
             | "cover.export"
             | "cover.generate"
             | "cover.cancel"
+            | "cover.release_upload"
             | "media.list"
             | "media.availability"
     )
@@ -643,10 +644,8 @@ async fn upload(
             json!({"id":value["id"], "name":value["name"], "kind":"cookies"}),
         ));
     }
-    let directory = server.assets.clone();
-    let id = uuid::Uuid::new_v4().to_string();
-    let filename = format!("{id}.png");
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let app = server.app.clone();
+    let uploaded = tokio::task::spawn_blocking(move || -> Result<Value> {
         let format = image::guess_format(&bytes)?;
         anyhow::ensure!(
             matches!(
@@ -662,18 +661,12 @@ async fn upload(
         limits.max_alloc = Some(128 * 1024 * 1024);
         reader.limits(limits);
         let image = reader.decode()?;
-        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
-        image.write_to(&mut temporary, image::ImageFormat::Png)?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist_noclobber(directory.join(filename))
-            .map_err(|e| e.error)?;
-        Ok(())
+        app.store_cover_upload(&name, &image)
     })
     .await
     .map_err(|_| ApiError::from(StatusCode::INTERNAL_SERVER_ERROR))?
     .map_err(failed)?;
-    Ok(Json(json!({"id":id,"name":name,"kind":"image"})))
+    Ok(Json(uploaded))
 }
 
 async fn browser_status(
@@ -1319,6 +1312,7 @@ mod tests {
         let response = router.clone().oneshot(initialize("admin")?).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let old_session = response.headers()["mcp-session-id"].clone();
+        drop(response);
         let old_stop = server.mcp_transport.read().await.0.clone();
         let response = router.clone().oneshot(Request::builder().method("POST").uri("/api/command").header("host", "localhost:19491").header("origin", "http://localhost:19491").header("cookie", &cookie).header("x-csrf-token", csrf).header("content-type", "application/json").body(Body::from(r#"{"command":"access.change_password","args":{"currentPassword":"admin","newPassword":"changed-password"}}"#))?).await?;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1354,9 +1348,16 @@ mod tests {
             router.clone().oneshot(old).await?.status(),
             StatusCode::NOT_FOUND
         );
+        let core = Arc::downgrade(&server.app);
         server.shutdown().await;
         drop(router);
         drop(server);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while core.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         let mut changed_environment = config();
         changed_environment.account = "environment-account".into();
         changed_environment.password = "environment-password".into();

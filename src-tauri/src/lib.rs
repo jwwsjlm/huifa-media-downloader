@@ -374,14 +374,14 @@ async fn upload_asset(host: State<'_, Host>, name: String, data: String) -> Resu
         return Err("Image upload is too large".into());
     }
     let bytes = STANDARD.decode(data).map_err(error)?;
-    let directory = host.data_dir.join("assets");
-    tauri::async_runtime::spawn_blocking(move || store_image(&directory, &name, bytes))
+    let core = host.core.clone();
+    tauri::async_runtime::spawn_blocking(move || store_image(&core, &name, bytes))
         .await
         .map_err(error)?
         .map_err(error)
 }
 
-fn store_image(directory: &std::path::Path, name: &str, bytes: Vec<u8>) -> Result<Value> {
+fn store_image(core: &App, name: &str, bytes: Vec<u8>) -> Result<Value> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= 25 * 1024 * 1024,
         "Image must be at most 25 MiB"
@@ -403,13 +403,7 @@ fn store_image(directory: &std::path::Path, name: &str, bytes: Vec<u8>) -> Resul
     limits.max_alloc = Some(400_000_000);
     reader.limits(limits);
     let image = reader.decode()?;
-    let id = uuid::Uuid::new_v4().to_string();
-    std::fs::create_dir_all(directory)?;
-    let path = directory.join(format!("{id}.png"));
-    image.save(&path)?;
-    Ok(
-        json!({"id":id,"name":std::path::Path::new(name).file_name().unwrap_or_default().to_string_lossy(),"kind":"image"}),
-    )
+    core.store_cover_upload(name, &image)
 }
 
 #[tauri::command]
@@ -883,24 +877,39 @@ mod tests {
         assert_eq!(std::fs::read(&source)?, b"new media");
         Ok(())
     }
-    #[test]
-    fn image_upload_checks_content_and_owns_filename() -> Result<()> {
+    #[tokio::test]
+    async fn image_upload_checks_content_and_owns_filename() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        assert!(
-            store_image(
-                directory.path(),
-                "../../untrusted.png",
-                b"not an image".to_vec()
-            )
-            .is_err()
-        );
+        let core = App::open(AppConfig {
+            data_dir: directory.path().join("data"),
+            download_dir: directory.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        assert!(store_image(&core, "../../untrusted.png", b"not an image".to_vec()).is_err());
         let mut data = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgb8(2, 3).write_to(&mut data, image::ImageFormat::Png)?;
-        let value = store_image(directory.path(), "../../untrusted.png", data.into_inner())?;
+        let value = store_image(&core, "../../untrusted.png", data.into_inner())?;
         let id = value["id"].as_str().unwrap();
         assert!(uuid::Uuid::parse_str(id).is_ok());
-        assert!(directory.path().join(format!("{id}.png")).is_file());
+        assert!(
+            directory
+                .path()
+                .join("data/assets")
+                .join(format!("{id}.png"))
+                .is_file()
+        );
         assert_eq!(value["name"], "untrusted.png");
+        core.command("cover.release_upload", json!({"assetId":id}))
+            .await?;
+        assert!(
+            !directory
+                .path()
+                .join("data/assets")
+                .join(format!("{id}.png"))
+                .exists()
+        );
+        core.shutdown().await?;
         Ok(())
     }
 }

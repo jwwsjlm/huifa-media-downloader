@@ -8,6 +8,7 @@ pub mod browser;
 mod compression;
 mod cover;
 mod credentials;
+mod data_lock;
 mod db;
 mod destination;
 mod download;
@@ -22,6 +23,8 @@ pub mod research;
 mod resources;
 mod state_sync;
 mod storage;
+#[cfg(test)]
+mod task_add_tests;
 mod task_logs;
 mod thumbnail;
 mod tools;
@@ -113,6 +116,7 @@ pub struct App {
     queue_changed: Notify,
     queued_slots: Mutex<SlotQueues>,
     request_queries: Mutex<HashMap<String, CancellationToken>>,
+    _data_lock: std::fs::File,
 }
 
 impl App {
@@ -129,6 +133,7 @@ impl App {
                 config.data_dir.display()
             )
         })?;
+        let data_lock = data_lock::acquire(&config.data_dir)?;
         backup::before_upgrade(&config.data_dir)
             .context("Could not prepare the application upgrade backup")?;
         let saved_download_directory = config
@@ -204,6 +209,7 @@ impl App {
             queue_changed: Notify::new(),
             queued_slots: Default::default(),
             request_queries: Default::default(),
+            _data_lock: data_lock,
         });
         app.myself.set(Arc::downgrade(&app)).unwrap();
         let mut settings = app.db.settings().context("Could not read saved settings")?;
@@ -714,7 +720,6 @@ impl App {
                 Ok(self.event_history.lock().unwrap().sync(since))
             }
             "tasks.add" => {
-                let _adding = self.task_add_lock.lock().await;
                 let urls = args["urls"].as_array().context("urls must be an array")?;
                 ensure!(
                     !urls.is_empty() && urls.len() <= 1000,
@@ -762,27 +767,30 @@ impl App {
                     );
                     validated = expanded;
                 }
+                let _adding = self.task_add_lock.lock().await;
+                let mut existing: HashMap<String, Vec<String>> = HashMap::new();
+                for task in self.db.tasks_including_retained()? {
+                    if task.kind == "media"
+                        && !task.conversion
+                        && let Ok(key) = download_key(&task.url)
+                    {
+                        existing.entry(key).or_default().push(task.id);
+                    }
+                }
+                let mut added = std::collections::HashSet::new();
                 let mut ids: Vec<String> = Vec::new();
                 let mut results = Vec::new();
                 for url in validated {
                     let key = download_key(&url)?;
-                    if ids.iter().any(|id| {
-                        self.db
-                            .task(id)
-                            .is_ok_and(|task| download_key(&task.url).ok().as_ref() == Some(&key))
-                    }) {
+                    if !added.insert(key.clone()) {
                         continue;
                     }
-                    let matches = self
-                        .db
-                        .tasks_including_retained()?
+                    let matches = existing
+                        .remove(&key)
+                        .unwrap_or_default()
                         .into_iter()
-                        .filter(|task| {
-                            task.kind == "media"
-                                && !task.conversion
-                                && download_key(&task.url).ok().as_ref() == Some(&key)
-                        })
-                        .collect::<Vec<_>>();
+                        .map(|id| self.db.task(&id))
+                        .collect::<Result<Vec<_>>>()?;
                     let previous = matches
                         .iter()
                         .find(|task| {
@@ -1177,9 +1185,11 @@ impl App {
                 Ok(json!(true))
             }
             "cookies.browser" => browser::import_browser(self, &args).await,
-            "cover.preview" | "cover.export" | "cover.generate" | "cover.cancel" => {
-                cover::command(self, command, args).await
-            }
+            "cover.preview"
+            | "cover.export"
+            | "cover.generate"
+            | "cover.cancel"
+            | "cover.release_upload" => cover::command(self, command, args).await,
             "media.availability" => availability::check(self, &args).await,
             "media.list" => Ok(json!(
                 self.db

@@ -725,15 +725,37 @@ pub(crate) async fn process_task(
     if audio_mode {
         ensure!(!audio.is_empty(), "Saved media has no audio");
     }
-    let duration = inputs
-        .iter()
-        .filter_map(|i| probe_duration(&i.probe))
-        .chain(manifest.duration)
-        .reduce(f64::max)
+    let live_timing = live_timing(&task, &inputs)?;
+    let duration = live_timing
+        .map(|(_, duration)| duration)
+        .or_else(|| {
+            inputs
+                .iter()
+                .filter_map(|i| probe_duration(&i.probe))
+                .chain(manifest.duration)
+                .reduce(f64::max)
+        })
         .context("Media duration is unavailable")?;
     let ranges = keep_ranges(duration, &task.options, &manifest.sponsor_segments)?;
     let covered = ranges.iter().map(|(start, end)| end - start).sum::<f64>();
     let cuts = ranges.len() != 1 || ranges[0].0 > 0.001 || (ranges[0].1 - duration).abs() > 0.001;
+    if (cuts || task.options.prepend_cover_enabled)
+        && let Some((origin, _)) = live_timing
+        && let Some(video) = video
+    {
+        let stream = streams(&inputs[video].probe)
+            .find(|stream| text(stream, "codec_type") == "video")
+            .unwrap();
+        let start = text(stream, "start_time")
+            .parse::<f64>()
+            .ok()
+            .filter(|start| start.is_finite())
+            .context("Live video timestamps are unavailable; choose a combined live format or disable cuts and the prepend cover")?;
+        ensure!(
+            start <= origin + 0.001,
+            "This split live video begins after the shared clock origin; choose a combined live format or disable cuts and the prepend cover"
+        );
+    }
     let thumbnail = prepare_thumbnail(&task, &workspace)?;
     if task.options.prepend_cover_enabled {
         ensure!(!audio_mode, "A prepend cover requires video output");
@@ -880,7 +902,13 @@ pub(crate) async fn process_task(
         "-filter_complex_threads".into(),
         "1".into(),
     ];
+    if live_timing.is_some() {
+        args.push("-copyts".into());
+    }
     for input in &inputs {
+        if let Some((origin, _)) = live_timing {
+            args.extend(["-itsoffset".into(), (-origin).to_string()]);
+        }
         args.extend(["-i".into(), input.path.to_string_lossy().into()]);
     }
     let mut subtitle_indices = Vec::new();
@@ -941,17 +969,32 @@ pub(crate) async fn process_task(
         let mut segments = Vec::new();
         for (segment, (start, end)) in ranges.iter().enumerate() {
             let mut labels = String::new();
+            let reset = if live_timing.is_some() {
+                format!("PTS-{start}/TB")
+            } else {
+                "PTS-STARTPTS".into()
+            };
             if let Some(video) = video {
                 let label = format!("v{segment}");
+                let padding = if let Some((_, duration)) = live_timing {
+                    format!("tpad=stop_mode=add:color=black:stop_duration={duration},")
+                } else {
+                    String::new()
+                };
                 filters.push(format!(
-                    "[{video}:v:0]trim=start={start}:end={end},setpts=PTS-STARTPTS[{label}]"
+                    "[{video}:v:0]{padding}trim=start={start}:end={end},setpts={reset}[{label}]"
                 ));
                 labels.push_str(&format!("[{label}]"));
             }
             for (track, (input, stream, _)) in audio.iter().enumerate() {
                 let label = format!("a{segment}_{track}");
+                let padding = if let Some((_, duration)) = live_timing {
+                    format!("aresample=async=1:first_pts=0,apad=whole_dur={duration},")
+                } else {
+                    String::new()
+                };
                 filters.push(format!(
-                    "[{input}:{stream}]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[{label}]"
+                    "[{input}:{stream}]{padding}atrim=start={start}:end={end},asetpts={reset}[{label}]"
                 ));
                 labels.push_str(&format!("[{label}]"));
             }
@@ -1293,10 +1336,14 @@ pub(crate) async fn process_task(
             "Processed duration differs from the requested cut"
         );
     } else {
-        let expected = inputs
-            .iter()
-            .filter_map(|input| probe_duration(&input.probe))
-            .reduce(f64::max)
+        let expected = live_timing
+            .map(|(_, duration)| duration)
+            .or_else(|| {
+                inputs
+                    .iter()
+                    .filter_map(|input| probe_duration(&input.probe))
+                    .reduce(f64::max)
+            })
             .context("Saved source duration is unavailable")?;
         verify_duration(final_duration, expected, "Processed output")?;
     }
@@ -2591,6 +2638,39 @@ fn probe_duration(probe: &Value) -> Option<f64> {
                 .reduce(f64::max)
         })
 }
+
+fn live_timing(task: &Task, inputs: &[Input]) -> Result<Option<(f64, f64)>> {
+    let metadata = &task.manifest.as_ref().unwrap().metadata;
+    if inputs.len() <= 1 || !(task.live || crate::download::is_live(metadata)) {
+        return Ok(None);
+    }
+    ensure!(
+        metadata["_liveSharedTimestamps"] == true,
+        "This saved live capture has no shared timestamp clock; record it again using a combined live format"
+    );
+    let mut origin = f64::INFINITY;
+    let mut end = f64::NEG_INFINITY;
+    let mut latest_start = f64::NEG_INFINITY;
+    let mut earliest_end = f64::INFINITY;
+    for input in inputs {
+        let start = text(&input.probe["format"], "start_time")
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .context("Live stream timestamps are unavailable; choose a combined live format")?;
+        let duration =
+            probe_duration(&input.probe).context("Live stream duration is unavailable")?;
+        origin = origin.min(start);
+        latest_start = latest_start.max(start);
+        end = end.max(start + duration);
+        earliest_end = earliest_end.min(start + duration);
+    }
+    ensure!(
+        latest_start < earliest_end,
+        "Live streams have no overlapping timestamp range; choose a combined live format"
+    );
+    Ok(Some((origin, end - origin)))
+}
 fn parse_fraction(s: &str) -> Option<f64> {
     let (a, b) = s.split_once('/')?;
     Some(a.parse::<f64>().ok()? / b.parse::<f64>().ok()?)
@@ -3138,6 +3218,360 @@ fn srt_time(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_inputs_use_one_origin_and_reject_unrecoverable_or_unrelated_clocks() -> Result<()> {
+        let mut task = crate::tests::paused_task(Default::default());
+        task.live = true;
+        task.manifest = Some(SourceManifest {
+            version: 1,
+            directory: PathBuf::new(),
+            files: vec![],
+            metadata: json!({"_liveSharedTimestamps":true}),
+            duration: None,
+            chapters: vec![],
+            sponsor_segments: vec![],
+            output_extension: "mkv".into(),
+        });
+        let input = |start: &str| Input {
+            path: PathBuf::new(),
+            kind: "video".into(),
+            language: None,
+            probe: json!({"format":{"start_time":start,"duration":"10"}}),
+        };
+        let mut inputs = [input("50"), input("52")];
+        assert_eq!(live_timing(&task, &inputs)?, Some((50.0, 12.0)));
+        inputs[1] = input("70");
+        assert!(live_timing(&task, &inputs).is_err());
+        inputs[1] = input("NaN");
+        assert!(live_timing(&task, &inputs).is_err());
+        inputs[1] = input("52");
+        task.manifest.as_mut().unwrap().metadata = json!({});
+        assert!(live_timing(&task, &inputs).is_err());
+        task.live = false;
+        assert_eq!(live_timing(&task, &inputs)?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bundled FFmpeg/FFprobe runtimes; CPU and local fixtures only"]
+    async fn separate_live_capture_preserves_offsets_when_muxed_cut_and_prepended() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let tools = std::env::var_os("HUIFA_TEST_TOOLS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools")
+            });
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: Some(tools),
+        })
+        .await?;
+        let cancel = CancellationToken::new();
+        let tools = app.freeze_tools().await?;
+        let mut captured = Vec::new();
+        for (kind, source, filter, codec) in [
+            (
+                "video",
+                "testsrc2=size=160x90:rate=10:duration=4",
+                "setpts=PTS+50/TB",
+                "libx264",
+            ),
+            (
+                "audio",
+                "sine=frequency=440:sample_rate=48000:duration=4",
+                "asetpts=PTS+52/TB",
+                "aac",
+            ),
+        ] {
+            let raw = root.path().join(format!("raw-{kind}.ts"));
+            let output = root.path().join(format!("captured-{kind}.ts"));
+            let mut args = vec![
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "error".into(),
+                "-nostdin".into(),
+                "-y".into(),
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                source.into(),
+            ];
+            args.extend([
+                if kind == "video" { "-vf" } else { "-af" }.into(),
+                filter.into(),
+                if kind == "video" { "-c:v" } else { "-c:a" }.into(),
+                codec.into(),
+                "-threads".into(),
+                "2".into(),
+            ]);
+            if kind == "video" {
+                args.extend([
+                    "-preset".into(),
+                    "ultrafast".into(),
+                    "-bf".into(),
+                    "0".into(),
+                ]);
+            }
+            args.extend([
+                "-f".into(),
+                "mpegts".into(),
+                "-mpegts_copyts".into(),
+                "1".into(),
+                raw.to_string_lossy().into_owned(),
+            ]);
+            process::run(&app.tool("ffmpeg")?, &args, None, &cancel, None).await?;
+            let args = [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-i",
+                raw.to_str().unwrap(),
+                "-c",
+                "copy",
+                "-f",
+                "mpegts",
+            ]
+            .into_iter()
+            .chain(crate::download::LIVE_TIMESTAMP_ARGS.split_whitespace())
+            .map(str::to_string)
+            .chain([output.to_string_lossy().into_owned()])
+            .collect::<Vec<_>>();
+            process::run(&app.tool("ffmpeg")?, &args, None, &cancel, None).await?;
+            captured.push((kind, output));
+        }
+        let late_video = root.path().join("captured-video-late.ts");
+        let args = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-copyts",
+            "-itsoffset",
+            "4",
+            "-i",
+            captured[0].1.to_str().unwrap(),
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+            "-mpegts_copyts",
+            "1",
+            "-avoid_negative_ts",
+            "disabled",
+            late_video.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        process::run(&app.tool("ffmpeg")?, &args, None, &cancel, None).await?;
+        for (name, changes, cut, intro) in [
+            ("mux", json!({}), 0.0, false),
+            (
+                "cut",
+                json!({"sectionStart":"1","sectionEnd":"3.5"}),
+                1.0,
+                false,
+            ),
+            (
+                "cover",
+                json!({"prependCoverEnabled":true,"prependCoverFrames":3}),
+                0.0,
+                true,
+            ),
+            (
+                "sponsor-cut",
+                json!({"sponsorblockMode":"remove","sponsorblockCategories":["sponsor"]}),
+                1.0,
+                false,
+            ),
+            ("video-late", json!({}), 0.0, false),
+            (
+                "video-late-cut",
+                json!({"sectionStart":"0","sectionEnd":"1"}),
+                1.0,
+                false,
+            ),
+        ] {
+            let video_late = name.starts_with("video-late");
+            let mut task = crate::tests::paused_task(tools.clone());
+            task.title = format!("live-{name}");
+            task.live = true;
+            task.options = DownloadOptions::parse(changes)?;
+            task.options.container = "mkv".into();
+            task.options.write_thumbnail = false;
+            let directory = app
+                .config
+                .data_dir
+                .join("tasks")
+                .join(&task.id)
+                .join("sources");
+            std::fs::create_dir_all(&directory)?;
+            let mut files = Vec::new();
+            for (kind, original) in &captured {
+                let path = directory.join(format!("{kind}.ts"));
+                let original = if video_late && *kind == "video" {
+                    &late_video
+                } else {
+                    original
+                };
+                copy_sync(original, &path)?;
+                let (hash, size) = hash_file(&path)?;
+                files.push(SourceFile {
+                    path,
+                    hash,
+                    size,
+                    kind: (*kind).into(),
+                    format_id: (*kind).into(),
+                    language: None,
+                });
+            }
+            let cover = directory.join("cover.jpg");
+            image::RgbImage::from_pixel(16, 16, image::Rgb([50, 20, 80])).save(&cover)?;
+            let (hash, size) = hash_file(&cover)?;
+            files.push(SourceFile {
+                path: cover,
+                hash,
+                size,
+                kind: "thumbnail".into(),
+                format_id: String::new(),
+                language: None,
+            });
+            task.manifest = Some(SourceManifest {
+                version: 1,
+                directory,
+                files,
+                metadata: json!({"is_live":true,"_liveSharedTimestamps":true}),
+                duration: None,
+                chapters: vec![],
+                sponsor_segments: vec![Chapter {
+                    start: 0.5,
+                    end: 1.5,
+                    title: "Sponsor".into(),
+                }],
+                output_extension: "mkv".into(),
+            });
+            app.db.insert_task(&task)?;
+            let video = probe_file(
+                &app,
+                &task,
+                if video_late {
+                    &late_video
+                } else {
+                    &captured[0].1
+                },
+                &cancel,
+            )
+            .await?;
+            let audio = probe_file(&app, &task, &captured[1].1, &cancel).await?;
+            let start =
+                |probe: &Value| text(&probe["format"], "start_time").parse::<f64>().unwrap();
+            assert!(
+                (start(&video) - if video_late { 54.0 } else { 50.0 }).abs() < 0.001,
+                "Capture reset the video clock"
+            );
+            let delay = start(&audio) - start(&video);
+            assert!(
+                (delay - if video_late { -2.021333 } else { 1.978667 }).abs() < 0.001,
+                "Capture reset the audio clock"
+            );
+            let processed = tokio::time::timeout(
+                Duration::from_secs(60),
+                process_task(&app, &task.id, &cancel),
+            )
+            .await?;
+            if video_late && (cut != 0.0 || intro) {
+                assert!(
+                    processed
+                        .unwrap_err()
+                        .to_string()
+                        .contains("begins after the shared clock origin")
+                );
+                assert!(app.db.media_for_task(&task.id)?.is_none());
+                assert!(
+                    task.manifest
+                        .as_ref()
+                        .unwrap()
+                        .files
+                        .iter()
+                        .all(|file| file.path.is_file())
+                );
+                continue;
+            }
+            processed?;
+            let media = app.db.media_for_task(&task.id)?.unwrap();
+            let output = probe_file(&app, &task, &media.path, &cancel).await?;
+            if cut != 0.0 || intro {
+                let pcm = root.path().join(format!("{name}-audio.s16le"));
+                let args = [
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    media.path.to_str().unwrap(),
+                    "-map",
+                    "0:a:0",
+                    "-af",
+                    "aresample=async=1:first_pts=0",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "1",
+                    "-c:a",
+                    "pcm_s16le",
+                    "-f",
+                    "s16le",
+                    pcm.to_str().unwrap(),
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+                process::run(&app.tool("ffmpeg")?, &args, None, &cancel, None).await?;
+                let samples = std::fs::read(pcm)?;
+                let actual = samples
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|sample| {
+                        i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 100
+                    })
+                    .context("Live audio was replaced by silence")?
+                    as f64
+                    / 48000.0;
+                eprintln!("{name}: live source A/V offset {delay:.6}s; audio onset {actual:.6}s");
+                let expected = delay - cut + if intro { 0.3 } else { 0.0 };
+                assert!(
+                    (actual - expected).abs() < 0.06,
+                    "{name} lost live audio alignment: {actual} versus {expected}"
+                );
+            } else {
+                let stream_start = |kind| {
+                    streams(&output)
+                        .find(|stream| text(stream, "codec_type") == kind)
+                        .unwrap()["start_time"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap()
+                };
+                let actual = stream_start("audio") - stream_start("video");
+                eprintln!("{name}: live source A/V offset {delay:.6}s; output {actual:.6}s");
+                assert!(
+                    (actual - (delay - cut)).abs() < 0.06,
+                    "{name} lost the live stream offset: {actual} versus {}",
+                    delay - cut
+                );
+            }
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
 
     #[test]
     fn dropping_unjournaled_preparations_removes_only_staged_files() -> Result<()> {
@@ -4432,6 +4866,7 @@ mod tests {
         );
         process_task(&app, &task.id, &CancellationToken::new()).await?;
         app.shutdown().await?;
+        drop(app);
         let reopened = App::open(config).await?;
         assert_eq!(reopened.db.task(&task.id)?.files[0].size, 13);
         assert!(reopened.db.media()?.is_empty());

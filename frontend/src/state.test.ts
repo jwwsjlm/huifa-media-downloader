@@ -90,9 +90,22 @@ describe('task delta state', () => {
     state = reducer(state, { type: 'view', patch: { quality: 'worst' } });
     state = reducer(state, { type: 'snapshot', snapshot });
     expect(state.view.quality).toBe('worst');
-    state = reducer(state, { type: 'saved', settings: { downloadOptions: { quality: '720p' } } });
+    state = reducer(state, { type: 'saved', settings: { downloadOptions: { quality: '720p' } }, submitted: state.view });
     expect(state.view.quality).toBeNull(); expect(state.settings.downloadOptions?.quality).toBe('720p');
     expect(state.tasks.a.options.quality).toBe('best');
+  });
+  it('keeps settings, download and quality edits made after a save was submitted', () => {
+    let state = reducer(initialState, { type: 'setting', key: 'uiLanguage', value: 'en-US' });
+    state = reducer(state, { type: 'option', key: 'quality', value: '720p' });
+    const submitted = state.view;
+    state = reducer(state, { type: 'setting', key: 'appearanceTheme', value: 'light' });
+    state = reducer(state, { type: 'option', key: 'quality', value: '1080p' });
+    state = reducer(state, { type: 'view', patch: { quality: '4k' } });
+    state = reducer(state, { type: 'saved', settings: { uiLanguage: 'en-US', downloadOptions: { quality: '720p' } }, submitted });
+    expect(state.settings.downloadOptions?.quality).toBe('720p');
+    expect(state.view.settingsDraft).toEqual({ uiLanguage: 'en-US', appearanceTheme: 'light' });
+    expect(state.view.optionsDraft?.quality).toBe('1080p');
+    expect(state.view.quality).toBe('4k');
   });
   it('shows processing progress independently from downloaded input progress', () => {
     expect(taskProgress({ ...makeTask('a'), status: 'processing', progress: 100, stageProgress: 12 })).toEqual({ value: 12, indeterminate: false });

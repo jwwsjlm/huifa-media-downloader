@@ -226,10 +226,7 @@ impl LoginBrowser {
             session.stop(app).await;
         }
         match command {
-            "browser.login.status" => {
-                let _ = self.sync_running(app, core, &mut running).await;
-                Ok(self.status(&running))
-            }
+            "browser.login.status" => Ok(self.status(&running)),
             "browser.login.open" => {
                 let url = login_url(args["url"].as_str().context("URL must be text")?)?;
                 let mode = args["mode"].as_str().context("Login mode is required")?;
@@ -1170,6 +1167,26 @@ async fn native_cookies(_: &Webview) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_preserves_the_last_saved_cookies_and_sync_failure() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let browser = LoginBrowser::new(directory.path().into())?;
+        {
+            let mut synced = browser.synced.lock().unwrap();
+            synced.saved = Some(json!({"cookie":{"id":"saved","count":3}}));
+            synced.error = Some("Cookie sync timed out; saved cookies were kept".into());
+        }
+        let status = browser.status(&None);
+        assert_eq!(status["cookie"]["id"], "saved");
+        assert_eq!(status["cookie"]["count"], 3);
+        assert_eq!(
+            status["saveError"],
+            "Cookie sync timed out; saved cookies were kept"
+        );
+        assert_eq!(browser.status(&None), status);
+        Ok(())
+    }
 
     #[test]
     fn login_modes_match_platform_support_and_normalize_old_preferences() -> Result<()> {
