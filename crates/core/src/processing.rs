@@ -777,6 +777,33 @@ pub(crate) async fn process_task(
     } else {
         0.0
     };
+    let mut cover_copy = cover_duration > 0.0
+        && !cuts
+        && live_timing.is_none()
+        && duration > 1.0
+        && task.options.prepend_cover_frames == 3
+        && audio.len() <= 1
+        && audio.iter().all(|(input, stream, _)| {
+            streams(&inputs[*input].probe)
+                .find(|s| s["index"].as_u64() == Some(*stream))
+                .is_some_and(|s| text(s, "codec_name") == "opus")
+        })
+        && video.is_some_and(|index| {
+            cover_copy_supported(&task, &inputs[index].probe, &manifest.output_extension)
+        });
+    if cover_copy {
+        let packets =
+            probe_first_video_packets(app, &task, &inputs[video.unwrap()].path, 1, cancel).await?;
+        cover_copy = packets.first().is_some_and(|packet| {
+            text(packet, "flags").contains('K')
+                && text(packet, "pts_time")
+                    .parse::<f64>()
+                    .is_ok_and(|pts| pts.abs() < 0.000_001)
+                && text(packet, "dts_time")
+                    .parse::<f64>()
+                    .is_ok_and(|dts| (dts + 1.0 / fps).abs() < 0.000_001)
+        });
+    }
     let intro = if cover_duration > 0.0 {
         let stream = streams(&inputs[video.unwrap()].probe)
             .find(|s| text(s, "codec_type") == "video")
@@ -785,7 +812,11 @@ pub(crate) async fn process_task(
         let height = stream["height"]
             .as_u64()
             .context("Video height is missing")?;
-        let path = workspace.join("cover-intro.mkv");
+        let path = workspace.join(if cover_copy {
+            "cover-intro.mp4"
+        } else {
+            "cover-intro.mkv"
+        });
         let mut cover_args = vec![
             "-hide_banner".into(),
             "-loglevel".into(),
@@ -799,7 +830,7 @@ pub(crate) async fn process_task(
             "-i".into(),
             thumbnail.as_ref().unwrap().to_string_lossy().into(),
         ];
-        for (input, stream, _) in &audio {
+        for (input, stream, _) in audio.iter().filter(|_| !cover_copy) {
             let probe = streams(&inputs[*input].probe)
                 .find(|s| s["index"].as_u64() == Some(*stream))
                 .unwrap();
@@ -819,10 +850,47 @@ pub(crate) async fn process_task(
             ]);
         }
         cover_args.extend(["-map".into(), "0:v:0".into()]);
-        for track in 0..audio.len() {
+        for track in 0..if cover_copy { 0 } else { audio.len() } {
             cover_args.extend(["-map".into(), format!("{}:a:0", track + 1)]);
         }
-        cover_args.extend(["-vf".into(),format!("scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"),"-t".into(),cover_duration.to_string(),"-r".into(),fps.to_string(),"-frames:v".into(),task.options.prepend_cover_frames.to_string(),"-c:v".into(),"ffv1".into(),"-pix_fmt".into(),"yuv420p".into(),"-c:a".into(),"pcm_s16le".into(),"-threads".into(),"2".into(),"-progress".into(),"pipe:1".into(),path.to_string_lossy().into()]);
+        cover_args.extend(["-vf".into(),format!("scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"),"-t".into(),cover_duration.to_string(),"-r".into(),fps.to_string(),"-frames:v".into(),task.options.prepend_cover_frames.to_string(),"-c:v".into(),if cover_copy { "libx264" } else { "ffv1" }.into(),"-pix_fmt".into(),"yuv420p".into()]);
+        if cover_copy {
+            cover_args.extend(
+                [
+                    "-an",
+                    "-profile:v",
+                    "high",
+                    "-level:v",
+                    "4.0",
+                    "-bf",
+                    "1",
+                    "-refs",
+                    "1",
+                    "-x264-params",
+                    "open-gop=0:repeat-headers=1:b-pyramid=none:colorprim=bt709:transfer=bt709:colormatrix=bt709",
+                    "-color_range",
+                    "tv",
+                    "-colorspace",
+                    "bt709",
+                    "-color_trc",
+                    "bt709",
+                    "-color_primaries",
+                    "bt709",
+                    "-video_track_timescale",
+                    "15360",
+                ]
+                .map(str::to_string),
+            );
+        } else {
+            cover_args.extend(["-c:a".into(), "pcm_s16le".into()]);
+        }
+        cover_args.extend([
+            "-threads".into(),
+            "2".into(),
+            "-progress".into(),
+            "pipe:1".into(),
+            path.to_string_lossy().into(),
+        ]);
         app.set_stage(id, "processing", "creating_cover_intro", None)?;
         run_ffmpeg(app, id, &cover_args, cover_duration, cancel).await?;
         Some(path)
@@ -902,12 +970,42 @@ pub(crate) async fn process_task(
         "-filter_complex_threads".into(),
         "1".into(),
     ];
-    if live_timing.is_some() {
+    if live_timing.is_some() || cover_copy {
         args.push("-copyts".into());
+    }
+    if cover_copy {
+        let source = &inputs[video.unwrap()].path;
+        let concat = workspace.join("cover.ffconcat");
+        let quoted = |path: &Path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .replace('\'', "'\\''")
+        };
+        write_sync(
+            &concat,
+            format!(
+                "ffconcat version 1.0\nfile '{}'\nduration {cover_duration:.9}\nfile '{}'\n",
+                quoted(intro.as_ref().unwrap()),
+                quoted(source)
+            )
+            .as_bytes(),
+        )?;
+        args.extend([
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "0".into(),
+            "-auto_convert".into(),
+            "1".into(),
+            "-i".into(),
+            concat.to_string_lossy().into(),
+        ]);
     }
     for input in &inputs {
         if let Some((origin, _)) = live_timing {
             args.extend(["-itsoffset".into(), (-origin).to_string()]);
+        } else if cover_copy {
+            args.extend(["-itsoffset".into(), cover_duration.to_string()]);
         }
         args.extend(["-i".into(), input.path.to_string_lossy().into()]);
     }
@@ -937,7 +1035,7 @@ pub(crate) async fn process_task(
     } else {
         None
     };
-    let cover_index = if task.options.prepend_cover_enabled {
+    let cover_index = if task.options.prepend_cover_enabled && !cover_copy {
         args.extend([
             "-i".into(),
             intro.as_ref().unwrap().to_string_lossy().into(),
@@ -964,7 +1062,12 @@ pub(crate) async fn process_task(
     } else {
         None
     };
-    if filtering {
+    if cover_copy {
+        args.extend(["-map".into(), "0:v:0".into()]);
+        for (input, stream, _) in &audio {
+            args.extend(["-map".into(), format!("{}:{stream}", input + 1)]);
+        }
+    } else if filtering {
         let mut filters = Vec::new();
         let mut segments = Vec::new();
         for (segment, (start, end)) in ranges.iter().enumerate() {
@@ -1115,13 +1218,17 @@ pub(crate) async fn process_task(
             ]);
         }
     }
-    let encoder = video_encoder(&task.options, filtering, extension);
+    let encoder = if cover_copy {
+        "copy"
+    } else {
+        video_encoder(&task.options, filtering, extension)
+    };
     if video.is_some() {
         args.extend(["-c:v:0".into(), encoder.into()]);
         if encoder != "copy" {
             args.extend(video_encoder_args(encoder));
         }
-        if filtering {
+        if filtering && !cover_copy {
             args.extend(["-r".into(), fps.to_string()]);
         }
     }
@@ -1133,7 +1240,7 @@ pub(crate) async fn process_task(
                 .and_then(Value::as_str)
         })
         .flatten()
-        .unwrap_or_else(|| audio_codec(&task.options, filtering, extension));
+        .unwrap_or_else(|| audio_codec(&task.options, filtering && !cover_copy, extension));
     if !audio.is_empty() {
         args.extend(["-c:a".into(), audio_codec.into()]);
         if !matches!(audio_codec, "copy" | "pcm_s16le" | "flac" | "alac" | "aac") {
@@ -1172,8 +1279,11 @@ pub(crate) async fn process_task(
     if matches!(extension.as_str(), "mp4" | "m4a") {
         args.extend(["-movflags".into(), "+faststart".into()]);
     }
-    if filtering {
+    if filtering && !cover_copy {
         args.extend(["-t".into(), (covered + cover_duration).to_string()]);
+    }
+    if cover_copy {
+        args.extend(["-avoid_negative_ts".into(), "disabled".into()]);
     }
     args.extend([
         "-threads".into(),
@@ -1302,6 +1412,54 @@ pub(crate) async fn process_task(
         ]);
         app.set_stage(id, "processing", "muxing_assets", None)?;
         run_ffmpeg(app, id, &args, covered + cover_duration, cancel).await?;
+    }
+    if cover_copy {
+        let packets = probe_first_video_packets(
+            app,
+            &task,
+            &output,
+            task.options.prepend_cover_frames as usize + 12,
+            cancel,
+        )
+        .await?;
+        let times = packets
+            .iter()
+            .enumerate()
+            // Matroska omits the first negative DTS; subsequent packets must provide it.
+            .filter(|(index, packet)| *index != 0 || !text(packet, "dts_time").is_empty())
+            .map(|(_, packet)| text(packet, "dts_time").parse::<f64>())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ensure!(
+            times.windows(2).all(|pair| pair[0] < pair[1]),
+            "Cover intro produced non-monotonic video timestamps"
+        );
+        ensure!(
+            text(
+                &packets[task.options.prepend_cover_frames as usize],
+                "pts_time"
+            )
+            .parse::<f64>()
+            .is_ok_and(|pts| (pts - cover_duration).abs() < 0.001),
+            "Cover intro changed the body start time"
+        );
+        let args = [
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-nostdin".into(),
+            "-xerror".into(),
+            "-i".into(),
+            output.to_string_lossy().into(),
+            "-t".into(),
+            (cover_duration + 1.0).to_string(),
+            "-map".into(),
+            "0:v:0".into(),
+            "-an".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ];
+        run_ffmpeg(app, id, &args, cover_duration + 1.0, cancel).await?;
     }
     app.set_stage(id, "processing", "verifying_output", None)?;
     let probe = probe_file(app, &task, &output, cancel).await?;
@@ -2613,6 +2771,85 @@ async fn probe_file(
     );
     Ok(value)
 }
+
+fn cover_copy_supported(task: &Task, probe: &Value, extension: &str) -> bool {
+    // shortcut: only the verified SDR H.264/MKV layout, expand after validating other decoder configurations.
+    !task.conversion
+        && extension == "mkv"
+        && text(&probe["format"], "format_name")
+            .split(',')
+            .any(|format| format == "mp4")
+        && matches!(task.options.encoder.as_str(), "copy" | "original")
+        && streams(probe).count() == 1
+        && streams(probe)
+            .find(|stream| text(stream, "codec_type") == "video")
+            .is_some_and(|stream| {
+                text(stream, "codec_name") == "h264"
+                    && stream["side_data_list"]
+                        .as_array()
+                        .is_none_or(|items| items.is_empty())
+                    && stream["tags"]["rotate"].is_null()
+                    && text(stream, "profile") == "High"
+                    && stream["level"].as_u64() == Some(40)
+                    && stream["width"].as_u64() == Some(1920)
+                    && stream["height"].as_u64() == Some(1080)
+                    && text(stream, "pix_fmt") == "yuv420p"
+                    && text(stream, "sample_aspect_ratio") == "1:1"
+                    && text(stream, "field_order") == "progressive"
+                    && text(stream, "r_frame_rate") == "30/1"
+                    && text(stream, "avg_frame_rate") == "30/1"
+                    && text(stream, "time_base") == "1/15360"
+                    && stream["has_b_frames"].as_u64() == Some(1)
+                    && text(stream, "color_range") == "tv"
+                    && text(stream, "color_space") == "bt709"
+                    && text(stream, "color_transfer") == "bt709"
+                    && text(stream, "color_primaries") == "bt709"
+                    && text(stream, "start_time")
+                        .parse::<f64>()
+                        .is_ok_and(|start| start.abs() < 0.000_001)
+            })
+}
+
+async fn probe_first_video_packets(
+    app: &App,
+    task: &Task,
+    path: &Path,
+    count: usize,
+    cancel: &CancellationToken,
+) -> Result<Vec<Value>> {
+    let args = [
+        "-v".into(),
+        "error".into(),
+        "-select_streams".into(),
+        "v:0".into(),
+        "-read_intervals".into(),
+        format!("%+#{count}"),
+        "-show_packets".into(),
+        "-show_entries".into(),
+        "packet=pts_time,dts_time,flags".into(),
+        "-of".into(),
+        "json".into(),
+        path.to_string_lossy().into(),
+    ];
+    let output = process::run_logged(
+        &app.task_tool(task, "ffprobe").await?,
+        &args,
+        None,
+        cancel,
+        None,
+        app.raw_task_log(&task.id)?,
+    )
+    .await?;
+    let probe: Value = serde_json::from_str(&output.stdout)?;
+    let packets = probe["packets"]
+        .as_array()
+        .context("Video packet timestamps are unavailable")?;
+    ensure!(
+        packets.len() == count,
+        "Video has too few packets for cover validation"
+    );
+    Ok(packets.clone())
+}
 fn streams(probe: &Value) -> impl Iterator<Item = &Value> {
     probe["streams"].as_array().into_iter().flatten()
 }
@@ -3218,6 +3455,299 @@ fn srt_time(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires bundled FFmpeg/FFprobe runtimes; CPU and local fixtures only"]
+    async fn copy_cover_intro_preserves_compressed_media_and_asset_timing() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let tools = std::env::var_os("HUIFA_TEST_TOOLS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools")
+            });
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: Some(tools),
+        })
+        .await?;
+        let cancel = CancellationToken::new();
+        let mut task = crate::tests::paused_task(app.freeze_tools().await?);
+        task.options = DownloadOptions::parse(
+            json!({"container":"mkv","encoder":"original","prependCoverEnabled":true,"prependCoverFrames":3,"embedChapters":true,"embedMetadata":true,"embedThumbnail":true,"embedSubtitles":true,"subtitleLanguage":"en","writeThumbnail":false,"writeInfoJson":false}),
+        )?;
+        let directory = app
+            .config
+            .data_dir
+            .join("tasks")
+            .join(&task.id)
+            .join("sources");
+        std::fs::create_dir_all(&directory)?;
+        let video = directory.join("video.mp4");
+        let audio = directory.join("audio.webm");
+        let thumbnail = directory.join("cover.jpg");
+        let subtitle = directory.join("en.srt");
+        let video_args = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1920x1080:rate=30",
+            "-t",
+            "2",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-profile:v",
+            "high",
+            "-level:v",
+            "4.0",
+            "-pix_fmt",
+            "yuv420p",
+            "-bf",
+            "1",
+            "-refs",
+            "1",
+            "-x264-params",
+            "open-gop=0:repeat-headers=1:b-pyramid=none:colorprim=bt709:transfer=bt709:colormatrix=bt709",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-video_track_timescale",
+            "15360",
+            "-threads",
+            "2",
+        ]
+        .map(str::to_string)
+        .into_iter()
+        .chain([video.to_string_lossy().into_owned()])
+        .collect::<Vec<_>>();
+        process::run_limited(
+            &app.tool("ffmpeg")?,
+            &video_args,
+            None,
+            &cancel,
+            1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .await?;
+        let audio_args = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000",
+            "-t",
+            "2",
+            "-c:a",
+            "libopus",
+        ]
+        .map(str::to_string)
+        .into_iter()
+        .chain([audio.to_string_lossy().into_owned()])
+        .collect::<Vec<_>>();
+        process::run_limited(
+            &app.tool("ffmpeg")?,
+            &audio_args,
+            None,
+            &cancel,
+            1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .await?;
+        image::RgbImage::from_pixel(32, 32, image::Rgb([30, 80, 120])).save(&thumbnail)?;
+        write_sync(&subtitle, b"1\n00:00:00,200 --> 00:00:01,500\nSubtitle\n\n")?;
+        let mut files = Vec::new();
+        for (path, kind) in [
+            (&video, "video"),
+            (&audio, "audio"),
+            (&thumbnail, "thumbnail"),
+            (&subtitle, "subtitle"),
+        ] {
+            let (hash, size) = hash_file(path)?;
+            files.push(SourceFile {
+                path: path.clone(),
+                hash,
+                size,
+                kind: kind.into(),
+                format_id: String::new(),
+                language: (kind == "subtitle").then(|| "en".into()),
+            });
+        }
+        task.manifest = Some(SourceManifest {
+            version: 1,
+            directory,
+            files,
+            metadata: json!({"title":"Copy cover"}),
+            duration: Some(2.0),
+            chapters: vec![Chapter {
+                start: 0.0,
+                end: 2.0,
+                title: "Body".into(),
+            }],
+            sponsor_segments: vec![],
+            output_extension: "mkv".into(),
+        });
+        app.db.insert_task(&task)?;
+        let source_probe = probe_file(&app, &task, &video, &cancel).await?;
+        assert!(
+            cover_copy_supported(&task, &source_probe, "mkv"),
+            "{source_probe:#}"
+        );
+        for (field, value) in [
+            ("pix_fmt", json!("yuv420p10le")),
+            ("codec_name", json!("hevc")),
+            ("color_transfer", json!("smpte2084")),
+            ("avg_frame_rate", json!("60/1")),
+        ] {
+            let mut incompatible = source_probe.clone();
+            incompatible["streams"][0][field] = value;
+            assert!(!cover_copy_supported(&task, &incompatible, "mkv"));
+        }
+        assert!(!cover_copy_supported(&task, &source_probe, "mp4"));
+        let baseline_video = root.path().join("baseline.mp4");
+        let baseline_audio = root.path().join("baseline.webm");
+        copy_sync(&video, &baseline_video)?;
+        copy_sync(&audio, &baseline_audio)?;
+        process_task(&app, &task.id, &cancel).await?;
+        let complete = app.db.task(&task.id)?;
+        assert_eq!(complete.status, "completed");
+        let media = app
+            .db
+            .media_for_task(&task.id)?
+            .context("Missing published media")?;
+        let output = &media.path;
+        let probe = probe_file(&app, &complete, output, &cancel).await?;
+        assert!((probe_duration(&probe).unwrap() - 2.1).abs() < 0.05);
+        assert_eq!(count_streams(&probe, "subtitle"), 1);
+        assert_eq!(probe["format"]["tags"]["title"], "Copy cover");
+        let show = ["-v", "error", "-show_chapters", "-of", "json"]
+            .map(str::to_string)
+            .into_iter()
+            .chain([output.to_string_lossy().into_owned()])
+            .collect::<Vec<_>>();
+        let chapters_output = process::run_limited(
+            &app.tool("ffprobe")?,
+            &show,
+            None,
+            &cancel,
+            1024 * 1024,
+            Duration::from_secs(10),
+        )
+        .await?;
+        let chapters: Value = serde_json::from_str(&chapters_output.stdout)?;
+        assert!(
+            chapters["chapters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|chapter| chapter["tags"]["title"] == "Body"
+                    && text(chapter, "start_time") == "0.100000")
+        );
+        let packet_hashes = |path: &Path, selector: &str, video: bool| {
+            let mut args = [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-copyts",
+                "-i",
+            ]
+            .map(str::to_string)
+            .into_iter()
+            .chain([
+                path.to_string_lossy().into_owned(),
+                "-map".into(),
+                selector.into(),
+                "-c".into(),
+                "copy".into(),
+            ])
+            .collect::<Vec<_>>();
+            if video {
+                args.extend([
+                    "-bsf:v".into(),
+                    "h264_mp4toannexb,filter_units=remove_types=7|8".into(),
+                ]);
+            }
+            args.extend([
+                "-avoid_negative_ts".into(),
+                "disabled".into(),
+                "-f".into(),
+                "framehash".into(),
+                "-hash".into(),
+                "sha256".into(),
+                "-".into(),
+            ]);
+            args
+        };
+        let mut video_rows = Vec::new();
+        let mut audio_rows = Vec::new();
+        for (path, selector, is_video) in [
+            (&baseline_video, "0:v:0", true),
+            (output, "0:v:0", true),
+            (&baseline_audio, "0:a:0", false),
+            (output, "0:a:0", false),
+        ] {
+            let result = process::run_limited(
+                &app.tool("ffmpeg")?,
+                &packet_hashes(path, selector, is_video),
+                None,
+                &cancel,
+                1024 * 1024,
+                Duration::from_secs(10),
+            )
+            .await?;
+            let rows = result
+                .stdout
+                .lines()
+                .filter(|line| !line.starts_with('#') && !line.is_empty())
+                .map(|line| {
+                    line.split(',')
+                        .map(|part| part.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            if is_video {
+                video_rows.push(rows);
+            } else {
+                audio_rows.push(rows);
+            }
+        }
+        assert_eq!(video_rows[1].len(), video_rows[0].len() + 3);
+        assert!(
+            video_rows[0]
+                .iter()
+                .zip(video_rows[1].iter().skip(3))
+                .all(|(a, b)| a[4..6] == b[4..6])
+        );
+        assert_eq!(audio_rows[0].len(), audio_rows[1].len());
+        assert!(
+            audio_rows[0]
+                .iter()
+                .zip(&audio_rows[1])
+                .all(|(a, b)| a[4..] == b[4..]
+                    && b[2].parse::<i64>().unwrap() - a[2].parse::<i64>().unwrap() == 100)
+        );
+        let raw = app.task_logs(&task.id, &json!({}))?;
+        assert!(raw["text"].as_str().unwrap().contains("cover.ffconcat"));
+        app.shutdown().await?;
+        Ok(())
+    }
 
     #[test]
     fn live_inputs_use_one_origin_and_reject_unrecoverable_or_unrelated_clocks() -> Result<()> {

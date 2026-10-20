@@ -535,6 +535,7 @@ impl App {
     async fn delete_task(&self, id: &str, delete_files: bool) -> Result<()> {
         self.stop_task(id, "cancelled").await?;
         processing::prepare_task_deletion(self, id).await?;
+        self.clear_download_checkpoint(id)?;
         let _publication = self.publication_lock.lock().await;
         let task = self.db.task(id)?;
         let media = if delete_files {
@@ -650,6 +651,7 @@ impl App {
         let tools = self.freeze_tools().await?;
         self.stop_task(id, "cancelled").await?;
         processing::prepare_redownload(self, &task).await?;
+        self.clear_download_checkpoint(id)?;
         task = self.db.task(id)?;
         for key in [&task.cookie_snapshot, &task.proxy_snapshot]
             .into_iter()
@@ -2272,6 +2274,9 @@ mod tests {
             std::fs::create_dir_all(&workspace)?;
             std::fs::write(source.join("source.bin"), b"source")?;
             std::fs::write(workspace.join("prepared.bin"), b"working media")?;
+            let checkpoint = source.join("sources/download-checkpoint.json");
+            std::fs::create_dir_all(checkpoint.parent().unwrap())?;
+            std::fs::write(&checkpoint, b"private extraction metadata")?;
             let path = app.config.download_dir.join(format!("{}.mp4", task.id));
             std::fs::write(&path, b"output")?;
             let media = model::Media {
@@ -2309,6 +2314,7 @@ mod tests {
             assert_eq!(path.exists(), !delete_files);
             assert_eq!(source.exists(), !delete_files);
             assert_eq!(workspace.exists(), !delete_files);
+            assert!(!checkpoint.exists());
             assert_eq!(app.db.media_for_task(&task.id)?.is_none(), delete_files);
             if delete_files {
                 assert!(app.db.task(&task.id).is_err());
@@ -3353,6 +3359,13 @@ mod queue_tests {
             .join("sources/previous/source-0.mp4.part");
         std::fs::create_dir_all(partial.parent().unwrap())?;
         std::fs::write(&partial, b"resume bytes")?;
+        let checkpoint = app
+            .config
+            .data_dir
+            .join("tasks")
+            .join(&task.id)
+            .join("sources/download-checkpoint.json");
+        std::fs::write(&checkpoint, b"private extraction metadata")?;
         app.save_settings(json!({"downloadOptions":{"quality":"720p","proxy":"http://127.0.0.1:8123","cookieId":"none"}}))?;
         app.command("tasks.retryCurrent", json!({"id":task.id}))
             .await?;
@@ -3364,7 +3377,14 @@ mod queue_tests {
             "http://127.0.0.1:8123"
         );
         assert_eq!(std::fs::read(&partial)?, b"resume bytes");
+        assert!(!checkpoint.exists());
         assert!(current.tools.contains_key("yt-dlp"));
+        app.stop_task(&task.id, "paused").await?;
+        std::fs::write(&checkpoint, b"private extraction metadata")?;
+        app.command("tasks.retryCurrent", json!({"id":task.id}))
+            .await?;
+        assert!(!checkpoint.exists());
+        assert_eq!(std::fs::read(&partial)?, b"resume bytes");
         app.stop_task(&task.id, "paused").await?;
         let previous_directory = app.download_directory();
         let next_directory = root.path().join("next-downloads");

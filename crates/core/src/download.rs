@@ -288,7 +288,10 @@ fn transient_metadata_error(error: &str) -> bool {
         "http error 504",
         "too many requests",
         "timed out",
-        "timeout",
+        // Verbose command lines contain --socket-timeout even without a timeout error.
+        "timeouterror",
+        "readtimeout",
+        "connecttimeout",
         "connection reset",
         "connection refused",
         "temporary failure",
@@ -1047,6 +1050,75 @@ fn transfer_identity(info: &Value, formats: &[Value]) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&identity)?)))
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DownloadCheckpoint {
+    version: u32,
+    plan: String,
+    identity: String,
+    info: Value,
+    directory: PathBuf,
+    files: Vec<SourceFile>,
+}
+
+const CHECKPOINT_LIMIT: u64 = 64 * 1024 * 1024;
+
+fn checkpoint_path(app: &App, id: &str) -> PathBuf {
+    app.config
+        .data_dir
+        .join("tasks")
+        .join(id)
+        .join("sources/download-checkpoint.json")
+}
+
+fn checkpoint_plan(task: &Task) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+        &task.id,
+        &task.kind,
+        &task.url,
+        &task.options,
+    ))?)))
+}
+
+fn save_download_checkpoint(app: &App, task: &Task, checkpoint: &DownloadCheckpoint) -> Result<()> {
+    let path = checkpoint_path(app, &task.id);
+    crate::reject_links(&path)?;
+    let bytes = serde_json::to_vec(checkpoint)?;
+    ensure!(
+        bytes.len() as u64 <= CHECKPOINT_LIMIT,
+        "Download checkpoint is too large"
+    );
+    let directory = path.parent().unwrap();
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn resolved_info_file(app: &App, info: &Value) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix(".download-info-")
+        .tempfile_in(&app.config.data_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    serde_json::to_writer(&mut file, info)?;
+    file.flush()?;
+    Ok(file)
+}
+
 pub(crate) async fn transfer(
     app: &Arc<App>,
     mut task: Task,
@@ -1129,22 +1201,9 @@ pub(crate) async fn transfer(
     let cookie_text = app.task_cookies(&task)?;
     let cookies = Cookies::new(app, cookie_text.as_deref())?;
     // Re-extracting can change CDN URLs behind the selected format and source identity.
-    let info_file = if live {
-        None
-    } else {
-        let mut file = tempfile::Builder::new()
-            .prefix(".download-info-")
-            .tempfile_in(&app.config.data_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        serde_json::to_writer(&mut file, &info)?;
-        file.flush()?;
-        Some(file)
-    };
+    let info_file = (!live)
+        .then(|| resolved_info_file(app, &info))
+        .transpose()?;
     let finish_capture = if live {
         Some(app.finish_capture_token(&task.id)?)
     } else {
@@ -1350,21 +1409,61 @@ pub(crate) async fn transfer(
             }
         })
         .collect::<Vec<_>>();
-    let mut files = collect_transfers(transfers, live, cancel).await?;
+    let files = collect_transfers(transfers, live, cancel).await?;
     task = app.db.task(&task.id)?;
+    ensure!(!cancel.is_cancelled(), "Operation interrupted");
+    let checkpoint = DownloadCheckpoint {
+        version: 1,
+        plan: checkpoint_plan(&task)?,
+        identity: transfer_identity(&info, &formats)?,
+        info,
+        directory,
+        files,
+    };
+    save_download_checkpoint(app, &task, &checkpoint)?;
+    complete_assets(app, task, checkpoint, cancel).await
+}
+
+async fn complete_assets(
+    app: &Arc<App>,
+    task: Task,
+    checkpoint: DownloadCheckpoint,
+    cancel: &CancellationToken,
+) -> Result<SourceManifest> {
+    ensure!(!cancel.is_cancelled(), "Operation interrupted");
+    let DownloadCheckpoint {
+        info,
+        directory,
+        mut files,
+        ..
+    } = checkpoint;
+    let formats = if task.kind == "assets" {
+        vec![]
+    } else {
+        select_formats(&info, &task.options)?
+    };
+    let live = is_live(&info);
+    let shared_live = live && formats.len() > 1;
+    let cookies = Cookies::new(app, app.task_cookies(&task)?.as_deref())?;
     app.set_stage(&task.id, "downloading", "downloading_assets", None)?;
     download_subtitles(app, &task, &info, &directory, &cookies, cancel, &mut files).await?;
     if task.options.write_thumbnail
         || task.options.embed_thumbnail
         || task.options.prepend_cover_enabled
     {
-        let thumbnail = text(&info, "thumbnail");
+        let has_thumbnail = !text(&info, "thumbnail").is_empty()
+            || info["thumbnails"].as_array().is_some_and(|thumbnails| {
+                thumbnails.iter().any(|thumbnail| {
+                    url::Url::parse(text(thumbnail, "url")).is_ok_and(|url| {
+                        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                    })
+                })
+            });
         ensure!(
-            !thumbnail.is_empty()
-                || !task.options.embed_thumbnail && !task.options.prepend_cover_enabled,
+            has_thumbnail || !task.options.embed_thumbnail && !task.options.prepend_cover_enabled,
             "This video has no thumbnail for the requested cover operation"
         );
-        if thumbnail.is_empty() && task.kind == "assets" {
+        if !has_thumbnail && task.kind == "assets" {
             let mut current = app.db.task(&task.id)?;
             let warning = "The media source did not provide the requested thumbnail.".to_string();
             if !current.warnings.contains(&warning) {
@@ -1372,7 +1471,7 @@ pub(crate) async fn transfer(
                 app.save_task(&current)?;
             }
         }
-        if !thumbnail.is_empty() {
+        if has_thumbnail {
             let bytes = crate::thumbnail::download(
                 app,
                 &task,
@@ -1588,7 +1687,11 @@ async fn download_subtitles(
     if task.options.automatic_subtitles {
         args.push("--write-auto-subs".into());
     }
-    args.extend(["--".into(), task.url.clone()]);
+    let info_file = resolved_info_file(app, info)?;
+    args.extend([
+        "--load-info-json".into(),
+        info_file.path().to_string_lossy().into(),
+    ]);
     process::run_logged(
         &app.task_tool(task, "yt-dlp").await?,
         &args,
@@ -1789,6 +1892,107 @@ pub(crate) fn write_sync(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 impl App {
+    pub(crate) fn clear_download_checkpoint(&self, id: &str) -> Result<()> {
+        let path = checkpoint_path(self, id);
+        crate::reject_links(&path)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn load_download_checkpoint(
+        &self,
+        task: &Task,
+        cancel: &CancellationToken,
+    ) -> Result<Option<DownloadCheckpoint>> {
+        ensure!(!cancel.is_cancelled(), "Operation interrupted");
+        let path = checkpoint_path(self, &task.id);
+        crate::reject_links(&path)?;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            file.metadata()?.is_file(),
+            "Download checkpoint is not a file"
+        );
+        let mut bytes = Vec::new();
+        file.take(CHECKPOINT_LIMIT + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= CHECKPOINT_LIMIT,
+            "Download checkpoint is too large"
+        );
+        let mut checkpoint: DownloadCheckpoint =
+            serde_json::from_slice(&bytes).context("Saved download checkpoint is invalid")?;
+        ensure!(
+            checkpoint.version == 1,
+            "Unsupported download checkpoint version"
+        );
+        ensure!(
+            checkpoint.plan == checkpoint_plan(task)?,
+            "Saved download checkpoint differs from this task; retry with current settings"
+        );
+        ensure!(
+            checkpoint.info.is_object(),
+            "Saved download metadata is invalid"
+        );
+        let formats = if task.kind == "assets" {
+            vec![]
+        } else {
+            select_formats(&checkpoint.info, &task.options)?
+        };
+        ensure!(
+            checkpoint.identity == transfer_identity(&checkpoint.info, &formats)?
+                && checkpoint.files.len() == formats.len(),
+            "Saved download checkpoint does not match its selected media"
+        );
+        let source_root = path.parent().unwrap().canonicalize()?;
+        crate::reject_links(&checkpoint.directory)?;
+        let directory = checkpoint.directory.canonicalize()?;
+        ensure!(
+            directory.parent() == Some(source_root.as_path())
+                && if is_live(&checkpoint.info) {
+                    directory
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.strip_prefix("live-"))
+                        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                } else {
+                    directory == source_root.join(&checkpoint.identity)
+                },
+            "Saved download checkpoint contains an unowned source directory"
+        );
+        let mut paths = std::collections::HashSet::new();
+        for (source, format) in checkpoint.files.iter_mut().zip(&formats) {
+            ensure!(!cancel.is_cancelled(), "Operation interrupted");
+            crate::reject_links(&source.path)?;
+            let canonical = source.path.canonicalize()?;
+            let kind = if has_video(format) { "video" } else { "audio" };
+            ensure!(
+                canonical.starts_with(&directory)
+                    && paths.insert(canonical.clone())
+                    && source.kind == kind
+                    && source.format_id == text(format, "format_id")
+                    && source.language.as_deref() == format["language"].as_str()
+                    && source.size > 0
+                    && std::fs::metadata(&canonical)?.len() == source.size,
+                "Saved download checkpoint contains an invalid media source"
+            );
+            let (hash, size) = crate::compression::hash_path(&canonical, cancel).await?;
+            ensure!(
+                hash == source.hash && size == source.size,
+                "Saved downloaded media changed; retry with current settings to download it again"
+            );
+            source.path = canonical;
+        }
+        checkpoint.directory = directory;
+        ensure!(!cancel.is_cancelled(), "Operation interrupted");
+        Ok(Some(checkpoint))
+    }
+
     pub(crate) async fn run_task(
         self: &Arc<Self>,
         id: &str,
@@ -1796,47 +2000,54 @@ impl App {
     ) -> Result<()> {
         let mut task = self.db.task(id)?;
         if task.manifest.is_none() {
+            let checkpoint = self.load_download_checkpoint(&task, cancel).await?;
             let permit = self
                 .task_permit(id, "network", &self.network, cancel)
                 .await?;
-            self.set_stage(id, "probing", "probing", None)?;
-            let cookies = self.task_cookies(&task)?;
-            let runtime_options = self.runtime_options(&task)?;
-            let info = probe(
-                self,
-                &task.url,
-                &runtime_options,
-                cookies.as_deref(),
-                cancel,
-                Some(&task),
-            )
-            .await?;
-            task = self.db.task(id)?;
-            task.title = text(&info, "title").to_string();
-            crate::workflow::plan(&mut task);
-            self.save_task(&task)?;
-            let preview = crate::thumbnail::cache_preview(self, &task, &info, cancel).await;
-            ensure!(!cancel.is_cancelled(), "Operation interrupted");
-            if let Ok(Some(path)) = preview {
-                task = self.db.task(id)?;
-                task.thumbnail = Some(path);
-                self.save_task(&task)?;
-            }
-            let special = task.kind != "assets" && is_live(&info);
-            task.live = special;
-            self.save_task(&task)?;
-            if special {
-                drop(permit);
-                self.set_stage(id, "queued", "waiting_live", None)?;
-                let _capture = self
-                    .task_permit(id, "capture", &self.capture, cancel)
-                    .await?;
-                let manifest = transfer(self, task.clone(), info, cancel).await?;
+            if let Some(checkpoint) = checkpoint {
+                let manifest = complete_assets(self, task.clone(), checkpoint, cancel).await?;
                 self.freeze_sources(id, manifest)?;
+                drop(permit);
             } else {
-                let manifest = transfer(self, task.clone(), info, cancel).await?;
-                self.freeze_sources(id, manifest)?;
-                drop(permit);
+                self.set_stage(id, "probing", "probing", None)?;
+                let cookies = self.task_cookies(&task)?;
+                let runtime_options = self.runtime_options(&task)?;
+                let info = probe(
+                    self,
+                    &task.url,
+                    &runtime_options,
+                    cookies.as_deref(),
+                    cancel,
+                    Some(&task),
+                )
+                .await?;
+                task = self.db.task(id)?;
+                task.title = text(&info, "title").to_string();
+                crate::workflow::plan(&mut task);
+                self.save_task(&task)?;
+                let preview = crate::thumbnail::cache_preview(self, &task, &info, cancel).await;
+                ensure!(!cancel.is_cancelled(), "Operation interrupted");
+                if let Ok(Some(path)) = preview {
+                    task = self.db.task(id)?;
+                    task.thumbnail = Some(path);
+                    self.save_task(&task)?;
+                }
+                let special = task.kind != "assets" && is_live(&info);
+                task.live = special;
+                self.save_task(&task)?;
+                if special {
+                    drop(permit);
+                    self.set_stage(id, "queued", "waiting_live", None)?;
+                    let _capture = self
+                        .task_permit(id, "capture", &self.capture, cancel)
+                        .await?;
+                    let manifest = transfer(self, task.clone(), info, cancel).await?;
+                    self.freeze_sources(id, manifest)?;
+                } else {
+                    let manifest = transfer(self, task.clone(), info, cancel).await?;
+                    self.freeze_sources(id, manifest)?;
+                    drop(permit);
+                }
             }
         }
         let _processor = self.processing_permit(id, cancel).await?;
@@ -1863,10 +2074,14 @@ impl App {
         let cookie_snapshot = task.cookie_snapshot.take();
         task.stage("waiting_processing", "waiting_processing", None);
         self.save_task(&task)?;
-        if let Some(key) = cookie_snapshot {
-            self.credentials.delete_secret(&key)?;
-        }
-        Ok(())
+        let cookies = if let Some(key) = cookie_snapshot {
+            self.credentials.delete_secret(&key)
+        } else {
+            Ok(())
+        };
+        let checkpoint = self.clear_download_checkpoint(id);
+        cookies?;
+        checkpoint
     }
 }
 
@@ -2760,10 +2975,19 @@ mod tests {
             "HTTP Error 429: Too Many Requests",
             "HTTP Error 503: Service Unavailable",
             "Connection timed out",
+            "Metadata query timed out",
+            "TimeoutError: request expired",
+            "requests.exceptions.ReadTimeout",
+            "requests.exceptions.ConnectTimeout",
             "Connection reset by peer",
             "getaddrinfo failed",
         ] {
             assert!(transient_metadata_error(message), "{message}");
+            let diagnostic = process::redact(&format!(
+                "yt-dlp exited with code 1: [debug] Command-line config: ['--socket-timeout', '30']\nERROR: {message}"
+            ));
+            assert!(transient_metadata_error(&diagnostic), "{diagnostic}");
+            assert!(transient_stream_error(&diagnostic), "{diagnostic}");
         }
         for message in [
             "HTTP Error 403: Forbidden",
@@ -2774,6 +2998,20 @@ mod tests {
             "Unsupported URL",
         ] {
             assert!(!transient_metadata_error(message), "{message}");
+        }
+    }
+    #[test]
+    fn metadata_retries_ignore_verbose_timeout_options() {
+        for message in [
+            "Video unavailable",
+            "Unable to extract requested data",
+            "No video formats found",
+        ] {
+            let diagnostic = process::redact(&format!(
+                "yt-dlp exited with code 1: [debug] Command-line config: ['--socket-timeout', '30']\nERROR: [youtube] video-id: {message}"
+            ));
+            assert!(!transient_metadata_error(&diagnostic), "{diagnostic}");
+            assert!(!transient_stream_error(&diagnostic), "{diagnostic}");
         }
     }
     #[test]
@@ -2966,6 +3204,99 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn metadata_process_classifies_verbose_errors_and_cancels_backoff() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        #[cfg(windows)]
+        let (executable, prefix) = {
+            let script = root.path().join("metadata-errors.ps1");
+            std::fs::write(
+                &script,
+                r#"Add-Content -LiteralPath $args[0] -Value attempt; [Console]::Error.WriteLine("[debug] Command-line config: ['--socket-timeout', '30']"); [Console]::Error.WriteLine('ERROR: ' + $args[1]); exit 1"#,
+            )?;
+            (
+                PathBuf::from("powershell.exe"),
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    script.to_string_lossy().into(),
+                ],
+            )
+        };
+        #[cfg(not(windows))]
+        let (executable, prefix) = {
+            let script = root.path().join("metadata-errors.sh");
+            std::fs::write(
+                &script,
+                "printf 'attempt\\n' >> \"$1\"; printf '%s\\n' \"[debug] Command-line config: ['--socket-timeout', '30']\" \"ERROR: $2\" >&2; exit 1",
+            )?;
+            (
+                PathBuf::from("/bin/sh"),
+                vec![script.to_string_lossy().into()],
+            )
+        };
+        for (message, retry) in [
+            ("Video unavailable", false),
+            ("Unable to extract requested data", false),
+            ("HTTP Error 503: Service Unavailable", true),
+            ("Connection timed out", true),
+            ("TimeoutError", true),
+        ] {
+            let task = crate::tests::paused_task(Default::default());
+            app.db.insert_task(&task)?;
+            let counter = root.path().join(&task.id);
+            let mut args = prefix.clone();
+            args.extend([counter.to_string_lossy().into(), message.into()]);
+            let cancel = CancellationToken::new();
+            let result = metadata_process(&app, &executable, &args, &cancel, false, Some(&task));
+            tokio::pin!(result);
+            if retry {
+                tokio::select! {
+                    _ = &mut result => bail!("Metadata ended before backoff cancellation: {message}"),
+                    observed = tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if app.db.task_logs(&task.id)?.iter().any(|entry| entry.message.contains("retry 1/2")) {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }) => observed??,
+                }
+                cancel.cancel();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(15), result)
+                .await?
+                .err()
+                .context("Fixture must fail")?;
+            assert_eq!(
+                std::fs::read_to_string(counter)?.lines().count(),
+                1,
+                "{message}"
+            );
+            if retry {
+                assert!(format!("{error:#}").contains("Operation interrupted"));
+            } else {
+                assert!(format!("{error:#}").contains(message));
+                assert!(
+                    !app.db
+                        .task_logs(&task.id)?
+                        .iter()
+                        .any(|entry| entry.message.contains("retry 1/2"))
+                );
+            }
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test]
     async fn ordinary_and_waiting_metadata_reject_a_single_65_mib_line() -> Result<()> {
         let root = tempfile::tempdir()?;
         let app = App::open(crate::AppConfig {
@@ -3114,5 +3445,344 @@ mod tests {
             text(&select_formats(&audio, &options).unwrap()[0], "format_id"),
             "audio"
         );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn checkpoints_validate_owned_media_and_the_saved_plan() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let task = crate::tests::paused_task(Default::default());
+        let info = json!({"id":"checkpoint","duration":1,"formats":[{"format_id":"v","url":"https://example.test/media?token=private","ext":"mp4","width":320,"height":180,"vcodec":"avc1","acodec":"mp4a.40.2"}]});
+        let formats = select_formats(&info, &task.options)?;
+        let identity = transfer_identity(&info, &formats)?;
+        let directory = checkpoint_path(&app, &task.id)
+            .parent()
+            .unwrap()
+            .join(&identity);
+        std::fs::create_dir_all(&directory)?;
+        let media = directory.join("source-0.mp4");
+        std::fs::write(&media, b"saved media")?;
+        let (hash, size) = hash_file(&media)?;
+        let mut checkpoint = DownloadCheckpoint {
+            version: 1,
+            plan: checkpoint_plan(&task)?,
+            identity,
+            info,
+            directory,
+            files: vec![SourceFile {
+                path: media.clone(),
+                hash,
+                size,
+                kind: "video".into(),
+                format_id: "v".into(),
+                language: None,
+            }],
+        };
+        let cancel = CancellationToken::new();
+        assert!(
+            app.load_download_checkpoint(&task, &cancel)
+                .await?
+                .is_none(),
+            "Old media without extraction metadata must not be guessed into a checkpoint"
+        );
+        save_download_checkpoint(&app, &task, &checkpoint)?;
+        assert!(
+            app.load_download_checkpoint(&task, &cancel)
+                .await?
+                .is_some()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(checkpoint_path(&app, &task.id))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let mut changed = task.clone();
+        changed.options.quality = "720p".into();
+        assert!(
+            app.load_download_checkpoint(&changed, &cancel)
+                .await
+                .is_err()
+        );
+        checkpoint.version = 2;
+        save_download_checkpoint(&app, &task, &checkpoint)?;
+        assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+        checkpoint.version = 1;
+        checkpoint.info["formats"][0]["url"] = json!("https://example.test/different");
+        save_download_checkpoint(&app, &task, &checkpoint)?;
+        assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+        checkpoint.info["formats"][0]["url"] = json!("https://example.test/media?token=private");
+        let outside = root.path().join("outside.mp4");
+        std::fs::write(&outside, b"saved media")?;
+        checkpoint.files[0].path = outside;
+        save_download_checkpoint(&app, &task, &checkpoint)?;
+        assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+        checkpoint.files[0].path = media.clone();
+        save_download_checkpoint(&app, &task, &checkpoint)?;
+        std::fs::write(&media, b"other media")?;
+        assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+        std::fs::write(&media, b"saved media")?;
+        #[cfg(unix)]
+        {
+            let link = checkpoint.directory.join("linked.mp4");
+            std::os::unix::fs::symlink(&media, &link)?;
+            checkpoint.files[0].path = link.clone();
+            save_download_checkpoint(&app, &task, &checkpoint)?;
+            assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+            std::fs::remove_file(link)?;
+            checkpoint.files[0].path = media.clone();
+        }
+        save_download_checkpoint(&app, &task, &checkpoint)?;
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert!(app.load_download_checkpoint(&task, &stopped).await.is_err());
+        assert!(checkpoint_path(&app, &task.id).exists());
+        std::fs::remove_file(&media)?;
+        assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+        write_sync(&checkpoint_path(&app, &task.id), b"incomplete JSON")?;
+        assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloaded_media_resumes_missing_assets_after_restart_without_reprobing() -> Result<()>
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir()?;
+        let tools = root.path().join("tools");
+        std::fs::create_dir(&tools)?;
+        let calls = root.path().join("tool-calls");
+        let shim_source = root.path().join("checkpoint-tool.rs");
+        std::fs::write(
+            &shim_source,
+            format!(
+                r#"
+use std::io::Write;
+fn main() {{
+    let args = std::env::args().collect::<Vec<_>>();
+    let mut calls = std::fs::OpenOptions::new().create(true).append(true).open({calls:?}).unwrap();
+    assert!(!args.iter().any(|arg| arg == "--dump-single-json"), "Metadata must not be extracted again");
+    let value = |flag: &str| args.iter().position(|arg| arg == flag).map(|index| args[index + 1].as_str()).unwrap();
+    let info = std::fs::read_to_string(value("--load-info-json")).unwrap();
+    assert!(info.contains("checkpoint-canary"));
+    assert!(!args.iter().any(|arg| arg.starts_with("https://")));
+    if args.iter().any(|arg| arg == "--write-subs") {{
+        assert!(args.iter().any(|arg| arg == "--skip-download"));
+        writeln!(calls, "subtitle").unwrap();
+        std::fs::write(value("--output").replace("%(ext)s", "en.srt"), "1\n00:00:00,000 --> 00:00:01,000\nSaved subtitle\n").unwrap();
+    }} else {{
+        let format = value("--format");
+        writeln!(calls, "media:{{format}}").unwrap();
+        let path = value("--output").replace("%(ext)s", if format == "v" {{ "mp4" }} else {{ "m4a" }});
+        std::fs::write(&path, format!("saved media {{format}}")).unwrap();
+        println!("HU_FILE:{{path:?}}");
+    }}
+}}
+"#,
+                calls = calls.to_string_lossy()
+            ),
+        )?;
+        let executable = tools.join(format!("yt-dlp{}", std::env::consts::EXE_SUFFIX));
+        let compiled = std::process::Command::new("rustc")
+            .arg("--crate-name")
+            .arg("checkpoint_tool")
+            .arg("--edition=2024")
+            .arg(&shim_source)
+            .arg("-o")
+            .arg(&executable)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Cannot build checkpoint fixture: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for name in ["ffmpeg", "ffprobe"] {
+            std::fs::copy(
+                &executable,
+                tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+            )?;
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([20, 40, 60])))
+            .write_to(&mut png, image::ImageFormat::Png)?;
+        let image = png.into_inner();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let thumbnail = format!("http://{}/cover.png", listener.local_addr()?);
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_available = available.clone();
+        let stop = CancellationToken::new();
+        let server_stop = stop.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    result = listener.accept() => result?,
+                    _ = server_stop.cancelled() => return Ok::<_, anyhow::Error>(()),
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).await?;
+                    ensure!(
+                        count > 0 && request.len() + count <= 8192,
+                        "Invalid thumbnail fixture request"
+                    );
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let (status, body) = if server_available.load(std::sync::atomic::Ordering::SeqCst) {
+                    (200, image.as_slice())
+                } else {
+                    (404, b"missing".as_slice())
+                };
+                socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await?;
+                socket.write_all(body).await?;
+            }
+        });
+        let config = crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: Some(tools),
+        };
+        let app = App::open(config.clone()).await?;
+        let mut task = crate::tests::paused_task(app.freeze_tools().await?);
+        task.url = "https://unavailable.invalid/video".into();
+        task.options = DownloadOptions::parse(
+            json!({"prependCoverEnabled":true,"writeThumbnail":true,"subtitleLanguages":["en"],"subtitleFormat":"srt","writeInfoJson":false}),
+        )?;
+        task.cookie_snapshot = Some(format!("task-cookie:{}", task.id));
+        app.credentials.put_secret(
+            task.cookie_snapshot.as_ref().unwrap(),
+            "# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tsid\tcheckpoint-cookie\n",
+        )?;
+        app.db.insert_task(&task)?;
+        let info = json!({"id":"checkpoint","title":"Checkpoint fixture","duration":1,"extractor_key":"Generic","webpage_url":task.url,"thumbnails":[{"url":thumbnail}],"description":"checkpoint-canary","http_headers":{"Cookie":"private-checkpoint-header"},"subtitles":{"en":[{"ext":"srt","url":"https://unavailable.invalid/subtitle"}]},"formats":[{"format_id":"v","url":"https://unavailable.invalid/video-stream","ext":"mp4","width":320,"height":180,"vcodec":"avc1","acodec":"none"},{"format_id":"a","url":"https://unavailable.invalid/audio-stream","ext":"m4a","vcodec":"none","acodec":"mp4a.40.2"}]});
+        assert!(
+            transfer(&app, task.clone(), info, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(app.db.task(&task.id)?.manifest.is_none());
+        assert!(
+            app.credentials
+                .secret(task.cookie_snapshot.as_ref().unwrap())?
+                .is_some()
+        );
+        let checkpoint = app
+            .load_download_checkpoint(&task, &CancellationToken::new())
+            .await?
+            .context("Completed media was not checkpointed before thumbnail failure")?;
+        assert_eq!(checkpoint.files.len(), 2);
+        let saved = checkpoint
+            .files
+            .iter()
+            .map(|source| Ok((source.path.clone(), hash_file(&source.path)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert!(
+            complete_assets(&app, task.clone(), checkpoint, &stopped)
+                .await
+                .is_err()
+        );
+        assert!(checkpoint_path(&app, &task.id).exists());
+        let mut failed = app.db.task(&task.id)?;
+        failed.stage("failed", "failed", None);
+        app.save_task(&failed)?;
+        app.shutdown().await?;
+        drop(app);
+        available.store(true, std::sync::atomic::Ordering::SeqCst);
+        let app = App::open(config).await?;
+        let slot = app.processor.clone().acquire_many_owned(2).await?;
+        let cancel = CancellationToken::new();
+        let result = app.run_task(&task.id, &cancel);
+        tokio::pin!(result);
+        tokio::select! {
+            result = &mut result => bail!("Asset recovery reached processing before the test barrier: {result:?}"),
+            observed = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if app.db.task(&task.id)?.manifest.is_some()
+                        && !checkpoint_path(&app, &task.id).exists()
+                        && app.credentials.secret(task.cookie_snapshot.as_ref().unwrap())?.is_none()
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => observed??,
+        }
+        let complete = app.db.task(&task.id)?;
+        let manifest = complete
+            .manifest
+            .context("Final source manifest is missing")?;
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .filter(|source| matches!(source.kind.as_str(), "video" | "audio"))
+                .count(),
+            2
+        );
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|source| source.kind == "thumbnail")
+        );
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|source| source.kind == "subtitle")
+        );
+        assert!(
+            !manifest
+                .metadata
+                .to_string()
+                .contains("private-checkpoint-header")
+        );
+        assert!(!checkpoint_path(&app, &task.id).exists());
+        assert!(
+            app.credentials
+                .secret(task.cookie_snapshot.as_ref().unwrap())?
+                .is_none()
+        );
+        for (path, hash) in saved {
+            assert_eq!(hash_file(&path)?, hash);
+        }
+        let calls = std::fs::read_to_string(calls)?;
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("media:"))
+                .count(),
+            2
+        );
+        assert_eq!(calls.lines().filter(|line| *line == "subtitle").count(), 2);
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), result)
+                .await?
+                .is_err()
+        );
+        drop(slot);
+        app.shutdown().await?;
+        stop.cancel();
+        server.await??;
+        Ok(())
     }
 }

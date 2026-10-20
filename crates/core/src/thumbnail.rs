@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderName, HeaderValue, LOCATION};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     io::{Cursor, Write},
     path::PathBuf,
     time::Duration,
@@ -75,67 +76,101 @@ pub(crate) async fn download(
     cancel: &CancellationToken,
 ) -> Result<Option<Vec<u8>>> {
     let thumbnail = text(info, "thumbnail");
-    let candidate = info["thumbnails"].as_array().and_then(|values| {
-        values.iter().rev().find(|value| {
-            if thumbnail.is_empty() {
-                text(value, "url").starts_with("http")
-            } else {
-                text(value, "url") == thumbnail
-            }
-        })
-    });
-    let thumbnail = if thumbnail.is_empty() {
-        candidate.map(|value| text(value, "url")).unwrap_or("")
-    } else {
-        thumbnail
-    };
-    if thumbnail.is_empty() {
-        return Ok(None);
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    if !thumbnail.is_empty() {
+        let candidate = info["thumbnails"].as_array().and_then(|values| {
+            values
+                .iter()
+                .rev()
+                .find(|value| text(value, "url") == thumbnail)
+        });
+        candidates.push((thumbnail, candidate));
+        seen.insert(thumbnail);
     }
-    let mut headers = HeaderMap::new();
-    for source in [
-        info.get("http_headers"),
-        candidate.and_then(|value| value.get("http_headers")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(source) = source.as_object() {
-            for (name, value) in source {
-                if matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "cookie"
-                        | "host"
-                        | "content-length"
-                        | "connection"
-                        | "proxy-authorization"
-                        | "proxy-connection"
-                ) {
-                    continue;
-                }
-                if let (Ok(name), Some(value)) =
-                    (HeaderName::from_bytes(name.as_bytes()), value.as_str())
-                    && let Ok(value) = HeaderValue::from_str(value)
-                {
-                    headers.insert(name, value);
-                }
-            }
+    for candidate in info["thumbnails"].as_array().into_iter().flatten().rev() {
+        let url = text(candidate, "url");
+        if url.starts_with("http") && seen.insert(url) {
+            candidates.push((url, Some(candidate)));
         }
     }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let origin = url::Url::parse(candidates[0].0)
+        .ok()
+        .map(|url| url.origin());
     let options = app.runtime_options(task)?;
     let cookies = app.task_cookies(task)?;
-    Ok(Some(
-        fetch(
-            thumbnail,
-            headers,
-            cookies.as_deref(),
-            &options.proxy,
-            max_bytes,
-            timeout,
-            cancel,
-        )
-        .await?,
-    ))
+    let deadline = tokio::time::Instant::now() + timeout;
+    let download = async {
+        let mut failure = anyhow::anyhow!("No thumbnail candidate is available");
+        for (thumbnail, candidate) in candidates {
+            ensure!(!cancel.is_cancelled(), "Operation interrupted");
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Thumbnail request timed out"
+            );
+            let mut headers = HeaderMap::new();
+            for (source, candidate_headers) in [
+                (info.get("http_headers"), false),
+                (candidate.and_then(|value| value.get("http_headers")), true),
+            ] {
+                if let Some(source) = source.and_then(Value::as_object) {
+                    for (name, value) in source {
+                        if matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "cookie"
+                                | "host"
+                                | "content-length"
+                                | "connection"
+                                | "proxy-authorization"
+                                | "proxy-connection"
+                        ) {
+                            continue;
+                        }
+                        if name.eq_ignore_ascii_case("authorization")
+                            && !candidate_headers
+                            && url::Url::parse(thumbnail).ok().map(|url| url.origin()) != origin
+                        {
+                            continue;
+                        }
+                        if let (Ok(name), Some(value)) =
+                            (HeaderName::from_bytes(name.as_bytes()), value.as_str())
+                            && let Ok(value) = HeaderValue::from_str(value)
+                        {
+                            headers.insert(name, value);
+                        }
+                    }
+                }
+            }
+            let result = fetch(
+                thumbnail,
+                headers,
+                cookies.as_deref(),
+                &options.proxy,
+                max_bytes,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                cancel,
+            )
+            .await
+            .and_then(|bytes| {
+                image::guess_format(&bytes)?;
+                Ok(bytes)
+            });
+            ensure!(!cancel.is_cancelled(), "Operation interrupted");
+            match result {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(reason) => failure = reason,
+            }
+        }
+        Err(failure).context("No thumbnail candidate could be downloaded")
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("Operation interrupted"),
+        result = tokio::time::timeout_at(deadline, download) => result.context("Thumbnail request timed out")?,
+    }
 }
 
 async fn fetch(
@@ -350,6 +385,171 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
+    }
+
+    #[tokio::test]
+    async fn thumbnail_candidates_fall_back_without_repeating_urls_or_sharing_headers() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let app = crate::App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy = format!("http://{}", listener.local_addr()?);
+        let expected = png();
+        let response = expected.clone();
+        let server = tokio::spawn(async move {
+            for candidate in ["preferred", "invalid", "fallback"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let headers = request(&mut socket).await.to_ascii_lowercase();
+                assert!(headers.starts_with(&format!(
+                    "get http://{candidate}.example.test/private/cover http/1.1"
+                )));
+                assert!(headers.contains("user-agent: extractor-agent"));
+                assert!(headers.contains(&format!("x-candidate: {candidate}")));
+                assert!(headers.contains(&format!("cookie: sid={candidate}")));
+                assert!(!headers.contains("unscoped"));
+                if candidate == "preferred" {
+                    assert!(headers.contains("authorization: bearer preferred-only"));
+                } else {
+                    assert!(!headers.contains("authorization:"));
+                }
+                let (status, bytes) = match candidate {
+                    "preferred" => ("404 Not Found", Vec::new()),
+                    "invalid" => ("200 OK", b"not an image".to_vec()),
+                    _ => ("200 OK", response.clone()),
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            bytes.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(&bytes).await.unwrap();
+            }
+        });
+        let mut task = crate::tests::paused_task(Default::default());
+        app.credentials.put_secret("fallback-proxy", &proxy)?;
+        app.credentials.put_secret("fallback-cookies", "# Netscape HTTP Cookie File\npreferred.example.test\tFALSE\t/private\tFALSE\t0\tsid\tpreferred\ninvalid.example.test\tFALSE\t/private\tFALSE\t0\tsid\tinvalid\nfallback.example.test\tFALSE\t/private\tFALSE\t0\tsid\tfallback\n")?;
+        task.proxy_snapshot = Some("fallback-proxy".into());
+        task.cookie_snapshot = Some("fallback-cookies".into());
+        let preferred = json!({"url":"http://preferred.example.test/private/cover","http_headers":{"X-Candidate":"preferred","Authorization":"Bearer preferred-only","Cookie":"unscoped=leak"}});
+        let info = json!({
+            "thumbnail":preferred["url"],
+            "http_headers":{"User-Agent":"extractor-agent","Cookie":"unscoped=leak","Authorization":"Bearer original-origin-only"},
+            "thumbnails":[
+                {"url":"http://fallback.example.test/private/cover","http_headers":{"X-Candidate":"fallback"}},
+                {"url":"http://invalid.example.test/private/cover","http_headers":{"X-Candidate":"invalid"}},
+                preferred.clone(), preferred,
+            ],
+        });
+        assert_eq!(
+            download(
+                &app,
+                &task,
+                &info,
+                1024 * 1024,
+                Duration::from_secs(5),
+                &CancellationToken::new()
+            )
+            .await?,
+            Some(expected)
+        );
+        server.await?;
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thumbnail_fallbacks_share_one_deadline_and_stop_when_cancelled() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = crate::App::open(crate::AppConfig {
+            data_dir: temp.path().join("data"),
+            download_dir: temp.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let task = crate::tests::paused_task(Default::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            for (status, bytes) in [("404 Not Found", Vec::new()), ("200 OK", png())] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = request(&mut socket).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            bytes.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let _ = socket.write_all(&bytes).await;
+            }
+        });
+        let info = json!({"thumbnail":format!("{url}/first"),"thumbnails":[{"url":format!("{url}/second")}]});
+        assert!(
+            download(
+                &app,
+                &task,
+                &info,
+                1024 * 1024,
+                Duration::from_millis(400),
+                &CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+        server.abort();
+        let _ = server.await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let stopped = cancel.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = request(&mut socket).await;
+            stopped.cancel();
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "Cancellation requested another thumbnail candidate"
+            );
+        });
+        let info = json!({"thumbnail":format!("{url}/first"),"thumbnails":[{"url":format!("{url}/second")}]});
+        assert!(
+            download(
+                &app,
+                &task,
+                &info,
+                1024 * 1024,
+                Duration::from_secs(5),
+                &cancel
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("interrupted")
+        );
+        server.await?;
+        app.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

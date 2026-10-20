@@ -287,6 +287,28 @@ describe('live interface stability', () => {
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'completed' } }));
     expect(total.textContent).toContain('0 B/s');
   });
+  it('summarizes the current filtered task list and follows live status changes and removals', async () => {
+    const statuses = ['queued', 'probing', 'downloading', 'waiting_processing', 'processing', 'paused', 'cancelled', 'failed', 'processing_failed', 'completed', 'retained'] as const;
+    const snapshot = makeSnapshot(); snapshot.tasks = statuses.map(status => ({ ...makeTask(status, `${['downloading', 'failed', 'completed', 'retained'].includes(status) ? 'Match' : 'Other'} ${status}`), status }));
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : []);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    const footer = within(screen.getByRole('contentinfo'));
+    const details = within(footer.getByRole('group', { name: 'Task status breakdown' }));
+    expect(footer.getByText('Current list: 11')).toBeTruthy(); expect(footer.getByText('Completed 2')).toBeTruthy(); expect(footer.getByText('Unfinished 9')).toBeTruthy();
+    for (const label of ['Downloading', 'Download queued', 'Reading media', 'Processing queued', 'Processing', 'Paused', 'Cancelled', 'Download failed', 'Processing failed']) expect(details.getByText(`${label} 1`)).toBeTruthy();
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: 'Match' } });
+    expect(footer.getByText('Current list: 4')).toBeTruthy(); expect(footer.getByText('11 total')).toBeTruthy(); expect(footer.getByText('Completed 2')).toBeTruthy(); expect(footer.getByText('Unfinished 2')).toBeTruthy(); expect(details.getByText('Download queued 0')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'failed', status: 'completed' } }));
+    expect(footer.getByText('Completed 3')).toBeTruthy(); expect(footer.getByText('Unfinished 1')).toBeTruthy(); expect(details.getByText('Download failed 0')).toBeTruthy();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Status filter' }), { target: { value: 'completed' } });
+    expect(footer.getByText('Current list: 3')).toBeTruthy(); expect(footer.getByText('Unfinished 0')).toBeTruthy();
+    act(() => transport.listener?.({ kind: 'task.remove', data: 'retained' }));
+    expect(footer.getByText('Current list: 2')).toBeTruthy(); expect(footer.getByText('Completed 2')).toBeTruthy(); expect(footer.getByText('10 total')).toBeTruthy();
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: 'no matches' } });
+    expect(footer.getByText('Current list: 0')).toBeTruthy(); expect(footer.getByText('Completed 0')).toBeTruthy(); expect(footer.getByText('Unfinished 0')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(footer.getByText('All tasks: 10')).toBeTruthy(); expect(footer.getByText('Completed 2')).toBeTruthy(); expect(footer.getByText('Unfinished 8')).toBeTruthy();
+  });
   it('starts background checks only after the initial task snapshot and leaves the interface usable', async () => {
     let finishSnapshot!: (value: unknown) => void;
     transport.command.mockImplementation(async command => command === 'snapshot' ? new Promise(resolve => { finishSnapshot = resolve; }) : new Promise(() => {}));
@@ -1205,7 +1227,7 @@ describe('live interface stability', () => {
     expect(screen.getByText('No matching tasks')).toBeTruthy();
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'paused' } }));
     expect(rows()[0].textContent).toContain('Alpha');
-    expect(screen.getByText('2 tasks · 1 active')).toBeTruthy();
+    expect(within(screen.getByRole('contentinfo')).getByText('Current list: 1')).toBeTruthy();
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: '' } });
     fireEvent.change(screen.getByRole('combobox', { name: 'Status filter' }), { target: { value: 'all' } });
     fireEvent.change(screen.getByRole('combobox', { name: 'Sort' }), { target: { value: 'newest' } });
