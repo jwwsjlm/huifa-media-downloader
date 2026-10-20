@@ -53,10 +53,10 @@ async fn command(
     args: Value,
     host: State<'_, Host>,
 ) -> Result<Value, String> {
+    if host.closing.load(Ordering::Acquire) || app.state::<startup::Initialization>().is_closing() {
+        return Err("Application is shutting down".into());
+    }
     if command == "host.clipboard_read" {
-        if host.closing.load(Ordering::Acquire) {
-            return Err("Application is shutting down".into());
-        }
         return tauri::async_runtime::spawn_blocking(move || {
             clipboard_text(app.clipboard().read_text()).map(Value::String)
         })
@@ -64,9 +64,6 @@ async fn command(
         .map_err(|_| "Clipboard is temporarily unavailable".to_string())?;
     }
     if command.starts_with("browser.login.") {
-        if host.closing.load(Ordering::Acquire) {
-            return Err("Application is shutting down".into());
-        }
         return host
             .login_browser
             .command(&app, &host.core, &command, &args)
@@ -127,9 +124,6 @@ async fn command(
         );
     }
     if command == "host.download_directory" {
-        if host.closing.load(Ordering::Acquire) {
-            return Err("Application is shutting down".into());
-        }
         let path = PathBuf::from(args["path"].as_str().ok_or("Choose a download folder")?);
         let core = host.core.clone();
         let path = tauri::async_runtime::spawn_blocking(move || core.set_download_directory(&path))
@@ -233,8 +227,16 @@ fn open_release(app: tauri::AppHandle, url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn capabilities(host: State<'_, Host>) -> Value {
-    json!({"desktop":true,"browserCookies":true,"remoteBrowser":false,"updates":!host.portable,"directoryPicker":true})
+async fn capabilities(app: tauri::AppHandle) -> Result<Value, String> {
+    let initialization = app.state::<startup::Initialization>();
+    initialization.wait().await?;
+    if initialization.is_closing() {
+        return Err("Application is shutting down".into());
+    }
+    let host = app.state::<Host>();
+    Ok(
+        json!({"desktop":true,"browserCookies":true,"remoteBrowser":false,"updates":!host.portable,"directoryPicker":true}),
+    )
 }
 
 fn portable_mode(executable: &std::path::Path) -> bool {
@@ -486,6 +488,57 @@ async fn install_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<
     app.restart();
 }
 
+async fn initialize_host(
+    handle: &tauri::AppHandle,
+    mut config: AppConfig,
+    portable: bool,
+) -> Result<Host> {
+    config.tool_dir = config.tool_dir.filter(|directory| directory.is_dir());
+    let data_dir = config.data_dir.clone();
+    let core = App::open(config).await?;
+    let mcp = huifa_mcp::DesktopMcp::new(core.clone());
+    let prepared = (|| {
+        let login_browser = login_browser::LoginBrowser::new(data_dir.join("login-browser"))
+            .context("Could not initialize the login browser profile")?;
+        Ok::<_, anyhow::Error>((
+            login_browser,
+            mcp.status()
+                .context("Could not read MCP startup settings")?,
+        ))
+    })();
+    let (login_browser, config) = match prepared {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            core.shutdown()
+                .await
+                .context("Could not save tasks after startup failed")?;
+            return Err(reason);
+        }
+    };
+    if !handle.state::<startup::Initialization>().is_closing()
+        && let Err(reason) = mcp
+            .configure(
+                config["autoStart"] == true,
+                true,
+                config["port"].as_u64().unwrap_or(19492) as u16,
+                None,
+            )
+            .await
+    {
+        eprintln!("MCP startup failed: {}", error(reason));
+    }
+    Ok(Host {
+        login_browser,
+        mcp,
+        core,
+        data_dir,
+        portable,
+        closing: AtomicBool::new(false),
+        shutdown_done: AtomicBool::new(false),
+        update: Mutex::new(None),
+    })
+}
+
 pub fn run() {
     startup::install();
     let builder = tauri::Builder::default()
@@ -500,11 +553,9 @@ pub fn run() {
                 let label = window.label().to_owned();
                 if label.starts_with("login-") {
                     tauri::async_runtime::spawn(async move {
-                        handle
-                            .state::<Host>()
-                            .login_browser
-                            .window_closed(&handle, &label)
-                            .await;
+                        if let Some(host) = handle.try_state::<Host>() {
+                            host.login_browser.window_closed(&handle, &label).await;
+                        }
                     });
                 }
             }
@@ -524,10 +575,7 @@ pub fn run() {
                 if window.label() != "main" {
                     return;
                 }
-                let Some(host) = window.try_state::<Host>() else {
-                    return;
-                };
-                if host.shutdown_done.load(Ordering::Acquire) {
+                if window.try_state::<Host>().is_some_and(|host| host.shutdown_done.load(Ordering::Acquire)) {
                     return;
                 }
                 api.prevent_close();
@@ -550,59 +598,58 @@ pub fn run() {
             let tools = std::env::var_os("HUIFA_TOOL_DIR")
                 .map(PathBuf::from)
                 .unwrap_or(app.path().resource_dir()?.join("tools"));
-            let tool_dir = tools.is_dir().then_some(tools);
-            let core = tauri::async_runtime::block_on(App::open(AppConfig {
+            let config = AppConfig {
                 data_dir: base.clone(),
-                download_dir: download_dir.clone(),
-                tool_dir,
-            }))
-            .map_err(error)?;
-            let mut events = core.subscribe();
+                download_dir,
+                tool_dir: Some(tools),
+            };
+            let (initialization, ready) = startup::Initialization::new();
+            app.manage(initialization);
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                loop {
-                    match events.recv().await {
-                        Ok(event) => {
-                            let _ = handle.emit("huifa-event", event);
+                let worker = handle.clone();
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    tauri::async_runtime::block_on(initialize_host(&worker, config, portable))
+                })
+                .await;
+                let panic_reported = matches!(&result, Err(tauri::Error::JoinError(reason)) if reason.is_panic());
+                let result = result.map_err(error).and_then(|result| result.map_err(error));
+                match result {
+                    Ok(host) => {
+                        let mut events = host.core.subscribe();
+                        handle.manage(host);
+                        let events_handle = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            loop {
+                                match events.recv().await {
+                                    Ok(event) => { let _ = events_handle.emit("huifa-event", event); }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { let _ = events_handle.emit("huifa-resync", ()); }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                        startup::ready();
+                        let _ = ready.send(Some(Ok(())));
+                        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                        loop {
+                            interval.tick().await;
+                            if handle.state::<startup::Initialization>().is_closing() { break; }
+                            let host = handle.state::<Host>();
+                            if host.closing.load(Ordering::Acquire) { break; }
+                            let _ = host.login_browser.sync(&handle, &host.core).await;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let _ = handle.emit("huifa-resync", ());
-                        }
-                        Err(_) => break,
                     }
-                }
-            });
-            let mcp = huifa_mcp::DesktopMcp::new(core.clone());
-            let config = mcp.status().context("Could not read MCP startup settings").map_err(error)?;
-            if let Err(reason) = tauri::async_runtime::block_on(mcp.configure(
-                    config["autoStart"] == true,
-                    true,
-                    config["port"].as_u64().unwrap_or(19492) as u16,
-                    None,
-                ))
-            {
-                eprintln!("MCP startup failed: {reason}");
-            }
-            app.manage(Host {
-                login_browser: login_browser::LoginBrowser::new(base.join("login-browser"))
-                    .context("Could not initialize the login browser profile")
-                    .map_err(error)?,
-                mcp,
-                core,
-                data_dir: base,
-                portable,
-                closing: AtomicBool::new(false),
-                shutdown_done: AtomicBool::new(false),
-                update: Mutex::new(None),
-            });
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-                loop {
-                    interval.tick().await;
-                    let host = handle.state::<Host>();
-                    if host.closing.load(Ordering::Acquire) { break; }
-                    let _ = host.login_browser.sync(&handle, &host.core).await;
+                    Err(reason) => {
+                        let closing = handle.state::<startup::Initialization>().is_closing();
+                        let _ = ready.send(Some(Err(reason.clone())));
+                        if !closing {
+                            // Worker panics have already shown the startup panic report.
+                            if !panic_reported {
+                                let _ = tauri::async_runtime::spawn_blocking(move || startup::report(&reason)).await;
+                            }
+                            handle.exit(1);
+                        }
+                    }
                 }
             });
             Ok(())
@@ -617,7 +664,7 @@ pub fn run() {
                         .query()
                         .and_then(|query| query.strip_prefix("kind="))
                         .unwrap_or("thumbnail");
-                    let host = handle.state::<Host>();
+                    let host = handle.try_state::<Host>().context("Application is starting")?;
                     let (path, mime) = owned_file(&host.core, id, kind).await?;
                     ensure!(
                         mime.starts_with("image/"),
@@ -665,33 +712,58 @@ pub fn run() {
             std::process::exit(1);
         }
     };
-    application.run(|app, event| {
-        if matches!(event, tauri::RunEvent::Ready) {
-            startup::ready();
+    let startup_failed = Arc::new(AtomicBool::new(false));
+    let failed = startup_failed.clone();
+    let code = application.run_return(move |app, event| {
+        if let tauri::RunEvent::Exit = event {
+            let initialization = app.state::<startup::Initialization>();
+            failed.store(
+                initialization.failed() && !initialization.is_closing(),
+                Ordering::Release,
+            );
         }
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
-            let host = app.state::<Host>();
-            if host.shutdown_done.load(Ordering::Acquire) {
+            if app
+                .try_state::<Host>()
+                .is_some_and(|host| host.shutdown_done.load(Ordering::Acquire))
+                || app.state::<startup::Initialization>().failed()
+            {
                 return;
             }
             api.prevent_exit();
             begin_shutdown(app);
         }
     });
+    std::process::exit(if startup_failed.load(Ordering::Acquire) {
+        1
+    } else {
+        code
+    });
 }
 
 fn begin_shutdown(app: &tauri::AppHandle) {
-    let host = app.state::<Host>();
-    if host.closing.swap(true, Ordering::AcqRel) {
+    if !app.state::<startup::Initialization>().request_close() {
         return;
     }
-    let core = Arc::clone(&host.core);
+    if let Some(host) = app.try_state::<Host>() {
+        host.closing.store(true, Ordering::Release);
+    }
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        handle.state::<Host>().mcp.shutdown().await;
+        if handle
+            .state::<startup::Initialization>()
+            .wait()
+            .await
+            .is_err()
+        {
+            handle.exit(0);
+            return;
+        }
         let host = handle.state::<Host>();
+        host.closing.store(true, Ordering::Release);
+        host.mcp.shutdown().await;
         host.login_browser.stop(&handle, &host.core).await;
-        match core.shutdown().await {
+        match host.core.shutdown().await {
             Ok(()) => {
                 handle
                     .state::<Host>()
@@ -700,6 +772,10 @@ fn begin_shutdown(app: &tauri::AppHandle) {
                 handle.exit(0);
             }
             Err(reason) => {
+                handle
+                    .state::<startup::Initialization>()
+                    .closing
+                    .store(false, Ordering::Release);
                 handle
                     .state::<Host>()
                     .closing

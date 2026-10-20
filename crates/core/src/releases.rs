@@ -3,7 +3,11 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 pub(crate) async fn status(app: &crate::App) -> Result<Value> {
-    status_for(env!("CARGO_PKG_VERSION"), &app.download_proxy()?).await
+    let proxy = app.download_proxy()?;
+    tokio::select! {
+        result=status_for(env!("CARGO_PKG_VERSION"), &proxy)=>result,
+        _=app.shutdown_token.cancelled()=>anyhow::bail!("Release check interrupted"),
+    }
 }
 
 fn client(proxy: &str) -> Result<reqwest::Client> {
@@ -122,6 +126,57 @@ pub fn valid_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_pending_release_check() -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let directory = tempfile::tempdir()?;
+        let app = crate::App::open(crate::AppConfig {
+            data_dir: directory.path().join("data"),
+            download_dir: directory.path().join("downloads"),
+            tool_dir: None,
+        })
+        .await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy = format!("http://{}", listener.local_addr()?);
+        app.command(
+            "settings.save",
+            json!({"settings":{"downloadOptions":{"proxy":proxy}}}),
+        )
+        .await?;
+        let (started, request_started) = tokio::sync::oneshot::channel();
+        let fixture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buffer = [0; 8192];
+            let size = socket.read(&mut buffer).await?;
+            let _ = started.send(String::from_utf8_lossy(&buffer[..size]).to_string());
+            std::future::pending::<()>().await;
+            drop(socket);
+            Ok::<_, anyhow::Error>(())
+        });
+        let checking_app = app.clone();
+        let checking =
+            tokio::spawn(
+                async move { checking_app.command("app.release_status", json!({})).await },
+            );
+        let request = tokio::time::timeout(Duration::from_secs(5), request_started).await??;
+        assert!(request.starts_with("CONNECT api.github.com:443 HTTP/1.1"));
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(1), app.shutdown()).await;
+        if shutdown.is_err() {
+            checking.abort();
+        }
+        let result = checking.await;
+        fixture.abort();
+        let _ = fixture.await;
+        shutdown
+            .context("Shutdown waited for the pending release check instead of cancelling it")??;
+        assert!(
+            result?.is_err(),
+            "A cancelled release check must not succeed"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn release_check_uses_the_configured_proxy() -> Result<()> {

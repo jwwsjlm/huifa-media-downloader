@@ -1778,10 +1778,13 @@ impl App {
                 drop(permit);
             }
         }
-        let _processor = self
-            .task_permit(id, "processor", &self.processor, cancel)
-            .await?;
+        let _processor = self.processing_permit(id, cancel).await?;
         let mut task = self.db.task(id)?;
+        let _cpu = if task.compression.is_none() {
+            Some(self.resource_permit(id, "cpu", cancel).await?)
+        } else {
+            None
+        };
         crate::workflow::plan(&mut task);
         self.save_task(&task)?;
         crate::processing::process_task(self, id, cancel).await
@@ -1937,7 +1940,7 @@ mod tests {
         let exe = PathBuf::from("powershell.exe");
         let args = vec![
             "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
-            "$worker = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30'; [Console]::WriteLine('READY:' + $PID + ':' + $worker.Id); Start-Sleep -Seconds 30".into(),
+            "$start = New-Object System.Diagnostics.ProcessStartInfo; $start.FileName = 'powershell.exe'; $start.Arguments = '-NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"'; $start.UseShellExecute = $false; $start.CreateNoWindow = $true; $worker = [System.Diagnostics.Process]::Start($start); [Console]::WriteLine('READY:' + $PID + ':' + $worker.Id); Start-Sleep -Seconds 30".into(),
         ];
         let transfers = (0..2).map(|index| {
             let callback = callback.clone();

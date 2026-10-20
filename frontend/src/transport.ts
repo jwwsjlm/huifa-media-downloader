@@ -2,10 +2,15 @@ import type { Capabilities, CoreEvent, Json, Session, Task } from './types';
 
 type McpConfiguration = { enabled?: boolean; autoStart?: boolean; port?: number };
 type ReleaseStatus = { currentVersion: string; latestVersion: string; updateAvailable: boolean; url: string; publishedAt?: string };
+export type RequestOptions = { signal?: AbortSignal; timeoutMs?: number };
 
 const desktop = '__TAURI_INTERNALS__' in window;
 let csrfToken = '';
 let capabilities: Capabilities = { desktop, browserCookies: desktop, remoteBrowser: false, updates: desktop, directoryPicker: desktop };
+const nativeReadCommands = new Set(['snapshot', 'state.sync', 'tools.check']);
+type NativeWaiter = { resolve: (value: unknown) => void; reject: (reason: unknown) => void; cleanup: () => void };
+type NativeRead = { waiters: Set<NativeWaiter> };
+const nativeReads = new Map<string, NativeRead>();
 
 async function response<T>(result: Response): Promise<T> {
   if (result.status === 401) window.dispatchEvent(new Event('huifa-session-expired'));
@@ -26,8 +31,43 @@ async function response<T>(result: Response): Promise<T> {
 async function invoke<T>(name: string, args: Record<string, unknown> = {}): Promise<T> {
   return (await import('@tauri-apps/api/core')).invoke<T>(name, args);
 }
-async function post<T>(path: string, body: unknown): Promise<T> {
-  return response<T>(await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(body) }));
+function nativeCommand<T>(command: string, args: unknown, signal?: AbortSignal): Promise<T> {
+  if (!nativeReadCommands.has(command)) return invoke<T>('command', { command, args });
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  let pending = nativeReads.get(command);
+  if (!pending) {
+    pending = { waiters: new Set() }; nativeReads.set(command, pending);
+    const entry = pending;
+    const settle = (value: unknown, failed: boolean) => {
+      nativeReads.delete(command);
+      for (const waiter of entry.waiters) { waiter.cleanup(); if (failed) waiter.reject(value); else waiter.resolve(value); }
+      entry.waiters.clear();
+    };
+    // Exactly one observer owns the uncancellable invoke. Timed-out callers are
+    // removed from the set instead of retaining a reaction on its pending promise.
+    void invoke<T>('command', { command, args }).then(value => settle(value, false), reason => settle(reason, true));
+  }
+  const entry = pending;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => { entry.waiters.delete(waiter); waiter.cleanup(); reject(signal?.reason); };
+    const waiter: NativeWaiter = { resolve: value => resolve(value as T), reject, cleanup: () => signal?.removeEventListener('abort', abort) };
+    entry.waiters.add(waiter); signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+async function post<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  return response<T>(await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(body), signal }));
+}
+async function request<T>(operation: (signal: AbortSignal) => Promise<T>, options: RequestOptions): Promise<T> {
+  const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectCancelled: (reason: unknown) => void = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => { rejectCancelled = reject; });
+  const cancel = (reason: DOMException) => { controller.abort(reason); rejectCancelled(reason); };
+  const abort = () => cancel(new DOMException('Request cancelled.', 'AbortError'));
+  if (options.signal?.aborted) throw new DOMException('Request cancelled.', 'AbortError');
+  options.signal?.addEventListener('abort', abort, { once: true });
+  if (options.timeoutMs !== undefined) timer = setTimeout(() => cancel(new DOMException('Request timed out.', 'TimeoutError')), options.timeoutMs);
+  try { return await Promise.race([operation(controller.signal), cancelled]); }
+  finally { if (timer !== undefined) clearTimeout(timer); options.signal?.removeEventListener('abort', abort); }
 }
 export const host = {
   desktop,
@@ -49,18 +89,24 @@ export const host = {
   async logout(): Promise<void> { await post('/api/logout', {}); csrfToken = ''; },
   async mcpStatus<T>(): Promise<T> { return response<T>(await fetch('/api/mcp', { credentials: 'same-origin', cache: 'no-store' })); },
   async mcpConfigure<T>(config: boolean | McpConfiguration): Promise<T> { return post<T>('/api/mcp', typeof config === 'boolean' ? { enabled: config } : config); },
-  async command<T = Json>(command: string, args: unknown = {}): Promise<T> {
-    if (desktop) return invoke<T>('command', { command, args });
-    return (await post<{ value: T }>('/api/command', { command, args })).value;
+  async command<T = Json>(command: string, args: unknown = {}, options?: RequestOptions): Promise<T> {
+    const execute = async (signal?: AbortSignal) => desktop ? nativeCommand<T>(command, args, signal) : (await post<{ value: T }>('/api/command', { command, args }, signal)).value;
+    // Native invokes cannot be interrupted, but callers can stop waiting and
+    // discard their result. Fetch receives the same cancellation signal.
+    return options ? request(execute, options) : execute();
   },
   async subscribe(listener: (event: CoreEvent) => void, connection: (connected: boolean) => void): Promise<() => void> {
     if (desktop) {
       const { listen } = await import('@tauri-apps/api/event');
-      const unlisten = await listen<CoreEvent>('huifa-event', event => listener(event.payload));
-      const resync = await listen('huifa-resync', () => listener({ kind: 'snapshot.required', data: null }));
-      const error = await listen<{ message: string }>('huifa-host-error', event => listener({ kind: 'host.error', data: event.payload }));
-      connection(true);
-      return () => { unlisten(); resync(); error(); };
+      const cleanups: (() => void)[] = [];
+      const dispose = () => { for (const cleanup of cleanups.splice(0)) cleanup(); };
+      try {
+        cleanups.push(await listen<CoreEvent>('huifa-event', event => listener(event.payload)));
+        cleanups.push(await listen('huifa-resync', () => listener({ kind: 'snapshot.required', data: null })));
+        cleanups.push(await listen<{ message: string }>('huifa-host-error', event => listener({ kind: 'host.error', data: event.payload })));
+        connection(true);
+        return dispose;
+      } catch (reason) { dispose(); throw reason; }
     }
     const stream = new EventSource('/api/events');
     stream.onopen = () => connection(true);

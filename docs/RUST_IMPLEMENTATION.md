@@ -25,11 +25,22 @@ dialogs and environment capabilities remain in their hosts.
 Commands use `{command, args}`. Web `POST /api/command` returns `{value}` or a
 non-success status with `{error}`. Tauri's `command` invoke returns the same
 value, with failures returned as a string. `snapshot` returns
-`{version, tasks, media, settings, tools}`. Core events use
-`{kind, data}`: `task.upsert`, `task.remove`, `media.upsert`, `media.remove`, `settings.updated`,
+`{revision, version, tasks, media, settings, tools}`. Core events use
+`{revision, kind, data}`: `task.upsert`, `task.remove`, `media.upsert`, `media.remove`, `settings.updated`,
 `tools.updated`. Removal events carry `{id}`. Deleting a task without deleting its
 files retains its media record. SSE uses the default message event; Tauri emits `huifa-event`.
 DTO fields use camelCase. View state and unsaved form inputs stay in React.
+
+`state.sync` accepts `{since: revision}` and returns `{revision, reset, events}`.
+Events are ordered and newer than `since`; removals retain their normal `{id}` payload.
+History is bounded to 2,048 events and 8 MiB. A restart or unavailable history returns
+`reset: true`, requiring a new snapshot. Revisions are JavaScript-safe integers.
+Snapshots establish their cursor before reading data; subsequent changes are replayed
+from history. Both web sync responses and live events apply the same public filtering.
+Clients merge progress for at most 200 ms, process state changes immediately, and use
+full snapshots only for initial loading, reconnects, or reset. Read-only web requests
+support abort/timeout; native requests reuse a single underlying invocation per command
+until it settles, even when an individual caller times out.
 
 Core commands:
 

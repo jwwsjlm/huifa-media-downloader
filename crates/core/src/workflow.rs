@@ -69,6 +69,7 @@ pub(crate) fn position(stage: &str, steps: &[String]) -> Option<usize> {
                 | "compression_analyzing"
                 | "compression_encoding"
                 | "compression_preparing"
+                | "compression_scanning"
         )
     {
         "process"

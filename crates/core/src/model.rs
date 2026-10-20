@@ -14,6 +14,8 @@ pub struct AppConfig {
 pub struct Event {
     pub kind: String,
     pub data: Value,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,7 +522,7 @@ pub fn parse_rate(value: &str) -> Option<u64> {
     (rate.is_finite() && rate >= 1.0 && rate <= u64::MAX as f64).then_some(rate as u64)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompressionOptions {
     pub target_bytes: Option<u64>,

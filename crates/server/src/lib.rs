@@ -367,6 +367,7 @@ fn allowed_command(command: &str) -> bool {
     matches!(
         command,
         "snapshot"
+            | "state.sync"
             | "access.status"
             | "access.change_password"
             | "app.release_status"
@@ -456,6 +457,15 @@ async fn command(
         .map_err(failed)?;
     if input.command == "snapshot" {
         strip_processing_folder(&mut value["settings"]);
+    }
+    if input.command == "state.sync"
+        && let Some(events) = value["events"].as_array_mut()
+    {
+        for event in events {
+            if event["kind"] == "settings.updated" {
+                strip_processing_folder(&mut event["data"]);
+            }
+        }
     }
     if matches!(
         input.command.as_str(),
@@ -1136,6 +1146,11 @@ mod tests {
                 ))
         };
         let args = json!({"preferences":{"deleteMediaOnTaskDelete":true}});
+        let since = server
+            .app
+            .command("snapshot", json!({"includeTools":false}))
+            .await?["revision"]
+            .clone();
         let forbidden = router
             .clone()
             .oneshot(request("settings.preferences", args.clone(), "incorrect")?)
@@ -1160,6 +1175,27 @@ mod tests {
         );
         assert!(!body.to_string().contains("fixture-password"));
         assert!(!body.to_string().contains("fixture-api-key"));
+        let synced = router
+            .clone()
+            .oneshot(request(
+                "state.sync",
+                json!({"since":since}),
+                &session.csrf,
+            )?)
+            .await?;
+        assert_eq!(synced.status(), StatusCode::OK);
+        let synced: Value =
+            serde_json::from_slice(&synced.into_body().collect().await?.to_bytes())?;
+        assert_eq!(synced["value"]["reset"], false);
+        let events = synced["value"]["events"].as_array().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"] == "settings.updated")
+        );
+        assert!(!synced.to_string().contains("private-processing"));
+        assert!(!synced.to_string().contains("fixture-password"));
+        assert!(!synced.to_string().contains("fixture-api-key"));
         let snapshot = server.app.command("snapshot", json!({})).await?;
         assert_eq!(
             snapshot["settings"]["downloadOptions"]["processingTempDir"],

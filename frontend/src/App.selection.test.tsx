@@ -86,7 +86,7 @@ describe('task list multiple selection', () => {
     await waitFor(() => expect((within(dialog).getByRole('button', { name: 'Delete' }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-    expect(transport.command).toHaveBeenLastCalledWith('snapshot', { includeTools: false });
+    expect(transport.command).toHaveBeenLastCalledWith('snapshot', { includeTools: false }, expect.objectContaining({ signal: expect.any(AbortSignal), timeoutMs: 10000 }));
     expect(transport.command.mock.calls.filter(([name]) => name === 'tasks.deleteBatch')[1]).toEqual(['tasks.deleteBatch', { ids: ['b'], deleteFiles: false }]);
     await waitFor(() => expect(screen.getByText('0 selected')).toBeTruthy());
   });

@@ -1,13 +1,72 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useReducer } from 'react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { SettingsPage } from './SettingsPage';
-import { initialState } from './state';
-import type { Tool } from './types';
+import { initialState, reducer } from './state';
+import type { Settings, Tool } from './types';
 
 const transport = vi.hoisted(() => ({ desktop: false, command: vi.fn(), paths: vi.fn(), directory: vi.fn(), openDownloadDirectory: vi.fn() }));
 vi.mock('./transport', () => ({ host: { get desktop() { return transport.desktop; }, command: transport.command, paths: transport.paths, directory: transport.directory, openDownloadDirectory: transport.openDownloadDirectory, capabilities: () => ({ updates: false }) } }));
 beforeEach(() => { transport.desktop = false; transport.command.mockReset().mockResolvedValue([]); transport.paths.mockReset().mockResolvedValue({ downloadDir: '/downloads' }); transport.directory.mockReset().mockResolvedValue(null); transport.openDownloadDirectory.mockReset().mockResolvedValue(undefined); });
 const run = (operation: () => Promise<unknown>) => { void operation(); };
+function AnalysisSettings({ settings = {} }: { settings?: Settings }) {
+  const [state, dispatch] = useReducer(reducer, { ...initialState, settings, view: { ...initialState.view, settingsTab: 'downloads' } });
+  return <SettingsPage state={state} dispatch={dispatch} t={(_zh, en) => en} run={run} message={vi.fn()} />;
+}
+it.each([false, true])('uses host detection for automatic analysis threads on desktop=%s', desktop => {
+  transport.desktop = desktop;
+  render(<AnalysisSettings settings={{ detectedAnalysisThreads: 20 }} />);
+  expect((screen.getByRole('combobox', { name: 'Video analysis threads' }) as HTMLSelectElement).value).toBe('auto');
+  expect(screen.getByRole('option', { name: 'Automatic (up to 8 threads; host: 20 logical processors)' })).toBeTruthy();
+  expect(screen.queryByRole('spinbutton', { name: 'Manual analysis threads' })).toBeNull();
+  expect(screen.getByText(/running analyses are unchanged/)).toBeTruthy();
+});
+it('shows automatic mode without inventing a processor count when host metadata is missing', () => {
+  render(<AnalysisSettings />);
+  expect(within(screen.getByRole('combobox', { name: 'Video analysis threads' })).getByRole('option', { name: 'Automatic (up to 8 threads)' })).toBeTruthy();
+  expect(screen.queryByText(/host:.*logical processors/)).toBeNull();
+});
+it('keeps a manual analysis draft across tabs, saves it without host metadata and can save automatic mode again', async () => {
+  transport.command.mockImplementation(async (name, args) => name === 'settings.save' ? { ...args.settings, detectedAnalysisThreads: 20 } : []);
+  render(<AnalysisSettings settings={{ analysisThreads: 0, detectedAnalysisThreads: 20 }} />);
+  fireEvent.change(screen.getByRole('combobox', { name: 'Video analysis threads' }), { target: { value: 'manual' } });
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'Manual analysis threads' }), { target: { value: '4' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Tools & updates' }));
+  expect(screen.queryByRole('spinbutton', { name: 'Manual analysis threads' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Downloads' }));
+  expect((screen.getByRole('spinbutton', { name: 'Manual analysis threads' }) as HTMLInputElement).value).toBe('4');
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ analysisThreads: 4 }) }));
+  const saved = transport.command.mock.calls.find(([name]) => name === 'settings.save')?.[1].settings;
+  expect(saved).not.toHaveProperty('detectedAnalysisThreads');
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true));
+  fireEvent.change(screen.getByRole('combobox', { name: 'Video analysis threads' }), { target: { value: 'auto' } });
+  expect(screen.queryByRole('spinbutton', { name: 'Manual analysis threads' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('settings.save', { settings: expect.objectContaining({ analysisThreads: 0 }) }));
+});
+it.each(['', '0', '-1', '1.5', '257'])('rejects invalid manual analysis threads %s without switching to automatic mode', value => {
+  render(<AnalysisSettings settings={{ analysisThreads: 4, detectedAnalysisThreads: 20 }} />);
+  const input = screen.getByRole('spinbutton', { name: 'Manual analysis threads' }) as HTMLInputElement;
+  fireEvent.change(input, { target: { value } });
+  expect((screen.getByRole('combobox', { name: 'Video analysis threads' }) as HTMLSelectElement).value).toBe('manual');
+  expect(screen.getByRole('alert').textContent).toContain('integer from 1 to 256');
+  expect(input.checkValidity()).toBe(false);
+  const save = screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement;
+  expect(save.disabled).toBe(true); fireEvent.click(save);
+  expect(transport.command.mock.calls.some(([name]) => name === 'settings.save')).toBe(false);
+});
+it('undoes an invalid manual analysis draft using the saved automatic mode', () => {
+  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  render(<AnalysisSettings settings={{ analysisThreads: 0 }} />);
+  fireEvent.change(screen.getByRole('combobox', { name: 'Video analysis threads' }), { target: { value: 'manual' } });
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'Manual analysis threads' }), { target: { value: '' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Undo changes' }));
+  expect((screen.getByRole('combobox', { name: 'Video analysis threads' }) as HTMLSelectElement).value).toBe('auto');
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+  confirm.mockRestore();
+});
 it('keeps desktop clipboard monitoring off until the changed setting is saved', async () => {
   transport.desktop = true;
   const dispatch = vi.fn();
@@ -196,7 +255,7 @@ it('shows automatic sign-in status without exposing cookie records or changing s
 it('explains Docker image updates instead of offering a forbidden tool command', async () => {
   show();
   await waitFor(() => expect(transport.command).toHaveBeenCalledWith('cookies.list'));
-  expect(screen.queryByRole('button', { name: 'Update / install' })).toBeNull();
+  expect(screen.queryByRole('button', { name: /^(?:Update|Install)$/ })).toBeNull();
   expect(screen.getByText(/Update the Docker image/)).toBeTruthy();
   expect(screen.queryByLabelText('yt-dlp update channel')).toBeNull();
   expect(screen.queryByLabelText('yt-dlp download source')).toBeNull();
@@ -219,25 +278,42 @@ it('shows a password placeholder, tool reference and independent MCP switches', 
   await waitFor(() => expect(transport.command).toHaveBeenCalledWith('mcp.configure', { enabled: true }));
   expect(await screen.findByText('Running')).toBeTruthy();
 });
-it('keeps runtime tool installation available on desktop', async () => {
-  transport.desktop = true; show();
+it('hides install and update actions for installed tools until an update is confirmed', async () => {
+  transport.desktop = true; show([{ name: 'yt-dlp', available: true, version: '2026.08.19', platform: 'windows-x86_64' }, { name: 'qjs', available: true, version: '0.17.0' }, { name: 'deno', available: true, version: '2.5.0' }]);
   await waitFor(() => expect(transport.paths).toHaveBeenCalled());
-  expect(screen.getByRole('button', { name: 'Update / install' })).toBeTruthy();
+  expect(screen.queryByRole('button', { name: /^(?:Update|Install)$/ })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Install Deno for faster parsing' })).toBeNull();
+  expect(screen.getByRole('button', { name: 'Apply FFmpeg version' })).toBeTruthy();
   expect(screen.getByText(/Current 2026.08.19/)).toBeTruthy();
   expect(screen.getByText(/Selected for this system: windows-x86_64/)).toBeTruthy();
+});
+it('installs missing tools and disables other tool actions while installing', async () => {
+  transport.desktop = true; let finish!: () => void;
+  transport.command.mockImplementation(async name => name === 'tools.update' ? new Promise<void>(resolve => { finish = resolve; }) : []);
+  show([{ name: 'yt-dlp', available: false }, { name: 'qjs', available: false }]);
+  expect(screen.getAllByRole('button', { name: 'Install' })).toHaveLength(2);
+  const qjs = within(screen.getByText('qjs').closest('.component-row') as HTMLElement);
+  fireEvent.click(qjs.getByRole('button', { name: 'Install' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'qjs' }));
+  expect((qjs.getByRole('button', { name: 'Installing…' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: 'Install' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: 'Check yt-dlp updates' }) as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => finish());
+  expect(screen.getAllByRole('button', { name: 'Install' }).every(button => !(button as HTMLButtonElement).disabled)).toBe(true);
 });
 it('sends the chosen official channel and exact tag and clears a tag when switching channels', async () => {
   transport.desktop = true; show();
   await waitFor(() => expect(transport.paths).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('yt-dlp update channel'), { target: { value: 'nightly' } });
   fireEvent.change(screen.getByLabelText(/Specific version/), { target: { value: ' 2026.10.10.233141 ' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Update / install' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Install specific version' }));
   await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'yt-dlp', channel: 'nightly', version: '2026.10.10.233141', downloadSource: 'auto' }));
   await waitFor(() => expect((screen.getByLabelText('yt-dlp update channel') as HTMLSelectElement).disabled).toBe(false));
   fireEvent.change(screen.getByLabelText('yt-dlp update channel'), { target: { value: 'stable' } });
   expect((screen.getByLabelText(/Specific version/) as HTMLInputElement).value).toBe('');
-  fireEvent.click(screen.getByRole('button', { name: 'Update / install' }));
-  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'yt-dlp', channel: 'stable', version: '', downloadSource: 'auto' }));
+  expect(screen.queryByRole('button', { name: 'Install specific version' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Update' })).toBeNull();
+  expect(transport.command.mock.calls.filter(([name]) => name === 'tools.update')).toHaveLength(1);
 });
 it('checks GitHub for the selected channel and shows the matching version and package', async () => {
   transport.desktop = true; show();
@@ -248,25 +324,52 @@ it('checks GitHub for the selected channel and shows the matching version and pa
   expect((await screen.findByRole('status')).textContent).toContain('Latest on GitHub 2026.10.10.233141');
   expect(screen.getByRole('status').textContent).toContain('An update is available');
   expect(screen.getByRole('status').textContent).toContain('windows-x86_64 · yt-dlp.exe');
+  expect(screen.getByRole('button', { name: 'Update' })).toBeTruthy();
   expect(transport.command.mock.calls.some(([command]) => command === 'tools.update')).toBe(false);
   fireEvent.change(screen.getByLabelText('yt-dlp update channel'), { target: { value: 'stable' } });
   expect(screen.queryByRole('status')).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Update' })).toBeNull();
 });
 it('lets the user explicitly select CDN downloads', async () => {
-  transport.desktop = true; show();
+  transport.desktop = true; show([{ name: 'yt-dlp', available: false }]);
   fireEvent.change(screen.getByLabelText('yt-dlp download source'), { target: { value: 'cdn' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Update / install' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Install' }));
   await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'yt-dlp', channel: 'stable', version: '', downloadSource: 'cdn' }));
 });
 it.each([
   ['2026.08.19', 'Up to date for this channel.'],
   ['2026.10.10.233141', 'The installed version is newer than this channel'],
 ])('shows the comparison for installed version %s without suggesting a newer release', async (current, hint) => {
-  transport.desktop = true; show();
+  transport.desktop = true; show([{ name: 'yt-dlp', available: true, version: current }]);
   transport.command.mockImplementation(async command => command === 'tools.latest' ? { name: 'yt-dlp', channel: 'stable', current, latest: '2026.08.19', updateAvailable: false, platform: 'windows-x86_64', asset: 'yt-dlp.exe' } : []);
   fireEvent.click(screen.getByRole('button', { name: 'Check yt-dlp updates' }));
   expect((await screen.findByRole('status')).textContent).toContain(hint);
   expect(screen.getByRole('status').textContent).not.toContain('An update is available');
+  expect(screen.queryByRole('button', { name: /^(?:Update|Install)$/ })).toBeNull();
+});
+
+it('updates an installed tool only after a newer release is confirmed and clears the action after installation', async () => {
+  transport.desktop = true; let finish!: () => void;
+  transport.command.mockImplementation(async name => name === 'tools.latest' ? { name: 'yt-dlp', channel: 'stable', current: '2026.08.19', latest: '2026.10.10', updateAvailable: true, platform: 'windows-x86_64', asset: 'yt-dlp.exe' } : name === 'tools.update' ? new Promise<void>(resolve => { finish = resolve; }) : []);
+  show();
+  fireEvent.click(screen.getByRole('button', { name: 'Check yt-dlp updates' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Update' }));
+  await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.update', { name: 'yt-dlp', channel: 'stable', version: '', downloadSource: 'auto' }));
+  expect((screen.getByRole('button', { name: 'Installing…' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: 'Check components' }) as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => finish());
+  expect(screen.queryByRole('button', { name: /^(?:Update|Installing…)$/ })).toBeNull();
+});
+
+it('hides a previously confirmed update when the installed version changes', async () => {
+  transport.desktop = true;
+  transport.command.mockImplementation(async name => name === 'tools.latest' ? { name: 'yt-dlp', channel: 'stable', current: '2026.08.19', latest: '2026.10.10', updateAvailable: true, platform: 'windows-x86_64', asset: 'yt-dlp.exe' } : []);
+  const props = { state: { ...initialState, tools: [{ name: 'yt-dlp', available: true, version: '2026.08.19' }], view: { ...initialState.view, settingsTab: 'tools' } }, dispatch: vi.fn(), t: (_zh: string, en: string) => en, run, message: vi.fn() };
+  const page = render(<SettingsPage {...props} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Check yt-dlp updates' }));
+  await screen.findByRole('button', { name: 'Update' });
+  page.rerender(<SettingsPage {...props} state={{ ...props.state, tools: [{ name: 'yt-dlp', available: true, version: '2026.10.10' }] }} />);
+  expect(screen.queryByRole('button', { name: 'Update' })).toBeNull();
 });
 
 it('keeps the default FFmpeg policy as a saved draft on the web without offering runtime installation', async () => {
@@ -329,7 +432,7 @@ it('applies the saved FFmpeg policy and exact tag without saving unrelated draft
   page.rerender(<SettingsPage {...props} state={{ ...props.state, tools: updated }} />);
   expect(screen.getByText('Current 8.0')).toBeTruthy();
   expect(screen.getByText(/Installed policy: Efficiency/)).toBeTruthy();
-  expect(screen.queryByRole('button', { name: 'Update / install' })).toBeNull();
+  expect(screen.queryByRole('button', { name: /^(?:Update|Install)$/ })).toBeNull();
 });
 
 it('keeps the active FFmpeg build after a failed install and does not infer a policy for bundled tools', async () => {

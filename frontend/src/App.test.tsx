@@ -1,8 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
-import { AppProvider } from './state';
-import { makeSnapshot } from './test-fixtures';
+import { AppProvider, useApp, type AppState } from './state';
+import { makeSnapshot, makeTask } from './test-fixtures';
 import type { CoreEvent } from './types';
 import { version as buildVersion } from '../package.json';
 
@@ -22,6 +22,112 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); });
 describe('live interface stability', () => {
+  it.each(['library', 'delete'])('keeps newer live state when the %s refresh returns an older snapshot', async source => {
+    const snapshot = { ...makeSnapshot(), revision: 100 };
+    snapshot.tasks.forEach(task => { task.status = 'completed'; task.mediaInfo = { width: 1920, height: 1080 }; });
+    snapshot.media = [{ id: 'media-b', taskId: 'b', title: 'Beta', filename: 'beta.mp4', size: 123, duration: 1, mediaInfo: { width: 1920, height: 1080 } }];
+    let snapshots = 0; let finish!: (value: unknown) => void; let latest!: AppState;
+    transport.command.mockImplementation(async (name, args) => {
+      if (name === 'snapshot') return ++snapshots === 1 ? snapshot : new Promise(resolve => { finish = resolve; });
+      if (name === 'state.sync') return { revision: args.since, reset: false, events: [] };
+      return [];
+    });
+    function Probe() { latest = useApp().state; return null; }
+    render(<AppProvider><App /><Probe /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'still editing' } });
+    if (source === 'library') {
+      fireEvent.click(screen.getAllByRole('button', { name: 'Completed' }).find(button => !button.hasAttribute('aria-pressed'))!);
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    } else {
+      fireEvent.contextMenu(screen.getByRole('option', { name: /Alpha/ }));
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Delete task' }));
+      fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete' }));
+    }
+    await waitFor(() => expect(snapshots).toBe(2));
+    await act(async () => {
+      transport.listener?.({ kind: 'task.remove', revision: 101, data: 'a' });
+      transport.listener?.({ kind: 'settings.updated', revision: 102, data: { ...snapshot.settings, appearanceTheme: 'light' } });
+      transport.listener?.({ kind: 'task.upsert', revision: 103, data: { id: 'b', title: 'Newest title' } });
+      finish(snapshot);
+    });
+    await waitFor(() => expect(latest.tasks.a).toBeUndefined());
+    expect(latest.tasks.b.title).toBe('Newest title'); expect(latest.settings.appearanceTheme).toBe('light');
+    expect(latest.view.urls).toBe('still editing');
+    expect(transport.command.mock.calls.filter(([name]) => name === 'state.sync').at(-1)).toEqual(['state.sync', { since: 103 }]);
+    expect(transport.command.mock.calls.filter(([name]) => name === 'snapshot').every(([, args]) => args.includeTools === false)).toBe(true);
+  });
+
+  it('does not notify twice when a buffered removal arrives before a completed metadata replay', async () => {
+    const snapshot = { ...makeSnapshot(), revision: 100 }; snapshot.settings.desktopNotifications = true;
+    transport.command.mockImplementation(async (name, args) => name === 'snapshot' ? snapshot : name === 'state.sync' ? { revision: args.since, reset: false, events: [] } : []);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    act(() => transport.listener?.({ kind: 'task.upsert', revision: 101, data: { id: 'a', title: 'Alpha', status: 'completed' } }));
+    expect(transport.notify).toHaveBeenCalledExactlyOnceWith('Download complete', 'Alpha');
+    transport.command.mockImplementation(async (name, args) => name === 'state.sync' ? { revision: 103, reset: false, events: [
+      { kind: 'task.upsert', revision: 102, data: { id: 'a', title: 'Alpha', status: 'completed', mediaInfo: { width: 1920 } } },
+      { kind: 'task.remove', revision: 103, data: 'a' },
+    ] } : name === 'snapshot' ? snapshot : []);
+    await act(async () => { transport.listener?.({ kind: 'task.remove', revision: 103, data: 'a' }); });
+    expect(transport.notify).toHaveBeenCalledTimes(1); expect(screen.queryByRole('option', { name: /Alpha/ })).toBeNull();
+  });
+
+  it('prunes notification history on a reconnect snapshot without repeating a buffered completion absent from that snapshot', async () => {
+    const initial = makeSnapshot(); initial.settings.desktopNotifications = true; initial.tasks[1].status = 'completed';
+    let snapshots = 0; let finish!: (value: unknown) => void;
+    const refreshed = { ...initial, tasks: [initial.tasks[0]] };
+    transport.command.mockImplementation(async name => name === 'snapshot' ? ++snapshots === 1 ? initial : new Promise(resolve => { finish = resolve; }) : []);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    act(() => transport.listener?.({ kind: 'snapshot.required', data: null })); await waitFor(() => expect(typeof finish).toBe('function'));
+    await act(async () => {
+      transport.listener?.({ kind: 'task.upsert', data: { ...makeTask('new', 'New task'), status: 'completed' } });
+      finish(refreshed);
+    });
+    expect(transport.notify).toHaveBeenCalledExactlyOnceWith('Download complete', 'New task');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { ...makeTask('b', 'Beta'), status: 'completed' } }));
+    expect(transport.notify).toHaveBeenCalledTimes(2); expect(transport.notify).toHaveBeenLastCalledWith('Download complete', 'Beta');
+  });
+
+  it('keeps an old completed replay quiet across a reconnect snapshot that no longer includes it', async () => {
+    const initial = { ...makeSnapshot(), revision: 100 }; initial.settings.desktopNotifications = true; initial.tasks[1].status = 'completed';
+    let snapshots = 0; let finish!: (value: unknown) => void;
+    const refreshed = { ...initial, revision: 102, tasks: [initial.tasks[0]] };
+    transport.command.mockImplementation(async (name, args) => name === 'snapshot' ? ++snapshots === 1 ? initial : new Promise(resolve => { finish = resolve; }) : name === 'state.sync' ? { revision: args.since, reset: false, events: [] } : []);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    act(() => transport.listener?.({ kind: 'snapshot.required', data: null })); await waitFor(() => expect(typeof finish).toBe('function'));
+    await act(async () => {
+      transport.listener?.({ kind: 'task.upsert', revision: 101, data: { ...initial.tasks[1], status: 'completed' } });
+      finish(refreshed);
+    });
+    expect(transport.notify).not.toHaveBeenCalled(); expect(screen.queryByRole('option', { name: /Beta/ })).toBeNull();
+    act(() => transport.listener?.({ kind: 'task.upsert', revision: 103, data: { ...makeTask('new', 'New completion'), status: 'completed' } }));
+    expect(transport.notify).toHaveBeenCalledExactlyOnceWith('Download complete', 'New completion');
+  });
+
+  it('closes compression settings after queueing and shows source analysis and encoding progress in the selected task', async () => {
+    const snapshot = makeSnapshot();
+    Object.assign(snapshot.tasks[0], { status: 'completed', stage: 'completed', kind: 'media', mediaInfo: { width: 1920, height: 1080, videoCodec: 'h264' } });
+    snapshot.media = [{ id: 'media-a', taskId: 'a', title: 'Alpha', filename: 'alpha.mkv', size: 4000000, duration: 60 }];
+    const compressed = { ...makeTask('compressed', 'Alpha [compressed]'), status: 'waiting_processing', stage: 'waiting_processing', stageProgress: null, stageIndeterminate: true, compression: { targetBytes: 4000000, encoder: 'hevc_nvenc' }, conversion: true };
+    const preview = { source: { sizeBytes: 4000000, duration: 60, width: 1920, height: 1080, displayWidth: 1920, displayHeight: 1080, fps: '30/1', variableFrameRate: false, videoBitrateBps: 500000, videoBitrateEstimated: false, hdr: 'sdr', bitDepth: 8, audioTracks: 1, subtitleTracks: 0, attachmentTracks: 0 }, capabilities: [{ encoder: 'hevc_nvenc', label: 'NVIDIA HEVC', available: true, reason: null }], blockingReasons: [], warnings: [] };
+    transport.command.mockImplementation(async (command, args) => command === 'snapshot' ? snapshot : command === 'tasks.convert' ? compressed : command === 'tasks.convertPreview' ? { ...preview, plan: args.compression.targetBytes ? { encoder: 'hevc_nvenc', videoBitrateBps: 400000, estimatedSizeBytes: 4000000, width: 1920, height: 1080, fps: '30/1' } : null } : []);
+    render(<AppProvider><App /></AppProvider>);
+    fireEvent.click(await screen.findByRole('option', { name: /Alpha/ }));
+    fireEvent.click(screen.getByText('More actions'));
+    fireEvent.click(screen.getByRole('button', { name: 'Compress video' }));
+    await screen.findByRole('dialog');
+    const start = await screen.findByRole('button', { name: 'Start compression' });
+    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(start);
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(screen.getByRole('option', { name: /Alpha \[compressed\]/ }).getAttribute('aria-selected')).toBe('true');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'compressed', status: 'processing', stage: 'compression_scanning', stageProgress: 23, stageIndeterminate: false } }));
+    const detail = within(screen.getByRole('complementary', { name: 'Task details' }));
+    expect(detail.getByText('Analyzing compression source')).toBeTruthy();
+    expect(detail.getByRole('progressbar').getAttribute('aria-valuenow')).toBe('23');
+    act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'compressed', stage: 'compression_encoding', stageProgress: 46, stageIndeterminate: false } }));
+    expect(detail.getByText('Compressing video')).toBeTruthy();
+    expect(detail.getByRole('progressbar').getAttribute('aria-valuenow')).toBe('46');
+  });
   it('starts clipboard monitoring only after saving and imports new copied links once using current settings', async () => {
     vi.useFakeTimers(); transport.desktop = true;
     const snapshot = makeSnapshot(); snapshot.settings.downloadOptions = { contentMode: 'video', quality: '1080p', collectionMode: 'single' };
@@ -158,10 +264,10 @@ describe('live interface stability', () => {
     render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
     const row = within(screen.getByRole('option', { name: /Alpha/ }));
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', downloadedBytes: 1048576, totalBytes: null } }));
-    expect(row.getByText('1.0 MiB')).toBeTruthy();
+    await waitFor(() => expect(row.getByText('1.0 MiB')).toBeTruthy());
     expect(row.getByText('Downloaded')).toBeTruthy();
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', downloadedBytes: 2097152, totalBytes: 4194304, totalBytesEstimated: true } }));
-    expect(row.getByText('2.0 MiB')).toBeTruthy(); expect(row.getByText('/ ≈ 4.0 MiB')).toBeTruthy();
+    await waitFor(() => expect(row.getByText('2.0 MiB')).toBeTruthy()); expect(row.getByText('/ ≈ 4.0 MiB')).toBeTruthy();
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', stage: 'downloading_audio_2', downloadedBytes: 3145728, totalBytes: 4194304, totalBytesEstimated: false } }));
     expect(row.getByText('3.0 MiB')).toBeTruthy(); expect(row.getByText('/ 4.0 MiB')).toBeTruthy();
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'paused' } }));
@@ -175,11 +281,28 @@ describe('live interface stability', () => {
     expect(total.textContent).toContain('2.0 KiB/s');
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: 'Alpha' } });
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', speed: 3072 } }));
-    expect(total.textContent).toContain('4.0 KiB/s');
+    await waitFor(() => expect(total.textContent).toContain('4.0 KiB/s'));
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'b', status: 'paused' } }));
     expect(total.textContent).toContain('1.0 KiB/s');
     act(() => transport.listener?.({ kind: 'task.upsert', data: { id: 'a', status: 'completed' } }));
     expect(total.textContent).toContain('0 B/s');
+  });
+  it('starts background checks only after the initial task snapshot and leaves the interface usable', async () => {
+    let finishSnapshot!: (value: unknown) => void;
+    transport.command.mockImplementation(async command => command === 'snapshot' ? new Promise(resolve => { finishSnapshot = resolve; }) : new Promise(() => {}));
+    transport.releaseStatus.mockImplementation(() => new Promise(() => {}));
+    render(<AppProvider><App /></AppProvider>);
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('snapshot', { includeTools: false }));
+    expect(transport.releaseStatus).not.toHaveBeenCalled();
+    expect(transport.command.mock.calls.some(([name]) => name === 'tools.check')).toBe(false);
+    await act(async () => finishSnapshot(makeSnapshot()));
+    expect(await screen.findByRole('listbox')).toBeTruthy();
+    await waitFor(() => expect(transport.releaseStatus).toHaveBeenCalledTimes(1));
+    expect(transport.command).toHaveBeenCalledWith('tools.check', {});
+    fireEvent.change(screen.getByRole('textbox', { name: 'Download links' }), { target: { value: 'https://example.test/video' } });
+    expect((screen.getByRole('textbox', { name: 'Download links' }) as HTMLTextAreaElement).value).toBe('https://example.test/video');
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeTruthy();
   });
   it('loads tasks before slow runtime and release checks and keeps tools through fast refreshes', async () => {
     const snapshot = makeSnapshot(); delete snapshot.tools;
@@ -189,7 +312,7 @@ describe('live interface stability', () => {
     render(<AppProvider><App /></AppProvider>);
     expect(await screen.findByRole('listbox')).toBeTruthy();
     expect(transport.command).toHaveBeenCalledWith('snapshot', { includeTools: false });
-    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.check'));
+    await waitFor(() => expect(transport.command).toHaveBeenCalledWith('tools.check', {}));
     await act(async () => finishTools([{ name: 'qjs', available: true, version: '0.17.0' }]));
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     fireEvent.click(screen.getByRole('button', { name: 'Tools & updates' }));
@@ -991,6 +1114,7 @@ describe('live interface stability', () => {
       transport.listener?.({ kind: 'task.upsert', data: { id: 'a', progress: 42, stageProgress: 42 } });
       finish(older);
     });
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
     expect(within(screen.getByRole('option', { name: /Alpha/ })).getByText('42.0%')).toBeTruthy();
     expect(within(screen.getByRole('complementary', { name: 'Task details' })).getByText('42.0%')).toBeTruthy();
     expect(snapshots).toBe(2);

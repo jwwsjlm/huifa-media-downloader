@@ -1,4 +1,53 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::watch;
+
+pub struct Initialization {
+    receiver: watch::Receiver<Option<Result<(), String>>>,
+    pub closing: AtomicBool,
+}
+
+impl Initialization {
+    pub fn new() -> (Self, watch::Sender<Option<Result<(), String>>>) {
+        let (sender, receiver) = watch::channel(None);
+        (
+            Self {
+                receiver,
+                closing: AtomicBool::new(false),
+            },
+            sender,
+        )
+    }
+
+    pub async fn wait(&self) -> Result<(), String> {
+        let mut receiver = self.receiver.clone();
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result;
+            }
+            if receiver.changed().await.is_err() {
+                return receiver.borrow().clone().unwrap_or_else(|| {
+                    Err("Application initialization stopped before completion".into())
+                });
+            }
+        }
+    }
+
+    pub fn request_close(&self) -> bool {
+        !self.closing.swap(true, Ordering::AcqRel)
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub fn failed(&self) -> bool {
+        match self.receiver.borrow().as_ref() {
+            Some(result) => result.is_err(),
+            None => self.receiver.has_changed().is_err(),
+        }
+    }
+}
 
 static STARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
@@ -70,6 +119,77 @@ pub fn report(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initialization_waits_for_and_retains_the_terminal_result() {
+        for result in [
+            Ok(()),
+            Err("Could not open the application database".into()),
+        ] {
+            let (initialization, sender) = Initialization::new();
+            assert!(!initialization.failed());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), initialization.wait())
+                    .await
+                    .is_err()
+            );
+            sender.send(Some(result.clone())).unwrap();
+            assert_eq!(initialization.failed(), result.is_err());
+            assert_eq!(initialization.wait().await, result);
+            drop(sender);
+            assert_eq!(initialization.failed(), result.is_err());
+            assert_eq!(initialization.wait().await, result);
+        }
+    }
+
+    #[tokio::test]
+    async fn initialization_releases_every_concurrent_waiter() {
+        let (initialization, sender) = Initialization::new();
+        let initialization = std::sync::Arc::new(initialization);
+        let (entered, mut entries) = tokio::sync::mpsc::channel(8);
+        let mut waiters = Vec::new();
+        for _ in 0..8 {
+            let initialization = initialization.clone();
+            let entered = entered.clone();
+            waiters.push(tokio::spawn(async move {
+                entered.send(()).await.unwrap();
+                initialization.wait().await
+            }));
+        }
+        drop(entered);
+        for _ in 0..8 {
+            entries.recv().await.unwrap();
+        }
+        assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+        sender.send(Some(Ok(()))).unwrap();
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap(), Ok(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn initialization_reports_a_disconnected_initializer() {
+        let (initialization, sender) = Initialization::new();
+        drop(sender);
+        assert!(initialization.failed());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), initialization.wait())
+            .await
+            .expect("A disconnected initializer must release its waiters");
+        assert_eq!(
+            result,
+            Err("Application initialization stopped before completion".into())
+        );
+    }
+
+    #[test]
+    fn initialization_close_request_is_idempotent() {
+        let (initialization, _sender) = Initialization::new();
+        assert!(!initialization.is_closing());
+        assert!(initialization.request_close());
+        assert!(initialization.is_closing());
+        assert!(!initialization.request_close());
+        assert!(initialization.is_closing());
+    }
 
     #[test]
     fn startup_report_keeps_cause_redacts_secrets_and_survives_invalid_data_path() {

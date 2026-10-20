@@ -1,7 +1,7 @@
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type OptionValue = string | number | boolean | string[];
 export type DownloadOptions = Record<string, OptionValue>;
-export type Settings = Record<string, Json> & { ffmpegMode?: 'compatibility' | 'efficiency'; clipboardMonitoring?: boolean; downloadOptions?: DownloadOptions; uiPreferences?: { deleteMediaOnTaskDelete?: boolean } };
+export type Settings = Record<string, Json> & { analysisThreads?: number; readonly detectedAnalysisThreads?: number; ffmpegMode?: 'compatibility' | 'efficiency'; clipboardMonitoring?: boolean; downloadOptions?: DownloadOptions; uiPreferences?: { deleteMediaOnTaskDelete?: boolean } };
 export type TaskStatus = 'queued' | 'probing' | 'downloading' | 'waiting_processing' | 'processing' | 'processing_failed' | 'paused' | 'cancelled' | 'failed' | 'completed' | 'retained';
 export type MediaInfo = { width?: number | null; height?: number | null; fps?: number | null; videoCodec?: string | null; audioCodec?: string | null; container?: string | null; size?: number | null; duration?: number | null };
 export interface Task {
@@ -38,12 +38,14 @@ export interface Task {
   sourceInfo?: MediaInfo | null;
   mediaInfo?: MediaInfo | null;
 }
+export type TaskProgress = Pick<Task, 'id'> & Partial<Pick<Task, 'progress' | 'stageProgress' | 'stageIndeterminate' | 'speed' | 'eta' | 'downloadedBytes' | 'totalBytes' | 'totalBytesEstimated'>>;
 export interface TaskLogs { text: string; start: number; end: number; total: number; hasMore: boolean; raw: boolean; legacy: boolean }
 export interface Media { id: string; taskId: string; title: string; filename: string; size: number; duration: number; hasCover?: boolean; mediaInfo?: MediaInfo | null }
 export interface Tool { name: string; available: boolean; version?: string; latest?: string; error?: string; path?: string; platform?: string; asset?: string; installedMode?: 'compatibility' | 'efficiency' | null; configuredMode?: 'compatibility' | 'efficiency'; releaseTag?: string | null; repository?: string | null }
 export interface ToolRelease { name: string; channel: string; current: string | null; latest: string; updateAvailable: boolean; platform: string; asset: string; mode?: 'compatibility' | 'efficiency'; repository?: string }
-export interface Snapshot { version: string; tasks: Task[]; media: Media[]; settings: Settings; tools?: Tool[] }
-export interface CoreEvent { kind: string; data: Json }
+export interface Snapshot { version: string; revision?: number; tasks: Task[]; media: Media[]; settings: Settings; tools?: Tool[] }
+export interface CoreEvent { kind: string; data: Json; revision?: number }
+export interface StateSync { revision: number; reset: boolean; events: CoreEvent[] }
 export interface AddReport { ids: string[]; results: { id: string; status: TaskStatus; action: 'added' | 'existing' | 'restarted' }[]; issues?: { url: string; error: string }[]; cancelled?: boolean }
 export interface ReleaseStatus { currentVersion: string; latestVersion: string; updateAvailable: boolean; url: string }
 export interface Capabilities { desktop: boolean; browserCookies: boolean; remoteBrowser: boolean; updates: boolean; directoryPicker: boolean }

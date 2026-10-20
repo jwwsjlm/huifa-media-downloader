@@ -327,10 +327,33 @@ async fn queue_conversion_prepared(
     );
     let path = app.owned_path(&media.path)?;
     let (hash, size) = if compression.is_some() {
-        crate::compression::hash_path(&path, cancellation).await?
+        crate::compression::source_snapshot(&path)?
     } else {
         hash_file(&path)?
     };
+    if let Some((compression, _)) = compression {
+        if let Some(target) = compression.target_bytes {
+            ensure!(
+                target <= size,
+                "Target size cannot exceed the actual source file size"
+            );
+            ensure!(
+                target > (target / 50).max(64 * 1024),
+                "The target is too small to preserve the existing audio, subtitles and attachments"
+            );
+        }
+        if let Some(existing) = app.db.tasks()?.into_iter().find(|task| {
+            matches!(task.status.as_str(), "waiting_processing" | "processing")
+                && task.compression.as_ref() == Some(compression)
+                && task
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.files.first())
+                    .is_some_and(|source| source.path == path)
+        }) {
+            return Ok(existing.public());
+        }
+    }
     let mut files = vec![SourceFile {
         path: path.clone(),
         hash,
@@ -411,7 +434,11 @@ async fn queue_conversion_prepared(
     };
     let mut task = original;
     task.id = uuid::Uuid::new_v4().to_string();
-    task.tools = tokio::select! {result=app.freeze_tools()=>result?,_=cancellation.cancelled()=>bail!("Compression cancelled")};
+    task.tools = if compression.is_some() {
+        crate::compression::current_tools(app, cancellation).await?
+    } else {
+        tokio::select! {result=app.freeze_tools()=>result?,_=cancellation.cancelled()=>bail!("Compression cancelled")}
+    };
     task.thumbnail = None;
     task.source_info = task.media_info.take();
     task.size = None;
@@ -512,13 +539,14 @@ pub(crate) async fn process_task(
     if task.publication.is_some() {
         return publish(app, task, cancel).await;
     }
-    let manifest = task
+    let mut manifest = task
         .manifest
-        .as_ref()
+        .clone()
         .context("Local source manifest is missing")?;
     ensure!(manifest.version == 1, "Unsupported source manifest version");
+    let source_disk = app.resource_permit(id, "disk", cancel).await?;
     app.set_stage(id, "processing", "verifying_sources", None)?;
-    for source in &manifest.files {
+    for source in &mut manifest.files {
         if cancel.is_cancelled() {
             bail!("Operation interrupted");
         }
@@ -535,7 +563,22 @@ pub(crate) async fn process_task(
             );
         }
         let (hash, size) = if task.compression.is_some() {
-            crate::compression::hash_path(&source.path, cancel).await?
+            let snapshot = crate::compression::source_snapshot(&source.path)?;
+            ensure!(
+                !source.hash.starts_with("pending-sha256:")
+                    || snapshot == (source.hash.clone(), source.size),
+                "Saved source changed while compression was waiting; queue it again"
+            );
+            let actual =
+                crate::compression::hash_task_source(app, id, &source.path, cancel).await?;
+            ensure!(
+                crate::compression::source_snapshot(&source.path)? == snapshot,
+                "Saved source changed during compression verification"
+            );
+            if source.hash.starts_with("pending-sha256:") {
+                source.hash = actual.0.clone();
+            }
+            actual
         } else {
             hash_file(&source.path)?
         };
@@ -549,11 +592,19 @@ pub(crate) async fn process_task(
                 .to_string_lossy()
         );
     }
+    if task.compression.is_some() {
+        // Persist the completed checksum before encoding so pause/restart keeps the same source.
+        task = app.db.task(id)?;
+        task.manifest = Some(manifest.clone());
+        app.save_task(&task)?;
+    }
+    drop(source_disk);
     if task.kind == "assets" {
         return prepare_assets(app, task, cancel).await;
     }
     if task.compression.is_some() {
         let output = crate::compression::encode(app, &task, cancel).await?;
+        let _staging_disk = app.resource_permit(id, "disk", cancel).await?;
         let target = task
             .output_path
             .clone()
@@ -2580,7 +2631,7 @@ async fn run_ffmpeg(
             }
         }
     });
-    process::run_logged(
+    process::run_logged_streamed(
         &app.task_tool(&app.db.task(id)?, "ffmpeg").await?,
         args,
         None,

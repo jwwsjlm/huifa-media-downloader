@@ -120,6 +120,130 @@ fn config(root: &Path) -> AppConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires HUIFA_TEST_MEDIA and installed tools; reads an existing local video without compressing it"]
+async fn real_compression_previews_existing_media_with_bounded_analysis() -> Result<()> {
+    let source = PathBuf::from(
+        std::env::var_os("HUIFA_TEST_MEDIA").context("Set HUIFA_TEST_MEDIA to a local video")?,
+    )
+    .canonicalize()?;
+    let before = std::fs::metadata(&source)?;
+    let root = tempfile::tempdir()?;
+    let mut configuration = config(root.path());
+    configuration.download_dir = source
+        .parent()
+        .context("Video directory is missing")?
+        .to_path_buf();
+    let app = App::open(configuration).await?;
+    let mut original = crate::tests::paused_task(Default::default());
+    original.status = "completed".into();
+    original.stage = "completed".into();
+    original.output_path = Some(source.clone());
+    app.db.insert_task(&original)?;
+    app.db.complete(
+        &original,
+        &crate::model::Media {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: original.id.clone(),
+            title: original.title.clone(),
+            filename: source
+                .file_name()
+                .context("Video filename is missing")?
+                .to_string_lossy()
+                .into(),
+            size: before.len(),
+            duration: 0.0,
+            path: source.clone(),
+            assets: vec![],
+            media_info: None,
+        },
+    )?;
+    let started = std::time::Instant::now();
+    let preview = app.command(
+        "tasks.convertPreview",
+        json!({"id":original.id,"compression":{},"requestId":"existing-local-video-preview"}),
+    );
+    tokio::pin!(preview);
+    let result = tokio::time::timeout(Duration::from_secs(60), &mut preview).await;
+    if result.is_err() {
+        app.command("probe.cancel", json!({"id":"existing-local-video-preview"}))
+            .await?;
+        let _ = tokio::time::timeout(Duration::from_secs(10), &mut preview).await;
+    }
+    let value = result.context("Existing local video preview exceeded 60 seconds")??;
+    ensure!(
+        value["source"]["sizeBytes"] == before.len(),
+        "Preview used a stale size"
+    );
+    let duration = value["source"]["duration"]
+        .as_f64()
+        .context("Video duration is missing")?;
+    let rate = value["source"]["videoBitrateBps"]
+        .as_u64()
+        .context("Video bitrate is missing")?;
+    ensure!(
+        duration > 0.0 && rate >= 1000 && rate as f64 <= before.len() as f64 * 16.0 / duration,
+        "Preview bitrate is inconsistent with the whole video duration: {value}"
+    );
+    ensure!(
+        value["capabilities"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "Encoder capabilities are missing"
+    );
+    let after = std::fs::metadata(&source)?;
+    ensure!(
+        before.len() == after.len() && before.modified()? == after.modified()?,
+        "Preview changed the original video"
+    );
+    eprintln!(
+        "Existing local video preview: {:.2}s; {} bytes; {:.3}s duration; {} bps; {}",
+        started.elapsed().as_secs_f64(),
+        before.len(),
+        duration,
+        rate,
+        value["capabilities"]
+    );
+    // Reserving the processor proves submission does not scan or checksum a multi-GB source.
+    let slot = app.processor.clone().acquire_many_owned(2).await?;
+    let queued_at = std::time::Instant::now();
+    let queued = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.command(
+            "tasks.convert",
+            json!({"id":original.id,"compression":{"targetBytes":before.len()*7/10}}),
+        ),
+    )
+    .await??;
+    let id = queued["id"]
+        .as_str()
+        .context("Compression task has no ID")?;
+    ensure!(
+        queued["status"] == "waiting_processing",
+        "Compression did not return a visible waiting task"
+    );
+    ensure!(
+        app.db.task(id)?.manifest.unwrap().files[0]
+            .hash
+            .starts_with("pending-sha256:"),
+        "Compression submission read the full source before entering the queue"
+    );
+    eprintln!(
+        "Existing {}-byte source queued in {:.3}s without acquiring a processing slot",
+        before.len(),
+        queued_at.elapsed().as_secs_f64()
+    );
+    app.command("tasks.cancel", json!({"id":id})).await?;
+    drop(slot);
+    let after = std::fs::metadata(&source)?;
+    ensure!(
+        before.len() == after.len() && before.modified()? == after.modified()?,
+        "Queue/cancellation changed the original video"
+    );
+    app.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires installed FFmpeg/FFprobe; local fixture only"]
 async fn real_compression_preserves_sources_tracks_chapters_and_honors_size() -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -419,6 +543,138 @@ async fn real_compression_preserves_sources_tracks_chapters_and_honors_size() ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires installed FFmpeg/FFprobe with libx265; local fixture only"]
+async fn real_compression_preserves_variable_frame_timestamps() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let app = App::open(config(root.path())).await?;
+    let token = CancellationToken::new();
+    let source = app.download_directory().join("variable-frame-rate.mkv");
+    let args = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x180:rate=30",
+        "-frames:v",
+        "60",
+        "-vf",
+        "setpts=if(lt(N\\,30)\\,N/(30*TB)\\,(1+(N-30)/15)/TB)",
+        "-fps_mode",
+        "vfr",
+        "-threads",
+        "2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .chain([source.to_string_lossy().into_owned()])
+    .collect::<Vec<_>>();
+    crate::process::run(&app.tool("ffmpeg")?, &args, None, &token, None).await?;
+    let original_hash = download::hash_file(&source)?;
+    let mut original = crate::tests::paused_task(app.freeze_tools().await?);
+    original.stage("completed", "completed", Some(100.0));
+    original.title = "Variable frame rate fixture".into();
+    original.output_path = Some(source.clone());
+    original.download_dir = Some(app.download_directory());
+    app.db.insert_task(&original)?;
+    app.db.complete(
+        &original,
+        &crate::model::Media {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: original.id.clone(),
+            title: original.title.clone(),
+            filename: "variable-frame-rate.mkv".into(),
+            size: original_hash.1,
+            duration: 3.0,
+            path: source.clone(),
+            assets: vec![],
+            media_info: None,
+        },
+    )?;
+    let queued = app
+        .command(
+            "tasks.convert",
+            json!({"id":original.id,"compression":{"videoBitrateBps":200_000}}),
+        )
+        .await?;
+    let id = queued["id"].as_str().unwrap().to_string();
+    wait_for(&app, std::slice::from_ref(&id), &["completed"]).await?;
+    let output = app
+        .db
+        .media_for_task(&id)?
+        .context("VFR compression did not publish media")?;
+    let mut timestamps = Vec::new();
+    for path in [&source, &output.path] {
+        let args = [
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .chain([path.to_string_lossy().into_owned()])
+        .collect::<Vec<_>>();
+        let probe = crate::process::run(&app.tool("ffprobe")?, &args, None, &token, None).await?;
+        let probe: serde_json::Value = serde_json::from_str(&probe.stdout)?;
+        timestamps.push(
+            probe["frames"]
+                .as_array()
+                .context("VFR frames are missing")?
+                .iter()
+                .map(|frame| {
+                    frame["best_effort_timestamp_time"]
+                        .as_str()
+                        .context("VFR timestamp missing")?
+                        .parse::<f64>()
+                        .map_err(Into::into)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    ensure!(
+        timestamps[0].len() == 60 && timestamps[1].len() == 60,
+        "VFR compression duplicated or dropped frames"
+    );
+    ensure!(
+        (timestamps[0][1] - timestamps[0][0] - 1.0 / 30.0).abs() < 0.002
+            && (timestamps[0][59] - timestamps[0][58] - 1.0 / 15.0).abs() < 0.002,
+        "Fixture is not variable frame rate"
+    );
+    ensure!(
+        timestamps[0]
+            .iter()
+            .zip(&timestamps[1])
+            .all(|(before, after)| (before - after).abs() < 0.002),
+        "Compression changed VFR presentation times"
+    );
+    ensure!(
+        download::hash_file(&source)? == original_hash,
+        "VFR compression changed its source"
+    );
+    app.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed FFmpeg/FFprobe with libx265; local fixture only"]
 async fn real_compression_preserves_hdr10_and_hlg() -> Result<()> {
     let root = tempfile::tempdir()?;
     let app = App::open(config(root.path())).await?;
@@ -552,19 +808,25 @@ async fn real_compression_preserves_hdr10_and_hlg() -> Result<()> {
                         .is_some_and(|reason| !reason.is_empty()),
                 "An 8-bit CPU encoder was allowed to reduce {name} bit depth"
             );
-            let count = app.db.tasks_including_retained()?.len();
-            ensure!(
-                app.command(
+            let queued = app
+                .command(
                     "tasks.convert",
-                    json!({"id":task.id,"compression":{"videoBitrateBps":200_000}})
+                    json!({"id":task.id,"compression":{"videoBitrateBps":200_000}}),
                 )
-                .await
-                .is_err(),
-                "An unsupported 10-bit CPU compression was queued"
-            );
+                .await?;
+            let rejected_id = queued["id"]
+                .as_str()
+                .context("Queued HDR task has no ID")?
+                .to_string();
+            wait_for(
+                &app,
+                std::slice::from_ref(&rejected_id),
+                &["processing_failed"],
+            )
+            .await?;
             ensure!(
-                app.db.tasks_including_retained()?.len() == count,
-                "Rejected HDR compression created a task"
+                app.db.media_for_task(&rejected_id)?.is_none(),
+                "Unsupported HDR compression published an output"
             );
             ensure!(
                 serde_json::to_value(app.db.task(&task.id)?)? == original_record
@@ -924,6 +1186,7 @@ async fn real_live_stop_save_publishes_valid_recording_and_cancel_does_not() -> 
         app.runners.lock().unwrap().insert(
             task.id.clone(),
             crate::Runtime {
+                generation: 0,
                 cancel,
                 finish_capture,
                 handle: supervisor,
@@ -1252,7 +1515,7 @@ async fn real_split_streams_queue_offline_restart_and_publication_recovery() -> 
             ),
         )?;
     }
-    let processor = app.processor.clone().acquire_owned().await?;
+    let processor = app.processor.clone().acquire_many_owned(2).await?;
     let options = json!({"writeThumbnail":false,"encoder":"copy","writeInfoJson":true});
     let mut events = app.subscribe();
     let ids:Vec<String>=serde_json::from_value(app.command("tasks.add",json!({"urls":(0..4).map(|i|format!("{}/sample-{i}.html",server.url)).collect::<Vec<_>>(),"options":options})).await?)?;
@@ -1434,7 +1697,7 @@ async fn real_processing_failure_retry_uses_local_sources_and_manual_conversion_
     let app = App::open(config(root.path())).await?;
     fixture(&app, &fixtures).await?;
     let server = LocalServer::start(fixtures.clone()).await?;
-    let processor = app.processor.clone().acquire_owned().await?;
+    let processor = app.processor.clone().acquire_many_owned(2).await?;
     let ids:Vec<String>=serde_json::from_value(app.command("tasks.add",json!({"urls":[format!("{}/sample.mpd",server.url)],"options":{"writeThumbnail":false}})).await?)?;
     let mut task = wait_for(&app, &ids, &["waiting_processing"])
         .await?
@@ -1946,7 +2209,7 @@ async fn real_generic_http_mp4_and_audio_extraction() -> Result<()> {
             4.0,
         ),
     ] {
-        let processor = app.processor.clone().acquire_owned().await?;
+        let processor = app.processor.clone().acquire_many_owned(2).await?;
         let old_hash = previous
             .as_ref()
             .map(|media| download::hash_file(&media.path))

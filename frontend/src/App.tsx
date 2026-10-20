@@ -18,6 +18,7 @@ import { TaskLogsDialog } from './TaskLogs';
 import { DestinationDialog } from './DestinationDialog';
 import { CompressionDialog } from './CompressionDialog';
 import { useMediaAvailability, type MediaAvailability } from './useMediaAvailability';
+import { startStateSync, type StateSyncController } from './stateSync';
 import type { AddReport, CollectionEntry, CollectionProbe, CoreEvent, DownloadOptions, Json, Media, MediaInfo, Page, ReleaseStatus, Session, Snapshot, Task, Tool } from './types';
 
 export type Run = (operation: () => Promise<unknown>) => void;
@@ -36,12 +37,12 @@ export function App() {
     if (dialog || batchReport) return;
     const task = state.taskIds.map(id => state.tasks[id]).find(task => task.destinationConflict && ['failed','processing_failed'].includes(task.status) && !conflictShown.current.has(task.id));
     if (task) { conflictShown.current.add(task.id); setDialog({ kind: 'destination', task }); }
-  }, [state.tasks, state.taskIds, dialog, batchReport]);
+  }, [state.taskChangeVersion, dialog, batchReport]);
   const cancelAdding = () => { const operation = addingOperation.current; if (!operation) return; operation.cancelled = true; void host.command('probe.cancel', { id: operation.requestId }).catch(() => {}); setAdding(translateRef.current('正在取消…', 'Cancelling…')); };
   const [release, setRelease] = useState<ReleaseStatus | null>(null); const [releaseBusy, setReleaseBusy] = useState(false); const [releaseError, setReleaseError] = useState('');
   const releaseChecked = useRef(false);
   const checkRelease = useCallback(async () => { setReleaseBusy(true); setReleaseError(''); try { setRelease(await host.releaseStatus()); } catch (reason) { setReleaseError(String(reason)); } finally { setReleaseBusy(false); } }, []);
-  useEffect(() => { if (authenticated && !releaseChecked.current) { releaseChecked.current = true; void checkRelease(); } }, [authenticated, checkRelease]);
+  useEffect(() => { if (authenticated && state.loaded && !releaseChecked.current) { releaseChecked.current = true; void checkRelease(); } }, [authenticated, state.loaded, checkRelease]);
   const locale = localeFor(state.settings); const t = useCallback<Translate>((zh, en) => translate(locale, zh, en), [locale]);
   useEffect(() => {
     const finished = pendingBatches.filter(batch => batch.ids.length > 0 && batch.ids.every(id => state.tasks[id] && ['completed', 'retained', 'failed', 'processing_failed', 'cancelled'].includes(state.tasks[id].status)));
@@ -50,9 +51,11 @@ export function App() {
     setPendingBatches(current => current.filter(batch => !finished.includes(batch)));
     if (issues.length) setBatchReport(current => { const results = [...new Map([...(current?.results || []), ...finished.flatMap(batch => batch.results)].map(result => [result.id, result])).values()]; return { ids: results.map(result => result.id), results, issues: [...(current?.issues || []), ...issues], cancelled: current?.cancelled }; });
     else setMessage(t(`批次下载已完成：${finished.reduce((count, batch) => count + batch.ids.length, 0)} 项。`, `Batch downloads completed: ${finished.reduce((count, batch) => count + batch.ids.length, 0)} tasks.`));
-  }, [pendingBatches, state.tasks, t]);
+  }, [pendingBatches, state.taskChangeVersion, t]);
   const settingsRef = useRef(state.settings); settingsRef.current = state.settings;
-  const pendingTasksRef = useRef(false); pendingTasksRef.current = state.taskIds.some(id => ['queued', 'probing', 'downloading', 'waiting_processing', 'processing'].includes(state.tasks[id].status));
+  const stateRef = useRef(state); stateRef.current = state;
+  const syncRef = useRef<StateSyncController | null>(null);
+  const refreshState = useCallback(() => syncRef.current?.refresh() ?? Promise.resolve(), []);
   const translateRef = useRef(t); translateRef.current = t;
   const run = useCallback<Run>(operation => { setError(''); void operation().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))); }, []);
   const navigate = useCallback((page: Page) => {
@@ -64,41 +67,32 @@ export function App() {
   useEffect(() => { let active = true; void host.session().then(session => { if (active) setAuthenticated(session.authenticated); }).catch(reason => { if (active) { setError(String(reason)); setAuthenticated(false); } }); return () => { active = false; }; }, []);
   useEffect(() => {
     if (!authenticated) return;
-    let disposed = false; let unlisten: (() => void) | undefined; let initialized = false; let toolsChecked = false; let refreshing: Promise<void> | null = null; let refreshAgain = false; const buffered: CoreEvent[] = []; const notified = new Set<string>();
-    const refresh = (): Promise<void> => {
-      if (refreshing) { refreshAgain = true; return refreshing; }
-      initialized = false;
-      refreshing = host.command<Snapshot>('snapshot', { includeTools: false }).then(snapshot => {
-        if (disposed) return;
-        dispatch({ type: 'snapshot', snapshot });
-        if (!toolsChecked) {
-          toolsChecked = true;
-          for (const task of snapshot.tasks) if (task.status === 'completed') notified.add(task.id);
-          void host.command<Tool[]>('tools.check').then(tools => { if (!disposed) dispatch({ type: 'event', event: { kind: 'tools.updated', data: tools as unknown as Json } }); }).catch(() => { if (!disposed) setMessage(translateRef.current('未能检查运行时组件，可在“工具与更新”重试。', 'Runtime components could not be checked. Retry under Tools & updates.')); });
-        }
-      }).catch(reason => { if (!disposed) setError(String(reason)); }).finally(() => {
-        if (!disposed) { for (const event of buffered.splice(0)) dispatch({ type: 'event', event }); initialized = true; }
-        refreshing = null;
-        if (refreshAgain && !disposed) { refreshAgain = false; void refresh(); }
-      });
-      return refreshing;
+    let toolsChecked = false; const notified = new Set<string>(); const bufferedCompletions = new Set<string>();
+    const observe = (event: CoreEvent) => {
+      if (event.kind === 'task.remove') { const id = typeof event.data === 'string' ? event.data : String((event.data as { id: string }).id); notified.delete(id); bufferedCompletions.delete(id); }
+      if (event.kind !== 'task.upsert') return;
+      const task = event.data as unknown as Task;
+      if (task.status === 'completed' && !notified.has(task.id)) { notified.add(task.id); if (settingsRef.current.desktopNotifications === true) run(() => host.notify(translateRef.current('下载完成', 'Download complete'), task.title)); }
     };
-    const reconcile = () => { if (!disposed && initialized && !refreshing && document.visibilityState === 'visible') void refresh(); };
-    const timer = window.setInterval(() => { if (pendingTasksRef.current) reconcile(); }, 2000);
-    window.addEventListener('focus', reconcile); document.addEventListener('visibilitychange', reconcile);
-    void (async () => {
-      unlisten = await host.subscribe(event => {
-        if (disposed) return;
-        if (event.kind === 'snapshot.required' || event.kind === 'host.resync') { void refresh(); return; }
-        if (event.kind === 'host.error') { setError(String((event.data as { message: string }).message)); return; }
-        if (event.kind === 'task.upsert') { const task = event.data as unknown as Task; if (task.status === 'completed' && !notified.has(task.id)) { notified.add(task.id); if (settingsRef.current.desktopNotifications === true) run(() => host.notify(translateRef.current('下载完成', 'Download complete'), task.title)); } }
-        if (!initialized) { buffered.push(event); return; }
-        dispatch({ type: 'event', event });
-      }, connected => { if (!disposed) { dispatch({ type: 'connection', connected }); if (connected && initialized) void refresh(); } });
-      if (disposed) { unlisten(); return; }
-      await refresh();
-    })().catch(reason => { if (!disposed) setError(String(reason)); });
-    return () => { disposed = true; window.clearInterval(timer); window.removeEventListener('focus', reconcile); document.removeEventListener('visibilitychange', reconcile); unlisten?.(); };
+    const sync = startStateSync({
+      host, dispatch, getTask: id => stateRef.current.tasks[id], shouldPoll: () => stateRef.current.pendingTaskCount > 0,
+      onError: reason => setError(String(reason)),
+      onSnapshot: (snapshot, signal) => {
+        const ids = new Set(snapshot.tasks.map(task => task.id));
+        for (const id of notified) if (!ids.has(id) && !bufferedCompletions.has(id)) notified.delete(id);
+        bufferedCompletions.clear();
+        if (toolsChecked) return;
+        toolsChecked = true;
+        for (const task of snapshot.tasks) if (task.status === 'completed') notified.add(task.id);
+        void host.command<Tool[]>('tools.check', {}, { signal, timeoutMs: 15000 }).then(tools => { if (!signal.aborted) dispatch({ type: 'event', event: { kind: 'tools.updated', data: tools as unknown as Json } }); }).catch(() => { if (!signal.aborted) setMessage(translateRef.current('未能检查运行时组件，可在“工具与更新”重试。', 'Runtime components could not be checked. Retry under Tools & updates.')); });
+      },
+      onEvent: observe, onBufferedEvent: event => {
+        if (event.kind !== 'task.upsert' || (event.data as unknown as Task).status !== 'completed') return;
+        bufferedCompletions.add((event.data as unknown as Task).id); observe(event);
+      },
+    });
+    syncRef.current = sync;
+    return () => { sync.dispose(); if (syncRef.current === sync) syncRef.current = null; };
   }, [authenticated, dispatch]);
   useEffect(() => {
     const theme = String(state.settings.appearanceTheme || 'dark');
@@ -213,7 +207,7 @@ export function App() {
       {state.view.page === 'downloads' && <div className="nav-categories"><small className="category-label">{t('任务分类', 'Task categories')}</small>{['all', 'active', 'queued', 'waiting_processing', 'processing', 'paused', 'completed', 'processing_failed', 'failed'].map(status => <button key={status} className={`nav-link category-link ${state.view.taskStatus === status ? 'active' : ''}`} aria-pressed={state.view.taskStatus === status} title={status === 'all' ? t('全部任务', 'All tasks') : status === 'active' ? t('进行中', 'Active') : statusLabel(status, t)} onClick={() => dispatch({ type: 'view', patch: { taskStatus: status } })}><Icon name={status === 'all' ? 'download' : status === 'completed' ? 'check' : status === 'paused' ? 'pause' : status.includes('failed') ? 'info' : 'play'} /><span>{status === 'all' ? t('全部任务', 'All tasks') : status === 'active' ? t('进行中', 'Active') : statusLabel(status, t)}</span></button>)}</div>}
       <div className="nav-bottom"><span className={`connection-dot ${state.connected ? '' : 'offline'}`} /><span>{state.connected ? t('服务已连接', 'Service connected') : t('连接恢复中', 'Reconnecting')}</span><button className="version-link" title={release?.updateAvailable ? t('打开新版下载页面', 'Open new release page') : t('版本与更新', 'Version and updates')} onClick={() => release?.updateAvailable ? run(() => host.openRelease(release.url)) : navigate('about')}>v{state.version}{release?.updateAvailable && <span className="badge">{t('有新版', 'Update')}</span>}</button></div>
     </nav><main className="main" id="main-content">
-      {!state.loaded ? <Empty title={t('载入任务、媒体和设置…', 'Loading tasks, media, and settings…')} /> : state.view.page === 'downloads' ? <Downloads adding={adding} cancelAdding={cancelAdding} clipboard={() => add([], true)} state={state} dispatch={dispatch} options={options} changeQuality={setQuality} add={add} select={selectTask} action={taskAction} bulkDelete={ids => setDialog({ kind: 'deleteBatch', tasks: ids.map(id => state.tasks[id]).filter(Boolean) })} run={run} quick={() => setDialog({ kind: 'options' })} t={t} /> : state.view.page === 'completed' ? <Completed state={state} dispatch={dispatch} select={selectMedia} action={taskAction} cover={cover} run={run} t={t} /> : state.view.page === 'mcp' ? <div className="page mcp-workspace page-scroll"><McpSettings run={run} t={t} /></div> : state.view.page === 'settings' ? <SettingsPage state={state} dispatch={dispatch} t={t} run={run} message={setMessage} /> : <About version={state.version} release={release} busy={releaseBusy} error={releaseError} check={checkRelease} t={t} run={run} />}
+      {!state.loaded ? <Empty title={t('载入任务、媒体和设置…', 'Loading tasks, media, and settings…')} /> : state.view.page === 'downloads' ? <Downloads adding={adding} cancelAdding={cancelAdding} clipboard={() => add([], true)} state={state} dispatch={dispatch} options={options} changeQuality={setQuality} add={add} select={selectTask} action={taskAction} bulkDelete={ids => setDialog({ kind: 'deleteBatch', tasks: ids.map(id => state.tasks[id]).filter(Boolean) })} run={run} quick={() => setDialog({ kind: 'options' })} t={t} /> : state.view.page === 'completed' ? <Completed state={state} dispatch={dispatch} select={selectMedia} action={taskAction} cover={cover} run={run} refresh={refreshState} t={t} /> : state.view.page === 'mcp' ? <div className="page mcp-workspace page-scroll"><McpSettings run={run} t={t} /></div> : state.view.page === 'settings' ? <SettingsPage state={state} dispatch={dispatch} t={t} run={run} message={setMessage} /> : <About version={state.version} release={release} busy={releaseBusy} error={releaseError} check={checkRelease} t={t} run={run} />}
     </main></div>
     <footer className="statusbar"><span>{t(`${state.taskIds.length} 项任务 · ${activeCount} 项活动`, `${state.taskIds.length} tasks · ${activeCount} active`)}</span><span className="status-speed" aria-label={t('总下载速度', 'Total download speed')}>{t('总下载速度', 'Total download speed')}：{state.connected ? state.downloadSpeed > 0 ? `${bytes(state.downloadSpeed)}/s` : '0 B/s' : '—'}</span><span className="status-message">{message || (!state.connected ? t('连接恢复后自动同步任务。', 'Tasks sync when the connection returns.') : t('就绪', 'Ready'))}</span><span className="status-shortcut">{t('Ctrl+1–4 切换页面', 'Ctrl+1–4 switch pages')}</span>{!host.desktop && <Button tone="text" onClick={() => run(async () => { await host.logout(); setAuthenticated(false); })}>{t('退出登录', 'Sign out')}</Button>}</footer>
     {(error || message) && <div className="toasts" aria-live="polite"><div className={`toast ${error ? 'danger' : ''}`}><span role={error ? 'alert' : 'status'}>{error ? explainError(error, t) : message}</span><Button icon="close" tone="icon-only" aria-label={t('关闭提示', 'Dismiss message')} onClick={() => { setError(''); setMessage(''); }} /></div></div>}
@@ -222,7 +216,7 @@ export function App() {
     {dialog?.kind === 'destination' && <DestinationDialog task={state.tasks[dialog.task.id] || dialog.task} t={t} close={() => setDialog(null)} />}
     {batchReport && !dialog && <Modal title={t('批量结果', 'Batch results')} t={t} close={() => setBatchReport(null)} footer={<Button onClick={() => setBatchReport(null)}>{t('关闭', 'Close')}</Button>}><p>{t(`已加入或定位 ${batchReport.results.length} 项任务，${batchReport.issues?.length || 0} 项异常或待处理。`, `${batchReport.results.length} tasks added or located, ${batchReport.issues?.length || 0} issues or decisions needed.`)}</p>{batchReport.cancelled && <p className="notice">{t('已取消剩余识别和添加，已创建的任务继续执行。', 'Remaining checks and additions were cancelled. Created tasks keep running.')}</p>}{batchReport.issues?.map((issue, index) => <p className="notice danger break-text" key={`${issue.url}-${index}`}><strong>{issue.url}</strong><br />{explainError(issue.error, t)}</p>)}</Modal>}
     {dialog?.kind === 'options' && <QuickOptions initial={options} t={t} close={() => setDialog(null)} apply={async next => { const settings = await host.command<Snapshot['settings']>('settings.save', { settings: { ...state.settings, downloadOptions: commandOptions(next) } }); dispatch({ type: 'event', event: { kind: 'settings.updated', data: settings } }); setQuality(null); setDialog(null); }} />}
-    {(dialog?.kind === 'delete' || dialog?.kind === 'deleteBatch') && <DeleteDialog tasks={dialog.kind === 'delete' ? [dialog.task] : dialog.tasks} batch={dialog.kind === 'deleteBatch'} initialFiles={state.settings.uiPreferences?.deleteMediaOnTaskDelete === true} remember={async files => { const settings = await host.command<Snapshot['settings']>('settings.preferences', { preferences: { deleteMediaOnTaskDelete: files } }); dispatch({ type: 'event', event: { kind: 'settings.updated', data: settings } }); }} t={t} run={run} removed={snapshot => dispatch({ type: 'snapshot', snapshot })} close={() => setDialog(null)} />}
+    {(dialog?.kind === 'delete' || dialog?.kind === 'deleteBatch') && <DeleteDialog tasks={dialog.kind === 'delete' ? [dialog.task] : dialog.tasks} batch={dialog.kind === 'deleteBatch'} initialFiles={state.settings.uiPreferences?.deleteMediaOnTaskDelete === true} remember={async files => { const settings = await host.command<Snapshot['settings']>('settings.preferences', { preferences: { deleteMediaOnTaskDelete: files } }); dispatch({ type: 'event', event: { kind: 'settings.updated', data: settings } }); }} t={t} run={run} refresh={refreshState} close={() => setDialog(null)} />}
     {dialog?.kind === 'convert' && <ConvertDialog task={dialog.task} t={t} run={run} close={() => setDialog(null)} />}
     {dialog?.kind === 'compress' && <CompressionDialog task={dialog.task} t={t} run={run} close={() => setDialog(null)} queued={task => { dispatch({ type: 'event', event: { kind: 'task.upsert', data: task as unknown as Json }, onlyIfTaskAbsent: true }); dispatch({ type: 'view', patch: { page: 'downloads', taskSelection: task.id, taskStatus: 'all', taskSearch: '' } }); setMessage(t('压缩任务已加入处理队列', 'Compression added to the processing queue')); }} />}
     {dialog?.kind === 'cover' && <CoverStudio media={dialog.media} t={t} run={run} close={() => setDialog(null)} />}
@@ -319,7 +313,7 @@ function MediaInformation({ title, info, size, t }: { title: string; info?: Medi
   const fileSize = size ?? info?.size;
   return <section className="media-information" aria-label={title}><h3>{title}</h3>{info || fileSize ? <dl className="facts"><dt>{t('实际画质 / 尺寸', 'Actual quality / dimensions')}</dt><dd>{mediaQuality(info)} · {dimensions(info)}</dd><dt>{t('帧率', 'Frame rate')}</dt><dd>{frameRate(info?.fps)}</dd><dt>{t('视频 / 音频编码', 'Video / audio codecs')}</dt><dd>{info?.videoCodec || '—'} / {info?.audioCodec || '—'}</dd><dt>{t('容器格式', 'Container')}</dt><dd>{info?.container || '—'}</dd><dt>{t('大小 / 时长', 'Size / duration')}</dt><dd>{bytes(fileSize)} · {duration(info?.duration)}</dd></dl> : <p className="hint">{t('暂无可用信息', 'No information available')}</p>}</section>;
 }
-function Completed({ state, dispatch, select, action, cover, run, t }: { state: AppState; dispatch: Dispatch<Action>; select: (id: string) => void; action: (task: Task, action: string) => void; cover: (media: Media) => void; run: Run; t: Translate }) {
+function Completed({ state, dispatch, select, action, cover, run, refresh, t }: { state: AppState; dispatch: Dispatch<Action>; select: (id: string) => void; action: (task: Task, action: string) => void; cover: (media: Media) => void; run: Run; refresh: () => Promise<void>; t: Translate }) {
   const ids = useMemo(() => state.mediaIds.filter(id => `${state.media[id].title} ${state.media[id].filename}`.toLowerCase().includes(state.view.mediaSearch.toLowerCase())).reverse(), [state.mediaIds, state.media, state.view.mediaSearch]);
   const selected = state.view.mediaSelection || ids[0]; const item = state.media[selected];
   const [visibleIds, setVisibleIds] = useState<string[]>([]);
@@ -351,7 +345,7 @@ function Completed({ state, dispatch, select, action, cover, run, t }: { state: 
   }, [item?.id, item?.taskId, item?.mediaInfo, infoRetry, unavailable, dispatch]);
   const row = useCallback((id: string) => <MediaRow media={state.media[id]} availability={availability[id]} t={t} />, [state.media, availability, t]);
   const contextMenu = context && state.media[context.id] && <TaskContextMenu task={state.tasks[context.task.id] || context.task} media={state.media[context.id]} availability={availability[context.id]} position={context.position} trigger={context.trigger} close={closeContext} action={action} run={run} t={t} />;
-  return <div className="page"><Heading title={t('已完成', 'Completed media')} subtitle={t(`完整媒体库 · ${state.mediaIds.length} 个媒体`, `Full media library · ${state.mediaIds.length} media`)}><Button icon="refresh" onClick={() => run(async () => { const snapshot = await host.command<Snapshot>('snapshot'); dispatch({ type: 'snapshot', snapshot }); refreshAvailability(); })}>{t('刷新', 'Refresh')}</Button></Heading><div className="toolbar"><input id="media-search" type="search" aria-label={t('搜索媒体库', 'Search media library')} value={state.view.mediaSearch} placeholder={t('搜索标题、文件名', 'Search title and filename')} onChange={event => dispatch({ type: 'view', patch: { mediaSearch: event.target.value } })} /></div><div className="workspace"><section className="panel list-panel"><div className="list-caption"><strong>{t('媒体库', 'Media library')}</strong><span>{ids.length} / {state.mediaIds.length}</span></div>{ids.length ? <VirtualList ids={ids} selected={selected} onSelect={select} onContextMenu={openContext} onVisibleIdsChange={setVisibleIds} renderRow={row} label={t('已完成媒体列表', 'Completed media list')} scrollKey="media" /> : <Empty title={t('没有匹配的媒体', 'No matching media')} detail={t('下载完成的媒体可在这里查看和准备封面。', 'View completed downloads and prepare covers here.')} icon="library" />}</section><aside className="detail panel">{item ? <><div className="detail-scroll"><span className="eyebrow">{t('已选媒体', 'Selected media')}</span><Thumbnail large url={host.assetUrl(item.id, 'thumbnail')} /><h2>{item.title}</h2><FileAvailability availability={availability[selected]} t={t} /><dl className="facts"><dt>{t('结果文件', 'Result file')}</dt><dd className="break-text">{item.filename}</dd><dt>{t('大小 / 时长', 'Size / duration')}</dt><dd>{bytes(item.size)} · {duration(item.duration)}</dd></dl><MediaInformation title={t('结果文件信息', 'Result file information')} info={item.mediaInfo} size={item.size} t={t} />{!item.mediaInfo && infoState.id === item.taskId && infoState.busy && <p className="hint">{t('正在读取本地文件信息…', 'Reading local file information…')}</p>}{!item.mediaInfo && infoState.id === item.taskId && infoState.error && <p className="hint" title={explainError(infoState.error, t)}>{t('暂时无法读取结果信息，原文件未修改。', 'Result information could not be read. The file is unchanged.')} <Button size="small" onClick={() => { infoRequest.current = null; setInfoRetry(value => value + 1); }}>{t('重试', 'Retry')}</Button></p>}<div className="actions wrap"><Button icon="image" disabled={unavailable} onClick={() => cover(item)}>{t('封面工作室', 'Cover studio')}</Button>{host.desktop && <Button icon="play" disabled={unavailable} onClick={() => run(() => host.result(item.id, 'open'))}>{t('打开媒体', 'Open media')}</Button>}</div></div><div className="detail-footer"><Button tone="primary" disabled={unavailable} icon={host.desktop ? 'folder' : 'download'} onClick={() => run(() => host.result(item.id, host.desktop ? 'reveal' : 'download'))}>{host.desktop ? t('定位结果文件', 'Reveal result file') : t('下载结果文件', 'Download result file')}</Button></div></> : <Empty title={t('媒体详情', 'Media details')} detail={t('选择媒体查看文件操作。', 'Select media to view file actions.')} icon="library" />}</aside></div>{contextMenu}</div>;
+  return <div className="page"><Heading title={t('已完成', 'Completed media')} subtitle={t(`完整媒体库 · ${state.mediaIds.length} 个媒体`, `Full media library · ${state.mediaIds.length} media`)}><Button icon="refresh" onClick={() => run(async () => { await refresh(); refreshAvailability(); })}>{t('刷新', 'Refresh')}</Button></Heading><div className="toolbar"><input id="media-search" type="search" aria-label={t('搜索媒体库', 'Search media library')} value={state.view.mediaSearch} placeholder={t('搜索标题、文件名', 'Search title and filename')} onChange={event => dispatch({ type: 'view', patch: { mediaSearch: event.target.value } })} /></div><div className="workspace"><section className="panel list-panel"><div className="list-caption"><strong>{t('媒体库', 'Media library')}</strong><span>{ids.length} / {state.mediaIds.length}</span></div>{ids.length ? <VirtualList ids={ids} selected={selected} onSelect={select} onContextMenu={openContext} onVisibleIdsChange={setVisibleIds} renderRow={row} label={t('已完成媒体列表', 'Completed media list')} scrollKey="media" /> : <Empty title={t('没有匹配的媒体', 'No matching media')} detail={t('下载完成的媒体可在这里查看和准备封面。', 'View completed downloads and prepare covers here.')} icon="library" />}</section><aside className="detail panel">{item ? <><div className="detail-scroll"><span className="eyebrow">{t('已选媒体', 'Selected media')}</span><Thumbnail large url={host.assetUrl(item.id, 'thumbnail')} /><h2>{item.title}</h2><FileAvailability availability={availability[selected]} t={t} /><dl className="facts"><dt>{t('结果文件', 'Result file')}</dt><dd className="break-text">{item.filename}</dd><dt>{t('大小 / 时长', 'Size / duration')}</dt><dd>{bytes(item.size)} · {duration(item.duration)}</dd></dl><MediaInformation title={t('结果文件信息', 'Result file information')} info={item.mediaInfo} size={item.size} t={t} />{!item.mediaInfo && infoState.id === item.taskId && infoState.busy && <p className="hint">{t('正在读取本地文件信息…', 'Reading local file information…')}</p>}{!item.mediaInfo && infoState.id === item.taskId && infoState.error && <p className="hint" title={explainError(infoState.error, t)}>{t('暂时无法读取结果信息，原文件未修改。', 'Result information could not be read. The file is unchanged.')} <Button size="small" onClick={() => { infoRequest.current = null; setInfoRetry(value => value + 1); }}>{t('重试', 'Retry')}</Button></p>}<div className="actions wrap"><Button icon="image" disabled={unavailable} onClick={() => cover(item)}>{t('封面工作室', 'Cover studio')}</Button>{host.desktop && <Button icon="play" disabled={unavailable} onClick={() => run(() => host.result(item.id, 'open'))}>{t('打开媒体', 'Open media')}</Button>}</div></div><div className="detail-footer"><Button tone="primary" disabled={unavailable} icon={host.desktop ? 'folder' : 'download'} onClick={() => run(() => host.result(item.id, host.desktop ? 'reveal' : 'download'))}>{host.desktop ? t('定位结果文件', 'Reveal result file') : t('下载结果文件', 'Download result file')}</Button></div></> : <Empty title={t('媒体详情', 'Media details')} detail={t('选择媒体查看文件操作。', 'Select media to view file actions.')} icon="library" />}</aside></div>{contextMenu}</div>;
 }
 const MediaRow = memo(function MediaRow({ media, availability, t }: { media: Media; availability?: MediaAvailability; t: Translate }) { const quality = mediaQualityWithFps(media.mediaInfo); return <div className="media-row-content"><Thumbnail url={host.assetUrl(media.id, 'thumbnail')} /><div className="row-main"><div className="row-heading"><strong className="truncate">{media.title}</strong><Badge tone={availability === 'missing' || availability === 'unknown' ? '' : 'success'}>{availabilityLabel(availability, t) || t('已完成', 'Completed')}{quality !== '—' && <> · {quality}</>}</Badge></div><div className="row-meta"><span className="truncate">{media.filename}</span><span>{bytes(media.size)} · {duration(media.duration)}</span></div></div></div>; });
 function QuickOptions({ initial, apply, close, t }: { initial: DownloadOptions; apply: (value: DownloadOptions) => Promise<void>; close: () => void; t: Translate }) { const [options, setOptions] = useState(initial); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const change = useCallback((key: string, value: DownloadOptions[string]) => setOptions(current => ({ ...current, [key]: value })), []); return <Modal title={t('下一批次下载方案', 'Next batch download plan')} subtitle={t('已加入任务的方案已固定。', 'Existing tasks keep their saved plans.')} t={t} close={() => { if (!busy) close(); }} footer={<><Button disabled={busy} onClick={close}>{t('取消', 'Cancel')}</Button><Button tone="primary" disabled={busy} onClick={() => { setBusy(true); void apply(options).catch(reason => setError(String(reason))).finally(() => setBusy(false)); }}>{busy ? t('保存中…', 'Saving…') : t('保存批次方案', 'Save batch plan')}</Button></>}>{error && <p className="notice danger" role="alert">{explainError(error, t)}</p>}<OptionsForm options={options} change={change} t={t} quick /></Modal>; }
@@ -360,7 +354,7 @@ function RequirementsDialog({ task, t, close, restarted }: { task: Task; t: Tran
   const submit = async () => { setBusy(true); setError(''); try { await host.command('tasks.retryCurrent', { id: task.id, options: commandOptions({ ...options, collectionMode: 'single' }) }); restarted(); } catch (reason) { setError(String(reason)); } finally { setBusy(false); } };
   return <Modal title={t('调整要求重试', 'Adjust requirements and retry')} subtitle={task.title} t={t} close={() => { if (!busy) close(); }} footer={<><Button disabled={busy} onClick={close}>{t('取消', 'Cancel')}</Button><Button tone="primary" disabled={busy} onClick={() => void submit()}>{t('使用这些要求重试', 'Retry with these requirements')}</Button></>}><p className="notice">{t('来源不满足已选要求。请明确调整需要放宽的项目，或取消。未更改的要求仍须满足；原结果文件保留。', 'The source does not meet the selected requirements. Adjust the requirements you accept relaxing, or cancel. Unchanged requirements must still be met; existing result files are kept.')}</p><p className="notice danger break-text">{explainError(error || task.error || '', t)}</p><OptionsForm options={options} change={(key, value) => setOptions(current => ({ ...current, [key]: value }))} t={t} /></Modal>;
 }
-function DeleteDialog({ tasks, batch = false, initialFiles, remember, close, removed, run, t }: { tasks: Task[]; batch?: boolean; initialFiles: boolean; remember: (files: boolean) => Promise<void>; close: () => void; removed: (snapshot: Snapshot) => void; run: Run; t: Translate }) {
+function DeleteDialog({ tasks, batch = false, initialFiles, remember, close, refresh, run, t }: { tasks: Task[]; batch?: boolean; initialFiles: boolean; remember: (files: boolean) => Promise<void>; close: () => void; refresh: () => Promise<void>; run: Run; t: Translate }) {
   const [files, setFiles] = useState(initialFiles); const [busy, setBusy] = useState(false); const [saving, setSaving] = useState(false); const [error, setError] = useState('');
   const [remaining, setRemaining] = useState(tasks);
   const changeFiles = (next: boolean) => {
@@ -385,7 +379,7 @@ function DeleteDialog({ tasks, batch = false, initialFiles, remember, close, rem
     } catch (reason) { setError(String(reason)); }
     finally {
       setRemaining([...pending.values()]);
-      try { removed(await host.command<Snapshot>('snapshot', { includeTools: false })); } finally { setBusy(false); }
+      try { await refresh(); } finally { setBusy(false); }
     }
     if (!pending.size) close();
   }); };

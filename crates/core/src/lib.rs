@@ -19,6 +19,8 @@ pub mod process;
 mod processing;
 pub mod releases;
 pub mod research;
+mod resources;
+mod state_sync;
 mod storage;
 mod task_logs;
 mod thumbnail;
@@ -45,15 +47,32 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 struct Runtime {
+    generation: u64,
     cancel: CancellationToken,
     finish_capture: CancellationToken,
     handle: JoinHandle<()>,
 }
 
+type SlotQueues = HashMap<&'static str, Vec<(String, u64, u64)>>;
+
 struct ProbeQuery<'a> {
     app: &'a App,
     id: Option<String>,
     token: CancellationToken,
+}
+
+struct QueuedSlot<'a> {
+    app: &'a App,
+    slot: &'static str,
+    ticket: u64,
+}
+impl Drop for QueuedSlot<'_> {
+    fn drop(&mut self) {
+        if let Some(queue) = self.app.queued_slots.lock().unwrap().get_mut(self.slot) {
+            queue.retain(|(_, _, ticket)| *ticket != self.ticket);
+        }
+        self.app.queue_changed.notify_waiters();
+    }
 }
 impl Drop for ProbeQuery<'_> {
     fn drop(&mut self) {
@@ -72,12 +91,15 @@ pub struct App {
     pub(crate) credentials: credentials::CredentialStore,
     pub(crate) shutdown_token: CancellationToken,
     events: broadcast::Sender<Event>,
+    event_history: Mutex<state_sync::History>,
     myself: OnceLock<Weak<Self>>,
     runners: Mutex<HashMap<String, Runtime>>,
+    runner_generation: std::sync::atomic::AtomicU64,
     closing: AtomicBool,
     pub(crate) network: Arc<Semaphore>,
     pub(crate) capture: Arc<Semaphore>,
     pub(crate) processor: Arc<Semaphore>,
+    resources: resources::Resources,
     pub(crate) cover_state: crate::cover::CoverState,
     pub(crate) research_state: research::ResearchState,
     pub(crate) tool_update_lock: tokio::sync::Mutex<()>,
@@ -85,10 +107,11 @@ pub struct App {
     pub(crate) media_info_lock: tokio::sync::Mutex<()>,
     task_add_lock: tokio::sync::Mutex<()>,
     task_log_lock: Arc<Mutex<()>>,
+    task_log_writer: task_logs::Writer,
     active_commands: AtomicUsize,
     commands_done: Notify,
     queue_changed: Notify,
-    queued_slots: Mutex<HashMap<&'static str, Vec<(String, u64)>>>,
+    queued_slots: Mutex<SlotQueues>,
     request_queries: Mutex<HashMap<String, CancellationToken>>,
 }
 
@@ -149,6 +172,8 @@ impl App {
             download_directory::DownloadDirectories::open(&config.data_dir, &config.download_dir)
                 .context("Could not read the saved download folders")?;
         let (events, _) = broadcast::channel(1024);
+        let task_log_lock = Arc::new(Mutex::new(()));
+        let task_log_writer = task_logs::Writer::new(task_log_lock.clone())?;
         let app = Arc::new(Self {
             access,
             config,
@@ -157,19 +182,23 @@ impl App {
             credentials,
             shutdown_token: CancellationToken::new(),
             events,
+            event_history: Default::default(),
             myself: OnceLock::new(),
             runners: Mutex::new(HashMap::new()),
+            runner_generation: Default::default(),
             closing: AtomicBool::new(false),
             network: Arc::new(Semaphore::new(3)),
             capture: Arc::new(Semaphore::new(1)),
-            processor: Arc::new(Semaphore::new(1)),
+            processor: Arc::new(Semaphore::new(2)),
+            resources: Default::default(),
             cover_state: Default::default(),
             research_state: Default::default(),
             tool_update_lock: Default::default(),
             publication_lock: Default::default(),
             media_info_lock: Default::default(),
             task_add_lock: Default::default(),
-            task_log_lock: Default::default(),
+            task_log_lock,
+            task_log_writer,
             active_commands: AtomicUsize::new(0),
             commands_done: Notify::new(),
             queue_changed: Notify::new(),
@@ -238,10 +267,8 @@ impl App {
         self.events.subscribe()
     }
     pub(crate) fn emit(&self, kind: &str, data: Value) {
-        let _ = self.events.send(Event {
-            kind: kind.into(),
-            data,
-        });
+        let mut history = self.event_history.lock().unwrap();
+        let _ = self.events.send(history.push(kind, data));
     }
     pub(crate) fn tool(&self, name: &str) -> Result<PathBuf> {
         tools::resolve(self, name)
@@ -285,8 +312,9 @@ impl App {
             .context("Runtime snapshot worker stopped")?
     }
     pub(crate) fn save_task(&self, task: &Task) -> Result<()> {
+        let mut history = self.event_history.lock().unwrap();
         self.db.save_task(task)?;
-        self.emit("task.upsert", task.public());
+        let _ = self.events.send(history.push("task.upsert", task.public()));
         Ok(())
     }
     pub(crate) fn set_stage(
@@ -361,13 +389,32 @@ impl App {
         semaphore: &Arc<Semaphore>,
         cancel: &CancellationToken,
     ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.task_permit_many(id, slot, semaphore, 1, cancel).await
+    }
+    async fn task_permit_many(
+        &self,
+        id: &str,
+        slot: &'static str,
+        semaphore: &Arc<Semaphore>,
+        count: u32,
+        cancel: &CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let ticket = self.runner_generation.fetch_add(1, Ordering::Relaxed);
         {
             let mut queues = self.queued_slots.lock().unwrap();
             let priority = self.db.task(id)?.priority;
-            queues.entry(slot).or_default().push((id.into(), priority));
+            queues
+                .entry(slot)
+                .or_default()
+                .push((id.into(), priority, ticket));
         }
+        let _queued = QueuedSlot {
+            app: self,
+            slot,
+            ticket,
+        };
         self.queue_changed.notify_waiters();
-        let result = loop {
+        loop {
             let changed = self.queue_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -380,15 +427,17 @@ impl App {
                     queue
                         .iter()
                         .enumerate()
-                        .max_by_key(|(index, (_, priority))| (*priority, std::cmp::Reverse(*index)))
-                        .map(|(_, (id, _))| id.clone())
+                        .max_by_key(|(index, (_, priority, _))| {
+                            (*priority, std::cmp::Reverse(*index))
+                        })
+                        .map(|(_, (_, _, ticket))| *ticket)
                 });
-            if first.as_deref() == Some(id) {
+            if first == Some(ticket) {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => break Err(anyhow::anyhow!("Operation interrupted")),
                     _ = &mut changed => {},
-                    permit = semaphore.clone().acquire_owned() => break permit.map_err(Into::into),
+                    permit = semaphore.clone().acquire_many_owned(count) => break permit.map_err(Into::into),
                 }
             } else {
                 tokio::select! {
@@ -396,15 +445,7 @@ impl App {
                     _ = &mut changed => {},
                 }
             }
-        };
-        self.queued_slots
-            .lock()
-            .unwrap()
-            .entry(slot)
-            .or_default()
-            .retain(|(queued, _)| queued != id);
-        self.queue_changed.notify_waiters();
-        result
+        }
     }
     pub(crate) fn finish_capture_token(&self, id: &str) -> Result<CancellationToken> {
         self.runners
@@ -432,6 +473,7 @@ impl App {
         let finish_capture = CancellationToken::new();
         let running_cancel = cancel.clone();
         let task_id = id.to_string();
+        let generation = self.runner_generation.fetch_add(1, Ordering::Relaxed);
         let handle = tokio::spawn(async move {
             let result = app.run_task(&task_id, &running_cancel).await;
             if let Err(error) = result
@@ -450,10 +492,18 @@ impl App {
                 task.error = Some(process::redact(&format!("{error:#}")));
                 let _ = app.save_task(&task);
             }
+            let mut runners = app.runners.lock().unwrap();
+            if runners
+                .get(&task_id)
+                .is_some_and(|runtime| runtime.generation == generation)
+            {
+                runners.remove(&task_id);
+            }
         });
         runners.insert(
             id.into(),
             Runtime {
+                generation,
                 cancel,
                 finish_capture,
                 handle,
@@ -648,11 +698,20 @@ impl App {
                     Some(value) => value.as_bool().context("includeTools must be a boolean")?,
                     None => true,
                 };
-                let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"tasks":self.db.tasks()?.iter().map(Task::public).collect::<Vec<_>>(),"media":self.db.media()?.iter().map(model::Media::public).collect::<Vec<_>>(),"settings":self.public_settings()?});
+                let mut value = {
+                    let history = self.event_history.lock().unwrap();
+                    json!({"revision":history.revision,"version":env!("CARGO_PKG_VERSION"),"tasks":self.db.tasks()?.iter().map(Task::public).collect::<Vec<_>>(),"media":self.db.media()?.iter().map(model::Media::public).collect::<Vec<_>>(),"settings":self.public_settings()?})
+                };
                 if include_tools {
                     value["tools"] = tools::check(self).await?;
                 }
                 Ok(value)
+            }
+            "state.sync" => {
+                let since = args["since"]
+                    .as_u64()
+                    .context("since must be an unsigned revision")?;
+                Ok(self.event_history.lock().unwrap().sync(since))
             }
             "tasks.add" => {
                 let _adding = self.task_add_lock.lock().await;
@@ -900,7 +959,7 @@ impl App {
                     let mut queues = self.queued_slots.lock().unwrap();
                     self.save_task(&task)?;
                     for queue in queues.values_mut() {
-                        for (id, priority) in queue {
+                        for (id, priority, _) in queue {
                             if *id == task.id {
                                 *priority = task.priority;
                             }
@@ -1241,6 +1300,11 @@ impl App {
         let mut value = self.db.settings()?;
         if let Some(object) = value.as_object_mut() {
             object.entry("ffmpegMode").or_insert(json!("compatibility"));
+            object.entry("analysisThreads").or_insert(json!(0));
+            object.insert(
+                "detectedAnalysisThreads".into(),
+                json!(std::thread::available_parallelism().map_or(1, |value| value.get())),
+            );
             object.remove("apiKey");
             object.remove("aiApiKey");
             object.remove("proxyPassword");
@@ -1345,6 +1409,13 @@ impl App {
         let object = value
             .as_object_mut()
             .context("settings must be an object")?;
+        object.remove("detectedAnalysisThreads");
+        if let Some(threads) = object.get("analysisThreads") {
+            ensure!(
+                threads.as_u64().is_some_and(|value| value <= 256),
+                "analysisThreads must be an integer between 0 and 256"
+            );
+        }
         if let Some(options) = object.get("downloadOptions") {
             DownloadOptions::parse(options.clone())?;
         }
@@ -1434,6 +1505,7 @@ impl App {
                 self.save_task(&task)?;
             }
         }
+        self.task_log_writer.finish()?;
         self.db.checkpoint()?;
         Ok(())
     }
@@ -1689,6 +1761,62 @@ mod tests {
         )
         .await?;
         assert_eq!(app.public_settings()?["ffmpegMode"], "compatibility");
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analysis_threads_settings_default_validate_persist_and_ignore_client_detection()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let detected = std::thread::available_parallelism().map_or(1, |value| value.get());
+        assert_eq!(app.public_settings()?["analysisThreads"], 0);
+        assert_eq!(app.public_settings()?["detectedAnalysisThreads"], detected);
+        app.command(
+            "settings.save",
+            json!({"settings":{"analysisThreads":4,"detectedAnalysisThreads":999999}}),
+        )
+        .await?;
+        assert_eq!(app.public_settings()?["analysisThreads"], 4);
+        assert_eq!(app.public_settings()?["detectedAnalysisThreads"], detected);
+        assert!(app.db.settings()?.get("detectedAnalysisThreads").is_none());
+        for value in [json!(0.5), json!(-1), json!(257), json!("4"), json!(null)] {
+            assert!(
+                app.command(
+                    "settings.save",
+                    json!({"settings":{"analysisThreads":value,"detectedAnalysisThreads":0}})
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(app.public_settings()?["analysisThreads"], 4);
+            assert!(app.db.settings()?.get("detectedAnalysisThreads").is_none());
+        }
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        assert_eq!(app.public_settings()?["analysisThreads"], 4);
+        assert_eq!(app.public_settings()?["detectedAnalysisThreads"], detected);
+        app.command("settings.save", json!({"settings":{"analysisThreads":256}}))
+            .await?;
+        assert_eq!(app.public_settings()?["analysisThreads"], 256);
+        app.command("settings.save", json!({"settings":{"analysisThreads":0}}))
+            .await?;
+        assert_eq!(app.public_settings()?["analysisThreads"], 0);
+        app.command(
+            "settings.save",
+            json!({"settings":{"uiLanguage":"en-US","detectedAnalysisThreads":1}}),
+        )
+        .await?;
+        assert_eq!(app.public_settings()?["analysisThreads"], 0);
+        assert_eq!(app.public_settings()?["detectedAnalysisThreads"], detected);
+        assert!(app.db.settings()?.get("detectedAnalysisThreads").is_none());
         app.shutdown().await?;
         Ok(())
     }
@@ -2246,6 +2374,7 @@ mod tests {
             app.runners.lock().unwrap().insert(
                 active.id.clone(),
                 Runtime {
+                    generation: 0,
                     cancel,
                     finish_capture: CancellationToken::new(),
                     handle,
@@ -2456,7 +2585,7 @@ mod tests {
         })
         .await?;
         let network = app.network.acquire_many(3).await?;
-        let processor = app.processor.acquire().await?;
+        let processor = app.processor.acquire_many(2).await?;
         let mut task = paused_task(app.freeze_tools().await?);
         task.stage("completed", "completed", Some(100.0));
         let path = app.config.download_dir.join("original.mp4");
@@ -3035,7 +3164,7 @@ mod queue_tests {
                     .lock()
                     .unwrap()
                     .get("network")
-                    .is_some_and(|queue| queue.iter().any(|(id, _)| id == &task.id))
+                    .is_some_and(|queue| queue.iter().any(|(id, _, _)| id == &task.id))
                 {
                     break;
                 }

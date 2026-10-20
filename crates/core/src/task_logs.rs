@@ -7,16 +7,204 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread::JoinHandle,
 };
 
 const LIMIT: usize = 500;
 const PAGE_LIMIT: u64 = 256 * 1024;
+const WRITE_CHUNK: usize = 64 * 1024;
+const WRITE_QUEUE: usize = 32;
+
+enum WriteMessage {
+    Bytes(Arc<File>, Vec<u8>),
+    Flush(
+        Option<Arc<File>>,
+        mpsc::SyncSender<std::result::Result<(), String>>,
+    ),
+    Stop(mpsc::SyncSender<std::result::Result<(), String>>),
+}
+
+struct WriteChannel {
+    sender: mpsc::SyncSender<WriteMessage>,
+    submit: Mutex<()>,
+    closed: AtomicBool,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+/// One bounded disk writer per application. Producers apply backpressure instead
+/// of keeping an unbounded copy of long-running tools' original output in RAM.
+pub(crate) struct Writer {
+    channel: Arc<WriteChannel>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Writer {
+    pub(crate) fn new(lock: Arc<Mutex<()>>) -> Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(WRITE_QUEUE);
+        let failure = Arc::new(Mutex::new(None));
+        let observed_failure = failure.clone();
+        let worker = std::thread::Builder::new()
+            .name("huifa-task-log".into())
+            .spawn(move || {
+                while let Ok(first) = receiver.recv() {
+                    let mut batch = Vec::with_capacity(WRITE_QUEUE);
+                    batch.push(first);
+                    while batch.len() < WRITE_QUEUE {
+                        match receiver.try_recv() {
+                            Ok(message) => batch.push(message),
+                            Err(_) => break,
+                        }
+                    }
+                    let mut stop = false;
+                    let mut pending_file: Option<Arc<File>> = None;
+                    let mut pending = Vec::with_capacity(WRITE_CHUNK);
+                    let flush_pending = |file: &mut Option<Arc<File>>, bytes: &mut Vec<u8>| {
+                        if let Some(file) = file.take() {
+                            if observed_failure.lock().unwrap().is_none() {
+                                let _guard = lock.lock().unwrap();
+                                if let Err(error) = (&*file).write_all(bytes) {
+                                    *observed_failure.lock().unwrap() =
+                                        Some(format!("Cannot write the task log: {error}"));
+                                }
+                            }
+                            bytes.clear();
+                        }
+                    };
+                    for message in batch {
+                        match message {
+                            WriteMessage::Bytes(file, bytes) => {
+                                if pending_file
+                                    .as_ref()
+                                    .is_some_and(|previous| !Arc::ptr_eq(previous, &file))
+                                    || pending.len() + bytes.len() > WRITE_CHUNK
+                                {
+                                    flush_pending(&mut pending_file, &mut pending);
+                                }
+                                pending_file = Some(file);
+                                pending.extend(bytes);
+                            }
+                            WriteMessage::Flush(file, completed) => {
+                                flush_pending(&mut pending_file, &mut pending);
+                                if observed_failure.lock().unwrap().is_none()
+                                    && let Some(file) = file
+                                {
+                                    let _guard = lock.lock().unwrap();
+                                    if let Err(error) = file.sync_data() {
+                                        *observed_failure.lock().unwrap() =
+                                            Some(format!("Cannot flush the task log: {error}"));
+                                    }
+                                }
+                                let _ = completed.send(
+                                    observed_failure.lock().unwrap().clone().map_or(Ok(()), Err),
+                                );
+                            }
+                            WriteMessage::Stop(completed) => {
+                                flush_pending(&mut pending_file, &mut pending);
+                                let _ = completed.send(
+                                    observed_failure.lock().unwrap().clone().map_or(Ok(()), Err),
+                                );
+                                stop = true;
+                            }
+                        }
+                    }
+                    flush_pending(&mut pending_file, &mut pending);
+                    if stop {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            channel: Arc::new(WriteChannel {
+                sender,
+                submit: Mutex::new(()),
+                closed: AtomicBool::new(false),
+                failure,
+            }),
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+
+    pub(crate) fn flush(&self) -> Result<()> {
+        self.channel.flush(None)
+    }
+
+    pub(crate) fn finish(&self) -> Result<()> {
+        let mut worker = self.worker.lock().unwrap();
+        let Some(handle) = worker.take() else {
+            return self.channel.result();
+        };
+        let completion = {
+            let _guard = self.channel.submit.lock().unwrap();
+            self.channel.closed.store(true, Ordering::Release);
+            let (sent, received) = mpsc::sync_channel(1);
+            self.channel
+                .sender
+                .send(WriteMessage::Stop(sent))
+                .map(|_| received)
+        };
+        let joined = handle.join();
+        joined.map_err(|_| anyhow::anyhow!("Task log writer stopped unexpectedly"))?;
+        completion
+            .context("Task log writer is unavailable")?
+            .recv()
+            .context("Task log writer did not confirm shutdown")?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+impl WriteChannel {
+    fn result(&self) -> Result<()> {
+        if let Some(error) = self.failure.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        Ok(())
+    }
+
+    fn send(&self, file: &Arc<File>, bytes: &[u8]) -> Result<()> {
+        self.result()?;
+        ensure!(
+            !self.closed.load(Ordering::Acquire),
+            "Task log writer is closed"
+        );
+        for chunk in bytes.chunks(WRITE_CHUNK) {
+            self.sender
+                .send(WriteMessage::Bytes(file.clone(), chunk.to_vec()))
+                .context("Task log writer is unavailable")?;
+        }
+        self.result()
+    }
+
+    fn flush(&self, file: Option<Arc<File>>) -> Result<()> {
+        let _guard = self.submit.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) {
+            return self.result();
+        }
+        let (sent, received) = mpsc::sync_channel(1);
+        self.sender
+            .send(WriteMessage::Flush(file, sent))
+            .context("Task log writer is unavailable")?;
+        received
+            .recv()
+            .context("Task log writer did not confirm the flush")?
+            .map_err(anyhow::Error::msg)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct RawLog {
     file: Arc<File>,
-    lock: Arc<Mutex<()>>,
+    writer: Arc<WriteChannel>,
     pub(crate) directory: PathBuf,
 }
 
@@ -28,27 +216,40 @@ impl RawLog {
             input.read_exact(&mut last)?;
         }
         input.rewind()?;
-        let _guard = self.lock.lock().unwrap();
-        let mut file = self.file.as_ref();
-        writeln!(file, "[{}] {source}", chrono::Utc::now().to_rfc3339())?;
-        std::io::copy(input, &mut file)?;
-        if last != *b"\n" {
-            writeln!(file)?;
+        let _guard = self.writer.submit.lock().unwrap();
+        self.writer.send(
+            &self.file,
+            format!("[{}] {source}\n", chrono::Utc::now().to_rfc3339()).as_bytes(),
+        )?;
+        let mut chunk = [0; WRITE_CHUNK];
+        loop {
+            let count = input.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            self.writer.send(&self.file, &chunk[..count])?;
         }
-        file.flush()?;
+        if last != *b"\n" {
+            self.writer.send(&self.file, b"\n")?;
+        }
         Ok(())
     }
 
     pub(crate) fn write(&self, source: &str, bytes: &[u8]) -> Result<()> {
-        let _guard = self.lock.lock().unwrap();
-        let mut file = self.file.as_ref();
-        writeln!(file, "[{}] {source}", chrono::Utc::now().to_rfc3339())?;
-        file.write_all(bytes)?;
+        let _guard = self.writer.submit.lock().unwrap();
+        self.writer.send(
+            &self.file,
+            format!("[{}] {source}\n", chrono::Utc::now().to_rfc3339()).as_bytes(),
+        )?;
+        self.writer.send(&self.file, bytes)?;
         if !bytes.ends_with(b"\n") {
-            writeln!(file)?;
+            self.writer.send(&self.file, b"\n")?;
         }
-        file.flush()?;
         Ok(())
+    }
+
+    pub(crate) fn flush(&self) -> Result<()> {
+        self.writer.flush(Some(self.file.clone()))
     }
 }
 
@@ -172,7 +373,9 @@ impl App {
             "warning" => "warning",
             _ => "info",
         };
-        self.raw_task_log(id)?.write(level, message.as_bytes())?;
+        let log = self.raw_task_log(id)?;
+        log.write(level, message.as_bytes())?;
+        log.flush()?;
         self.db.append_task_log(id, &Entry::new(level, message))
     }
 
@@ -209,12 +412,13 @@ impl App {
         }
         Ok(RawLog {
             file: Arc::new(file),
-            lock: self.task_log_lock.clone(),
+            writer: self.task_log_writer.channel.clone(),
             directory: self.config.data_dir.join("task-logs"),
         })
     }
 
     pub(crate) fn remove_task_log(&self, id: &str) -> Result<()> {
+        self.task_log_writer.flush()?;
         let path = self.raw_task_log_path(id)?;
         let _guard = self.task_log_lock.lock().unwrap();
         match std::fs::remove_file(path) {
@@ -225,6 +429,7 @@ impl App {
     }
 
     pub(crate) fn task_logs(&self, id: &str, args: &Value) -> Result<Value> {
+        self.task_log_writer.flush()?;
         let path = self.raw_task_log_path(id)?;
         let cursor = |key: &str| -> Result<Option<u64>> {
             args.get(key)
@@ -318,6 +523,62 @@ impl<T: Read + Seek> ReadSeek for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_applies_backpressure_and_confirms_complete_output_before_shutdown() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let lock = Arc::new(Mutex::new(()));
+        let writer = Writer::new(lock.clone())?;
+        let path = root.path().join("journal.log");
+        let log = RawLog {
+            file: Arc::new(File::create(&path)?),
+            writer: writer.channel.clone(),
+            directory: root.path().into(),
+        };
+        let (completed, received) = mpsc::sync_channel(1);
+        let blocked = lock.lock().unwrap();
+        let producer = std::thread::spawn(move || {
+            let result = log
+                .write("stdout", &vec![b'x'; WRITE_CHUNK * (WRITE_QUEUE * 3)])
+                .and_then(|_| log.flush());
+            completed.send(result).unwrap();
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "A blocked disk writer must backpressure its producer"
+        );
+        drop(blocked);
+        received.recv_timeout(std::time::Duration::from_secs(5))??;
+        producer.join().unwrap();
+        writer.finish()?;
+        let bytes = std::fs::read(path)?;
+        assert_eq!(
+            bytes.iter().filter(|byte| **byte == b'x').count(),
+            WRITE_CHUNK * WRITE_QUEUE * 3
+        );
+        writer.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn writer_reports_disk_errors_without_leaving_a_waiter_or_worker_running() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("read-only.log");
+        std::fs::write(&path, b"")?;
+        let writer = Writer::new(Arc::new(Mutex::new(())))?;
+        let log = RawLog {
+            file: Arc::new(File::open(path)?),
+            writer: writer.channel.clone(),
+            directory: root.path().into(),
+        };
+        let _ = log.write("stdout", b"cannot write");
+        assert!(log.flush().is_err());
+        assert!(writer.finish().is_err());
+        assert!(writer.worker.lock().unwrap().is_none());
+        Ok(())
+    }
     use crate::AppConfig;
 
     #[tokio::test]

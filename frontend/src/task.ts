@@ -40,6 +40,7 @@ export function completionTime(value?: string | null, format = DEFAULT_COMPLETED
 export function stageLabel(stage: string, status: string, t: Translate): string {
   if (['completed', 'retained', 'failed', 'processing_failed', 'cancelled'].includes(status)) return statusLabel(status, t);
   if (stage === 'probing') return t('正在确定工序', 'Determining workflow');
+  if (stage === 'compression_scanning') return t('分析压缩源视频', 'Analyzing compression source');
   if (stage === 'compression_analyzing') return t('分析压缩码率', 'Analyzing compression bitrate');
   if (stage === 'compression_encoding') return t('压缩视频', 'Compressing video');
   if (stage === 'compression_preparing') return t('保留音轨与字幕', 'Preserving audio and subtitles');

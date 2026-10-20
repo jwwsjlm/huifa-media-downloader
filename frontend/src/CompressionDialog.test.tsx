@@ -23,6 +23,19 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); });
 
+it('stops the initial loading message after a failed check and can retry the backend analysis', async () => {
+  const base = command.getMockImplementation()!;
+  command.mockImplementationOnce(async () => { throw new Error('Compression video analysis timed out'); });
+  render(<CompressionDialog {...props} />);
+  expect(await screen.findByRole('alert')).toBeTruthy();
+  expect(screen.queryByText('Checking the local video and encoders…')).toBeNull();
+  expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(true);
+  command.mockImplementation(base);
+  fireEvent.click(screen.getByRole('button', { name: 'Check again' }));
+  await screen.findByRole('textbox', { name: 'Target size' });
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(false));
+});
+
 it('uses the actual source size as the accessible slider maximum and submits exact decimal target bytes', async () => {
   render(<CompressionDialog {...props} />);
   const target = await screen.findByRole('textbox', { name: 'Target size' });
@@ -50,6 +63,7 @@ it('keeps separate drafts, offers only lower portrait sizes and rational frame r
   fireEvent.change(resolution, { target: { value: '1080' } });
   fireEvent.change(screen.getByRole('combobox', { name: 'Frame rate' }), { target: { value: '30000/1001' } });
   expect((screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }) as HTMLInputElement).disabled).toBe(true);
+  expect((screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }) as HTMLInputElement).checked).toBe(false);
   expect(screen.getByText('No compatible NVIDIA encoder is available.')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Simple' }));
   expect((screen.getByRole('textbox', { name: 'Target size' }) as HTMLInputElement).value).toBe('2G');
@@ -83,7 +97,7 @@ it('debounces changing targets, cancels the obsolete probe and never accepts its
   expect(command).toHaveBeenCalledWith('tasks.convert', { id: 'local', requestId: expect.any(String), compression: { targetBytes: 1000000000, encoder: 'libx265' } });
 });
 
-it('uses an available GPU encoder only after explicit selection and never starts without a valid plan', async () => {
+it('defaults to an available GPU encoder and never starts without a valid plan', async () => {
   const base = command.getMockImplementation()!;
   command.mockImplementation(async (name, args) => {
     const value = await base(name, args);
@@ -91,9 +105,9 @@ it('uses an available GPU encoder only after explicit selection and never starts
   });
   render(<CompressionDialog {...props} />);
   await screen.findByRole('textbox', { name: 'Target size' });
+  expect((screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }) as HTMLInputElement).checked).toBe(true);
   fireEvent.click(screen.getByRole('button', { name: 'Advanced' }));
   fireEvent.change(screen.getByRole('textbox', { name: 'Video bitrate' }), { target: { value: '8Mbps' } });
-  fireEvent.click(screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }));
   expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(true);
   await waitFor(() => expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(screen.getByRole('button', { name: 'Start compression' }));
@@ -109,7 +123,7 @@ it('shows target savings and allows verified GPU acceleration in simple size mod
   render(<CompressionDialog {...props} />);
   fireEvent.change(await screen.findByRole('textbox', { name: 'Target size' }), { target: { value: '2G' } });
   expect(screen.getByText('Target reduction: 50%')).toBeTruthy();
-  fireEvent.click(screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }));
+  expect((screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }) as HTMLInputElement).checked).toBe(true);
   await waitFor(() => expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(screen.getByRole('button', { name: 'Start compression' }));
   await waitFor(() => expect(command).toHaveBeenCalledWith('tasks.convert', { id: 'local', requestId: expect.any(String), compression: { targetBytes: 2000000000, encoder: 'hevc_nvenc' } }));
@@ -130,13 +144,38 @@ it('keeps the selected GPU and its rejection visible when another GPU supports t
   render(<CompressionDialog {...props} />);
   await screen.findByRole('textbox', { name: 'Target size' });
   fireEvent.click(screen.getByRole('button', { name: 'Advanced' }));
-  fireEvent.click(screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }));
   await waitFor(() => expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(false));
   fireEvent.change(screen.getByRole('combobox', { name: 'Resolution' }), { target: { value: '1080' } });
   expect(await screen.findByText(`NVIDIA H.265 · ${rejection}`)).toBeTruthy();
   expect((screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }) as HTMLInputElement).checked).toBe(true);
   expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(true);
   expect(command.mock.calls.filter(([name, args]) => name === 'tasks.convertPreview' && args.compression.maxWidth === 1080).every(([, args]) => args.compression.encoder === 'hevc_nvenc')).toBe(true);
+});
+
+it('selects the first supported GPU and preserves manual CPU selection through new previews and mode changes', async () => {
+  const base = command.getMockImplementation()!;
+  command.mockImplementation(async (name, args) => {
+    const value = await base(name, args);
+    return name === 'tasks.convertPreview' ? { ...value, capabilities: [
+      { encoder: 'hevc_nvenc', label: 'NVIDIA H.265', available: false, reason: 'Unavailable' },
+      { encoder: 'hevc_qsv', label: 'Intel H.265', available: true, reason: null },
+      { encoder: 'hevc_amf', label: 'AMD H.265', available: true, reason: null },
+    ] } : value;
+  });
+  render(<CompressionDialog {...props} />);
+  const target = await screen.findByRole('textbox', { name: 'Target size' });
+  const gpu = screen.getByRole('checkbox', { name: 'GPU encoding acceleration' }) as HTMLInputElement;
+  expect(gpu.checked).toBe(true);
+  await waitFor(() => expect(command.mock.calls.some(([name, args]) => name === 'tasks.convertPreview' && args.compression.encoder === 'hevc_qsv')).toBe(true));
+  fireEvent.click(gpu);
+  fireEvent.change(target, { target: { value: '2G' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Advanced' }));
+  fireEvent.change(screen.getByRole('textbox', { name: 'Video bitrate' }), { target: { value: '8Mbps' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Simple' }));
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(false));
+  expect(gpu.checked).toBe(false);
+  fireEvent.click(screen.getByRole('button', { name: 'Start compression' }));
+  await waitFor(() => expect(command).toHaveBeenCalledWith('tasks.convert', { id: 'local', requestId: expect.any(String), compression: { targetBytes: 2000000000, encoder: 'libx265' } }));
 });
 
 it('shows the preview rejection and keeps compression disabled instead of discarding source tracks', async () => {
@@ -148,7 +187,9 @@ it('shows the preview rejection and keeps compression disabled instead of discar
   render(<CompressionDialog {...props} />);
   await screen.findByRole('textbox', { name: 'Target size' });
   expect(await screen.findByText('The target is too small to preserve all source audio and subtitles.')).toBeTruthy();
-  expect(screen.getByText('Output: HEVC · MKV · HDR10 · 10-bit · Preserves 2 audio tracks, 3 subtitle tracks and 2 attachments. Saves a new file and keeps the source.')).toBeTruthy();
+  expect(screen.getByText('Output: HEVC · MKV · HDR10 · 10-bit · Saves a new file and keeps the source.')).toBeTruthy();
+  fireEvent.click(screen.getByText('Compression and preservation details'));
+  expect(screen.getByText('Preserves 2 audio tracks, 3 subtitle tracks and 2 attachments.')).toBeTruthy();
   expect((screen.getByRole('button', { name: 'Start compression' }) as HTMLButtonElement).disabled).toBe(true);
   expect(command.mock.calls.some(([name]) => name === 'tasks.convert')).toBe(false);
 });
@@ -162,6 +203,7 @@ it.each(['cancelled', 'queued'] as const)('cancels only pending queue preparatio
   const start = screen.getByRole('button', { name: 'Start compression' });
   await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(start);
+  expect(screen.getByRole('progressbar', { name: 'Adding compression to queue' })).toBeTruthy();
   const prepare = command.mock.calls.find(([name]) => name === 'tasks.convert')!;
   expect(prepare[1].requestId).toEqual(expect.any(String));
   expect(command.mock.calls.filter(([name]) => name === 'tasks.convertPreview').some(([, args]) => args.requestId === prepare[1].requestId)).toBe(false);

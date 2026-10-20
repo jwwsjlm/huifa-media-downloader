@@ -22,6 +22,12 @@ defaults on: missing requested languages are skipped while the video continues.
 Turn it off to require every requested subtitle language. Fragment concurrency
 defaults to 4, recommends 6 and is limited to 8.
 
+**Settings → Downloads → Video analysis threads** automatically allocates up to
+8 threads for full analysis, or accepts a manual integer from 1 to 256.
+Saving applies to video analyses started afterward; running analyses are unchanged.
+Manual threads count toward admission to the shared resource budget. Docker reports the server host's
+detected processors rather than the browser device's.
+
 **Download clipboard** extracts and deduplicates links before adding them. On desktop,
 **Settings → Downloads → Clipboard monitoring** can automatically add copied HTTP/HTTPS
 links while the app runs, including in the background. It is off by default and
@@ -51,6 +57,19 @@ Open a completed video's context menu and choose **Compress video**. The app che
 the local file and available encoders first. Compression creates a separate task
 and saves a new HEVC video in MKV; the original file is preserved.
 
+**Start compression** adds the job to the processing queue and selects the new task.
+
+At most two jobs run together; CPU re-encoding remains single lane. Two NVIDIA jobs
+require Windows, at least 8 logical processors, 8 GiB free RAM, 4 GiB free VRAM,
+and a successful concurrent encoder probe. High resolution, HDR, 10-bit video, or
+unknown resources use serial admission. Full scans and disk verification are limited
+separately, preserving priority and FIFO within each priority. Eligible 8-bit SDR
+video up to 4K, without scaling or frame-rate reduction, can use NVIDIA hardware
+decoding after matching decoded pixels and timestamps; failed checks retain the
+selected encoder with software decoding.
+The task list and details show progress for source verification, full video analysis
+and encoding. Each progress bar represents the current stage. Cancel from the task actions.
+
 | Mode | Controls and limits |
 | --- | --- |
 | **Simple** | Enter a target size or drag the percentage slider. Keeps source resolution and frame rate. The target cannot exceed the actual source file size. |
@@ -68,10 +87,14 @@ streams fails rather than silently removing them. Unsupported features such as
 Dolby Vision/dynamic HDR, certain pixel formats or uncopyable streams block compression.
 Changed source files or failed preservation checks stop the task and keep the original.
 
-CPU encoding is the default. Enable **GPU encoding acceleration** only when an
-encoder passes the current video's capability checks. GPU encoding failure stops
-the task; choose **Retry with CPU** explicitly. Hardware availability alone does
-not guarantee support for a video's bit depth, pixel format or HDR metadata.
+Opening the compression dialog checks encoders for the current video. **GPU encoding
+acceleration** is selected by default when a GPU encoder is available; otherwise,
+CPU is used and the reason is shown. You can turn GPU acceleration off, and switching
+between Simple and Advanced keeps your choice. Changing resolution or other options
+rechecks the selected encoder; if unsupported, adjust the options or choose CPU.
+GPU encoding failure stops the task; choose **Retry with CPU** explicitly.
+Hardware availability alone does not guarantee support for a video's bit depth,
+pixel format or HDR metadata.
 The bundled macOS CPU x265 encoder currently supports 8-bit output only; paths
 that cannot preserve 10-bit video or HDR are disabled with an explanation.
 

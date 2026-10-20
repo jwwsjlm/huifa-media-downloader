@@ -11,6 +11,7 @@ import './CompressionDialog.css';
 
 export function CompressionDialog({ task, close, queued, run, t }: { task: Task; close: () => void; queued?: (task: Task) => void; run: Run; t: Translate }) {
   const [initial, setInitial] = useState<CompressionPreview | null>(null);
+  const [initialLoading, setInitialLoading] = useState(true); const [initialAttempt, setInitialAttempt] = useState(0);
   const [mode, setMode] = useState<'simple' | 'advanced'>('simple');
   const [sizeText, setSizeText] = useState('');
   const [advanced, setAdvanced] = useState({ bitrate: '', resolution: 'original', fps: 'original', encoder: 'libx265' });
@@ -30,12 +31,15 @@ export function CompressionDialog({ task, close, queued, run, t }: { task: Task;
   }, []);
   useEffect(() => {
     let active = true; const requestId = newRequestId();
+    setInitialLoading(true); setInitial(null); setError('');
     void host.command<CompressionPreview>('tasks.convertPreview', { id: task.id, compression: {}, requestId }).then(value => {
       if (!active) return;
       setInitial(value); setSizeText(sizeInput(value.source.sizeBytes));
-    }).catch(reason => { if (active) setError(String(reason)); });
+      const gpu = value.capabilities.find(capability => capability.available && !['libx264', 'libx265'].includes(capability.encoder));
+      setAdvanced(value => ({ ...value, encoder: gpu?.encoder || 'libx265' }));
+    }).catch(reason => { if (active) setError(String(reason)); }).finally(() => { if (active) setInitialLoading(false); });
     return () => { active = false; void host.command('probe.cancel', { id: requestId }).catch(() => {}); };
-  }, [task.id]);
+  }, [task.id, initialAttempt]);
   const source = initial?.source;
   const resolutions = useMemo(() => source ? resolutionChoices(source.displayWidth, source.displayHeight) : [], [source]);
   const frameRates = useMemo(() => frameRateChoices(source?.fps || null), [source?.fps]);
@@ -99,13 +103,12 @@ export function CompressionDialog({ task, close, queued, run, t }: { task: Task;
   };
   return <Modal title={t('压缩视频', 'Compress video')} subtitle={task.title} t={t} close={dismiss} footer={<><Button disabled={cancelRequested} onClick={dismiss}>{cancelRequested ? t('取消准备…', 'Cancelling preparation…') : submitting ? t('取消准备', 'Cancel preparation') : t('取消', 'Cancel')}</Button><Button tone="primary" disabled={!canStart} onClick={submit}>{submitting ? t('加入队列中…', 'Adding to queue…') : t('开始压缩', 'Start compression')}</Button></>}>
     <div className="compression-dialog">
-      {!source ? <p className="hint" role="status">{t('正在检查本地视频与编码器…', 'Checking the local video and encoders…')}</p> : <>
+      {!source ? initialLoading ? <p className="hint" role="status">{t('正在检查本地视频与编码器…', 'Checking the local video and encoders…')}</p> : <Button icon="refresh" onClick={() => setInitialAttempt(value => value + 1)}>{t('重新检查', 'Check again')}</Button> : <>
         <dl className="compression-source"><div><dt>{t('原文件', 'Source file')}</dt><dd>{formatSize(source.sizeBytes)}</dd></div><div><dt>{t('分辨率', 'Resolution')}</dt><dd>{source.displayWidth} × {source.displayHeight}</dd></div><div><dt>{t('当前视频码率', 'Current video bitrate')}</dt><dd>{source.videoBitrateBps ? `${source.videoBitrateEstimated ? '≈ ' : ''}${formatBitrate(source.videoBitrateBps)}` : t('无法确定', 'Unavailable')}</dd></div></dl>
         <div className="filter-tabs" aria-label={t('压缩模式', 'Compression mode')}><Button disabled={submitting} aria-pressed={mode === 'simple'} tone={mode === 'simple' ? 'primary' : ''} onClick={() => switchMode('simple')}>{t('简单', 'Simple')}</Button><Button disabled={submitting} aria-pressed={mode === 'advanced'} tone={mode === 'advanced' ? 'primary' : ''} onClick={() => switchMode('advanced')}>{t('高级', 'Advanced')}</Button></div>
         {mode === 'simple' ? <>
-          <Field label={t('目标大小', 'Target size')} hint={t('支持 4MB、4GB、4G 和 MiB / GiB；MB / GB 为十进制。', 'Accepts 4MB, 4GB, 4G and MiB / GiB. MB / GB use decimal units.')}><input aria-label={t('目标大小', 'Target size')} value={sizeText} maxLength={48} aria-invalid={Boolean(invalid)} disabled={submitting} onChange={event => setSizeText(event.target.value)} /></Field>
+          <Field label={t('目标大小', 'Target size')} hint={t('如 4MB、4GB、4G；保持原分辨率和帧率。', 'For example 4MB, 4GB or 4G. Keeps source resolution and frame rate.')}><input aria-label={t('目标大小', 'Target size')} value={sizeText} maxLength={48} aria-invalid={Boolean(invalid)} disabled={submitting} onChange={event => setSizeText(event.target.value)} /></Field>
           <label className="compression-slider"><span>{t('拖动调整目标大小', 'Drag to set the target size')}</span><input type="range" aria-label={t('目标大小百分比', 'Target size percentage')} min="0" max="100" step="0.1" value={targetBytes ? Math.min(100, targetBytes / source.sizeBytes * 100) : 0} aria-valuetext={`${targetBytes ? formatSize(targetBytes) : '—'} / ${formatSize(source.sizeBytes)}`} disabled={submitting} onChange={event => setSizeText(sizeInput(Math.max(1, Math.floor(source.sizeBytes * Number(event.target.value) / 100))))} /><span className="compression-scale"><small>0 MB</small><small>{formatSize(source.sizeBytes)}</small></span></label>
-          <p className="hint">{t('保留原分辨率和帧率；目标越小，画面损失越明显。', 'Keeps the source resolution and frame rate. Smaller targets reduce picture quality.')}</p>
           {!invalid && targetBytes && <strong>{t(`目标减少 ${Number(((1 - targetBytes / source.sizeBytes) * 100).toFixed(1))}%`, `Target reduction: ${Number(((1 - targetBytes / source.sizeBytes) * 100).toFixed(1))}%`)}</strong>}
         </> : <>
           <Field label={t('视频码率', 'Video bitrate')} hint={t('码率决定输出，文件大小仅估算，不作为上限。', 'Bitrate controls the output; file size is estimated only, without a size limit.')}><input aria-label={t('视频码率', 'Video bitrate')} value={advanced.bitrate} maxLength={48} aria-invalid={Boolean(invalid)} disabled={submitting} onChange={event => setAdvanced(value => ({ ...value, bitrate: event.target.value }))} /></Field>
@@ -118,10 +121,15 @@ export function CompressionDialog({ task, close, queued, run, t }: { task: Task;
         {!invalid && (mode === 'simple' && current?.plan || mode === 'advanced' && estimatedBytes) && <div className="compression-estimate" role="status"><strong>{mode === 'simple' ? t('目标上限', 'Target limit') : t('估算输出大小', 'Estimated output size')} · {formatSize(mode === 'simple' ? targetBytes! : estimatedBytes!)}</strong>{current?.plan && <span>{current.plan.width} × {current.plan.height} · {formatBitrate(current.plan.videoBitrateBps)}</span>}</div>}
         {checking && !invalid && <p className="hint" role="status">{t('正在更新压缩预览…', 'Updating compression preview…')}</p>}
         {blocking.map(reason => <p key={reason} className="notice danger" role="alert">{compressionReason(reason, t)}</p>)}
-        {current?.warnings.map(warning => <p key={warning} className="notice">{compressionReason(warning, t)}</p>)}
-        <p className="hint">{t('输出：', 'Output: ')}HEVC · MKV · {source.hdr.toUpperCase()} · {source.bitDepth}-bit · {t(`保留 ${source.audioTracks} 条音轨、${source.subtitleTracks} 条字幕和 ${source.attachmentTracks} 个附件。另存新文件，原文件保留。`, `Preserves ${source.audioTracks} audio tracks, ${source.subtitleTracks} subtitle tracks and ${source.attachmentTracks} attachments. Saves a new file and keeps the source.`)}</p>
+        <p className="hint">{t('输出：', 'Output: ')}HEVC · MKV · {source.hdr.toUpperCase()} · {source.bitDepth}-bit · {t('另存新文件，原文件保留。', 'Saves a new file and keeps the source.')}</p>
+        <details className="help-details"><summary>{t('压缩与保留说明', 'Compression and preservation details')}</summary>
+          <p className="hint">{t(`保留 ${source.audioTracks} 条音轨、${source.subtitleTracks} 条字幕和 ${source.attachmentTracks} 个附件。`, `Preserves ${source.audioTracks} audio tracks, ${source.subtitleTracks} subtitle tracks and ${source.attachmentTracks} attachments.`)}</p>
+          {current?.warnings.map(warning => <p key={warning} className="hint">{compressionReason(warning, t)}</p>)}
+          <p className="hint">{t('MB / GB 为十进制，MiB / GiB 为二进制。目标越小，画面损失越明显。', 'MB / GB use decimal units; MiB / GiB use binary units. Smaller targets reduce picture quality.')}</p>
+        </details>
+        {submitting && <div role="status"><p className="hint">{t('正在加入处理队列，分析和压缩进度将在任务列表显示。', 'Adding to the processing queue. Analysis and compression progress will appear in the task list.')}</p><div className="progress indeterminate" role="progressbar" aria-label={t('正在加入压缩队列', 'Adding compression to queue')}><span /></div></div>}
       </>}
-      {error && <p className="notice danger" role="alert">{explainError(error, t)}</p>}
+      {error && <p className="notice danger" role="alert">{/timed?\s*out|timeout/i.test(error) ? t('本地视频或编码器检查超时，请重试。可在“工具与更新”检查 FFmpeg / FFprobe。', 'Local video or encoder analysis timed out. Retry the check, or verify FFmpeg / FFprobe under Tools & updates.') : explainError(error, t)}</p>}
     </div>
   </Modal>;
 }

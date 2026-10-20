@@ -4,15 +4,32 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+use tokio_util::sync::CancellationToken;
 
 fn executable(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+#[cfg(test)]
 fn native_executable(bytes: &[u8], platform: &str) -> bool {
+    native_reader(
+        &mut std::io::Cursor::new(bytes),
+        bytes.len() as u64,
+        platform,
+    )
+    .unwrap_or(false)
+}
+
+fn native_file(path: &Path, platform: &str) -> Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    native_reader(&mut file, size, platform)
+}
+
+fn native_reader(reader: &mut (impl Read + Seek), file_size: u64, platform: &str) -> Result<bool> {
     fn word(bytes: &[u8], offset: usize, little: bool) -> Option<u32> {
         let value: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
         Some(if little {
@@ -38,48 +55,63 @@ fn native_executable(bytes: &[u8], platform: &str) -> bool {
                 _ => false,
             }
     }
+    let mut header = [0; 64];
+    let count = file_size.min(header.len() as u64) as usize;
+    reader.read_exact(&mut header[..count])?;
+    let bytes = &header[..count];
     let arm = platform.ends_with("-aarch64");
     if platform.starts_with("windows-") {
         if !bytes.starts_with(b"MZ") {
-            return false;
+            return Ok(false);
         }
         let Some(offset) = word(bytes, 60, true).map(|value| value as usize) else {
-            return false;
+            return Ok(false);
         };
-        return word(bytes, offset, true) == Some(0x4550)
-            && bytes
-                .get(offset + 4..offset + 6)
-                .is_some_and(|value| value == if arm { [0x64, 0xaa] } else { [0x64, 0x86] });
+        if (offset as u64)
+            .checked_add(6)
+            .is_none_or(|end| end > file_size)
+        {
+            return Ok(false);
+        }
+        reader.seek(SeekFrom::Start(offset as u64))?;
+        let mut pe = [0; 6];
+        reader.read_exact(&mut pe)?;
+        return Ok(word(&pe, 0, true) == Some(0x4550)
+            && pe[4..6] == if arm { [0x64, 0xaa] } else { [0x64, 0x86] });
     }
     if platform.starts_with("linux-") {
-        return bytes.starts_with(b"\x7fELF\x02\x01")
+        return Ok(bytes.starts_with(b"\x7fELF\x02\x01")
             && bytes
                 .get(18..20)
-                .is_some_and(|value| value == if arm { [183, 0] } else { [62, 0] });
+                .is_some_and(|value| value == if arm { [183, 0] } else { [62, 0] }));
     }
     if !platform.starts_with("darwin-") {
-        return false;
+        return Ok(false);
     }
     let cpu = if arm { 0x0100000c } else { 0x01000007 };
     if thin(bytes, cpu) {
-        return true;
+        return Ok(true);
     }
     let Some(magic) = word(bytes, 0, false) else {
-        return false;
+        return Ok(false);
     };
     let fat64 = matches!(magic, 0xcafebabf | 0xbfbafeca);
     let little = matches!(magic, 0xbebafeca | 0xbfbafeca);
     if !matches!(magic, 0xcafebabe | 0xbebafeca | 0xcafebabf | 0xbfbafeca) {
-        return false;
+        return Ok(false);
     }
     let Some(count) = word(bytes, 4, little).filter(|value| (1..=64).contains(value)) else {
-        return false;
+        return Ok(false);
     };
     let stride = if fat64 { 32 } else { 20 };
     let table_end = 8 + count as usize * stride;
-    if table_end > bytes.len() {
-        return false;
+    if table_end as u64 > file_size {
+        return Ok(false);
     }
+    reader.rewind()?;
+    let mut table = vec![0; table_end];
+    reader.read_exact(&mut table)?;
+    let bytes = &table;
     for index in 0..count as usize {
         let entry = 8 + index * stride;
         if word(bytes, entry, little) != Some(cpu) {
@@ -95,16 +127,23 @@ fn native_executable(bytes: &[u8], platform: &str) -> bool {
         } else {
             word(bytes, entry + 12, little).map(|v| v as usize)
         };
-        return offset.zip(size).is_some_and(|(offset, size)| {
-            offset >= table_end
-                && size >= 32
-                && offset
-                    .checked_add(size)
-                    .and_then(|end| bytes.get(offset..end))
-                    .is_some_and(|slice| thin(slice, cpu))
-        });
+        let Some((offset, slice_size)) = offset.zip(size) else {
+            return Ok(false);
+        };
+        if offset < table_end
+            || slice_size < 32
+            || (offset as u64)
+                .checked_add(slice_size as u64)
+                .is_none_or(|end| end > file_size)
+        {
+            return Ok(false);
+        }
+        reader.seek(SeekFrom::Start(offset as u64))?;
+        let mut slice = [0; 32];
+        reader.read_exact(&mut slice)?;
+        return Ok(thin(&slice, cpu));
     }
-    false
+    Ok(false)
 }
 
 fn ffmpeg_dll(name: &str) -> bool {
@@ -761,13 +800,10 @@ pub(crate) async fn update(app: &App, args: &Value) -> Result<Value> {
     if ffmpeg {
         let client = runtime_client(&app.download_proxy()?)?;
         let (repository, release, mode) = tokio::select! {result=ffmpeg_release(app,args,&client)=>result?,_=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted")};
-        return tokio::select! {result=update_inner(app,name,repository,"",source,Some((release,mode)))=>result,_=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted")};
+        return update_inner(app, name, repository, "", source, Some((release, mode))).await;
     }
     let (repository, release_url) = selection.context("Runtime selection is missing")?;
-    tokio::select! {
-        result=update_inner(app,name,repository,&release_url,source,None)=>result,
-        _=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted"),
-    }
+    update_inner(app, name, repository, &release_url, source, None).await
 }
 
 fn runtime_client(proxy: &str) -> Result<reqwest::Client> {
@@ -966,7 +1002,10 @@ async fn verified_download(
     client: &reqwest::Client,
     urls: &[String],
     digest: &str,
-) -> Result<Vec<u8>> {
+    directory: &Path,
+    cancel: &CancellationToken,
+) -> Result<tempfile::NamedTempFile> {
+    use tokio::io::AsyncWriteExt;
     let mut failures = Vec::new();
     for (index, url) in urls.iter().enumerate() {
         let result = async {
@@ -976,22 +1015,38 @@ async fn verified_download(
             } else {
                 request
             };
-            let response = request.send().await.map_err(|e| e.without_url())?;
+            let mut response = tokio::select! {result=request.send()=>result.map_err(|e| e.without_url())?,_=cancel.cancelled()=>bail!("Runtime update interrupted")};
             anyhow::ensure!(
                 response.status().is_success(),
                 "HTTP {}",
                 response.status().as_u16()
             );
-            let bytes = bounded_response(response, 512 * 1024 * 1024).await?;
+            anyhow::ensure!(response.content_length().is_none_or(|size| size <= 512 * 1024 * 1024), "Runtime response is too large");
+            let archive = tempfile::NamedTempFile::new_in(directory)?;
+            let mut output = tokio::fs::File::from_std(archive.reopen()?);
+            let mut hash = Sha256::new();
+            let mut size = 0usize;
+            loop {
+                let chunk = tokio::select! {chunk=response.chunk()=>chunk.map_err(|e| e.without_url())?,_=cancel.cancelled()=>bail!("Runtime update interrupted")};
+                let Some(chunk) = chunk else { break; };
+                anyhow::ensure!(chunk.len() <= (512 * 1024 * 1024_usize).saturating_sub(size), "Runtime response is too large");
+                size += chunk.len();
+                hash.update(&chunk);
+                tokio::select! {written=output.write_all(&chunk)=>written?,_=cancel.cancelled()=>bail!("Runtime update interrupted")};
+            }
+            output.flush().await?;
+            output.sync_data().await?;
+            drop(output);
             anyhow::ensure!(
-                hex::encode(Sha256::digest(&bytes)) == digest.to_ascii_lowercase(),
+                hex::encode(hash.finalize()) == digest.to_ascii_lowercase(),
                 "Runtime archive checksum mismatch"
             );
-            Ok::<_, anyhow::Error>(bytes)
+            Ok::<_, anyhow::Error>(archive)
         }
         .await;
         match result {
             Ok(bytes) => return Ok(bytes),
+            Err(error) if cancel.is_cancelled() => return Err(error),
             Err(error) => failures.push(format!(
                 "{}: {error:#}",
                 url::Url::parse(url)?.host_str().unwrap_or("download")
@@ -1168,51 +1223,56 @@ async fn update_inner(
     let (ffmpeg_release, ffmpeg_mode) = ffmpeg
         .map(|(release, mode)| (Some(release), Some(mode)))
         .unwrap_or((None, None));
-    let mut release: Value = if let Some(release) = ffmpeg_release {
-        release
-    } else if name == "yt-dlp" {
-        // Official release checksum assets avoid the unauthenticated GitHub API quota.
-        let base = if release_url.ends_with("/latest/download") {
-            format!(
-                "https://github.com/{repository}/releases/download/{}",
-                latest_version(&client, repository).await?
-            )
+    let release_query = async {
+        Ok::<Value, anyhow::Error>(if let Some(release) = ffmpeg_release {
+            release
+        } else if name == "yt-dlp" {
+            // Official release checksum assets avoid the unauthenticated GitHub API quota.
+            let base = if release_url.ends_with("/latest/download") {
+                format!(
+                    "https://github.com/{repository}/releases/download/{}",
+                    latest_version(&client, repository).await?
+                )
+            } else {
+                release_url.to_string()
+            };
+            let response = client
+                .get(format!("{base}/SHA2-256SUMS"))
+                .timeout(std::time::Duration::from_secs(20))
+                .send()
+                .await
+                .map_err(|e| e.without_url())
+                .context("Cannot download official yt-dlp checksums from GitHub")?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                bail!(
+                    "Runtime release not found for yt-dlp; check the channel and exact release tag"
+                );
+            }
+            ensure!(
+                response.status().is_success(),
+                "Cannot download official yt-dlp runtime checksums from GitHub: HTTP {}",
+                response.status().as_u16()
+            );
+            let sums = String::from_utf8(bounded_response(response, 256 * 1024).await?)
+                .context("Invalid official runtime checksum file")?;
+            let digest = checksum_for(&sums, initial_asset_name)?;
+            json!({"assets":[{"name":initial_asset_name,"digest":format!("sha256:{digest}"),"browser_download_url":format!("{base}/{initial_asset_name}")}]})
         } else {
-            release_url.to_string()
-        };
-        let response = client
-            .get(format!("{base}/SHA2-256SUMS"))
-            .timeout(std::time::Duration::from_secs(20))
-            .send()
-            .await
-            .map_err(|e| e.without_url())
-            .context("Cannot download official yt-dlp checksums from GitHub")?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!("Runtime release not found for yt-dlp; check the channel and exact release tag");
-        }
-        ensure!(
-            response.status().is_success(),
-            "Cannot download official yt-dlp runtime checksums from GitHub: HTTP {}",
-            response.status().as_u16()
-        );
-        let sums = String::from_utf8(bounded_response(response, 256 * 1024).await?)
-            .context("Invalid official runtime checksum file")?;
-        let digest = checksum_for(&sums, initial_asset_name)?;
-        json!({"assets":[{"name":initial_asset_name,"digest":format!("sha256:{digest}"),"browser_download_url":format!("{base}/{initial_asset_name}")}]})
-    } else {
-        let response = client
-            .get(release_url)
-            .send()
-            .await
-            .map_err(|e| e.without_url())
-            .with_context(|| format!("Cannot connect to GitHub to query {name} release"))?;
-        ensure!(
-            response.status().is_success(),
-            "Cannot query {name} runtime release from GitHub: HTTP {}",
-            response.status().as_u16()
-        );
-        serde_json::from_slice(&bounded_response(response, 2 * 1024 * 1024).await?)?
+            let response = client
+                .get(release_url)
+                .send()
+                .await
+                .map_err(|e| e.without_url())
+                .with_context(|| format!("Cannot connect to GitHub to query {name} release"))?;
+            ensure!(
+                response.status().is_success(),
+                "Cannot query {name} runtime release from GitHub: HTTP {}",
+                response.status().as_u16()
+            );
+            serde_json::from_slice(&bounded_response(response, 2 * 1024 * 1024).await?)?
+        })
     };
+    let mut release: Value = tokio::select! { result=release_query=>result?,_=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted") };
     let split_ffmpeg = platform.starts_with("darwin-") && matches!(name, "ffmpeg" | "ffprobe");
     let asset_names = if let Some(mode) = &ffmpeg_mode {
         ffmpeg_assets(&release, &platform, mode)?
@@ -1225,9 +1285,11 @@ async fn update_inner(
         vec![initial_asset_name.to_string()]
     };
     if ffmpeg_mode.is_some() {
-        fill_ffmpeg_checksums(&client, &mut release, repository, &asset_names).await?;
+        tokio::select! { result=fill_ffmpeg_checksums(&client, &mut release, repository, &asset_names)=>result?,_=app.shutdown_token.cancelled()=>bail!("Runtime update interrupted") };
     }
     let selected_assets = asset_names.clone();
+    let directory = app.config.data_dir.join("tools");
+    std::fs::create_dir_all(&directory)?;
     let mut downloads = Vec::new();
     let mut digests = Vec::new();
     for filename in asset_names {
@@ -1236,7 +1298,8 @@ async fn update_inner(
             url.as_str(),
             if name == "yt-dlp" { source } else { "github" },
         );
-        let archive = verified_download(&client, &urls, &digest).await?;
+        let archive =
+            verified_download(&client, &urls, &digest, &directory, &app.shutdown_token).await?;
         downloads.push((archive, filename.to_string()));
         digests.push(digest);
     }
@@ -1245,8 +1308,6 @@ async fn update_inner(
     } else {
         hex::encode(Sha256::digest(digests.join("\n")))
     };
-    let directory = app.config.data_dir.join("tools");
-    std::fs::create_dir_all(&directory)?;
     let group = if name == "ffprobe" { "ffmpeg" } else { name };
     let version_dir = directory.join(format!("{group}-{}", &digest[..16]));
     let temporary = tempfile::tempdir_in(&directory)?;
@@ -1259,33 +1320,25 @@ async fn update_inner(
         .iter()
         .map(|name| format!("{name}{}", std::env::consts::EXE_SUFFIX))
         .collect::<Vec<_>>();
-    let extraction_dir = temporary.path().to_path_buf();
-    let extracted_names = filenames.clone();
-    let extracted = tokio::task::spawn_blocking(move || {
-        let mut extracted = Vec::new();
-        for (index, (archive, format)) in downloads.into_iter().enumerate() {
-            let wanted = if split_ffmpeg {
-                &extracted_names[index..index + 1]
-            } else {
-                &extracted_names[..]
-            };
-            extracted.extend(extract_archive(&archive, &format, wanted, &extraction_dir)?);
-        }
-        Ok::<_, anyhow::Error>(extracted)
-    })
-    .await??;
+    let (temporary, extracted) = extract_downloads(
+        downloads,
+        split_ffmpeg,
+        filenames.clone(),
+        temporary,
+        &app.shutdown_token,
+    )
+    .await?;
     for filename in extracted.iter().filter(|filename| ffmpeg_dll(filename)) {
         ensure!(
-            native_executable(&std::fs::read(temporary.path().join(filename))?, &platform),
+            native_file(&temporary.path().join(filename), &platform)?,
             "Runtime DLL is not a native library"
         );
     }
     let mut tested_versions = BTreeMap::new();
     for (tool, filename) in wanted.iter().zip(&filenames) {
         let path = temporary.path().join(filename);
-        let header = std::fs::read(&path)?;
         ensure!(
-            native_executable(&header, &platform),
+            native_file(&path, &platform)?,
             "Runtime payload is not a native executable"
         );
         #[cfg(unix)]
@@ -1396,8 +1449,8 @@ async fn update_inner(
     if version_dir.exists() {
         for filename in &extracted {
             ensure!(
-                std::fs::read(version_dir.join(filename))?
-                    == std::fs::read(temporary.path().join(filename))?,
+                file_digest(&version_dir.join(filename))?
+                    == file_digest(&temporary.path().join(filename))?,
                 "Existing runtime version differs; refusing replacement"
             );
         }
@@ -1432,6 +1485,46 @@ async fn update_inner(
     Ok(value)
 }
 
+async fn extract_downloads(
+    downloads: Vec<(tempfile::NamedTempFile, String)>,
+    split_ffmpeg: bool,
+    extracted_names: Vec<String>,
+    temporary: tempfile::TempDir,
+    cancel: &CancellationToken,
+) -> Result<(tempfile::TempDir, Vec<String>)> {
+    let extraction_cancel = cancel.child_token();
+    struct CancelOnDrop(CancellationToken);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let _cancel_worker = CancelOnDrop(extraction_cancel.clone());
+    tokio::task::spawn_blocking(move || {
+        let mut extracted = Vec::new();
+        for (index, (archive, format)) in downloads.into_iter().enumerate() {
+            let wanted = if split_ffmpeg {
+                &extracted_names[index..index + 1]
+            } else {
+                &extracted_names[..]
+            };
+            extracted.extend(extract_archive_file(
+                archive.path(),
+                &format,
+                wanted,
+                temporary.path(),
+                &extraction_cancel,
+            )?);
+        }
+        anyhow::ensure!(
+            !extraction_cancel.is_cancelled(),
+            "Runtime update interrupted"
+        );
+        Ok::<_, anyhow::Error>((temporary, extracted))
+    })
+    .await?
+}
+
 fn target() -> Result<String> {
     let os = if cfg!(windows) {
         "windows"
@@ -1464,15 +1557,80 @@ async fn bounded_response(mut response: reqwest::Response, limit: usize) -> Resu
     }
     Ok(bytes)
 }
+#[cfg(test)]
 fn extract_archive(
     archive: &[u8],
     name: &str,
     wanted: &[String],
     destination: &Path,
 ) -> Result<Vec<String>> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(archive)?;
+    extract_archive_file(
+        file.path(),
+        name,
+        wanted,
+        destination,
+        &CancellationToken::new(),
+    )
+}
+
+struct CancellableReader<R> {
+    reader: R,
+    cancel: CancellationToken,
+}
+impl<R: Read> Read for CancellableReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::other("Runtime update interrupted"));
+        }
+        self.reader.read(output)
+    }
+}
+impl<R: Seek> Seek for CancellableReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::other("Runtime update interrupted"));
+        }
+        self.reader.seek(position)
+    }
+}
+
+fn copy_runtime(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    limit: u64,
+    cancel: &CancellationToken,
+) -> Result<u64> {
+    let mut chunk = [0; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        anyhow::ensure!(!cancel.is_cancelled(), "Runtime update interrupted");
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        anyhow::ensure!(
+            count as u64 <= limit.saturating_sub(total),
+            "Runtime binary is too large"
+        );
+        writer.write_all(&chunk[..count])?;
+        total += count as u64;
+    }
+    Ok(total)
+}
+
+fn extract_archive_file(
+    archive: &Path,
+    name: &str,
+    wanted: &[String],
+    destination: &Path,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>> {
     use std::io::{Read, Write};
+    anyhow::ensure!(!cancel.is_cancelled(), "Runtime update interrupted");
     if name.ends_with(".7z") {
-        return extract_system_archive(archive, wanted, destination);
+        return extract_system_archive(archive, wanted, destination, cancel);
     }
     let mut found = std::collections::HashSet::new();
     let mut save = |path: &Path, reader: &mut dyn Read, size: u64| -> Result<()> {
@@ -1499,14 +1657,17 @@ fn extract_archive(
             .write(true)
             .create_new(true)
             .open(destination.join(filename))?;
-        let written = std::io::copy(&mut reader.take(256 * 1024 * 1024 + 1), &mut file)?;
-        anyhow::ensure!(written <= 256 * 1024 * 1024, "Runtime binary is too large");
+        copy_runtime(reader, &mut file, 256 * 1024 * 1024, cancel)?;
         file.flush()?;
         Ok(())
     };
     if name.ends_with(".zip") {
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(archive))?;
+        let mut archive = zip::ZipArchive::new(CancellableReader {
+            reader: std::fs::File::open(archive)?,
+            cancel: cancel.clone(),
+        })?;
         for i in 0..archive.len() {
+            anyhow::ensure!(!cancel.is_cancelled(), "Runtime update interrupted");
             let mut entry = archive.by_index(i)?;
             let path = entry
                 .enclosed_name()
@@ -1519,9 +1680,12 @@ fn extract_archive(
             }
         }
     } else if name.ends_with(".tar.xz") {
-        let mut archive =
-            tar::Archive::new(xz2::read::XzDecoder::new(std::io::Cursor::new(archive)));
+        let mut archive = tar::Archive::new(xz2::read::XzDecoder::new(CancellableReader {
+            reader: std::fs::File::open(archive)?,
+            cancel: cancel.clone(),
+        }));
         for entry in archive.entries()? {
+            anyhow::ensure!(!cancel.is_cancelled(), "Runtime update interrupted");
             let mut entry = entry?;
             let path = entry.path()?.into_owned();
             anyhow::ensure!(
@@ -1536,8 +1700,9 @@ fn extract_archive(
         }
     } else {
         anyhow::ensure!(wanted.len() == 1, "Invalid standalone runtime");
-        let mut reader = std::io::Cursor::new(archive);
-        save(Path::new(&wanted[0]), &mut reader, archive.len() as u64)?;
+        let mut reader = std::fs::File::open(archive)?;
+        let size = reader.metadata()?.len();
+        save(Path::new(&wanted[0]), &mut reader, size)?;
     }
     anyhow::ensure!(
         wanted.iter().all(|name| found.contains(name)),
@@ -1568,22 +1733,45 @@ fn extract_archive(
 }
 
 #[cfg(not(windows))]
-fn extract_system_archive(_: &[u8], _: &[String], _: &Path) -> Result<Vec<String>> {
+fn extract_system_archive(
+    _: &Path,
+    _: &[String],
+    _: &Path,
+    _: &CancellationToken,
+) -> Result<Vec<String>> {
     bail!("This runtime archive requires Windows system tar")
 }
 
 #[cfg(windows)]
 fn extract_system_archive(
-    archive: &[u8],
+    archive: &Path,
     wanted: &[String],
     destination: &Path,
+    cancel: &CancellationToken,
 ) -> Result<Vec<String>> {
     use std::{
         os::windows::process::CommandExt,
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
-    fn output(tar: &Path, archive: &Path, member: Option<&str>, limit: u64) -> Result<Vec<u8>> {
+    struct TarProcess {
+        child: std::process::Child,
+        tree: crate::process::ProcessTree,
+    }
+    impl Drop for TarProcess {
+        fn drop(&mut self) {
+            self.tree.terminate();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+    fn output(
+        tar: &Path,
+        archive: &Path,
+        member: Option<&str>,
+        limit: u64,
+        cancel: &CancellationToken,
+    ) -> Result<tempfile::NamedTempFile> {
         let file = tempfile::NamedTempFile::new()?;
         let mut command = Command::new(tar);
         command
@@ -1599,23 +1787,31 @@ fn extract_system_archive(
             .creation_flags(0x08000000)
             .spawn()
             .context("Cannot start Windows system tar")?;
+        let tree = match crate::process::ProcessTree::attach(child.id()) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        let mut process = TarProcess { child, tree };
         let started = Instant::now();
         loop {
+            anyhow::ensure!(!cancel.is_cancelled(), "Runtime update interrupted");
             if file.as_file().metadata()?.len() > limit
                 || started.elapsed() > Duration::from_secs(60)
             {
-                let _ = child.kill();
-                let _ = child.wait();
                 bail!("Runtime archive extraction exceeded its size or time limit");
             }
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = process.child.try_wait()? {
                 anyhow::ensure!(
                     status.success(),
                     "Windows system tar could not read the verified runtime archive"
                 );
                 let size = file.as_file().metadata()?.len();
                 anyhow::ensure!(size <= limit, "Runtime archive output is too large");
-                return Ok(std::fs::read(file.path())?);
+                return Ok(file);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1624,11 +1820,9 @@ fn extract_system_archive(
         std::env::var_os("SystemRoot").context("Windows system directory is unavailable")?,
     )
     .join("System32/tar.exe");
-    let mut file = tempfile::Builder::new().suffix(".7z").tempfile()?;
-    file.write_all(archive)?;
-    file.flush()?;
-    let listed = String::from_utf8(output(&tar, file.path(), None, 4 * 1024 * 1024)?)
-        .context("Invalid runtime archive listing")?;
+    let listing = output(&tar, archive, None, 4 * 1024 * 1024, cancel)?;
+    let listed =
+        std::fs::read_to_string(listing.path()).context("Invalid runtime archive listing")?;
     let members = listed.lines().collect::<Vec<_>>();
     let mut found = Vec::new();
     for filename in wanted {
@@ -1657,12 +1851,17 @@ fn extract_system_archive(
                     && !part.contains(':')),
             "Unsafe runtime archive path"
         );
-        let bytes = output(&tar, file.path(), Some(member), 256 * 1024 * 1024)?;
+        let payload = output(&tar, archive, Some(member), 256 * 1024 * 1024, cancel)?;
         let mut saved = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(destination.join(filename))?;
-        saved.write_all(&bytes)?;
+        copy_runtime(
+            &mut std::fs::File::open(payload.path())?,
+            &mut saved,
+            256 * 1024 * 1024,
+            cancel,
+        )?;
         saved.flush()?;
         found.push(filename.clone());
     }
@@ -1686,9 +1885,15 @@ pub(crate) async fn check(app: &App) -> Result<Value> {
                 } else {
                     "--version"
                 };
-                let result =
-                    crate::process::run(&path, &[flag.into()], None, &app.shutdown_token, None)
-                        .await;
+                let result = crate::process::run_limited(
+                    &path,
+                    &[flag.into()],
+                    None,
+                    &app.shutdown_token,
+                    512 * 1024,
+                    std::time::Duration::from_secs(15),
+                )
+                .await;
                 match result {
                     Ok(output) => {
                         json!({"name":name,"available":true,"version":output.stdout.lines().next().unwrap_or("")})
@@ -2063,6 +2268,8 @@ mod tests {
             .build()?;
         let expected = b"MZverified fixture";
         let digest = hex::encode(Sha256::digest(expected));
+        let directory = tempfile::tempdir()?;
+        let cancel = CancellationToken::new();
         for (status, bad) in [
             (403, b"rate limited".as_slice()),
             (429, b"try later".as_slice()),
@@ -2071,7 +2278,11 @@ mod tests {
             let (direct, first) = download_fixture(status, bad).await?;
             let (cdn, second) = download_fixture(200, expected).await?;
             assert_eq!(
-                verified_download(&client, &[direct, cdn], &digest).await?,
+                std::fs::read(
+                    verified_download(&client, &[direct, cdn], &digest, directory.path(), &cancel)
+                        .await?
+                        .path()
+                )?,
                 expected
             );
             first.await??;
@@ -2079,13 +2290,109 @@ mod tests {
         }
         let (cdn, fixture) = download_fixture(200, b"MZuntrusted replacement").await?;
         assert!(
-            verified_download(&client, &[cdn], &digest)
+            verified_download(&client, &[cdn], &digest, directory.path(), &cancel)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("checksum mismatch")
         );
         fixture.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_streamed_runtime_download_removes_the_partial_archive() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/runtime", listener.local_addr()?);
+        let (sent, started) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await?;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4194304\r\n\r\npartial archive")
+                .await?;
+            let _ = sent.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok::<_, anyhow::Error>(())
+        });
+        let directory = tempfile::tempdir()?;
+        let cancel = CancellationToken::new();
+        let stopped = cancel.clone();
+        let control = tokio::spawn(async move {
+            started.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            stopped.cancel();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            verified_download(
+                &reqwest::Client::builder().no_proxy().build()?,
+                &[url],
+                &"0".repeat(64),
+                directory.path(),
+                &cancel,
+            ),
+        )
+        .await?;
+        server.abort();
+        let _ = server.await;
+        control.await?;
+        assert!(result.unwrap_err().to_string().contains("interrupted"));
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_extraction_joins_its_worker_before_removing_owned_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut archive = tempfile::NamedTempFile::new_in(directory.path())?;
+        archive.write_all(b"unused cancelled archive")?;
+        let archive_path = archive.path().to_path_buf();
+        let extraction = tempfile::tempdir_in(directory.path())?;
+        let extraction_path = extraction.path().to_path_buf();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = extract_downloads(
+            vec![(archive, "runtime.exe".into())],
+            false,
+            vec!["runtime.exe".into()],
+            extraction,
+            &cancel,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("interrupted"));
+        assert!(!archive_path.exists());
+        assert!(!extraction_path.exists());
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_copy_observes_cancellation_between_bounded_chunks() -> Result<()> {
+        struct CancelAfterRead {
+            cancel: CancellationToken,
+        }
+        impl Read for CancelAfterRead {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                output.fill(b'x');
+                self.cancel.cancel();
+                Ok(output.len())
+            }
+        }
+        let cancel = CancellationToken::new();
+        let mut output = Vec::new();
+        let result = copy_runtime(
+            &mut CancelAfterRead {
+                cancel: cancel.clone(),
+            },
+            &mut output,
+            256 * 1024 * 1024,
+            &cancel,
+        );
+        assert!(result.unwrap_err().to_string().contains("interrupted"));
+        assert!(output.len() <= 64 * 1024);
         Ok(())
     }
 
