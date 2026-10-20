@@ -1315,8 +1315,7 @@ fn encoder_args(encoder: &str, plan: &Plan, hardware_decode: bool) -> Vec<String
     args
 }
 
-fn input_args(encoder: &str, path: &Path) -> Vec<String> {
-    let budget = ThreadBudget::detected(encoder == "libx265");
+fn input_args(encoder: &str, path: &Path, budget: ThreadBudget) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -1421,7 +1420,11 @@ async fn verified_cuda_decode(
     let executable = app.task_tool(task, "ffmpeg").await?;
     let mut reference = None;
     for hardware in [false, true] {
-        let input = input_args(&plan.encoder, &source.key.path);
+        let input = input_args(
+            &plan.encoder,
+            &source.key.path,
+            ThreadBudget::detected(plan.encoder == "libx265"),
+        );
         let mut args = if hardware {
             with_cuda_decode(input)
         } else {
@@ -1657,7 +1660,8 @@ async fn capabilities(
                 .prefix(".compression-probe-")
                 .tempdir_in(&app.config.data_dir)?;
             let output = workspace.path().join("probe.mkv");
-            let mut args = input_args(encoder, &source.key.path);
+            let budget = ThreadBudget::for_cores(1, encoder == "libx265");
+            let mut args = input_args(encoder, &source.key.path, budget);
             args.extend([
                 "-map".into(),
                 format!("0:{}", source.video["index"]),
@@ -1669,12 +1673,14 @@ async fn capabilities(
                 encoder.into(),
                 "-b:v".into(),
                 plan.bitrate.to_string(),
+                "-threads:v:0".into(),
+                budget.encoder.to_string(),
             ]);
             args.extend(encoder_args(encoder, plan, false));
             if encoder == "libx265" {
                 let mut params = vec![format!(
                     "pools={}:frame-threads=1:log-level=error",
-                    ThreadBudget::detected(true).encoder
+                    budget.encoder
                 )];
                 params.extend(hdr_params(source));
                 params.extend(x265_colors(source));
@@ -1683,17 +1689,9 @@ async fn capabilities(
             args.extend(color_args(source));
             args.push(output.to_string_lossy().into());
             let probe_cancel = cancel.child_token();
-            let permit = if encoder == "libx265" {
-                app.resource_permit(&task.id, "cpu", cancel).await?
-            } else {
-                app.gpu_permit(
-                    &task.id,
-                    encoder == "hevc_nvenc" && cuda_decode_eligible(source, plan),
-                    task,
-                    cancel,
-                )
-                .await?
-            };
+            let permit = app
+                .encoder_probe_permit(&task.id, encoder != "libx265", cancel)
+                .await?;
             let process = process::run(&executable, &args, None, &probe_cancel, None);
             tokio::pin!(process);
             let encoded = tokio::select! {result=&mut process=>result,_=tokio::time::sleep(Duration::from_secs(5))=>{probe_cancel.cancel();let _=process.await;Err(anyhow::anyhow!("Encoder capability probe timed out"))}};
@@ -1824,7 +1822,8 @@ async fn encode_video(
     let fixed_streams = streams(&source.probe)
         .filter(|stream| stream["index"].as_u64() != Some(video_index))
         .collect::<Vec<_>>();
-    let mut base = input_args(&plan.encoder, path);
+    let budget = ThreadBudget::detected(plan.encoder == "libx265");
+    let mut base = input_args(&plan.encoder, path, budget);
     let output = workspace.join("compressed.mkv");
     if hardware_decode {
         base = with_cuda_decode(base);
@@ -1870,16 +1869,14 @@ async fn encode_video(
         "-b:v:0".into(),
         plan.bitrate.to_string(),
         "-threads".into(),
-        ThreadBudget::detected(plan.encoder == "libx265")
-            .encoder
-            .to_string(),
+        budget.encoder.to_string(),
     ]);
     args.extend(encoder_args(&plan.encoder, plan, hardware_decode));
     args.extend(["-fps_mode:v:0".into(), "passthrough".into()]);
     args.extend(color_args(source));
     if plan.encoder == "libx265" {
         let mut params = vec![
-            format!("pools={}", ThreadBudget::detected(true).encoder),
+            format!("pools={}", budget.encoder),
             "frame-threads=1".into(),
         ];
         params.extend(hdr_params(source));
@@ -2546,7 +2543,11 @@ mod tests {
         plan.fps = Some("24".into());
         assert!(!cuda_decode_eligible(&source, &plan));
         plan.fps = None;
-        let input = input_args("hevc_nvenc", Path::new("source.mkv"));
+        let input = input_args(
+            "hevc_nvenc",
+            Path::new("source.mkv"),
+            ThreadBudget::detected(false),
+        );
         let mut args = with_cuda_decode(input.clone());
         args.extend(["-c:v:0".into(), "hevc_nvenc".into()]);
         args.extend(encoder_args("hevc_nvenc", &plan, true));
@@ -3099,6 +3100,18 @@ fn main() {{
                 "Preview launched an unbounded video scan: {line}"
             );
         }
+        for line in recorded
+            .lines()
+            .filter(|line| line.contains("-frames:v 1 "))
+        {
+            assert!(
+                line.contains("-threads 1 -filter_threads 1") && line.contains("-threads:v:0 1"),
+                "One-frame capability check used unbounded threads: {line}"
+            );
+            if line.contains("-c:v libx265") {
+                assert!(line.contains("pools=1:frame-threads=1"));
+            }
+        }
 
         let mut probe_task = task.clone();
         probe_task.tools = current_tools(&app, &CancellationToken::new()).await?;
@@ -3262,6 +3275,11 @@ fn main() {{
             64,
             "Background checksum was not persisted before analysis"
         );
+        CAPABILITIES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .retain(|(key, _)| key.0.path != path);
         // The child remains at an explicit barrier even if both progress lines arrive together.
         // A sampled preview must finish before that full-file scan is allowed to finish.
         tokio::time::timeout(

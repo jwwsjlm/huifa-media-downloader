@@ -143,6 +143,22 @@ impl App {
         })
     }
 
+    pub(crate) async fn encoder_probe_permit(
+        &self,
+        id: &str,
+        gpu: bool,
+        cancel: &CancellationToken,
+    ) -> Result<OwnedSemaphorePermit> {
+        // One-frame checks use bounded threads and must not wait for a full scan's thread budget.
+        if gpu {
+            self.task_permit_many(id, "gpu", &self.resources.gpu, 2, cancel)
+                .await
+        } else {
+            self.task_permit(id, "cpu", &self.resources.cpu, cancel)
+                .await
+        }
+    }
+
     pub(crate) async fn gpu_permit(
         &self,
         id: &str,
