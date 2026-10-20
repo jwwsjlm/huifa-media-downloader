@@ -122,10 +122,11 @@ fn config(root: &Path) -> AppConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires HUIFA_TEST_MEDIA and installed tools; reads an existing local video without compressing it"]
 async fn real_compression_previews_existing_media_with_bounded_analysis() -> Result<()> {
-    let source = PathBuf::from(
-        std::env::var_os("HUIFA_TEST_MEDIA").context("Set HUIFA_TEST_MEDIA to a local video")?,
-    )
-    .canonicalize()?;
+    let Some(source) = std::env::var_os("HUIFA_TEST_MEDIA") else {
+        eprintln!("Existing media preview skipped: set HUIFA_TEST_MEDIA to a local video");
+        return Ok(());
+    };
+    let source = PathBuf::from(source).canonicalize()?;
     let before = std::fs::metadata(&source)?;
     let root = tempfile::tempdir()?;
     let mut configuration = config(root.path());
