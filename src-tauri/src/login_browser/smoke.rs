@@ -438,6 +438,8 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                     navigation::command(toolbar.clone(), "reload", None).await?;
                     wait_navigation(&toolbar, "/second").await?;
                     wait_page_ready(&fixture.second_ready, generation).await?;
+                    // This isolated app has no desktop host loop; run its synchronization step explicitly.
+                    browser.sync(&handle, &core).await?;
                     let status = browser.command(&handle, &core, "browser.login.status", &json!({})).await?;
                     ensure!(status["preferredUrl"] == second && status["preferredMode"] == "embedded", "Navigation did not update saved browser preferences");
                     let reopened = LoginBrowser::new(browser.directory.clone())?;
@@ -564,6 +566,7 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                     wait_cookie(&browser, &handle, "domain_sid")
                         .await
                         .context("Compatible browser did not receive cookies")?;
+                    browser.sync(&handle, &core).await?;
                     {
                         let running = browser.running.lock().await;
                         let Session::System { cdp, .. } = running.as_ref().unwrap() else { unreachable!() };
@@ -576,6 +579,8 @@ fn real_login_cookie_export_persistence_popups_and_ipc_isolation() -> Result<()>
                     }
                     let status = tokio::time::timeout(Duration::from_secs(10), async {
                         loop {
+                            // Match the host poll: closing the last page may disconnect CDP during this tick.
+                            let _ = browser.sync(&handle, &core).await;
                             let status = browser.command(&handle, &core, "browser.login.status", &json!({})).await?;
                             if status["active"] == false {
                                 return Ok::<_, anyhow::Error>(status);

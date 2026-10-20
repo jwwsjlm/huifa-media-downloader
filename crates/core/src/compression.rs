@@ -2941,6 +2941,7 @@ mod tests {
         std::fs::create_dir_all(&runtime)?;
         let calls = root.path().join("calls.txt");
         let full_scan = root.path().join("full-scan");
+        let full_scan_started = root.path().join("full-scan-started");
         let static_hdr = root.path().join("static-hdr");
         let audio_only = root.path().join("audio-only");
         let survived = root.path().join("survived-timeout");
@@ -2974,12 +2975,12 @@ fn main() {{
         }}
         let full = !args.iter().any(|arg| arg == "-read_intervals");
         if full && !std::path::Path::new({full_scan:?}).exists() {{
-            println!("width=160|height=90|pix_fmt=yuv420p|interlaced_frame=0|best_effort_timestamp_time=3600|duration_time=0.04");
+            std::io::stdout().write_all(b"width=160|height=90|pix_fmt=yuv420p|interlaced_frame=0|best_effort_timestamp_time=3600|duration_time=0.04\nwidth=160|height=90|pix_fmt=yuv420p|interlaced_frame=0|best_effort_timestamp_time=4500|duration_time=0.04\n").unwrap();
             std::io::stdout().flush().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            println!("width=160|height=90|pix_fmt=yuv420p|interlaced_frame=0|best_effort_timestamp_time=4500|duration_time=0.04");
-            std::io::stdout().flush().unwrap();
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::fs::write({full_scan_started:?}, b"full scan reached barrier").unwrap();
+            while !std::path::Path::new({full_scan:?}).exists() {{
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }}
             std::fs::write({survived:?}, b"cancelled probe survived").unwrap();
         }}
         if args.iter().any(|arg| arg == "-show_frames") {{
@@ -3008,6 +3009,7 @@ fn main() {{
 "#,
                 calls = calls.to_string_lossy(),
                 full_scan = full_scan.to_string_lossy(),
+                full_scan_started = full_scan_started.to_string_lossy(),
                 static_hdr = static_hdr.to_string_lossy(),
                 audio_only = audio_only.to_string_lossy(),
                 survived = survived.to_string_lossy(),
@@ -3233,11 +3235,8 @@ fn main() {{
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let current = app.db.task(queued_id)?;
-                if current.stage == "compression_scanning"
-                    && current
-                        .stage_progress
-                        .is_some_and(|progress| progress >= 20.0)
-                {
+                if full_scan_started.exists() {
+                    assert_eq!(current.stage, "compression_scanning");
                     break Ok::<_, anyhow::Error>(());
                 }
                 ensure!(
@@ -3248,16 +3247,13 @@ fn main() {{
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await??;
+        .await
+        .context("Full source scan did not reach its test barrier")??;
         let snapshot = app
             .command("snapshot", json!({"includeTools":false}))
             .await?;
         assert!(snapshot["tasks"].as_array().unwrap().iter().any(|current| {
-            current["id"] == queued_id
-                && current["stage"] == "compression_scanning"
-                && current["stageProgress"]
-                    .as_f64()
-                    .is_some_and(|progress| progress > 0.0)
+            current["id"] == queued_id && current["stage"] == "compression_scanning"
         }));
         assert_eq!(
             app.db.task(queued_id)?.manifest.unwrap().files[0]
@@ -3266,7 +3262,8 @@ fn main() {{
             64,
             "Background checksum was not persisted before analysis"
         );
-        // A sampled preview must not wait behind another task's full-file scan.
+        // The child remains at an explicit barrier even if both progress lines arrive together.
+        // A sampled preview must finish before that full-file scan is allowed to finish.
         tokio::time::timeout(
             Duration::from_secs(5),
             app.command(
@@ -3274,7 +3271,13 @@ fn main() {{
                 json!({"id":task.id,"compression":{}}),
             ),
         )
-        .await??;
+        .await
+        .context("Sampled preview waited behind an active full source scan")??;
+        assert!(
+            !full_scan.exists(),
+            "Preview released the full source scan barrier"
+        );
+        assert_eq!(app.db.task(queued_id)?.status, "processing");
         tokio::time::timeout(
             Duration::from_secs(5),
             app.command("tasks.cancel", json!({"id":queued_id})),
