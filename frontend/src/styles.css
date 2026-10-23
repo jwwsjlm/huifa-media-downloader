@@ -290,6 +290,9 @@ details[open]>summary::after{transform:rotate(225deg)}
 .status-count.success{color:var(--success)}
 .status-count.accent{color:var(--accent)}
 .status-count.danger{color:var(--danger)}
+.status-filter{border:0;border-radius:3px;padding:0;background:transparent;color:inherit}
+.status-filter:hover,.status-filter:focus-visible{background:var(--hover);text-decoration:underline;text-underline-offset:3px}
+.status-filter[aria-pressed=true]{background:var(--selection);text-decoration:underline;text-underline-offset:3px}
 .status-message{flex:1 1 60px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent)}
 .status-speed{flex-shrink:0;white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--text)}
 .status-shortcut{margin-left:auto;white-space:nowrap}

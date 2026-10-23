@@ -309,6 +309,31 @@ describe('live interface stability', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     expect(footer.getByText('All tasks: 10')).toBeTruthy(); expect(footer.getByText('Completed 2')).toBeTruthy(); expect(footer.getByText('Unfinished 8')).toBeTruthy();
   });
+  it('filters tasks from every status breakdown button and returns to downloads without clearing search', async () => {
+    const statuses = ['downloading', 'queued', 'probing', 'waiting_processing', 'processing', 'paused', 'cancelled', 'failed', 'processing_failed'] as const;
+    const labels = ['Downloading', 'Download queued', 'Reading media', 'Processing queued', 'Processing', 'Paused', 'Cancelled', 'Download failed', 'Processing failed'];
+    const snapshot = makeSnapshot(); snapshot.tasks = statuses.map(status => ({ ...makeTask(status, `Match ${status}`), status }));
+    snapshot.tasks.push({ ...makeTask('other', 'Other downloading'), status: 'downloading' });
+    transport.command.mockImplementation(async command => command === 'snapshot' ? snapshot : []);
+    render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search tasks' }), { target: { value: 'Match' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    const details = within(screen.getByRole('group', { name: 'Task status breakdown' }));
+    for (const [index, status] of statuses.entries()) {
+      fireEvent.click(details.getByRole('button', { name: new RegExp(`^${labels[index]} \\d+$`) }));
+      expect((screen.getByRole('combobox', { name: 'Status filter' }) as HTMLSelectElement).value).toBe(status);
+      expect((screen.getByRole('searchbox', { name: 'Search tasks' }) as HTMLInputElement).value).toBe('Match');
+      const rows = within(screen.getByRole('listbox')).getAllByRole('option');
+      expect(rows).toHaveLength(1); expect(rows[0].textContent).toContain(`Match ${status}`);
+      expect(details.getByRole('button', { name: `${labels[index]} 1` }).getAttribute('aria-pressed')).toBe('true');
+    }
+    act(() => transport.listener?.({ kind: 'task.remove', data: 'queued' }));
+    const emptyStatus = details.getByRole('button', { name: 'Download queued 0' });
+    expect((emptyStatus as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(emptyStatus);
+    expect((screen.getByRole('combobox', { name: 'Status filter' }) as HTMLSelectElement).value).toBe('queued');
+    expect(screen.queryByRole('listbox')).toBeNull(); expect(screen.getByText('No matching tasks')).toBeTruthy();
+  });
   it('starts background checks only after the initial task snapshot and leaves the interface usable', async () => {
     let finishSnapshot!: (value: unknown) => void;
     transport.command.mockImplementation(async command => command === 'snapshot' ? new Promise(resolve => { finishSnapshot = resolve; }) : new Promise(() => {}));
