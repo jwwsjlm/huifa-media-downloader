@@ -61,37 +61,37 @@
     },
     "yt-dlp": {
       "repository": "yt-dlp/yt-dlp",
-      "version": "2026.08.19",
+      "version": "2026.10.21",
       "assets": {
         "windows-x86_64": {
           "name": "yt-dlp.exe",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe",
-          "sha256": "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp.exe",
+          "sha256": "33121d192d706e62f684a06f80918e3f3a8ba52ac3a65213b6951c39c7d9f555"
         },
         "linux-x86_64": {
           "name": "yt-dlp_linux",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux",
-          "sha256": "58162f9bfdc27458ea47bfcb311cf47028f17d8154a8bf7d689861d46399230a"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_linux",
+          "sha256": "d8bd33fca9d5b23bd5b9952b3fca36db5c46331933fda9f598a3da14ce2c243f"
         },
         "linux-aarch64": {
           "name": "yt-dlp_linux_aarch64",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux_aarch64",
-          "sha256": "b16e4dab368a816cd05d477d698a605a6ae87ccee1c8ffd38fa21d7254141fcc"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_linux_aarch64",
+          "sha256": "e137c2171b0b8ef648e6136e86aa70c65923e93e434f01c93901d64744b190aa"
         },
         "windows-aarch64": {
           "name": "yt-dlp_arm64.exe",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_arm64.exe",
-          "sha256": "05b438997bafc3affdfda9d041353c9d73e04dc842207254b655b0887c4445b0"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_arm64.exe",
+          "sha256": "1380a9f105302764e6a5d383c2f07238ae242f0f4fbf3414aea00e56619a79b3"
         },
         "darwin-x86_64": {
           "name": "yt-dlp_macos",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
-          "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_macos",
+          "sha256": "7a6fe71d7d680f1fb0ac18d4949873d77db2859e90017c0f44bd94b23be4ee40"
         },
         "darwin-aarch64": {
           "name": "yt-dlp_macos",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
-          "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_macos",
+          "sha256": "7a6fe71d7d680f1fb0ac18d4949873d77db2859e90017c0f44bd94b23be4ee40"
         }
       }
     },
@@ -118,22 +118,22 @@
     },
     "deno": {
       "repository": "denoland/deno",
-      "version": "v2.9.7",
+      "version": "v2.9.8",
       "assets": {
         "windows-aarch64": {
           "name": "deno-aarch64-pc-windows-msvc.zip",
-          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-pc-windows-msvc.zip",
-          "sha256": "c4c4ac8bfdaa37814bda5c05fc9cdf2154904e2ef8277673a30bdceaaa649807"
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.8/deno-aarch64-pc-windows-msvc.zip",
+          "sha256": "b413b92b735b50c198e8fe3b85af1aa50e29d5f72e229aab701d132286e14cef"
         },
         "darwin-x86_64": {
           "name": "deno-x86_64-apple-darwin.zip",
-          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-apple-darwin.zip",
-          "sha256": "95daaff11c116a52ad54785e7914c8e9c9cdcaba793c5ed929c74ca2d8e6259a"
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-apple-darwin.zip",
+          "sha256": "4b2f5edd2639b7470f034238b321d7002d8dfb4726d8558f52c17afac370eb2c"
         },
         "darwin-aarch64": {
           "name": "deno-aarch64-apple-darwin.zip",
-          "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-apple-darwin.zip",
-          "sha256": "5cd46d6268f6f78f5d88bdc7159d20bd44cdaa4b3303474839f87ec6fe7ae25c"
+          "url": "https://github.com/denoland/deno/releases/download/v2.9.8/deno-aarch64-apple-darwin.zip",
+          "sha256": "9f0bf660393da2eaff044cdc7444cb08c73f235849b61d224d825a194ce7c98e"
         }
       }
     }

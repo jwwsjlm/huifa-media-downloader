@@ -1911,7 +1911,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "huifa-core"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1945,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "huifa-desktop"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "huifa-mcp"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "huifa-server"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "anyhow",
  "argon2",
