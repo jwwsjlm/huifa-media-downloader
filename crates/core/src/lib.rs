@@ -569,10 +569,39 @@ impl App {
                     self.remove_owned(path)?;
                 }
             }
+        }
+        if delete_files || self.db.media_for_task(id)?.is_none() {
+            let mut directories = vec![self.config.data_dir.join("tasks").join(id)];
             if !task.options.processing_temp_dir.is_empty() {
-                remove_task_directory(&processing::workspace(self, &task))?;
+                directories.push(processing::workspace(self, &task));
             }
-            remove_task_directory(&self.config.data_dir.join("tasks").join(id))?;
+            for directory in &mut directories {
+                reject_links(directory)?;
+                if directory.try_exists()? {
+                    *directory = directory.canonicalize()?;
+                }
+            }
+            if !delete_files {
+                let mut preserved = task.previous_outputs.clone();
+                preserved.extend(task.output_path.iter().cloned());
+                if let Some(publication) = &task.publication {
+                    preserved.push(publication.target.clone());
+                    preserved.extend(publication.auxiliary.iter().map(|file| file.target.clone()));
+                }
+                for media in self.db.media()? {
+                    preserved.push(media.path);
+                    preserved.extend(media.assets);
+                }
+                ensure!(
+                    !preserved.iter().any(|file| directories
+                        .iter()
+                        .any(|directory| file.starts_with(directory))),
+                    "A saved output is inside this task's cache; task and files were preserved"
+                );
+            }
+            for directory in directories {
+                remove_task_directory(&directory)?;
+            }
         }
         self.credentials
             .delete_secret(&format!("task-cookie:{id}"))?;
@@ -2340,6 +2369,74 @@ mod tests {
             }
             assert_eq!(removed, delete_files);
             assert!(sentinel.is_file());
+        }
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_unfinished_records_cleans_caches_but_preserves_saved_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        })
+        .await?;
+        let processing = root.path().join("custom");
+        std::fs::create_dir_all(&processing)?;
+        let sentinel = processing.join("keep.txt");
+        std::fs::write(&sentinel, b"unrelated")?;
+        for status in ["paused", "failed", "cancelled"] {
+            for custom_workspace in [false, true] {
+                let mut task = paused_task(HashMap::new());
+                task.status = status.into();
+                if custom_workspace {
+                    task.options.processing_temp_dir = processing.to_string_lossy().into();
+                }
+                let output = app.download_directory().join(format!("{}.mp4", task.id));
+                std::fs::write(&output, b"saved media")?;
+                task.output_path = Some(output.clone());
+                let sources = app.config.data_dir.join("tasks").join(&task.id);
+                let workspace = processing::workspace(&app, &task);
+                std::fs::create_dir_all(sources.join("sources"))?;
+                std::fs::create_dir_all(&workspace)?;
+                std::fs::write(sources.join("sources/video.part"), b"partial media")?;
+                std::fs::write(workspace.join("intermediate.mp4"), b"intermediate media")?;
+                app.db.insert_task(&task)?;
+                app.command("tasks.delete", json!({"id":task.id,"deleteFiles":false}))
+                    .await?;
+                assert!(app.db.task(&task.id).is_err());
+                assert!(
+                    !sources.exists(),
+                    "deleted task left unreachable source files"
+                );
+                assert!(
+                    !workspace.exists(),
+                    "deleted task left unreachable processing files"
+                );
+                assert_eq!(std::fs::read(&output)?, b"saved media");
+                assert_eq!(std::fs::read(&sentinel)?, b"unrelated");
+            }
+        }
+        for custom_workspace in [false, true] {
+            let mut nested = paused_task(HashMap::new());
+            if custom_workspace {
+                nested.options.processing_temp_dir = processing.to_string_lossy().into();
+            }
+            let directory = processing::workspace(&app, &nested);
+            std::fs::create_dir_all(&directory)?;
+            let output = directory.join("saved.mp4");
+            std::fs::write(&output, b"saved inside old workspace")?;
+            nested.output_path = Some(output.canonicalize()?);
+            app.db.insert_task(&nested)?;
+            assert!(
+                app.command("tasks.delete", json!({"id":nested.id,"deleteFiles":false}))
+                    .await
+                    .is_err()
+            );
+            assert!(app.db.task(&nested.id).is_ok());
+            assert_eq!(std::fs::read(output)?, b"saved inside old workspace");
         }
         app.shutdown().await?;
         Ok(())

@@ -1436,14 +1436,18 @@ async fn real_filename_conflict_confirmation_rename_and_successful_cache_cleanup
         download::hash_file(&original.path)? == old_hash,
         "Unconfirmed conflict changed the original"
     );
+    let sources = app
+        .config
+        .data_dir
+        .join("tasks")
+        .join(&second[0])
+        .join("sources");
+    let pending = std::fs::read_dir(&sources)?.collect::<std::io::Result<Vec<_>>>()?;
     ensure!(
-        !app.config
-            .data_dir
-            .join("tasks")
-            .join(&second[0])
-            .join("sources")
-            .exists(),
-        "Conflict downloaded media before confirmation"
+        pending.len() == 1
+            && pending[0].file_name() == "download-checkpoint.json"
+            && pending[0].file_type()?.is_file(),
+        "Conflict downloaded media before confirmation instead of only saving metadata"
     );
     app.command(
         "tasks.destination",
