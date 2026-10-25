@@ -100,6 +100,7 @@ pub struct App {
     runner_generation: std::sync::atomic::AtomicU64,
     closing: AtomicBool,
     pub(crate) network: Arc<Semaphore>,
+    pub(crate) metadata: Arc<Semaphore>,
     pub(crate) capture: Arc<Semaphore>,
     pub(crate) processor: Arc<Semaphore>,
     resources: resources::Resources,
@@ -134,6 +135,8 @@ impl App {
             )
         })?;
         let data_lock = data_lock::acquire(&config.data_dir)?;
+        // Holding the directory lock ensures these files have no active users.
+        download::clean_interrupted_files(&config.data_dir)?;
         backup::before_upgrade(&config.data_dir)
             .context("Could not prepare the application upgrade backup")?;
         let saved_download_directory = config
@@ -193,6 +196,7 @@ impl App {
             runner_generation: Default::default(),
             closing: AtomicBool::new(false),
             network: Arc::new(Semaphore::new(3)),
+            metadata: Arc::new(Semaphore::new(3)),
             capture: Arc::new(Semaphore::new(1)),
             processor: Arc::new(Semaphore::new(2)),
             resources: Default::default(),
@@ -2600,7 +2604,7 @@ mod tests {
             tool_dir: Some(bundled),
         })
         .await?;
-        let network = app.network.acquire_many(3).await?;
+        let network = app.metadata.acquire_many(3).await?;
         let processor = app.processor.acquire_many(2).await?;
         let mut task = paused_task(app.freeze_tools().await?);
         task.stage("completed", "completed", Some(100.0));
@@ -2686,7 +2690,7 @@ mod tests {
             tool_dir: Some(bundled),
         })
         .await?;
-        let permit = app.network.acquire_many(3).await?;
+        let permit = app.metadata.acquire_many(3).await?;
         let request = json!({"urls":["https://www.youtube.com/watch?v=abcdef12345&list=one","https://youtu.be/abcdef12345"],"options":{"quality":"best"},"report":true});
         let (one, two) = tokio::join!(
             app.command("tasks.add", request.clone()),
@@ -3165,7 +3169,7 @@ mod queue_tests {
             tool_dir: None,
         })
         .await?;
-        let _blocked = app.network.clone().acquire_many_owned(3).await?;
+        let _blocked = app.metadata.clone().acquire_many_owned(3).await?;
         let mut task = tests::paused_task(Default::default());
         task.status = "failed".into();
         task.error = Some("Connection reset by peer".into());
@@ -3179,7 +3183,7 @@ mod queue_tests {
                     .queued_slots
                     .lock()
                     .unwrap()
-                    .get("network")
+                    .get("metadata")
                     .is_some_and(|queue| queue.iter().any(|(id, _, _)| id == &task.id))
                 {
                     break;
@@ -3341,7 +3345,7 @@ mod queue_tests {
             tool_dir: Some(tools),
         })
         .await?;
-        let _blocked = app.network.clone().acquire_many_owned(3).await?;
+        let _blocked = app.metadata.clone().acquire_many_owned(3).await?;
         let mut task = tests::paused_task(app.freeze_tools().await?);
         task.url = "https://example.test/video?p=2&signature=keep-original".into();
         task.cookie_snapshot = Some(format!("task-cookie:{}", task.id));

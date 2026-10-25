@@ -16,6 +16,27 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(crate) fn clean_interrupted_files(directory: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if entry.file_type()?.is_file()
+            && [".cookie-", ".download-info-"].iter().any(|prefix| {
+                name.strip_prefix(prefix).is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+            })
+        {
+            std::fs::remove_file(entry.path())
+                .context("Could not remove interrupted download temporary file")?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct Cookies {
     file: Option<tempfile::NamedTempFile>,
     plugins: tempfile::TempDir,
@@ -181,7 +202,7 @@ pub(crate) async fn public_probe(
     cookies: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<Value> {
-    let permit = tokio::select! { permit=app.network.acquire()=>permit?, _=cancel.cancelled()=>bail!("Operation interrupted") };
+    let permit = tokio::select! { permit=app.metadata.acquire()=>permit?, _=cancel.cancelled()=>bail!("Operation interrupted") };
     let info = probe(app, url, options, cookies, cancel, None).await?;
     drop(permit);
     let formats=all_formats(&info).iter().map(|f|json!({"formatId":f["format_id"],"ext":f["ext"],"width":f["width"],"height":f["height"],"fps":f["fps"],"vcodec":f["vcodec"],"acodec":f["acodec"],"language":f["language"],"filesize":f.get("filesize").or(f.get("filesize_approx")),"formatNote":f["format_note"]})).collect::<Vec<_>>();
@@ -209,7 +230,7 @@ pub(crate) async fn collection(
     cookie_text: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<Value> {
-    let _permit = tokio::select! { permit=app.network.acquire()=>permit?, _=cancel.cancelled()=>bail!("Operation interrupted") };
+    let _permit = tokio::select! { permit=app.metadata.acquire()=>permit?, _=cancel.cancelled()=>bail!("Operation interrupted") };
     let _tools = tokio::select! {
         guard = app.tool_update_lock.lock() => guard,
         _ = cancel.cancelled() => bail!("Operation interrupted"),
@@ -403,6 +424,20 @@ fn transient_stream_error(error: &str) -> bool {
         .iter()
         .any(|value| error.contains(value))
         || error.contains("downloaded ") && error.contains(" bytes, expected ")
+}
+
+fn rejected_saved_stream(error: &anyhow::Error) -> bool {
+    let error = format!("{error:#}").to_ascii_lowercase();
+    (error.starts_with("failed to download video stream")
+        || error.starts_with("failed to download audio stream"))
+        && [
+            "http error 401",
+            "http error 403",
+            "http error 404",
+            "http error 410",
+        ]
+        .iter()
+        .any(|status| error.contains(status))
 }
 
 async fn stream_process(
@@ -1058,6 +1093,8 @@ struct DownloadCheckpoint {
     info: Value,
     directory: PathBuf,
     files: Vec<SourceFile>,
+    #[serde(default)]
+    transfer_pending: bool,
 }
 
 const CHECKPOINT_LIMIT: u64 = 64 * 1024 * 1024;
@@ -1102,6 +1139,34 @@ fn save_download_checkpoint(app: &App, task: &Task, checkpoint: &DownloadCheckpo
     #[cfg(unix)]
     std::fs::File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+fn save_pending_download(app: &App, task: &Task, info: &Value) -> Result<()> {
+    let formats = if task.kind == "assets" {
+        vec![]
+    } else {
+        select_formats(info, &task.options)?
+    };
+    let identity = transfer_identity(info, &formats)?;
+    let root = checkpoint_path(app, &task.id)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    crate::reject_links(&root)?;
+    std::fs::create_dir_all(&root)?;
+    save_download_checkpoint(
+        app,
+        task,
+        &DownloadCheckpoint {
+            version: 1,
+            plan: checkpoint_plan(task)?,
+            directory: root.join(&identity),
+            identity,
+            info: info.clone(),
+            files: vec![],
+            transfer_pending: true,
+        },
+    )
 }
 
 fn resolved_info_file(app: &App, info: &Value) -> Result<tempfile::NamedTempFile> {
@@ -1198,6 +1263,10 @@ pub(crate) async fn transfer(
         app.save_task(&task)?;
     }
     std::fs::create_dir_all(&directory)?;
+    if !live {
+        // Keep the exact stream URLs so pause/restart can reuse their partial files.
+        save_pending_download(app, &task, &info)?;
+    }
     let cookie_text = app.task_cookies(&task)?;
     let cookies = Cookies::new(app, cookie_text.as_deref())?;
     // Re-extracting can change CDN URLs behind the selected format and source identity.
@@ -1419,6 +1488,7 @@ pub(crate) async fn transfer(
         info,
         directory,
         files,
+        transfer_pending: false,
     };
     save_download_checkpoint(app, &task, &checkpoint)?;
     complete_assets(app, task, checkpoint, cancel).await
@@ -1946,12 +2016,20 @@ impl App {
         };
         ensure!(
             checkpoint.identity == transfer_identity(&checkpoint.info, &formats)?
-                && checkpoint.files.len() == formats.len(),
+                && if checkpoint.transfer_pending {
+                    !is_live(&checkpoint.info) && checkpoint.files.is_empty()
+                } else {
+                    checkpoint.files.len() == formats.len()
+                },
             "Saved download checkpoint does not match its selected media"
         );
         let source_root = path.parent().unwrap().canonicalize()?;
         crate::reject_links(&checkpoint.directory)?;
-        let directory = checkpoint.directory.canonicalize()?;
+        let directory = if checkpoint.transfer_pending && !checkpoint.directory.try_exists()? {
+            checkpoint.directory.clone()
+        } else {
+            checkpoint.directory.canonicalize()?
+        };
         ensure!(
             directory.parent() == Some(source_root.as_path())
                 && if is_live(&checkpoint.info) {
@@ -2000,54 +2078,91 @@ impl App {
     ) -> Result<()> {
         let mut task = self.db.task(id)?;
         if task.manifest.is_none() {
-            let checkpoint = self.load_download_checkpoint(&task, cancel).await?;
-            let permit = self
-                .task_permit(id, "network", &self.network, cancel)
-                .await?;
-            if let Some(checkpoint) = checkpoint {
-                let manifest = complete_assets(self, task.clone(), checkpoint, cancel).await?;
-                self.freeze_sources(id, manifest)?;
-                drop(permit);
-            } else {
-                self.set_stage(id, "probing", "probing", None)?;
-                let cookies = self.task_cookies(&task)?;
-                let runtime_options = self.runtime_options(&task)?;
-                let info = probe(
-                    self,
-                    &task.url,
-                    &runtime_options,
-                    cookies.as_deref(),
-                    cancel,
-                    Some(&task),
-                )
-                .await?;
-                task = self.db.task(id)?;
-                task.title = text(&info, "title").to_string();
-                crate::workflow::plan(&mut task);
-                self.save_task(&task)?;
-                let preview = crate::thumbnail::cache_preview(self, &task, &info, cancel).await;
-                ensure!(!cancel.is_cancelled(), "Operation interrupted");
-                if let Ok(Some(path)) = preview {
-                    task = self.db.task(id)?;
-                    task.thumbnail = Some(path);
-                    self.save_task(&task)?;
-                }
-                let special = task.kind != "assets" && is_live(&info);
-                task.live = special;
-                self.save_task(&task)?;
-                if special {
-                    drop(permit);
-                    self.set_stage(id, "queued", "waiting_live", None)?;
-                    let _capture = self
-                        .task_permit(id, "capture", &self.capture, cancel)
+            for attempt in 0..2 {
+                let mut live_info = None;
+                if !checkpoint_path(self, id).try_exists()? {
+                    let _metadata = self
+                        .task_permit(id, "metadata", &self.metadata, cancel)
                         .await?;
-                    let manifest = transfer(self, task.clone(), info, cancel).await?;
-                    self.freeze_sources(id, manifest)?;
-                } else {
-                    let manifest = transfer(self, task.clone(), info, cancel).await?;
-                    self.freeze_sources(id, manifest)?;
-                    drop(permit);
+                    self.set_stage(id, "probing", "probing", None)?;
+                    task = self.db.task(id)?;
+                    let cookies = self.task_cookies(&task)?;
+                    let runtime_options = self.runtime_options(&task)?;
+                    let info = probe(
+                        self,
+                        &task.url,
+                        &runtime_options,
+                        cookies.as_deref(),
+                        cancel,
+                        Some(&task),
+                    )
+                    .await?;
+                    task = self.db.task(id)?;
+                    task.title = text(&info, "title").to_string();
+                    task.live = task.kind != "assets" && is_live(&info);
+                    crate::workflow::plan(&mut task);
+                    self.save_task(&task)?;
+                    let preview = crate::thumbnail::cache_preview(self, &task, &info, cancel).await;
+                    ensure!(!cancel.is_cancelled(), "Operation interrupted");
+                    if let Ok(Some(path)) = preview {
+                        task = self.db.task(id)?;
+                        task.thumbnail = Some(path);
+                        self.save_task(&task)?;
+                    }
+                    if is_live(&info) {
+                        live_info = Some(info);
+                    } else {
+                        // Persist queued metadata instead of holding every parsed result in memory.
+                        save_pending_download(self, &task, &info)?;
+                    }
                 }
+                let special = live_info.is_some() && task.live;
+                self.set_stage(
+                    id,
+                    "queued",
+                    if special { "waiting_live" } else { "queued" },
+                    None,
+                )?;
+                let (slot, semaphore) = if special {
+                    ("capture", &self.capture)
+                } else {
+                    ("network", &self.network)
+                };
+                let _permit = self.task_permit(id, slot, semaphore, cancel).await?;
+                task = self.db.task(id)?;
+                let result = if let Some(info) = live_info {
+                    transfer(self, task.clone(), info, cancel).await
+                } else {
+                    let checkpoint = self
+                        .load_download_checkpoint(&task, cancel)
+                        .await?
+                        .context("Saved download metadata is missing")?;
+                    if checkpoint.transfer_pending {
+                        self.log_task(
+                            id,
+                            "info",
+                            "Downloading using saved stream URLs and any existing partial files",
+                        )?;
+                        transfer(self, task.clone(), checkpoint.info, cancel).await
+                    } else {
+                        complete_assets(self, task.clone(), checkpoint, cancel).await
+                    }
+                };
+                let manifest = match result {
+                    Err(error)
+                        if attempt == 0
+                            && !special
+                            && !cancel.is_cancelled()
+                            && rejected_saved_stream(&error) =>
+                    {
+                        self.log_task(id, "warning", "Saved stream URL was rejected; refreshing metadata once and keeping different sources separate")?;
+                        self.clear_download_checkpoint(id)?;
+                        continue;
+                    }
+                    result => result?,
+                };
+                self.freeze_sources(id, manifest)?;
+                break;
             }
         }
         let _processor = self.processing_permit(id, cancel).await?;
@@ -2090,7 +2205,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn collection_waiting_for_tool_update_remains_cancellable_and_releases_network()
+    async fn collection_waiting_for_tool_update_remains_cancellable_and_releases_metadata()
     -> Result<()> {
         for shutdown in [false, true] {
             let root = tempfile::tempdir()?;
@@ -2116,7 +2231,7 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(app.network.available_permits(), 2);
+            assert_eq!(app.metadata.available_permits(), 2);
             if shutdown {
                 app.shutdown_token.cancel();
             } else {
@@ -2127,7 +2242,7 @@ mod tests {
                     .await?
                     .is_err()
             );
-            assert_eq!(app.network.available_permits(), 3);
+            assert_eq!(app.metadata.available_permits(), 3);
             drop(guard);
             app.shutdown().await?;
         }
@@ -3453,6 +3568,76 @@ mod checkpoint_tests {
     use super::*;
 
     #[tokio::test]
+    async fn pending_checkpoints_preserve_urls_before_transfer_and_reject_changed_plans()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: None,
+        };
+        let app = App::open(config.clone()).await?;
+        let mut task = crate::tests::paused_task(Default::default());
+        let info = json!({"id":"pending","duration":1,"formats":[{"format_id":"v","url":"https://example.test/media?signature=original","ext":"mp4","width":320,"height":180,"vcodec":"avc1","acodec":"mp4a.40.2"}]});
+        save_pending_download(&app, &task, &info)?;
+        app.shutdown().await?;
+        drop(app);
+        let app = App::open(config).await?;
+        let cancel = CancellationToken::new();
+        let mut saved = app.load_download_checkpoint(&task, &cancel).await?.unwrap();
+        assert!(saved.transfer_pending);
+        assert_eq!(saved.info, info);
+        assert!(saved.files.is_empty());
+        assert!(
+            !saved.directory.exists(),
+            "Metadata preparation must not start a media transfer"
+        );
+        let original = saved.directory.clone();
+        saved.directory = root.path().join("outside");
+        save_download_checkpoint(&app, &task, &saved)?;
+        assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+        saved.directory = original;
+        save_download_checkpoint(&app, &task, &saved)?;
+        task.options.quality = "720p".into();
+        assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
+        app.clear_download_checkpoint(&task.id)?;
+        assert!(
+            app.load_download_checkpoint(&task, &cancel)
+                .await?
+                .is_none()
+        );
+        app.shutdown().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn only_rejected_media_urls_trigger_metadata_refresh() {
+        for status in [401, 403, 404, 410] {
+            let error = anyhow::anyhow!("HTTP Error {status}: rejected")
+                .context("Failed to download video stream (format v) with yt-dlp");
+            assert!(rejected_saved_stream(&error));
+        }
+        for message in [
+            "Operation interrupted",
+            "Permission denied",
+            "HTTP Error 429",
+            "Connection reset",
+        ] {
+            let error = anyhow::anyhow!(message)
+                .context("Failed to download audio stream (format a) with yt-dlp");
+            assert!(!rejected_saved_stream(&error));
+        }
+        for context in [
+            "Failed to download subtitles with yt-dlp",
+            "Failed to parse video with yt-dlp",
+        ] {
+            assert!(!rejected_saved_stream(
+                &anyhow::anyhow!("HTTP Error 403").context(context)
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn checkpoints_validate_owned_media_and_the_saved_plan() -> Result<()> {
         let root = tempfile::tempdir()?;
         let app = App::open(crate::AppConfig {
@@ -3487,6 +3672,7 @@ mod checkpoint_tests {
                 format_id: "v".into(),
                 language: None,
             }],
+            transfer_pending: false,
         };
         let cancel = CancellationToken::new();
         assert!(
@@ -3523,6 +3709,18 @@ mod checkpoint_tests {
         save_download_checkpoint(&app, &task, &checkpoint)?;
         assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());
         checkpoint.version = 1;
+        let mut legacy = serde_json::to_value(&checkpoint)?;
+        legacy.as_object_mut().unwrap().remove("transfer_pending");
+        write_sync(
+            &checkpoint_path(&app, &task.id),
+            &serde_json::to_vec(&legacy)?,
+        )?;
+        assert!(
+            !app.load_download_checkpoint(&task, &cancel)
+                .await?
+                .unwrap()
+                .transfer_pending
+        );
         checkpoint.info["formats"][0]["url"] = json!("https://example.test/different");
         save_download_checkpoint(&app, &task, &checkpoint)?;
         assert!(app.load_download_checkpoint(&task, &cancel).await.is_err());

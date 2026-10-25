@@ -381,7 +381,7 @@ impl App {
             }
         }
         let cookies = Cookies::new(self, cookie.as_deref())?;
-        let _permit = tokio::select! { p=self.network.acquire()=>p?, _=cancel.cancelled()=>anyhow::bail!("Query cancelled") };
+        let _permit = tokio::select! { p=self.metadata.acquire()=>p?, _=cancel.cancelled()=>anyhow::bail!("Query cancelled") };
         let mut cli = base_args(self, &options, &cookies, None).await?;
         cli.extend([
             "--simulate".into(),

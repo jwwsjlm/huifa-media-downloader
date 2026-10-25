@@ -252,7 +252,7 @@ mod tests {
             tool_dir: Some(tools),
         })
         .await?;
-        let network = app.network.acquire_many(3).await?;
+        let network = app.metadata.acquire_many(3).await?;
         let ids = app
             .command(
                 "tasks.add",

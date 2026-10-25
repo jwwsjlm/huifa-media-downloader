@@ -59,4 +59,47 @@ mod tests {
         reopened.shutdown().await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn startup_removes_interrupted_download_secrets_only_after_locking() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("downloads"),
+            tool_dir: None,
+        };
+        std::fs::create_dir_all(config.data_dir.join("tasks/sources"))?;
+        for name in [".cookie-Ab12Cd", ".download-info-Ef34Gh"] {
+            std::fs::write(config.data_dir.join(name), b"interrupted secret")?;
+        }
+        for name in [
+            ".cookie-notes.txt",
+            "tasks/sources/download-checkpoint.json",
+        ] {
+            std::fs::write(config.data_dir.join(name), b"keep")?;
+        }
+        let directory = config.data_dir.join(".download-info-folder");
+        std::fs::create_dir(&directory)?;
+        let app = crate::App::open(config.clone()).await?;
+        for name in [".cookie-Ab12Cd", ".download-info-Ef34Gh"] {
+            assert!(!config.data_dir.join(name).exists());
+        }
+        for name in [
+            ".cookie-notes.txt",
+            "tasks/sources/download-checkpoint.json",
+        ] {
+            assert_eq!(std::fs::read(config.data_dir.join(name))?, b"keep");
+        }
+        assert!(directory.is_dir());
+        let active = config.data_dir.join(".cookie-Live12");
+        std::fs::write(&active, b"active secret")?;
+        assert!(crate::App::open(config.clone()).await.is_err());
+        assert_eq!(std::fs::read(&active)?, b"active secret");
+        app.shutdown().await?;
+        drop(app);
+        let reopened = crate::App::open(config).await?;
+        assert!(!active.exists());
+        reopened.shutdown().await?;
+        Ok(())
+    }
 }

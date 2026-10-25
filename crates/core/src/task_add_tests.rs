@@ -12,7 +12,7 @@ async fn collection_expansion_does_not_block_queue_controls() -> Result<()> {
     .await?;
     let task = tests::paused_task(Default::default());
     app.db.insert_task(&task)?;
-    let network = app.network.acquire_many(3).await?;
+    let network = app.metadata.acquire_many(3).await?;
     let adding = app.command(
         "tasks.add",
         json!({"urls":["https://example.test/playlist"],"options":{"collectionMode":"all"}}),

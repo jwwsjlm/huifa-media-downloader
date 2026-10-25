@@ -380,7 +380,7 @@ mod tests {
             tool_dir: None,
         })
         .await?;
-        let _network = app.network.clone().acquire_many_owned(3).await?;
+        let _network = app.metadata.clone().acquire_many_owned(3).await?;
         let mut old = crate::tests::paused_task(Default::default());
         old.title = "Same title".into();
         old.stage("completed", "completed", Some(100.0));

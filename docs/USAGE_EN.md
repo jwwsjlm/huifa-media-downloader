@@ -124,6 +124,13 @@ use a `title [converted]` name with a number for conflicts, and keep the origina
 ## Task recovery and file safety
 
 Task plans freeze options, cookies, proxy, runtime versions and save locations.
+Metadata queries and downloads have separate queues, each with up to 3 concurrent
+tasks. Waiting downloads can obtain titles, thumbnails and formats without starting
+media transfer. Saved metadata lets paused or interrupted downloads resume the same
+stream URLs; rejected URLs trigger at most one fresh extraction. Different sources
+keep separate partial files to avoid mixing content. Older tasks without saved
+metadata may restart their transfer on first resume.
+
 Download and processing queues run separately. **Move to front of queue** persists
 the order of pending downloads, live captures and processing without interrupting
 running work. Stage prefixes such as `2/6` show major workflow steps, not a fixed
