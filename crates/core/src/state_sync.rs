@@ -36,7 +36,7 @@ impl Default for History {
 }
 
 impl History {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn retained(&self) -> (usize, usize) {
         (self.events.len(), self.bytes)
     }
