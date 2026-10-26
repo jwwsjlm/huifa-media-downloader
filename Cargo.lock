@@ -1952,8 +1952,10 @@ dependencies = [
  "huifa-core",
  "huifa-mcp",
  "image",
+ "minisign-verify",
  "serde",
  "serde_json",
+ "sha2",
  "soup3",
  "tauri",
  "tauri-build",
@@ -1964,10 +1966,13 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "tokio",
+ "tokio-util",
  "uuid",
  "webkit2gtk",
  "webview2-com",
  "windows",
+ "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]

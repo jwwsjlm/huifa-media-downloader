@@ -33,11 +33,19 @@ base64 = "0.22"
 uuid.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 tempfile.workspace = true
+sha2.workspace = true
+zip.workspace = true
+tokio-util.workspace = true
+minisign-verify = "0.2.5"
 
 [target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 webview2-com = "0.38"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "=2.0.2"
 soup3 = "0.5"
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }

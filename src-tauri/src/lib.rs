@@ -14,11 +14,12 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
-use tauri_plugin_updater::UpdaterExt;
-use tokio::sync::Mutex;
 
 mod login_browser;
+#[cfg(windows)]
+mod portable_update;
 mod startup;
+mod updater;
 
 #[tauri::command]
 async fn login_navigation(
@@ -38,7 +39,7 @@ struct Host {
     portable: bool,
     closing: AtomicBool,
     shutdown_done: AtomicBool,
-    update: Mutex<Option<tauri_plugin_updater::Update>>,
+    updater: updater::Updater,
     login_browser: login_browser::LoginBrowser,
 }
 
@@ -235,7 +236,7 @@ async fn capabilities(app: tauri::AppHandle) -> Result<Value, String> {
     }
     let host = app.state::<Host>();
     Ok(
-        json!({"desktop":true,"browserCookies":true,"remoteBrowser":false,"updates":!host.portable,"directoryPicker":true}),
+        json!({"desktop":true,"browserCookies":true,"remoteBrowser":false,"updates":host.updater.supported(),"directoryPicker":true}),
     )
 }
 
@@ -420,66 +421,35 @@ fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-async fn check_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<Value, String> {
-    if host.portable {
-        return Err("Download and extract the latest portable ZIP to update this edition".into());
-    }
-    let mut builder = app.updater_builder();
-    let proxy = host.core.download_proxy().map_err(error)?;
-    if !proxy.is_empty() {
-        builder = builder.proxy(proxy.parse().map_err(error)?);
-    } else {
-        builder = builder.no_proxy();
-    }
-    let update = builder
-        .build()
-        .map_err(error)?
-        .check()
+async fn check_update(
+    app: tauri::AppHandle,
+    host: State<'_, Host>,
+) -> Result<updater::Status, String> {
+    host.updater
+        .check(&app, &host.core.download_proxy().map_err(error)?)
         .await
-        .map_err(error)?;
-    let value = update
-        .as_ref()
-        .map(|update| json!({"version":update.version,"body":update.body}))
-        .unwrap_or(json!({}));
-    *host.update.lock().await = update;
-    Ok(value)
+        .map_err(error)
+}
+
+#[tauri::command]
+fn update_status(host: State<'_, Host>) -> updater::Status {
+    host.updater.status()
+}
+
+#[tauri::command]
+async fn download_update(
+    app: tauri::AppHandle,
+    host: State<'_, Host>,
+) -> Result<updater::Status, String> {
+    host.updater
+        .download(&app, &host.core.download_proxy().map_err(error)?)
+        .await
+        .map_err(error)
 }
 
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle, host: State<'_, Host>) -> Result<(), String> {
-    if host.portable {
-        return Err("Portable ZIP updates do not run the installer".into());
-    }
-    let mut guard = host.update.lock().await;
-    let update = guard.as_mut().ok_or("Check for an update first")?;
-    let proxy = host.core.download_proxy().map_err(error)?;
-    update.proxy = if proxy.is_empty() {
-        None
-    } else {
-        Some(proxy.parse().map_err(error)?)
-    };
-    update.no_proxy = proxy.is_empty();
-    let bytes = update.download(|_, _| {}, || {}).await.map_err(error)?;
-    host.closing.store(true, Ordering::Release);
-    host.login_browser.stop(&app, &host.core).await;
-    if let Err(reason) = host.core.shutdown().await {
-        host.closing.store(false, Ordering::Release);
-        return Err(error(reason));
-    }
-    host.shutdown_done.store(true, Ordering::Release);
-    if let Err(reason) = huifa_core::backup::create(&host.data_dir, "before-update") {
-        return Err(error(format!(
-            "Update was not installed because the configuration backup failed: {reason:#}. Tasks were saved; restart the application before retrying."
-        )));
-    }
-    if let Err(reason) = update.install(bytes) {
-        let message = format!(
-            "Update installation failed after tasks were saved: {reason}. Restart the application to resume work."
-        );
-        let _ = app.emit("huifa-host-error", json!({"message":message}));
-        return Err(message);
-    }
-    app.restart();
+    host.updater.install(&app, &host).await.map_err(error)
 }
 
 async fn initialize_host(
@@ -521,6 +491,8 @@ async fn initialize_host(
     {
         eprintln!("MCP startup failed: {}", error(reason));
     }
+    let updater =
+        updater::Updater::new(&data_dir, updater::public_key()?, updater::target(portable));
     Ok(Host {
         login_browser,
         mcp,
@@ -529,11 +501,21 @@ async fn initialize_host(
         portable,
         closing: AtomicBool::new(false),
         shutdown_done: AtomicBool::new(false),
-        update: Mutex::new(None),
+        updater,
     })
 }
 
 pub fn run() {
+    #[cfg(windows)]
+    let recovery = match portable_update::startup() {
+        Ok(message) => message,
+        Err(reason) => {
+            startup::report(&format!("Portable update: {reason:#}"));
+            std::process::exit(1);
+        }
+    };
+    #[cfg(not(windows))]
+    let recovery: Option<String> = None;
     startup::install();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -612,6 +594,9 @@ pub fn run() {
                     Ok(host) => {
                         let mut events = host.core.subscribe();
                         handle.manage(host);
+                        if let Some(message) = recovery.as_deref() {
+                            handle.state::<Host>().updater.report_recovery(&handle, message);
+                        }
                         let events_handle = handle.clone();
                         tauri::async_runtime::spawn(async move {
                             loop {
@@ -692,6 +677,8 @@ pub fn run() {
             upload_asset,
             notify,
             check_update,
+            download_update,
+            update_status,
             install_update,
             task_copy_value,
             release_status,
@@ -741,6 +728,7 @@ fn begin_shutdown(app: &tauri::AppHandle) {
     }
     if let Some(host) = app.try_state::<Host>() {
         host.closing.store(true, Ordering::Release);
+        host.updater.cancel();
     }
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {

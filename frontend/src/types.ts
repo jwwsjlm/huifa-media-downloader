@@ -48,6 +48,7 @@ export interface CoreEvent { kind: string; data: Json; revision?: number }
 export interface StateSync { revision: number; reset: boolean; events: CoreEvent[] }
 export interface AddReport { ids: string[]; results: { id: string; status: TaskStatus; action: 'added' | 'existing' | 'restarted' }[]; issues?: { url: string; error: string }[]; cancelled?: boolean }
 export interface ReleaseStatus { currentVersion: string; latestVersion: string; updateAvailable: boolean; url: string }
+export interface UpdateStatus { revision: number; phase: 'idle' | 'checking' | 'available' | 'downloading' | 'verifying' | 'ready' | 'installing' | 'error'; version?: string | null; body?: string | null; downloadedBytes: number; totalBytes?: number | null; error?: string | null; canDownload: boolean; canInstall: boolean; restartRequired: boolean }
 export interface Capabilities { desktop: boolean; browserCookies: boolean; remoteBrowser: boolean; updates: boolean; directoryPicker: boolean }
 export interface Session { authenticated: boolean; csrfToken?: string; capabilities?: Partial<Capabilities> }
 export interface CookieEntry { id: string; name: string; domains?: string[]; count?: number; createdAt?: string; updatedAt?: string }

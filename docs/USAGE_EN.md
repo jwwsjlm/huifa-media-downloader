@@ -325,10 +325,26 @@ a temporary compatibility fix based on [yt-dlp PR #17826](https://github.com/yt-
 while waiting for the bundled upstream engine to include it. Website changes can
 still break extraction; do not treat an extractor's presence as a site availability guarantee.
 
-The sidebar indicates available application releases; **About** can check again.
-Checks try the official GitHub API and then the release-page redirect. Failure
-shows a reason and allows retry. Portable Windows builds update by closing the
-app and replacing the extracted program directory; they do not launch an installer.
+Desktop builds check once after startup. The sidebar, **About**, and
+**Settings → Tools & updates** share update status. Choose **Download update**,
+wait for signature verification, then choose **Restart and install** when ready.
+Checks and downloads use the saved proxy. Quitting normally keeps complete packages;
+on reopening, the app first checks the online manifest and reuses the package only
+when its version, platform and signature still match.
+
+Installation immediately stops background work, saves task progress and backs up
+configuration, then starts the new version. Downloads follow normal resume rules;
+media processing may restart and live captures are interrupted. Saving or backup
+failure prevents installation. If background work has already stopped, close and
+reopen the app before retrying.
+
+This supports Windows x64/ARM64 installers and portable ZIPs, macOS, and Linux
+AppImage. Portable program folders must be writable; keep `tools` and `portable.flag`
+beside `HuifaDownloader.exe`. Only managed program files and bundled tools are replaced.
+File replacement failures restore the previous files; reopening recovers interrupted
+replacements. Older portable builds need one manual ZIP upgrade to gain this flow.
+Update other Linux package formats manually. Web release checks retain the official
+GitHub API and release-page fallback.
 Container application and component updates require pulling and recreating the image,
 with existing storage preserved. See [installation](../README_EN.md#download-and-install)
 and the [Docker guide](../docker/README.md#released-image).

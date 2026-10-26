@@ -63,7 +63,7 @@ gh workflow run release.yml --ref main -f version=X.Y.Z -F release_notes=@releas
 
 全部成功后才生成版本标签和 GitHub Release，发布 Windows 安装包与便携 ZIP、Linux AppImage、macOS DMG 与 `.app.tar.gz` 更新包、各桌面更新签名、`rust-updates.json`、`SHA256SUMS`，并发布 Docker 多架构版本及 `latest`。Tauri 更新签名不等于操作系统发布者签名：Windows 当前没有 Authenticode 证书，macOS 使用 ad-hoc 签名且未经 Apple 公证，最低要求 macOS 15。已发布版本不可覆盖。中断时使用 **Re-run failed jobs** 恢复同一个构建；另发版本时重新填写版本号和说明。
 
-Windows 构建通过 `scripts/package-windows-portable.ps1` 打包原生程序、MCP 桥接程序及校验过的全部工具，执行隔离启动检查，再用同一 Tauri 密钥签名 ZIP。`portable.flag` 禁用安装包更新入口；便携版沿用系统用户数据目录，更新方式为手动解压覆盖程序。发布门禁要求安装包和便携 ZIP 均有签名，两者都进入 `SHA256SUMS`。
+Windows 构建通过 `scripts/package-windows-portable.ps1` 打包原生程序、MCP 桥接程序及校验过的全部工具，执行隔离启动检查，再用同一 Tauri 密钥签名 ZIP。`portable.flag` 选择便携版更新目标；便携版沿用系统用户数据目录，通过下载签名 ZIP 后重启替换程序更新。更新清单保留原有六个平台，并增加 `windows-x86_64-portable`、`windows-aarch64-portable`。发布门禁要求八个目标完整且均有签名，安装包和便携 ZIP 均进入 `SHA256SUMS`。便携版辅助进程在退出后验证 ZIP、替换固定程序文件和 `tools`，通过 `.huifa-update` 记录恢复文件替换中断；不要手动删除未完成替换的备份。
 
 为已有发行版补 Windows x64 便携包时，在 **Release** 勾选 `portable_only`，填写当前源码一致的版本号和原有说明。此模式目前仅构建 x64，只增加 ZIP、签名和独立的 `.zip.sha256` 校验清单，保留原有产物、更新清单和标签；ZIP 内的说明记录实际构建提交。
 

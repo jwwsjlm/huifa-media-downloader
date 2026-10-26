@@ -5,7 +5,8 @@ import { test } from 'node:test';
 test('every desktop command is declared and granted only to its intended webview', () => {
   const read = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
   const registered = read('src-tauri/src/lib.rs').match(/generate_handler!\[([\s\S]*?)\]/)[1].split(',').map(name => name.trim()).filter(Boolean).sort();
-  const declared = [...read('src-tauri/build.rs').matchAll(/"([a-z_]+)"/g)].map(match => match[1]).sort();
+  const declarations = read('src-tauri/build.rs').match(/\.commands\(\s*&\s*\[([\s\S]*?)\]\s*\)/)[1];
+  const declared = [...declarations.matchAll(/"([a-z_]+)"/g)].map(match => match[1]).sort();
   assert.deepEqual(declared, registered);
   const main = JSON.parse(read('src-tauri/capabilities/main.json'));
   const toolbar = JSON.parse(read('src-tauri/capabilities/login-toolbar.json'));

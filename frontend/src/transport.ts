@@ -1,4 +1,4 @@
-import type { Capabilities, CoreEvent, Json, Session, Task } from './types';
+import type { Capabilities, CoreEvent, Json, Session, Task, UpdateStatus } from './types';
 
 type McpConfiguration = { enabled?: boolean; autoStart?: boolean; port?: number };
 type ReleaseStatus = { currentVersion: string; latestVersion: string; updateAvailable: boolean; url: string; publishedAt?: string };
@@ -146,7 +146,13 @@ export const host = {
     const body = new FormData(); body.set('file', file);
     return response(await fetch('/api/upload', { method: 'POST', credentials: 'same-origin', headers: { 'X-CSRF-Token': csrfToken }, body }));
   },
-  async checkUpdate(): Promise<{ version?: string; body?: string }> { return invoke('check_update'); },
+  async updateStatus(): Promise<UpdateStatus> { return invoke('update_status'); },
+  async checkUpdate(): Promise<UpdateStatus> { return invoke('check_update'); },
+  async downloadUpdate(): Promise<UpdateStatus> { return invoke('download_update'); },
+  async subscribeUpdate(listener: (status: UpdateStatus) => void): Promise<() => void> {
+    const { listen } = await import('@tauri-apps/api/event');
+    return listen<UpdateStatus>('huifa-update', event => listener(event.payload));
+  },
   async installUpdate(): Promise<void> { await invoke('install_update'); },
   async releaseStatus<T = ReleaseStatus>(): Promise<T> { return desktop ? invoke<T>('release_status') : this.command<T>('app.release_status'); },
   async openProject(): Promise<void> {

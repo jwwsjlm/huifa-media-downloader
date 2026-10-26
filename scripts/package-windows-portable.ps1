@@ -44,8 +44,11 @@ Tasks and settings use %LOCALAPPDATA%\HuifaDownloaderRust, shared with the insta
 Media uses the HuifaDownloaderRust folder under your Windows Downloads directory.
 Close the other edition before switching. Moving the program folder does not move your data.
 
-To update, close the app and extract the latest portable ZIP over the program folder.
-Portable editions do not run installer updates. Keep portable.flag beside the executable.
+To update, choose Download update in Settings or About, then Restart and install.
+The app verifies the signed ZIP, saves tasks and backs up configuration before replacing
+program files and bundled tools. Keep portable.flag beside the executable.
+Downloaded updates are kept; reopening the app first checks the online update manifest.
+Older portable editions without this flow need one manual ZIP replacement to upgrade.
 Download ZIP signatures and SHA256SUMS from the same release page:
 https://github.com/jwwsjlm/huifa-media-downloader/releases/latest
 "@)

@@ -6,7 +6,7 @@
   "permissions": [
     "core:event:allow-listen", "core:event:allow-unlisten",
     "allow-command", "allow-capabilities", "allow-open-download-directory", "allow-choose-directory",
-    "allow-result-action", "allow-upload-asset", "allow-notify", "allow-check-update", "allow-install-update",
+    "allow-result-action", "allow-upload-asset", "allow-notify", "allow-check-update", "allow-download-update", "allow-update-status", "allow-install-update",
     "allow-task-copy-value", "allow-release-status", "allow-open-release", "allow-open-project"
   ]
 }

@@ -1640,7 +1640,7 @@ impl Drop for CommandGuard<'_> {
     }
 }
 
-pub(crate) fn reject_links(path: &std::path::Path) -> Result<()> {
+pub fn reject_links(path: &std::path::Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);

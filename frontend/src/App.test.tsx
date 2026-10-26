@@ -3,17 +3,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { AppProvider, useApp, type AppState } from './state';
 import { makeSnapshot, makeTask } from './test-fixtures';
-import type { CoreEvent } from './types';
+import type { CoreEvent, UpdateStatus } from './types';
 import { version as buildVersion } from '../package.json';
 
-const transport = vi.hoisted(() => ({ desktop: false, listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), openProject: vi.fn(), copyTask: vi.fn(), result: vi.fn(), notify: vi.fn(), readClipboard: vi.fn() }));
+const transport = vi.hoisted(() => ({ desktop: false, updates: false, updateListener: null as null | ((status: UpdateStatus) => void), checkUpdate: vi.fn(), downloadUpdate: vi.fn(), installUpdate: vi.fn(), listener: null as null | ((event: CoreEvent) => void), command: vi.fn(), releaseStatus: vi.fn(), openRelease: vi.fn(), openProject: vi.fn(), copyTask: vi.fn(), result: vi.fn(), notify: vi.fn(), readClipboard: vi.fn() }));
 vi.mock('./transport', () => ({ host: {
-  get desktop() { return transport.desktop; }, capabilities: () => ({ browserCookies: false, remoteBrowser: false, updates: false }),
+  get desktop() { return transport.desktop; }, capabilities: () => ({ browserCookies: false, remoteBrowser: false, updates: transport.updates }),
+  checkUpdate: transport.checkUpdate, downloadUpdate: transport.downloadUpdate, installUpdate: transport.installUpdate,
+  updateStatus: async () => ({ revision: 0, phase: 'idle', downloadedBytes: 0, canDownload: false, canInstall: false, restartRequired: false }),
+  subscribeUpdate: async (listener: (status: UpdateStatus) => void) => { transport.updateListener = listener; return () => { transport.updateListener = null; }; },
   session: async () => ({ authenticated: true }), subscribe: async (listener: (event: CoreEvent) => void, connection: (value: boolean) => void) => { transport.listener = listener; connection(true); return () => { transport.listener = null; }; },
   command: (command: string, args?: { ids?: string[] }) => command === 'media.availability' ? Promise.resolve((args?.ids || []).map(id => ({ id, status: 'available' }))) : args === undefined ? transport.command(command) : transport.command(command, args), assetUrl: (id: string, kind = 'cover') => `/api/files/${id}?kind=${kind}`, notify: transport.notify, releaseStatus: transport.releaseStatus, openRelease: transport.openRelease, openProject: transport.openProject, copyTask: transport.copyTask, result: transport.result, readClipboard: transport.readClipboard, paths: async () => ({ downloadDir: 'D:/downloads' }),
 } }));
 beforeEach(() => {
   transport.desktop = false; transport.readClipboard.mockReset().mockImplementation(async () => navigator.clipboard.readText());
+  transport.updates = false; transport.updateListener = null; transport.checkUpdate.mockReset(); transport.downloadUpdate.mockReset(); transport.installUpdate.mockReset();
   transport.command.mockReset(); transport.command.mockImplementation(async command => command === 'snapshot' ? makeSnapshot() : command === 'cookies.list' ? [] : true);
   transport.releaseStatus.mockReset().mockResolvedValue({ currentVersion:'0.3.0', latestVersion:'0.3.0', updateAvailable:false, url:'https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.3.0' });
   transport.openRelease.mockReset().mockResolvedValue(undefined);
@@ -21,6 +25,28 @@ beforeEach(() => {
   transport.copyTask.mockReset().mockResolvedValue(undefined); transport.result.mockReset().mockResolvedValue(undefined); transport.notify.mockReset().mockResolvedValue(undefined);
 });
 afterEach(() => { vi.useRealTimers(); });
+it('shares signed desktop updates between the sidebar, About and Settings while downloading', async () => {
+  transport.desktop = true; transport.updates = true;
+  const available: UpdateStatus = { revision: 2, phase: 'available', version: '0.6.0', downloadedBytes: 0, canDownload: true, canInstall: false, restartRequired: false };
+  transport.checkUpdate.mockResolvedValue(available);
+  let finish!: (status: UpdateStatus) => void;
+  transport.downloadUpdate.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  render(<AppProvider><App /></AppProvider>); await screen.findByRole('listbox');
+  const version = await screen.findByRole('button', { name: /v0\.2\.0.*Update/ });
+  fireEvent.click(version);
+  fireEvent.click(await screen.findByRole('button', { name: 'Download update' }));
+  act(() => transport.updateListener?.({ ...available, revision: 3, phase: 'downloading', canDownload: false, downloadedBytes: 2048, totalBytes: 4096 }));
+  fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Tools & updates' }));
+  expect((screen.getByRole('progressbar', { name: 'Update download progress' }) as HTMLProgressElement).value).toBe(50);
+  await act(async () => finish({ ...available, revision: 5, phase: 'ready', canDownload: false, canInstall: true, downloadedBytes: 4096, totalBytes: 4096 }));
+  expect(screen.getByRole('button', { name: 'Restart and install' })).toBeTruthy();
+  expect(transport.releaseStatus).not.toHaveBeenCalled(); expect(transport.openRelease).not.toHaveBeenCalled();
+  expect(transport.checkUpdate).toHaveBeenCalledOnce(); expect(transport.downloadUpdate).toHaveBeenCalledOnce();
+  act(() => transport.updateListener?.({ ...available, revision: 6, phase: 'error', canDownload: false, restartRequired: true, error: 'Saving failed' }));
+  expect(screen.getByRole('dialog').textContent).toContain('Close and reopen');
+  expect(document.querySelector('.app-shell')?.hasAttribute('inert')).toBe(true);
+});
 describe('live interface stability', () => {
   it.each(['library', 'delete'])('keeps newer live state when the %s refresh returns an older snapshot', async source => {
     const snapshot = { ...makeSnapshot(), revision: 100 };

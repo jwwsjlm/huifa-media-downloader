@@ -75,6 +75,8 @@ jobs:
       - run: node scripts/acquire-rust-tools.mjs windows-x86_64
       - name: Verify native login, cookie sync, IPC isolation and proxy
         run: node scripts/check-login-browser.mjs
+      - name: Verify signed updates, cache recovery and portable rollback
+        run: cargo test --locked --release -p huifa-desktop --lib -- --test-threads=1
       - name: Build desktop with the packaged frontend
         run: cargo build --locked --release -p huifa-desktop --features tauri/custom-protocol
       - name: Verify normal startup and visible initialization failures

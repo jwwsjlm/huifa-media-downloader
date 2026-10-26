@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { validateVersion } from './rust-release.mjs';
 import { renderReleaseNotes } from './release-notes.mjs';
-import { releasePlatforms, isReleaseAsset } from './release-platforms.mjs';
+import { updatePlatforms, isReleaseAsset } from './release-platforms.mjs';
 
 function gh(args, optional404 = false) {
   const result = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, shell: false });
@@ -43,7 +43,7 @@ if (portableOnly) {
   required.push(portable + '.sha256');
 } else {
   const manifest = JSON.parse(readFileSync(join(folder, 'rust-updates.json'), 'utf8'));
-  if (manifest.version !== version || Object.keys(releasePlatforms).some(platform => !manifest.platforms?.[platform])) throw new Error('Incomplete update manifest');
+  if (manifest.version !== version || Object.keys(updatePlatforms).some(platform => !manifest.platforms?.[platform])) throw new Error('Incomplete update manifest');
   required.push('SHA256SUMS', 'rust-updates.json');
   required.push(`HuifaDownloader-${version}-windows-arm64-portable.zip`, `HuifaDownloader-${version}-windows-arm64-portable.zip.sig`, `HuifaDownloader-${version}-macos-x64.dmg`, `HuifaDownloader-${version}-macos-arm64.dmg`);
   for (const entry of Object.values(manifest.platforms)) {

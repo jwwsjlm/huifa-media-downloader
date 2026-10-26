@@ -5,12 +5,12 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { validateVersion, validateNotes } from './rust-release.mjs';
-import { releasePlatforms, isReleaseAsset } from './release-platforms.mjs';
+import { updatePlatforms, isReleaseAsset } from './release-platforms.mjs';
 
 export function makeManifest(version, notes, repository, records, now = new Date()) {
   validateVersion(version);
   const platforms = {};
-  for (const target of Object.keys(releasePlatforms)) {
+  for (const target of Object.keys(updatePlatforms)) {
     const record = records.find(item => item.platform === target);
     if (!record?.signature || !/^[a-f0-9]{64}$/.test(record.sha256) || record.filename.includes('/') || !record.filename.includes(`-${version}-`)) {
       throw new Error(`Missing signed artifact for ${target}`);
@@ -25,7 +25,7 @@ export function makeManifest(version, notes, repository, records, now = new Date
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.includes('--self-test')) {
-    const records = Object.keys(releasePlatforms).map(platform => ({ platform, signature: 'validSignature', filename: `HuifaDownloader-2.1.3-${platform}`, sha256: 'f'.repeat(64) }));
+    const records = Object.keys(updatePlatforms).map(platform => ({ platform, signature: 'validSignature', filename: `HuifaDownloader-2.1.3-${platform}`, sha256: 'f'.repeat(64) }));
     assert.equal(makeManifest('2.1.3', '修复下载', 'owner/repo', records).version, '2.1.3');
     assert.throws(() => makeManifest('2.1.3', 'notes', 'owner/repo', records.slice(0, 1)), /Missing/);
     assert.throws(() => makeManifest('2.1.3', 'notes', 'owner/repo', records.map(item => ({ ...item, filename: '../bad' }))), /Missing/);
@@ -34,7 +34,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const folder = resolve(process.argv[2] ?? 'rust-release-assets');
     const version = process.env.RELEASE_VERSION;
     const notes = readFileSync(resolve('release-notes', `${validateVersion(version)}.md`), 'utf8');
-    const records = Object.keys(releasePlatforms).map(platform => JSON.parse(readFileSync(join(folder, `${platform}.json`), 'utf8')));
+    const records = Object.keys(updatePlatforms).map(platform => JSON.parse(readFileSync(join(folder, `${platform}.json`), 'utf8')));
     for (const record of records) {
       const digest = createHash('sha256').update(readFileSync(join(folder, record.filename))).digest('hex');
       if (digest !== record.sha256 || readFileSync(join(folder, record.filename + '.sig'), 'utf8').trim() !== record.signature) {

@@ -112,6 +112,19 @@ it('uses native release commands on desktop', async () => {
   expect(tauri.invoke).toHaveBeenCalledWith('open_release', { url });
 });
 
+it('uses separate native update phases and listens for complete status snapshots', async () => {
+  const host = await desktop(); const status = { revision: 2, phase: 'available', version: '0.6.0', downloadedBytes: 0, canDownload: true, canInstall: false, restartRequired: false };
+  tauri.invoke.mockResolvedValue(status);
+  await expect(host.updateStatus()).resolves.toEqual(status);
+  await host.checkUpdate(); await host.downloadUpdate(); await host.installUpdate();
+  expect(tauri.invoke.mock.calls.map(([name]) => name)).toEqual(['update_status', 'check_update', 'download_update', 'install_update']);
+  const unlisten = vi.fn(); tauri.listen.mockResolvedValue(unlisten); const listener = vi.fn();
+  const dispose = await host.subscribeUpdate(listener);
+  expect(tauri.listen.mock.calls[0][0]).toBe('huifa-update');
+  tauri.listen.mock.calls[0][1]({ payload: status });
+  expect(listener).toHaveBeenCalledWith(status); dispose(); expect(unlisten).toHaveBeenCalledOnce();
+});
+
 it.each([
   'https://github.com/other/repo/releases/latest',
   'https://github.com.evil.example/jwwsjlm/huifa-media-downloader/releases/latest',

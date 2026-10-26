@@ -44,6 +44,11 @@ export function stage(root, platform, version) {
   }
   const info = { platform, filename: name, signature: signatures[0], sha256: createHash('sha256').update(readFileSync(source)).digest('hex') };
   writeFileSync(join(folder, `${platform}.json`), JSON.stringify(info, null, 2) + '\n');
+  if (windows) {
+    const [file, filename] = artifacts[1];
+    const portable = { platform: `${platform}-portable`, filename, signature: signatures[1], sha256: createHash('sha256').update(readFileSync(file)).digest('hex') };
+    writeFileSync(join(folder, `${portable.platform}.json`), JSON.stringify(portable, null, 2) + '\n');
+  }
   return info;
 }
 

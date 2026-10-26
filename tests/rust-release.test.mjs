@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { synchronize } from '../scripts/rust-release.mjs';
 import { stage } from '../scripts/stage-rust-artifacts.mjs';
 import { makeManifest } from '../scripts/rust-update-manifest.mjs';
-import { releasePlatforms } from '../scripts/release-platforms.mjs';
+import { releasePlatforms, updatePlatforms } from '../scripts/release-platforms.mjs';
 
 test('one explicit version reaches every manifest and notes cannot be replaced', () => {
   const root = mkdtempSync(join(tmpdir(), 'huifa-release-'));
@@ -71,6 +71,9 @@ test('Windows releases require a signed portable archive alongside the installer
     const staged = join(root, 'rust-release-assets/HuifaDownloader-2.1.3-windows-x64-portable.zip');
     assert.equal(readFileSync(staged, 'utf8'), 'fixture portable');
     assert.equal(readFileSync(staged + '.sig', 'utf8'), 'dGVzdA==\n');
+    const record = JSON.parse(readFileSync(join(root, 'rust-release-assets/windows-x86_64-portable.json'), 'utf8'));
+    assert.equal(record.platform, 'windows-x86_64-portable');
+    assert.equal(record.sha256, createHash('sha256').update('fixture portable').digest('hex'));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -109,7 +112,7 @@ test('publication creates or resumes a draft and leaves published assets unchang
     mkdirSync(folder); mkdirSync(join(root, 'release-notes'));
     writeFileSync(join(root, 'release-notes/2.1.3.md'), 'Verified build\n');
     const platforms = {};
-    for (const [platform, target] of Object.entries(releasePlatforms)) {
+    for (const [platform, target] of Object.entries(updatePlatforms)) {
       const filename = `HuifaDownloader-2.1.3-${target.suffix}${target.extension}`;
       writeFileSync(join(folder, filename), 'verified fixture');
       writeFileSync(join(folder, filename + '.sig'), 'dGVzdA==\n');
@@ -184,7 +187,7 @@ test('update files keep the build commit date and identical bytes on retry', () 
     writeFileSync(join(folder, 'HuifaDownloader-2.1.3-windows-arm64-portable.zip'), 'fixture portable');
     writeFileSync(join(folder, 'HuifaDownloader-2.1.3-windows-arm64-portable.zip.sig'), 'dGVzdA==\n');
     for (const suffix of ['macos-x64', 'macos-arm64']) writeFileSync(join(folder, `HuifaDownloader-2.1.3-${suffix}.dmg`), 'disk image');
-    for (const [platform, target] of Object.entries(releasePlatforms)) {
+    for (const [platform, target] of Object.entries(updatePlatforms)) {
       const filename = `HuifaDownloader-2.1.3-${target.suffix}${target.extension}`;
       writeFileSync(join(folder, filename), 'fixture installer');
       writeFileSync(join(folder, filename + '.sig'), 'dGVzdA==\n');
