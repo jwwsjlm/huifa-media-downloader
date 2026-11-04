@@ -399,6 +399,7 @@ fn allowed_command(command: &str) -> bool {
             | "settings.preferences"
             | "tools.check"
             | "tools.latest"
+            | "sites.check"
             | "cookies.import"
             | "cookies.list"
             | "cookies.status"
@@ -784,6 +785,7 @@ mod tests {
     #[test]
     fn remote_version_checks_are_read_only_in_the_web_host() {
         assert!(allowed_command("tools.latest"));
+        assert!(allowed_command("sites.check"));
         assert!(!allowed_command("tools.update"));
     }
 

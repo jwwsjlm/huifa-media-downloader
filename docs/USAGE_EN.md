@@ -4,6 +4,8 @@
 
 ## Add downloads
 
+Choose **Check website support** under New download to enter a domain or a video URL. A single pasted URL is also checked automatically against the installed yt-dlp and bundled plugin patterns, without contacting the website. Updating yt-dlp updates these rules. A dedicated extractor does not guarantee access to individual content. If a domain alone is inconclusive, provide a specific video URL. URLs without a dedicated match may still work through generic extraction, including direct media and embedded video. Unsupported-URL failures show a specific explanation. A single lookup is not used to claim support for an entire pasted batch.
+
 Paste a single link or a batch into the home page. Automatic quality queues known
 single videos directly, including YouTube video links containing playlist parameters.
 Unknown links are identified first; actual collections show item selection, while

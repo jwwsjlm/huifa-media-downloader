@@ -67,7 +67,8 @@ impl History {
         } else {
             self.events
                 .iter()
-                .filter(|(event, _)| event.revision > since)
+                // Retained revisions are contiguous; jump directly to the unread suffix.
+                .skip((since - self.floor) as usize)
                 .map(|(event, _)| event)
                 .collect()
         };
@@ -161,5 +162,83 @@ mod tests {
         );
         app.shutdown().await?;
         Ok(())
+    }
+
+    #[test]
+    fn suffix_matches_revision_filter_after_ring_wrap_and_byte_eviction() {
+        let mut history = History::default();
+        for index in 0..MAX_EVENTS * 2 {
+            history.push("task.remove", json!(index));
+        }
+        for since in [
+            history.floor,
+            history.floor + 1,
+            history.revision - 1,
+            history.revision,
+        ] {
+            let expected: Vec<_> = history
+                .events
+                .iter()
+                .filter(|(event, _)| event.revision > since)
+                .map(|(event, _)| event)
+                .collect();
+            assert_eq!(
+                history.sync(since),
+                json!({"revision":history.revision,"reset":false,"events":expected})
+            );
+        }
+        assert_eq!(history.sync(history.floor - 1)["reset"], true);
+        for _ in 0..2 {
+            history.push("large", json!("x".repeat(MAX_BYTES / 2)));
+        }
+        assert_eq!(history.events.len(), 1);
+        assert_eq!(
+            history.sync(history.floor)["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(history.sync(history.revision)["events"], json!([]));
+        assert_eq!(history.sync(history.floor - 1)["reset"], true);
+    }
+
+    #[test]
+    #[ignore = "opt-in state sync CPU benchmark"]
+    fn sync_suffix_benchmark() {
+        let mut history = History::default();
+        for index in 0..MAX_EVENTS {
+            history.push("task.remove", json!(index));
+        }
+        for unread in [0, 1, 4] {
+            let since = history.revision - unread;
+            let baseline = || {
+                let since = std::hint::black_box(since);
+                let events: Vec<_> = history
+                    .events
+                    .iter()
+                    .filter(|(event, _)| event.revision > since)
+                    .map(|(event, _)| event)
+                    .collect();
+                json!({"revision":history.revision,"reset":false,"events":events})
+            };
+            assert_eq!(baseline(), history.sync(since));
+            for sample in 0..5 {
+                let start = std::time::Instant::now();
+                for _ in 0..20000 {
+                    std::hint::black_box(baseline());
+                }
+                let before = start.elapsed();
+                let start = std::time::Instant::now();
+                for _ in 0..20000 {
+                    std::hint::black_box(history.sync(std::hint::black_box(since)));
+                }
+                println!(
+                    "SYNC_PERF unread={unread} sample={sample} before_ms={} after_ms={}",
+                    before.as_secs_f64() * 1000.0,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
     }
 }

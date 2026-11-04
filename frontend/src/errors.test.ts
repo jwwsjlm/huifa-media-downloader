@@ -3,6 +3,8 @@ import { explainError } from './errors';
 
 const en = (_zh: string, english: string) => english;
 it.each([
+  ['ERROR: Unsupported URL: https://unsupported.test/video', 'not currently supported'],
+  ['Cannot check latest runtime release from GitHub: timeout', 'failed check does not mean'],
   ['Source is live or upcoming, but liveFilter is set to videos. Choose All content to download live streams.', 'Quick options → Live stream filter'],
   ['Source is not live or upcoming, but liveFilter is set to live. Choose All content to download recordings.', 'regular video or finished recording'],
   ['Source duration is longer than durationMax.', 'minimum or maximum'],

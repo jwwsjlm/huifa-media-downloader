@@ -466,11 +466,11 @@ it('queries an exact FFmpeg release for the draft policy and clears the tag when
 
 it('applies the saved FFmpeg policy and exact tag without saving unrelated drafts or claiming installation early', async () => {
   transport.desktop = true; const dispatch = vi.fn(); const message = vi.fn();
-  let finish!: () => void;
+  let finish!: (tools: Tool[]) => void;
   const tools: Tool[] = [{ name: 'ffmpeg', available: true, version: '7.1.1', installedMode: 'compatibility', releaseTag: 'n7.1.1' }];
   const updated: Tool[] = [{ name: 'ffmpeg', available: true, version: '8.0', installedMode: 'efficiency', releaseTag: 'n8.0', repository: 'official/efficiency', platform: 'windows-x86_64' }];
   const props = { state: { ...initialState, tools, settings: { ffmpegMode: 'efficiency' as const }, view: { ...initialState.view, settingsTab: 'tools', optionsDraft: { quality: '720p' } } }, dispatch, t: (_zh: string, en: string) => en, run, message };
-  transport.command.mockImplementation(async name => name === 'tools.update' ? new Promise<void>(resolve => { finish = resolve; }) : name === 'tools.check' ? updated : []);
+  transport.command.mockImplementation(async name => name === 'tools.update' ? new Promise<Tool[]>(resolve => { finish = resolve; }) : []);
   const page = render(<SettingsPage {...props} />);
   fireEvent.change(screen.getByRole('textbox', { name: /FFmpeg exact release tag/ }), { target: { value: ' n8.0 ' } });
   fireEvent.click(screen.getByRole('button', { name: 'Apply FFmpeg version' }));
@@ -478,9 +478,10 @@ it('applies the saved FFmpeg policy and exact tag without saving unrelated draft
   expect(screen.getByText('Current 7.1.1')).toBeTruthy();
   expect(screen.queryByText('Current 8.0')).toBeNull(); expect(message).not.toHaveBeenCalled();
   expect((screen.getByRole('combobox', { name: 'FFmpeg version policy' }) as HTMLSelectElement).disabled).toBe(true);
-  await act(async () => finish());
+  await act(async () => finish(updated));
   await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'event', event: { kind: 'tools.updated', data: updated } }));
   expect(message).toHaveBeenCalledWith('FFmpeg updated');
+  expect(transport.command.mock.calls.some(([name]) => name === 'tools.check')).toBe(false);
   expect(transport.command.mock.calls.some(([name]) => name === 'settings.save')).toBe(false);
   page.rerender(<SettingsPage {...props} state={{ ...props.state, tools: updated }} />);
   expect(screen.getByText('Current 8.0')).toBeTruthy();

@@ -23,7 +23,6 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --prefix frontend
-      - run: npm run check --prefix frontend
       - run: npm test --prefix frontend
       - run: npm run build --prefix frontend
       - run: node --test tests/*.test.mjs
@@ -72,9 +71,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: npm ci --prefix frontend
+      - uses: actions/download-artifact@v4
+        with:
+          name: checked-frontend
+          path: frontend/dist
       - run: node scripts/acquire-rust-tools.mjs windows-x86_64
       - name: Verify native login, cookie sync, IPC isolation and proxy
-        run: node scripts/check-login-browser.mjs
+        run: node scripts/check-login-browser.mjs --prebuilt-frontend
       - name: Verify signed updates, cache recovery and portable rollback
         run: cargo test --locked --release -p huifa-desktop --lib -- --test-threads=1
       - name: Build desktop with the packaged frontend

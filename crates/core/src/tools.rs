@@ -492,6 +492,15 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
     };
     let version = version.trim();
     validate_version(version)?;
+    if matches!(name, "deno" | "qjs") && !version.is_empty() {
+        anyhow::ensure!(
+            version
+                .strip_prefix('v')
+                .and_then(version_numbers)
+                .is_some(),
+            "Invalid runtime version; enter the complete official v-prefixed release tag"
+        );
+    }
     let repository = match (name, channel) {
         ("yt-dlp", "stable") => "yt-dlp/yt-dlp",
         ("yt-dlp", "nightly") => "yt-dlp/yt-dlp-nightly-builds",
@@ -505,10 +514,10 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
                 "BtbN/FFmpeg-Builds"
             }
         }
-        ("deno", "stable") if version.is_empty() => "denoland/deno",
-        ("qjs", "stable") if version.is_empty() => "quickjs-ng/quickjs",
+        ("deno", "stable") => "denoland/deno",
+        ("qjs", "stable") => "quickjs-ng/quickjs",
         ("ffmpeg" | "ffprobe" | "deno" | "qjs", _) => {
-            bail!("Channel and version selection is only supported for yt-dlp")
+            bail!("This runtime only supports the stable channel")
         }
         _ => bail!("Unknown runtime tool"),
     };
@@ -521,6 +530,8 @@ fn release_source(name: &str, channel: &str, version: &str) -> Result<(&'static 
                 format!("download/{version}")
             },
         )
+    } else if !version.is_empty() {
+        ("https://api.github.com/repos", format!("tags/{version}"))
     } else if repository == "tordona/ffmpeg-win-arm64" {
         // shortcut: latest includes mutable nightlies; bump this stable tag with the next ARM64 tool update.
         ("https://api.github.com/repos", "tags/9.0.2".into())
@@ -882,8 +893,16 @@ fn release_tag(repository: &str, url: &url::Url) -> Result<String> {
         .strip_prefix(&prefix)
         .context("GitHub did not resolve the latest runtime release")?;
     anyhow::ensure!(
-        tag.len() <= 64 && version_numbers(tag).is_some(),
-        "Invalid official yt-dlp release version"
+        tag.len() <= 64
+            && version_numbers(
+                if matches!(repository, "denoland/deno" | "quickjs-ng/quickjs") {
+                    tag.strip_prefix('v').unwrap_or(tag)
+                } else {
+                    tag
+                }
+            )
+            .is_some(),
+        "Invalid official runtime release version"
     );
     Ok(tag.to_string())
 }
@@ -896,10 +915,10 @@ async fn latest_version(client: &reqwest::Client, repository: &str) -> Result<St
         .send()
         .await
         .map_err(|e| e.without_url())
-        .context("Cannot check latest yt-dlp release from GitHub")?;
+        .context("Cannot check latest runtime release from GitHub")?;
     anyhow::ensure!(
         response.status().is_success(),
-        "Cannot check latest yt-dlp release from GitHub: HTTP {}",
+        "Cannot check latest runtime release from GitHub: HTTP {}",
         response.status().as_u16()
     );
     release_tag(repository, response.url())
@@ -949,8 +968,8 @@ pub(crate) async fn latest(app: &App, args: &Value) -> Result<Value> {
         );
     }
     anyhow::ensure!(
-        name == "yt-dlp",
-        "Remote version checks are only supported for yt-dlp"
+        matches!(name, "yt-dlp" | "deno" | "qjs"),
+        "Unknown runtime tool"
     );
     let channel = args
         .get("channel")
@@ -966,23 +985,34 @@ pub(crate) async fn latest(app: &App, args: &Value) -> Result<Value> {
         _=app.shutdown_token.cancelled()=>bail!("Runtime update check interrupted"),
     };
     let current = if let Ok(path) = resolve(app, name) {
-        crate::process::run(
+        crate::process::run_limited(
             &path,
             &["--version".into()],
             None,
             &app.shutdown_token,
-            None,
+            512 * 1024,
+            std::time::Duration::from_secs(15),
         )
         .await
         .ok()
-        .map(|v| v.stdout.trim().to_string())
+        .map(|v| v.stdout.lines().next().unwrap_or("").trim().to_string())
     } else {
         None
     };
     let update_available = current
         .as_deref()
-        .and_then(version_numbers)
-        .zip(version_numbers(&version))
+        .and_then(|current| {
+            version_numbers(
+                current
+                    .strip_prefix("deno ")
+                    .unwrap_or(current)
+                    .split_whitespace()
+                    .next()?,
+            )
+        })
+        .zip(version_numbers(
+            version.strip_prefix('v').unwrap_or(&version),
+        ))
         .is_none_or(|(current, latest)| current < latest);
     Ok(
         json!({"name":name,"channel":if channel.is_empty() {"stable"} else {channel},"current":current,"latest":version,"updateAvailable":update_available,"platform":platform,"asset":asset}),
@@ -2217,6 +2247,81 @@ mod tests {
         ] {
             assert!(version_numbers(invalid).is_none());
         }
+    }
+
+    #[test]
+    fn javascript_releases_use_official_tags_and_pinned_install_urls() -> Result<()> {
+        for (name, repository, tag) in [
+            ("deno", "denoland/deno", "v2.9.8"),
+            ("qjs", "quickjs-ng/quickjs", "v0.18.0"),
+        ] {
+            assert_eq!(
+                release_tag(
+                    repository,
+                    &url::Url::parse(&format!(
+                        "https://github.com/{repository}/releases/tag/{tag}"
+                    ))?
+                )?,
+                tag
+            );
+            assert_eq!(
+                release_source(name, "stable", tag)?,
+                (
+                    repository,
+                    format!("https://api.github.com/repos/{repository}/releases/tags/{tag}")
+                )
+            );
+            assert!(release_source(name, "nightly", "").is_err());
+            assert!(release_source(name, "stable", "../latest").is_err());
+            assert!(
+                release_tag(
+                    repository,
+                    &url::Url::parse(&format!(
+                        "https://github.com/{repository}/releases/tag/v2.9.8-rc.1"
+                    ))?
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads official yt-dlp and JavaScript runtimes into an isolated temporary directory"]
+    async fn real_upstream_runtime_updates() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = App::open(crate::AppConfig {
+            data_dir: root.path().join("data"),
+            download_dir: root.path().join("output"),
+            tool_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools")),
+        })
+        .await?;
+        let frozen = app.freeze_tools().await?;
+        let javascript = if resolve(&app, "deno").is_ok() {
+            "deno"
+        } else {
+            "qjs"
+        };
+        for name in ["yt-dlp", javascript] {
+            if asset_name(name, &target()?).is_err() {
+                continue;
+            }
+            let release = latest(&app, &json!({"name":name})).await?;
+            println!("UPSTREAM {release}");
+            update(
+                &app,
+                &json!({"name":name,"version":release["latest"],"downloadSource":"github"}),
+            )
+            .await?;
+            let current = latest(&app, &json!({"name":name})).await?;
+            assert_eq!(current["latest"], release["latest"]);
+            assert_eq!(current["updateAvailable"], false);
+            for (tool, path) in &frozen {
+                validate_frozen(&app, path, tool)?;
+            }
+        }
+        app.shutdown().await?;
+        Ok(())
     }
 
     #[test]

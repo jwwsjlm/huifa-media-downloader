@@ -7,7 +7,6 @@ description = "Huifa Media Downloader Rust desktop host"
 
 [lib]
 name = "huifa_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 login-smoke = []

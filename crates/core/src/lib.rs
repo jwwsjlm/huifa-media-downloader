@@ -21,6 +21,7 @@ mod processing;
 pub mod releases;
 pub mod research;
 mod resources;
+mod sites;
 mod state_sync;
 mod storage;
 #[cfg(test)]
@@ -726,6 +727,7 @@ impl App {
     pub async fn command(&self, command: &str, args: Value) -> Result<Value> {
         let _active = CommandGuard::begin(self)?;
         match command {
+            "sites.check" => sites::check(self, &args).await,
             "tasks.get" => Ok(self.db.task(required_id(&args)?)?.public()),
             "tasks.logs" => self.task_logs(required_id(&args)?, &args),
             "tasks.destination" => destination::resolve(self, required_id(&args)?, &args).await,

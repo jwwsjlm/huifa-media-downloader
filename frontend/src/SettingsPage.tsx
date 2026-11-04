@@ -9,18 +9,20 @@ import { StoragePanel } from './StoragePanel';
 import { DEFAULT_COMPLETED_TIME_FORMAT } from './task';
 import { McpSettings } from './McpSettings';
 import { AppUpdatePanel, type AppUpdateController } from './AppUpdate';
+import { RuntimeUpdatePanel, type RuntimeUpdateController } from './RuntimeUpdates';
 import type { AppState, Action } from './state';
 import type { CookieEntry, DownloadOptions, Settings, Tool, ToolRelease } from './types';
 import type { Translate } from './i18n';
 import type { Run } from './App';
 
-export function SettingsPage({ state, dispatch, t, run, message, appUpdate }: { state: AppState; dispatch: Dispatch<Action>; t: Translate; run: Run; message: (value: string) => void; appUpdate?: AppUpdateController }) {
+export function SettingsPage({ state, dispatch, t, run, message, appUpdate, runtimeUpdates }: { state: AppState; dispatch: Dispatch<Action>; t: Translate; run: Run; message: (value: string) => void; appUpdate?: AppUpdateController; runtimeUpdates?: RuntimeUpdateController }) {
   const settings = state.view.settingsDraft || state.settings; const options = { ...defaults, ...state.settings.downloadOptions, ...state.view.optionsDraft };
   const analysisThreads = settings.analysisThreads ?? 0; const validAnalysisThreads = Number.isInteger(analysisThreads) && analysisThreads >= 0 && analysisThreads <= 256;
   const detectedAnalysisThreads = state.settings.detectedAnalysisThreads; const automaticAnalysisLabel = typeof detectedAnalysisThreads === 'number' && Number.isInteger(detectedAnalysisThreads) && detectedAnalysisThreads > 0 ? t(`自动（最多 8 线程；主机有 ${detectedAnalysisThreads} 个逻辑处理器）`, `Automatic (up to 8 threads; host: ${detectedAnalysisThreads} logical processors)`) : t('自动（最多 8 线程）', 'Automatic (up to 8 threads)');
   const tab = state.view.settingsTab; const [saving, setSaving] = useState(false); const [apiKey, setApiKey] = useState(''); const [remote, setRemote] = useState(false);
   const [cookies, setCookies] = useState<CookieEntry[]>([]); const [browser, setBrowser] = useState('chrome'); const [profile, setProfile] = useState(''); const [cookieAction, setCookieAction] = useState<'import' | 'browser' | null>(null); const cookieBusy = cookieAction !== null;
-  const [toolBusy, setToolBusy] = useState('');
+  const [localToolBusy, setToolBusy] = useState('');
+  const toolBusy = localToolBusy || runtimeUpdates?.busy || '';
   const [downloadDir, setDownloadDir] = useState(host.desktop ? '' : '/downloads');
   const [downloadDirBusy, setDownloadDirBusy] = useState(host.desktop); const [downloadDirError, setDownloadDirError] = useState('');
   const [toolChannel, setToolChannel] = useState('stable'); const [toolVersion, setToolVersion] = useState('');
@@ -43,7 +45,7 @@ export function SettingsPage({ state, dispatch, t, run, message, appUpdate }: { 
   const applyFfmpeg = () => {
     if (!host.desktop || ffmpegPolicyPending || toolBusy) return;
     setToolBusy('ffmpeg.update'); setFfmpegError('');
-    run(async () => { try { await host.command('tools.update', { name: 'ffmpeg', mode: savedFfmpegMode, ...(ffmpegVersion.trim() ? { version: ffmpegVersion.trim() } : {}) }); const tools = await host.command<Tool[]>('tools.check'); dispatch({ type: 'event', event: { kind: 'tools.updated', data: tools as unknown as import('./types').Json } }); setFfmpegRelease(null); message(t('FFmpeg 更新完成', 'FFmpeg updated')); } catch (reason) { setFfmpegError(String(reason)); } finally { setToolBusy(''); } });
+    run(async () => { try { const tools = await host.command<Tool[]>('tools.update', { name: 'ffmpeg', mode: savedFfmpegMode, ...(ffmpegVersion.trim() ? { version: ffmpegVersion.trim() } : {}) }); dispatch({ type: 'event', event: { kind: 'tools.updated', data: tools as unknown as import('./types').Json } }); setFfmpegRelease(null); message(t('FFmpeg 更新完成', 'FFmpeg updated')); } catch (reason) { setFfmpegError(String(reason)); } finally { setToolBusy(''); } });
   };
   const installTool = (name: string) => {
     if (!host.desktop || toolBusy) return;
@@ -75,7 +77,7 @@ export function SettingsPage({ state, dispatch, t, run, message, appUpdate }: { 
             {host.capabilities().browserCookies && <><hr /><div className="form-grid"><Field label={t('浏览器来源', 'Browser source')}><select value={browser} onChange={event => setBrowser(event.target.value)}>{['chrome', 'edge', 'firefox', 'brave', 'chromium', 'opera', 'vivaldi'].map(value => <option key={value}>{value}</option>)}</select></Field><Field label={t('浏览器配置文件', 'Browser profile')} hint={t('留空使用默认配置文件', 'Leave empty for the default profile')}><input value={profile} onChange={event => setProfile(event.target.value)} /></Field></div><Button icon="download" disabled={cookieBusy} onClick={() => { setCookieAction('browser'); run(async () => { try { const result = await host.command<CookieEntry>('cookies.browser', { browser, profile }); setCookies(await host.command<CookieEntry[]>('cookies.list')); if (result.id) change('cookieId', 'auto'); message(t('浏览器 Cookie 已本地保存', 'Browser cookies saved locally')); } finally { setCookieAction(null); } }); }}>{cookieAction === 'browser' ? t('读取中…', 'Reading…') : t('读取浏览器 Cookie', 'Read browser cookies')}</Button></>}
           </details>
         </section></>}
-      {tab === 'tools' && <><section className="settings-group panel"><div className="section-heading"><h2>{t('运行时组件', 'Runtime components')}</h2><Button icon="refresh" disabled={Boolean(toolBusy)} onClick={() => { setToolBusy('check'); run(async () => { try { const tools = await host.command<Tool[]>('tools.check'); dispatch({ type: 'event', event: { kind: 'tools.updated', data: tools as unknown as import('./types').Json } }); } finally { setToolBusy(''); } }); }}>{toolBusy === 'check' ? t('检查中…', 'Checking…') : t('检查组件', 'Check components')}</Button></div>
+      {tab === 'tools' && <>{host.desktop && runtimeUpdates && <RuntimeUpdatePanel update={runtimeUpdates} disabled={Boolean(localToolBusy)} t={t} />}<section className="settings-group panel"><div className="section-heading"><h2>{t('运行时组件', 'Runtime components')}</h2><Button icon="refresh" disabled={Boolean(toolBusy)} onClick={() => { setToolBusy('check'); run(async () => { try { const tools = await host.command<Tool[]>('tools.check'); dispatch({ type: 'event', event: { kind: 'tools.updated', data: tools as unknown as import('./types').Json } }); } finally { setToolBusy(''); } }); }}>{toolBusy === 'check' ? t('检查中…', 'Checking…') : t('检查组件', 'Check components')}</Button></div>
         {host.desktop && <>
           <div className="form-grid">
             <Field label={t('yt-dlp 更新通道', 'yt-dlp update channel')}><select value={toolChannel} disabled={Boolean(toolBusy)} onChange={event => { setToolChannel(event.target.value); setToolVersion(''); setToolRelease(null); }}><option value="stable">{t('官方稳定版', 'Official stable')}</option><option value="nightly">{t('官方 nightly', 'Official nightly')}</option></select></Field>
