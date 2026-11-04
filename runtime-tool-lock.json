@@ -61,58 +61,58 @@
     },
     "yt-dlp": {
       "repository": "yt-dlp/yt-dlp",
-      "version": "2026.10.21",
+      "version": "2026.10.26",
       "assets": {
         "windows-x86_64": {
           "name": "yt-dlp.exe",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp.exe",
-          "sha256": "33121d192d706e62f684a06f80918e3f3a8ba52ac3a65213b6951c39c7d9f555"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp.exe",
+          "sha256": "f5389d3698ecde4ef06f4e6b1ce0294fe9ac1396228c8990b8d3416d6d177a7d"
         },
         "linux-x86_64": {
           "name": "yt-dlp_linux",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_linux",
-          "sha256": "d8bd33fca9d5b23bd5b9952b3fca36db5c46331933fda9f598a3da14ce2c243f"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_linux",
+          "sha256": "767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795"
         },
         "linux-aarch64": {
           "name": "yt-dlp_linux_aarch64",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_linux_aarch64",
-          "sha256": "e137c2171b0b8ef648e6136e86aa70c65923e93e434f01c93901d64744b190aa"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_linux_aarch64",
+          "sha256": "e87e9533e89fe5889abaa21f5114dfe7756d6aa6219b83551add04d48b18e483"
         },
         "windows-aarch64": {
           "name": "yt-dlp_arm64.exe",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_arm64.exe",
-          "sha256": "1380a9f105302764e6a5d383c2f07238ae242f0f4fbf3414aea00e56619a79b3"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_arm64.exe",
+          "sha256": "0066dbac3c124028e2dcae2a197fccee33cd91f456313d24f7af89fd54590e98"
         },
         "darwin-x86_64": {
           "name": "yt-dlp_macos",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_macos",
-          "sha256": "7a6fe71d7d680f1fb0ac18d4949873d77db2859e90017c0f44bd94b23be4ee40"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_macos",
+          "sha256": "0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa"
         },
         "darwin-aarch64": {
           "name": "yt-dlp_macos",
-          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_macos",
-          "sha256": "7a6fe71d7d680f1fb0ac18d4949873d77db2859e90017c0f44bd94b23be4ee40"
+          "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_macos",
+          "sha256": "0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa"
         }
       }
     },
     "qjs": {
       "repository": "quickjs-ng/quickjs",
-      "version": "v0.17.0",
+      "version": "v0.18.0",
       "assets": {
         "windows-x86_64": {
           "name": "qjs-windows-x86_64.exe",
-          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-windows-x86_64.exe",
-          "sha256": "2aeabf0092c3262d6b2609824418f7dd7ed1f1df939f73b2b15645230cac0d77"
+          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.18.0/qjs-windows-x86_64.exe",
+          "sha256": "ff03398d74ea6e6bd3a8e58058f7003225abcac229d7d57775b7aaae812a49c7"
         },
         "linux-x86_64": {
           "name": "qjs-linux-x86_64",
-          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-linux-x86_64",
-          "sha256": "0bfc02511a9f549c28b53880d988fc7cd5d361e90c5e8afdfcd7dc6774ceace5"
+          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.18.0/qjs-linux-x86_64",
+          "sha256": "85ded23b9fabe8c1644fc40a8d2bbdd71157affcbd807359c618cc717ee24d7d"
         },
         "linux-aarch64": {
           "name": "qjs-linux-aarch64",
-          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-linux-aarch64",
-          "sha256": "3372133484edf50a69f3c67903af41206d22a061e930e3cfb63269272ef56d2e"
+          "url": "https://github.com/quickjs-ng/quickjs/releases/download/v0.18.0/qjs-linux-aarch64",
+          "sha256": "2c005c7171424a598d31c53c8dc4a0ae2e4958eb6fbb37908c885a307c78187c"
         }
       }
     },
