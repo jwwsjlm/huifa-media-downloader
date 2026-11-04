@@ -57,4 +57,6 @@ cargo test --locked --release -p huifa-core state_sync::tests::sync_suffix_bench
 - 桌面仅产出可执行程序实际使用的 Rust 库，不再同时链接未使用的静态库与动态库；发行优化参数保持原值。
 - Windows 登录验证接受已检查的前端产物，缺少 `dist/index.html` 会直接失败。本地未指定参数时仍检查类型并构建前端。
 - 前端生产构建已包含 TypeScript 检查，移除工作流中紧邻的重复检查；压缩后的桌面发行包关闭 artifact 二次压缩。
+- 测试失败后也保留已编译的依赖缓存，减少单项失败修复后的重复编译；失败仍阻止发布。
 - 首轮 Windows CI 发现 yt-dlp 的解析器列表包含本地编码字节。网站查询现复用现有 `run_limited_text`，保留字节上限、超时和进程监督；结构化元数据继续严格校验 UTF-8。
+- macOS Intel 队列验收发现等待处理状态先于下载许可释放。现在下载成功后先释放许可，再持久化和发布等待处理状态。

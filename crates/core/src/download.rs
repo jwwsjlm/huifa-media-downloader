@@ -2161,6 +2161,7 @@ impl App {
                     }
                     result => result?,
                 };
+                drop(_permit);
                 self.freeze_sources(id, manifest)?;
                 break;
             }
