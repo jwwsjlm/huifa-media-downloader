@@ -50,7 +50,7 @@ cargo test --locked --release -p huifa-core state_sync::tests::sync_suffix_bench
 - 真实组件更新和真实解析器查询测试通过。
 - TypeScript、前端生产构建及 workspace Clippy 严格检查通过。
 - 未新增依赖、数据库迁移或后台自动安装任务。
-- 本轮没有重新打包发布，也没有在 macOS / Linux 上运行原生安装或测量公网下载、长视频转码性能。
+- 首次本地检查未包含重新打包发布；后续发布验证见下。未测量公网下载、长视频转码性能，也未执行各平台的人工安装验收。
 
 ## v0.5.9 发布流水线
 
@@ -60,3 +60,14 @@ cargo test --locked --release -p huifa-core state_sync::tests::sync_suffix_bench
 - 测试失败后也保留已编译的依赖缓存，减少单项失败修复后的重复编译；失败仍阻止发布。
 - 首轮 Windows CI 发现 yt-dlp 的解析器列表包含本地编码字节。网站查询现复用现有 `run_limited_text`，保留字节上限、超时和进程监督；结构化元数据继续严格校验 UTF-8。
 - macOS Intel 队列验收发现等待处理状态先于下载许可释放。现在下载成功后先释放许可，再持久化和发布等待处理状态。
+- Linux x64 的真实上游更新测试发现探测结束后写打开可执行文件会偶发 `ETXTBSY`。文件同步现移到探测前；Linux 最小复现的旧顺序 30 次均失败，新顺序 30 次均通过，修复后的 Linux 全量 CI（含真实上游更新）通过。
+- 本次单轮观察：前端阶段 41 秒（0.5.8 为 46 秒），macOS Intel 发行构建 9 分 28 秒（此前为 10 分 04 秒）。原生测试、缓存、工具链与下载状态不同，尚不能据此确认整轮发布提速。
+
+## 已发布与公开验证
+
+- [v0.5.9 已公开发布](https://github.com/jwwsjlm/huifa-media-downloader/releases/tag/v0.5.9)，构建提交为 `f42c1b82ffa0db69316f3ce282219d607ac09980`，是当前最新稳定版。
+- [独立 CI](https://github.com/jwwsjlm/huifa-media-downloader/actions/runs/41886555414) 与 [Release](https://github.com/jwwsjlm/huifa-media-downloader/actions/runs/41886570508) 均成功，覆盖六个平台原生测试、签名打包，以及双架构容器的认证、持久化与浏览器验收。
+- 公开资源共 28 个；`SHA256SUMS` 的 27 项摘要均与 GitHub 资源的 SHA-256 digest 一致。下载后的更新清单和校验和文件也通过摘要核对。
+- 更新清单包含八个固定版本目标，涵盖六个平台与两种 Windows 便携版；资源命名、签名文件及固定 `v0.5.9` 下载地址已核对。
+- `ghcr.io/jwwsjlm/huifa-media-downloader:0.5.9` 与 `latest` 均包含 Linux amd64、arm64，两个标签的架构镜像 digest 完全一致。
+- macOS ARM64 曾出现一次进程清理测试的 6 秒超时；未修改断言或时限，本次两个 macOS 架构上的该项测试均通过。下载许可回归也已在原失败的 macOS Intel 平台通过。
