@@ -67,10 +67,9 @@ pub(crate) async fn check(app: &App, args: &Value) -> Result<Value> {
         download::base_args(app, &DownloadOptions::default(), &cookies, None).await?;
     // Matching the installed extractor patterns performs no requests to the website.
     arguments.extend(["--list-extractors".into(), "--".into(), url.to_string()]);
-    let result = process::run_limited(
+    let result = process::run_limited_text(
         &app.tool("yt-dlp")?,
         &arguments,
-        None,
         &app.shutdown_token,
         2 * 1024 * 1024,
         std::time::Duration::from_secs(15),
@@ -153,7 +152,6 @@ mod tests {
             ("example.invalid", "needs_url"),
             ("https://example.invalid/video.mp4", "generic"),
         ] {
-            eprintln!("[DEBUG-sites-20261105] checking {url}");
             assert_eq!(
                 check(&app, &json!({"url":url})).await?["status"],
                 status,
