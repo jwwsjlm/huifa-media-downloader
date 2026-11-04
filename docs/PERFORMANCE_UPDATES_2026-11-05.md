@@ -51,3 +51,10 @@ cargo test --locked --release -p huifa-core state_sync::tests::sync_suffix_bench
 - TypeScript、前端生产构建及 workspace Clippy 严格检查通过。
 - 未新增依赖、数据库迁移或后台自动安装任务。
 - 本轮没有重新打包发布，也没有在 macOS / Linux 上运行原生安装或测量公网下载、长视频转码性能。
+
+## v0.5.9 发布流水线
+
+- 桌面仅产出可执行程序实际使用的 Rust 库，不再同时链接未使用的静态库与动态库；发行优化参数保持原值。
+- Windows 登录验证接受已检查的前端产物，缺少 `dist/index.html` 会直接失败。本地未指定参数时仍检查类型并构建前端。
+- 前端生产构建已包含 TypeScript 检查，移除工作流中紧邻的重复检查；压缩后的桌面发行包关闭 artifact 二次压缩。
+- 首轮 Windows CI 发现 yt-dlp 的解析器列表包含本地编码字节。网站查询现复用现有 `run_limited_text`，保留字节上限、超时和进程监督；结构化元数据继续严格校验 UTF-8。
