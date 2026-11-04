@@ -17,10 +17,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Acquire the failing CI runtime version
-        shell: bash
+        shell: pwsh
         run: |
           git fetch --depth=1 origin 441f27fca89ad9228f144b544aed536b5f069d82
-          git show 441f27fca89ad9228f144b544aed536b5f069d82:runtime-tool-lock.json > runtime-tool-lock.json
+          node --input-type=module -e 'import fs from "node:fs"; import {execFileSync} from "node:child_process"; fs.writeFileSync("runtime-tool-lock.json",execFileSync("git",["show","441f27fca89ad9228f144b544aed536b5f069d82:runtime-tool-lock.json"]));'
           node scripts/acquire-rust-tools.mjs windows-x86_64
       - name: Isolate website query
         run: cargo test --locked -p huifa-core sites::tests -- --include-ignored --test-threads=1 --nocapture
