@@ -1376,6 +1376,11 @@ async fn update_inner(
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         }
+        // Sync before execution; exiting runtime children can still hold Linux text mappings.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .sync_all()?;
         let version = crate::process::run(
             &path,
             &[if tool == "ffmpeg" || tool == "ffprobe" {
@@ -1462,10 +1467,6 @@ async fn update_inner(
             ], Some(temporary.path()), &app.shutdown_token, None).await.context("This yt-dlp version is incompatible with required application options; choose a newer release")?;
             std::fs::remove_file(fixture)?;
         }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)?
-            .sync_all()?;
     }
     if group == "ffmpeg" {
         anyhow::ensure!(
