@@ -133,7 +133,12 @@ mod tests {
             data_dir: root.path().join("data"),
             download_dir: root.path().join("output"),
             tool_dir: Some(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime-tools"),
+                std::env::var_os("HUIFA_TEST_TOOLS")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../runtime-tools")
+                    }),
             ),
         })
         .await?;
@@ -148,6 +153,7 @@ mod tests {
             ("example.invalid", "needs_url"),
             ("https://example.invalid/video.mp4", "generic"),
         ] {
+            eprintln!("[DEBUG-sites-20261105] checking {url}");
             assert_eq!(
                 check(&app, &json!({"url":url})).await?["status"],
                 status,

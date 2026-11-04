@@ -317,6 +317,11 @@ async fn run_inner(
             }
         };
         if result.is_err() {
+            #[cfg(test)]
+            eprintln!(
+                "[DEBUG-sites-20261105] stdout: {:#}",
+                result.as_ref().unwrap_err()
+            );
             out_failure.cancel();
         }
         result
@@ -329,6 +334,11 @@ async fn run_inner(
             read_lines(stderr, true, callback, err_log, true, err_failure.clone()).await
         };
         if result.is_err() {
+            #[cfg(test)]
+            eprintln!(
+                "[DEBUG-sites-20261105] stderr: {:#}",
+                result.as_ref().unwrap_err()
+            );
             err_failure.cancel();
         }
         result
